@@ -2,3 +2,19 @@
 name = "cli"
 edition.workspace = true
 version.workspace = true
+
+[[bin]]
+name = "cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+lsp-core = { path = "../lsp-core" }
+serde_json.workspace = true
+supervisor = { path = "../supervisor" }
+tokio.workspace = true
+dunce.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Console"] }

@@ -2,3 +2,20 @@
 name = "supervisor"
 edition.workspace = true
 version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+lsp-core = { path = "../lsp-core" }
+lsp-types.workspace = true
+ls-adapters = { path = "../ls-adapters" }
+ls-registry = { path = "../ls-registry" }
+ls-runtime = { path = "../ls-runtime" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+dunce.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
