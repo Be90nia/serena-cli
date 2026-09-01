@@ -98,11 +98,12 @@ async fn launch_info_returns_not_installed_when_clangd_missing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let original = std::env::var_os("PATH").unwrap_or_default();
     unsafe { std::env::set_var("PATH", dir.path()) };
+    unsafe { std::env::set_var("SERENA_SKIP_LLVM_FALLBACK", "1") };
 
     let result = ClangdAdapter.launch_info(&dummy_ctx()).await;
 
     unsafe { std::env::set_var("PATH", &original) };
-
+    unsafe { std::env::remove_var("SERENA_SKIP_LLVM_FALLBACK") };
     let err = result.expect_err("PATH 无 clangd 时 launch_info 必须报错");
     let msg = format!("{err:?}");
     assert!(

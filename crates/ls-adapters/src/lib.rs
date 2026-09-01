@@ -146,6 +146,21 @@ pub(crate) fn which_no_unc(name: &str) -> Option<PathBuf> {
             }
         }
     }
+    // 兜底：LLVM 标准安装路径（用户环境 Windows winget 默认 D:/Program Files）——
+    // PATH 没挂时也能用，避免"装了却报 not installed"的 UX 撕裂。仅 Windows。
+    // 测试可通过设 `SERENA_SKIP_LLVM_FALLBACK=1` 临时禁用以验证 not-installed 路径。
+    if cfg!(windows)
+        && std::env::var_os("SERENA_SKIP_LLVM_FALLBACK").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        && matches!(name, "clangd" | "clangd.exe" | "clangd.cmd" | "clangd.bat")
+    {
+        for dir in ["D:/Program Files/LLVM/bin", "C:/Program Files/LLVM/bin"] {
+            let p = std::path::Path::new(dir).join("clangd.exe");
+            if p.is_file() {
+                return Some(dunce::canonicalize(&p).unwrap_or(p));
+            }
+        }
+    }
     None
 }
 

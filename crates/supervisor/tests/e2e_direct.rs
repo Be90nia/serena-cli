@@ -135,5 +135,14 @@ fn has_clangd() -> bool {
             }
         }
     }
+    // 兜底：LLVM 标准安装路径（用户环境 Windows + LLVM winget 默认 D:/Program Files）。
+    if cfg!(windows) {
+        for dir in ["D:/Program Files/LLVM/bin", "C:/Program Files/LLVM/bin"] {
+            let p = std::path::Path::new(dir).join("clangd.exe");
+            if p.is_file() {
+                return true;
+            }
+        }
+    }
     false
 }

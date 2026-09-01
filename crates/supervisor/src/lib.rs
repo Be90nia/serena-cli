@@ -211,9 +211,12 @@ impl Supervisor {
             "textDocument": { "uri": uri.clone() },
             "position": { "line": pos.line, "character": pos.character },
         });
-        let resp: Option<Location> = session
+        // clangd 22 回 `LocationLink[]`（带 `originSelectionRange` / `targetSelectionRange`），
+        // 而 LSP 3.17 spec 还允 `Location | Location[]`。统一接 `serde_json::Value` 后归一化。
+        let raw: Option<serde_json::Value> = session
             .request("textDocument/definition", params, TOOL_TIMEOUT)
             .await?;
+        let resp = normalize_definition(raw.as_ref());
         Ok(resp)
     }
 
@@ -336,4 +339,34 @@ fn extract_install_hint(msg: &str) -> String {
         .map(str::trim)
         .unwrap_or("see upstream docs")
         .to_string()
+}
+
+/// LSP 3.17 `textDocument/definition` 响应允四种形态：
+/// `null | Location | Location[] | LocationLink[]`（clangd 22 默认 LocationLink[]）。
+/// 归一化为 `Option<Location>`：空 None；单 Location 直返；单元素数组返首项；
+/// LocationLink[] 把 `targetUri + targetRange` 折叠为 Location。
+fn normalize_definition(raw: Option<&serde_json::Value>) -> Option<Location> {
+    let v = raw?;
+    if v.is_null() {
+        return None;
+    }
+    // 数组形态：取首个 LocationLike，归一化。
+    let first = if v.is_array() {
+        v.as_array()?.first()?
+    } else {
+        v
+    };
+    // LocationLink 形态：{ targetUri, targetRange, ... } → 转为 Location。
+    if let (Some(target_uri), Some(target_range)) = (
+        first.get("targetUri").and_then(|x| x.as_str()),
+        first.get("targetRange"),
+    ) {
+        let range: lsp_types::Range = serde_json::from_value(target_range.clone()).ok()?;
+        return Some(Location {
+            uri: lsp_types::Uri::from_str(target_uri).ok()?,
+            range,
+        });
+    }
+    // 标准 Location：{ uri, range }。
+    serde_json::from_value::<Location>(first.clone()).ok()
 }
