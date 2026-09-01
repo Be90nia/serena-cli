@@ -59,6 +59,17 @@ pub enum ToolError {
 /// supervisor 公共结果类型（库层 Result 别名）。
 pub type ToolResult<T> = std::result::Result<T, ToolError>;
 
+/// Daemon 工具语义层抽象；实现负责按工具名分派只读请求。
+#[async_trait::async_trait]
+pub trait SupervisorTrait: Send + Sync {
+    async fn execute_tool(
+        &self,
+        tool: &str,
+        project_root: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError>;
+}
+
 /// M0 单实例 supervisor。
 ///
 /// - `instances`：`Mutex<HashMap<Key, Arc<Session>>>`。M0 仅 Cpp 一个 lang；同 (root, cpp) 复用 Session。
@@ -67,17 +78,15 @@ pub type ToolResult<T> = std::result::Result<T, ToolError>;
 ///   此处留模式开关便于未来扩展。
 pub struct Supervisor {
     instances: Mutex<HashMap<Key, Arc<Session>>>,
+    load_gates: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
     direct_mode: bool,
 }
 
-/// 实例键：dunce 规范化的 root + language 字符串（M0 仅 "cpp"）。
-///
-/// ponylabel: 不实现完整 `Eq` 比较的 case-folding —— root 走 `dunce::canonicalize` 后
-/// Windows 已是大小写无关形态（同盘）。M1 跨平台接入再加 `to_lowercase`。
+/// 实例键：canonicalize、去尾分隔符并大小写折叠的 root + language。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Key {
-    root: PathBuf,
-    lang: &'static str,
+pub struct Key {
+    pub root: PathBuf,
+    pub lang: Box<str>,
 }
 
 /// 对外暴露给工具调用方的"位置"结构（直接复用 lsp-types `Location`，
@@ -91,6 +100,7 @@ impl Supervisor {
     pub async fn direct() -> ToolResult<Self> {
         Ok(Self {
             instances: Mutex::new(HashMap::new()),
+            load_gates: Mutex::new(HashMap::new()),
             direct_mode: true,
         })
     }
@@ -101,30 +111,59 @@ impl Supervisor {
         self.direct_mode
     }
 
-    /// 解析 key（root 走 dunce canonicalize 避免 Windows UNC `\\?\` 污染 LSP URI）。
-    fn key(root: &Path, lang: &'static str) -> Key {
-        let canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        Key { root: canon, lang }
+    #[doc(hidden)]
+    pub fn key(root: &Path, lang: &str) -> Key {
+        let mut canonical = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        while matches!(
+            canonical.as_os_str().as_encoded_bytes().last(),
+            Some(b'/' | b'\\')
+        ) {
+            canonical.pop();
+        }
+        Key {
+            root: PathBuf::from(canonical.to_string_lossy().to_lowercase()),
+            lang: Box::from(lang.to_ascii_lowercase()),
+        }
     }
 
-    /// 拿到/创建 (root, lang) 对应的 Session。M0 single-key per (root,lang)。
+    /// 返回同 key 共用的异步加载门。
+    #[doc(hidden)]
+    pub fn load_gate_for(&self, root: &Path, lang: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = Self::key(root, lang);
+        self.load_gates
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// 拿到/创建 (root, lang) 对应的 Session，同 key 只允许一次冷启动。
     async fn session_for(&self, root: &Path, lang: &'static str) -> ToolResult<Arc<Session>> {
         let key = Self::key(root, lang);
-        // 快路径：缓存命中。
-        if let Some(s) = self.instances.lock().unwrap().get(&key).cloned() {
-            return Ok(s);
+        if let Some(session) = self.instances.lock().unwrap().get(&key).cloned() {
+            if !matches!(session.state(), lsp_core::session::SessionState::Failed(_)) {
+                return Ok(session);
+            }
+            self.instances.lock().unwrap().remove(&key);
         }
 
-        // 慢路径：拉起 adapter → spawn → 握手 → Ready。
+        let gate = self.load_gate_for(root, lang);
+        let _guard = gate.lock().await;
+        if let Some(session) = self.instances.lock().unwrap().get(&key).cloned() {
+            if !matches!(session.state(), lsp_core::session::SessionState::Failed(_)) {
+                return Ok(session);
+            }
+            self.instances.lock().unwrap().remove(&key);
+        }
+
         let adapter = ls_registry::adapter_for(lang).ok_or_else(|| ToolError::BadArgs {
             detail: format!("unknown language: {lang}"),
         })?;
-
         let ctx = ls_adapters::ProjectCtx {
             project_root: key.root.clone(),
         };
         let launch = adapter.launch_info(&ctx).await.map_err(|e| {
-            // 区分 LS_NOT_INSTALLED（PATH miss）与其它 launch 错误。
             let msg = format!("{e:#}");
             if msg.contains("not found in PATH") {
                 ToolError::NotInstalled {
@@ -143,7 +182,6 @@ impl Supervisor {
                 detail: format!("root not URI: {e}"),
             }
         })?;
-        // LSP 3.17 deprecates `root_uri` in favor of `workspace_folders`.
         params.workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
             uri: uri.clone(),
             name: key
@@ -153,7 +191,6 @@ impl Supervisor {
                 .unwrap_or("root")
                 .to_string(),
         }]);
-        // adapter patch（clangd 加 utf-16 / hierarchical 等）。
         adapter.initialize_patches(&mut params);
 
         let session = Session::start(child, params).await?;
@@ -338,6 +375,66 @@ fn extract_install_hint(msg: &str) -> String {
         .map(str::trim)
         .unwrap_or("see upstream docs")
         .to_string()
+}
+
+fn required_file(args: &serde_json::Value) -> ToolResult<String> {
+    args.get("file")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing args.file".into(),
+        })
+}
+
+fn required_position(args: &serde_json::Value) -> ToolResult<(String, u32, u32)> {
+    let file = required_file(args)?;
+    let line = args
+        .get("line")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing or invalid args.line".into(),
+        })?;
+    let col = args
+        .get("col")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing or invalid args.col".into(),
+        })?;
+    Ok((file, line, col))
+}
+
+#[async_trait::async_trait]
+impl SupervisorTrait for Supervisor {
+    async fn execute_tool(
+        &self,
+        tool: &str,
+        project_root: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        let root = Path::new(project_root);
+        match tool {
+            "overview" => {
+                let file = required_file(&args)?;
+                serde_json::to_value(self.tool_overview(root, &file).await?)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "def" => {
+                let (file, line, col) = required_position(&args)?;
+                serde_json::to_value(self.tool_def(root, &file, line, col).await?)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "refs" => {
+                let (file, line, col) = required_position(&args)?;
+                serde_json::to_value(self.tool_refs(root, &file, line, col).await?)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            other => Err(ToolError::BadArgs {
+                detail: format!("unknown tool: {other}"),
+            }),
+        }
+    }
 }
 
 /// LSP 3.17 `textDocument/definition` 响应允四种形态：

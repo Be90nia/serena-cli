@@ -25,21 +25,10 @@ use crate::dto::{
     wire_error_from_tool_error,
 };
 
-/// Supervisor trait —— 抽象供 daemon 测试 mock。
-#[async_trait::async_trait]
-pub trait SupervisorTrait: Send + Sync {
-    async fn execute_tool(
-        &self,
-        tool: &str,
-        project_root: &str,
-        args: serde_json::Value,
-    ) -> Result<serde_json::Value, supervisor::ToolError>;
-}
-
 /// Daemon 状态。`token` 来自 lock 文件（Task 11）；draining 标志由 Reaper（Task 14）置。
 #[derive(Clone)]
 pub struct AppState {
-    pub supervisor: Arc<dyn SupervisorTrait>,
+    pub supervisor: Arc<dyn supervisor::SupervisorTrait>,
     pub token: Arc<String>,
     pub start_ts: std::time::Instant,
     pub loaded_ls: Arc<std::sync::Mutex<Vec<String>>>,
@@ -213,7 +202,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl SupervisorTrait for MockSupervisor {
+    impl supervisor::SupervisorTrait for MockSupervisor {
         async fn execute_tool(
             &self,
             _tool: &str,
