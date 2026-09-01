@@ -78,6 +78,7 @@ regex = "1"
 win32job = "2"
 dunce = "1"
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+bytes = "1"
 ```
 
 （子 crate `Cargo.toml` 逐个声明依赖，从 workspace 继承：`tokio.workspace = true` 形式。`cli` 为唯一 bin，其余全 lib。）
@@ -197,7 +198,7 @@ fn split_across_reads() { // 半帧不解码，拼齐才出
 - Test: `crates/lsp-core/tests/session.rs`
 
 **Interfaces:**
-- Produces: `Session::start(child: ChildHandle, params: InitializeParams) -> Arc<Session>`（状态 `Uninitialized→Initializing→Ready`，ARCHITECTURE §5；`initialized_notify: Notify` 就绪门——`request()` 在 Ready 前到达则等门）；`Session::request/notify` 转发 client；`shutdown(self)` 走 `timeout(2s, shutdown)` → `exit` 通知 → 关 stdin → `timeout(5s, wait)` → kill（↖ mirror: `_send_shutdown_in_thread`）。失败态 `Failed` 懒重试环由 supervisor Task 13 消费。
+- Produces: `Session::start(child: ChildHandle, params: InitializeParams) -> Result<Arc<Session>, CoreError>`（审计修订：启动可能失败——spawn/io/init 超时——必须传错；状态 `Uninitialized→Initializing→Ready`，ARCHITECTURE §5；`initialized_notify: Notify` 就绪门——`request()` 在 Ready 前到达则等门）；`Session::request/notify` 转发 client；`shutdown(self)` 走 `timeout(2s, shutdown)` → `exit` 通知 → 关 stdin → `timeout(5s, wait)` → kill（↖ mirror: `_send_shutdown_in_thread`）。失败态 `Failed` 懒重试环由 supervisor Task 13 消费。
 
 - [ ] **Step 1**: 失败测试：对 mock_ls `Session::start` → `Ready`；`request("textDocument/documentSymbol")` 拿到数组；`shutdown` 后 mock 进程退出（`child.wait` 已完成）。
 - [ ] **Step 2**: FAIL → 实现（init_params.rs 构造 base InitializeParams：capabilities 声明 hierarchicalDocumentSymbolSupport、staleRequestSupport 与 client.rs 重试机制一致——ARCHITECTURE §3.2 注）。
@@ -385,9 +386,10 @@ cargo test --workspace          # 全绿
 cargo clippy --workspace        # 0 error
 cargo build --release           # 单 exe 产出
 # M1 起追加：
-./target/release/serena-cli.exe status                 # daemon 起 + JSON 状态
-./target/release/serena-cli.exe overview --project fixtures/cpp_demo fixtures/cpp_demo/main.cpp
-taskkill /F /IM serena-cli.exe & tasklist | findstr clangd   # 空输出=无孤儿(C2)
+# M1 起追加（产物名为 cli —— crates/cli Cargo.toml [[bin]] name="cli"；M1 若改 name="serena-cli" 同步此处）：
+./target/release/cli.exe status                 # daemon 起 + JSON 状态
+./target/release/cli.exe overview --project fixtures/cpp_demo fixtures/cpp_demo/main.cpp
+taskkill /F /IM cli.exe & tasklist | findstr clangd   # 空输出=无孤儿(C2)
 ```
 
 ## 执行交接
