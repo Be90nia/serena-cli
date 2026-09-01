@@ -79,9 +79,9 @@ pub trait SupervisorTrait: Send + Sync {
 pub struct Supervisor {
     instances: Mutex<HashMap<Key, Arc<Session>>>,
     load_gates: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
+    last_used: Mutex<HashMap<Key, std::time::Instant>>,
     direct_mode: bool,
 }
-
 /// 实例键：canonicalize、去尾分隔符并大小写折叠的 root + language。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -101,6 +101,7 @@ impl Supervisor {
         Ok(Self {
             instances: Mutex::new(HashMap::new()),
             load_gates: Mutex::new(HashMap::new()),
+            last_used: Mutex::new(HashMap::new()),
             direct_mode: true,
         })
     }
@@ -138,20 +139,57 @@ impl Supervisor {
             .clone()
     }
 
+    /// 更新 last_used 时间戳（reaper LRU 用）。
+    fn touch(&self, key: &Key) {
+        self.last_used
+            .lock()
+            .unwrap()
+            .insert(key.clone(), std::time::Instant::now());
+    }
+
+    /// 当前已加载实例快照：`(key, last_used, Arc<Session>)`，按 last_used 升序。
+    /// reaper 巡检用；取锁后立刻 clone 释放。
+    pub fn loaded_entries(&self) -> Vec<(Key, std::time::Instant)> {
+        self.last_used
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, t)| (k.clone(), *t))
+            .collect()
+    }
+
+    /// 卸载指定实例：先 shutdown session（5s 超时转 kill），再从池中移除。
+    /// 返回 Ok(true) 表示真的卸了；Ok(false) 表示 key 不存在。
+    pub async fn evict(&self, key: &Key) -> ToolResult<bool> {
+        let session = self.instances.lock().unwrap().remove(key);
+        self.last_used.lock().unwrap().remove(key);
+        match session {
+            Some(s) => {
+                s.shutdown().await;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// 拿到/创建 (root, lang) 对应的 Session，同 key 只允许一次冷启动。
     async fn session_for(&self, root: &Path, lang: &'static str) -> ToolResult<Arc<Session>> {
         let key = Self::key(root, lang);
+        // 快路径：缓存命中（Failed 状态视为 miss 触发懒重启）。
         if let Some(session) = self.instances.lock().unwrap().get(&key).cloned() {
             if !matches!(session.state(), lsp_core::session::SessionState::Failed(_)) {
+                self.touch(&key);
                 return Ok(session);
             }
             self.instances.lock().unwrap().remove(&key);
         }
 
+        // 慢路径：per-key 加载门（防同 key 并发双 spawn）+ 双检锁。
         let gate = self.load_gate_for(root, lang);
         let _guard = gate.lock().await;
         if let Some(session) = self.instances.lock().unwrap().get(&key).cloned() {
             if !matches!(session.state(), lsp_core::session::SessionState::Failed(_)) {
+                self.touch(&key);
                 return Ok(session);
             }
             self.instances.lock().unwrap().remove(&key);
@@ -194,7 +232,11 @@ impl Supervisor {
         adapter.initialize_patches(&mut params);
 
         let session = Session::start(child, params).await?;
-        self.instances.lock().unwrap().insert(key, session.clone());
+        self.instances
+            .lock()
+            .unwrap()
+            .insert(key.clone(), session.clone());
+        self.touch(&key);
         Ok(session)
     }
 
