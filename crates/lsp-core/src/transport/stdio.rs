@@ -7,9 +7,7 @@
 //!   防诊断代际倒序）；
 //! - stderr 泵逐行 → tracing 分级（缺省 info；Task 8 接 logmap 表：clangd `I[..]/E[..]`）。
 //!
-//! Task 5 接管分发表（消除 `todo!()`）：响应帧走 Client `pending` 表完成 oneshot；
-//! 服务器→客户端请求默认回 null 成功（未注册 handler 时），或交注册 handler；
-//! 通知按 method 派发；泵 EOF 时调 `on_eof` 让 Client drain pending → Terminated。
+//! 响应帧走 Client `pending` 表完成 oneshot；
 
 use bytes::BytesMut;
 use std::sync::Arc;

@@ -10,6 +10,7 @@ use std::io;
 /// `ContentModified(-32801)` **不**设独立变体 —— 由 `client.rs` 在内部消化重试，
 /// 不外泄（ARCHITECTURE §6.1）。
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)] // Framing 变体占位到 M1 transport 把 `FrameError` 转 `CoreError::Framing`（stdio pump 解码失败路径）
 pub enum CoreError {
     /// 帧解析失败（CONTENT_LENGTH 缺失/头非 UTF-8/JSON 不合法等）。
     #[error("framing error: {detail}")]
