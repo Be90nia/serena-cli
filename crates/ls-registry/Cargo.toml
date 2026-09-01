@@ -2,3 +2,6 @@
 name = "ls-registry"
 edition.workspace = true
 version.workspace = true
+
+[dependencies]
+ls-adapters = { path = "../ls-adapters" }
