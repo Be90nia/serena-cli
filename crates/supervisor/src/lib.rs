@@ -83,10 +83,9 @@ struct Key {
 /// 对外暴露给工具调用方的"位置"结构（直接复用 lsp-types `Location`，
 /// 但放本 crate re-export 以避免下游依赖 `lsp-types`）。
 ///
-/// `Location { uri: Uri, range: Range }` —— `Uri`/`Range` 也直接 re-export。
+pub use lsp_core::error::CoreError as CoreErrorWire;
 pub use lsp_types::Location;
 pub use lsp_types::Range as LspRange;
-
 impl Supervisor {
     /// `--direct` 模式入口：创建空 supervisor（懒加载 Session）。
     pub async fn direct() -> ToolResult<Self> {
