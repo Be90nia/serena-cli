@@ -1,0 +1,4 @@
+[package]
+name = "supervisor"
+edition.workspace = true
+version.workspace = true

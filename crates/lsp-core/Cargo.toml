@@ -1,0 +1,4 @@
+[package]
+name = "lsp-core"
+edition.workspace = true
+version.workspace = true

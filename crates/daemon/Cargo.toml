@@ -1,0 +1,4 @@
+[package]
+name = "daemon"
+edition.workspace = true
+version.workspace = true

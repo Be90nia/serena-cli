@@ -1,0 +1,4 @@
+[package]
+name = "ls-runtime"
+edition.workspace = true
+version.workspace = true

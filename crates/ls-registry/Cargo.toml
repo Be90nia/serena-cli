@@ -1,0 +1,4 @@
+[package]
+name = "ls-registry"
+edition.workspace = true
+version.workspace = true
