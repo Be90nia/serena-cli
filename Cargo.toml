@@ -29,6 +29,7 @@ regex = "1"
 win32job = "2"
 dunce = "1"
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+bytes = "1"
 
 [workspace.lints.clippy]
 all = { level = "deny" }
