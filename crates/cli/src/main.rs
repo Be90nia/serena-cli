@@ -115,6 +115,10 @@ async fn main() -> ExitCode {
                     eprintln!("bad args: {detail}");
                     2
                 }
+                ToolError::WriteConflict { path, reason } => {
+                    eprintln!("write conflict on {path}: {reason}（请重读文件后重试）");
+                    1
+                }
                 ToolError::Core(_) | ToolError::Launch(_) => {
                     eprintln!("LSP error: {e}");
                     3

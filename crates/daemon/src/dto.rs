@@ -102,6 +102,9 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
             other => (WireErrorCode::Internal, format!("{}: {:?}", other, other)),
         },
         ToolError::Launch(re) => (WireErrorCode::LsSpawnFailed, format!("{re}")),
+        ToolError::WriteConflict { path, reason } => {
+            (WireErrorCode::WriteConflict, format!("{path}: {reason}"))
+        }
     };
     let ls = match err {
         ToolError::Core(supervisor::CoreErrorWire::Terminated { ls, .. }) => Some(ls.clone()),
@@ -201,6 +204,17 @@ mod tests {
         let w = wire_error_from_tool_error(&e);
         assert_eq!(w.code, WireErrorCode::LsNotInstalled);
         assert_eq!(w.ls.as_deref(), Some("cpp"));
+        assert!(!w.retryable);
+    }
+
+    #[test]
+    fn wire_error_from_write_conflict() {
+        let e = supervisor::ToolError::WriteConflict {
+            path: "src/x.rs".into(),
+            reason: "hash mismatch".into(),
+        };
+        let w = wire_error_from_tool_error(&e);
+        assert_eq!(w.code, WireErrorCode::WriteConflict);
         assert!(!w.retryable);
     }
 

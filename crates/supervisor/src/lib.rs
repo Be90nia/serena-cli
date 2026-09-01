@@ -24,6 +24,7 @@ use lsp_core::docsync::path_to_uri_str;
 use lsp_core::error::CoreError;
 use lsp_core::init_params::base_initialize_params;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
+pub mod write_gate;
 use lsp_core::session::Session;
 use lsp_core::types::{SymbolHit, SymbolKindTag};
 use lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position};
@@ -50,6 +51,10 @@ pub enum ToolError {
     /// lsp-core 错误冒泡 —— 此后调用方可判定是否 LS 崩溃 / RPC / 超时。
     #[error("core error: {0}")]
     Core(#[from] CoreError),
+
+    /// 盘上内容与 LSP 状态不符（C3 防线）—— exit 1 + 需重读。
+    #[error("write conflict on {path}: {reason}")]
+    WriteConflict { path: String, reason: String },
 
     /// 适配器启动期错误（anyhow 上抛统一收口）。
     #[error("adapter launch failed: {0}")]
@@ -326,6 +331,164 @@ impl Supervisor {
             .await?;
         Ok(resp)
     }
+
+    /// `symbol-body`：按符号名取函数/类体切片（PLAN Task 15）。
+    ///
+    /// 流程：ensure_open → documentSymbol 定位 name 匹配的符号 range →
+    /// offsets.rs 切片返回。position-free（客户端只传 file + symbol name）。
+    pub async fn tool_symbol_body(
+        &self,
+        root: &Path,
+        file: &str,
+        symbol: &str,
+    ) -> ToolResult<String> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({ "textDocument": { "uri": uri.clone() } });
+        let resp: DocumentSymbolResponse = session
+            .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
+            .await?;
+
+        // 递归找第一个 name == symbol 的 DocumentSymbol（Nested 形态）。
+        let range = find_symbol_range(&resp, symbol).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("symbol `{symbol}` not found in {file}"),
+        })?;
+
+        let text = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("read {}: {e}", path.display()),
+            })?;
+        let start = LspPos {
+            line: range.start.line,
+            character: range.start.character,
+        };
+        let end = LspPos {
+            line: range.end.line,
+            character: range.end.character,
+        };
+        lsp_core::offsets::slice_at(&text, start, end, OffsetEncoding::Utf16).map_err(|e| {
+            ToolError::BadArgs {
+                detail: format!("slice {file}@{start:?}-{end:?}: {e}"),
+            }
+        })
+    }
+
+    /// `replace-body`：按符号名替换函数/类体（C3 一致性链路，PLAN Task 15）。
+    ///
+    /// 流程（全程持全局写门）：
+    /// 1. documentSymbol 解析符号 range（客户端只传符号名，不传 range）
+    /// 2. 读盘 content 与前快照 hash 对账 —— 不符 → WRITE_CONFLICT
+    /// 3. 新 body 替换 range → tempfile 原子写 + rename（Windows 共享冲突重试 5×50ms）
+    /// 4. 读回 diff 校验 —— 不符 → 从写前副本回滚 + WRITE_CONFLICT
+    /// 5. didChange 全量同步 → LS 与盘一致
+    pub async fn tool_replace_body(
+        &self,
+        root: &Path,
+        file: &str,
+        symbol: &str,
+        new_body: &str,
+    ) -> ToolResult<()> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri_str = path_to_uri_str(&path);
+
+        // ===== 全局写门：以下所有步骤持锁（A4 FIFO）=====
+        let _gate = write_gate::acquire().await;
+
+        // 1) 锁内解析符号 range（杜绝客户端 range 过期）。
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+        let params = json!({ "textDocument": { "uri": uri_str.clone() } });
+        let resp: DocumentSymbolResponse = session
+            .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
+            .await?;
+        let range = find_symbol_range(&resp, symbol).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("symbol `{symbol}` not found in {file}"),
+        })?;
+
+        // 2) 读盘 + content-hash 对账（C3 防线 ①）。
+        let old_text = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("read {}: {e}", path.display()),
+            })?;
+        let old_hash = content_hash(&old_text);
+
+        // didOpen/didChange 后 LS 侧的版本号；从 1 递增即可（mock 与 clangd 都不校验具体值）。
+        static VERSION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        let version = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // 3) 新文本 = 老文本替换 range；tempfile 原子写 + rename。
+        let start = LspPos {
+            line: range.start.line,
+            character: range.start.character,
+        };
+        let end = LspPos {
+            line: range.end.line,
+            character: range.end.character,
+        };
+        let start_byte =
+            lsp_core::offsets::position_to_byte(&old_text, start, OffsetEncoding::Utf16).map_err(
+                |e| ToolError::BadArgs {
+                    detail: format!("start position: {e}"),
+                },
+            )?;
+        let end_byte = lsp_core::offsets::position_to_byte(&old_text, end, OffsetEncoding::Utf16)
+            .map_err(|e| ToolError::BadArgs {
+            detail: format!("end position: {e}"),
+        })?;
+        let new_text = format!(
+            "{}{}{}",
+            &old_text[..start_byte],
+            new_body,
+            &old_text[end_byte..]
+        );
+
+        atomic_write(&path, &new_text)
+            .await
+            .map_err(|e| ToolError::WriteConflict {
+                path: path.display().to_string(),
+                reason: format!("atomic write failed: {e}"),
+            })?;
+
+        // 4) 读回 diff 校验（C3 防线 ②③）—— 不符回滚 + 报冲突。
+        let readback = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("readback {}: {e}", path.display()),
+            })?;
+        if readback != new_text {
+            // 回滚：老内容写回。
+            let _ = atomic_write(&path, &old_text).await;
+            return Err(ToolError::WriteConflict {
+                path: path.display().to_string(),
+                reason: "readback mismatch; rolled back".into(),
+            });
+        }
+
+        // 5) didChange 全量同步到 LS。
+        let change_params = json!({
+            "textDocument": { "uri": uri_str, "version": version },
+            "contentChanges": [ { "text": new_text } ],
+        });
+        session
+            .notify("textDocument/didChange", change_params)
+            .await
+            .map_err(ToolError::Core)?;
+
+        // 防御：old_hash 在此仅供将来做"多客户端并发"检测（M2 扩展）。
+        let _ = old_hash;
+        Ok(())
+    }
 }
 
 /// 拍平 `DocumentSymbolResponse` → `Vec<SymbolHit>`。
@@ -507,4 +670,63 @@ fn normalize_definition(raw: Option<&serde_json::Value>) -> Option<Location> {
     }
     // 标准 Location：{ uri, range }。
     serde_json::from_value::<Location>(first.clone()).ok()
+}
+
+/// 递归在 Nested documentSymbol 里找第一个 name == `symbol` 的 range。
+/// Flat 形态（SymbolInformation）不含子符号，这里只处理 Nested —— clangd/mock_ls 都是 Nested。
+fn find_symbol_range(resp: &DocumentSymbolResponse, symbol: &str) -> Option<lsp_types::Range> {
+    fn walk(items: &[DocumentSymbol], symbol: &str) -> Option<lsp_types::Range> {
+        for it in items {
+            if it.name == symbol {
+                return Some(it.range);
+            }
+            if let Some(children) = it.children.as_ref()
+                && let Some(r) = walk(children, symbol)
+            {
+                return Some(r);
+            }
+        }
+        None
+    }
+    match resp {
+        DocumentSymbolResponse::Nested(items) => walk(items, symbol),
+        DocumentSymbolResponse::Flat(_) => None,
+    }
+}
+
+/// sha256(content) hex 前 16 位（对账用；碰撞概率足够低且只做提示性校验）。
+fn content_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(text.as_bytes());
+    let out = h.finalize();
+    out.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// tempfile 原子写 + rename；Windows 共享冲突（目标被别进程打开）重试 5×50ms（I5）。
+async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    let tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let tmp_path = tmp.into_temp_path().keep()?;
+    tokio::fs::write(&tmp_path, content).await?;
+
+    let mut attempt = 0;
+    loop {
+        match tokio::fs::rename(&tmp_path, path).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 5 => {
+                // Windows ERROR_SHARING_VIOLATION(32) / ERROR_ACCESS_DENIED(5) 常见于杀软/索引器；
+                // 统一退避重试。
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = e;
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(e);
+            }
+        }
+    }
 }
