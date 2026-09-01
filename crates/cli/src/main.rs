@@ -25,7 +25,11 @@ use supervisor::{Supervisor, ToolError};
 
 /// M0 直接模式 CLI 入口。
 #[derive(Parser, Debug)]
-#[command(name = "serena-cli", version, about = "serena-rust LSP CLI (M0 --direct)")]
+#[command(
+    name = "serena-cli",
+    version,
+    about = "serena-rust LSP CLI (M0 --direct)"
+)]
 struct Cli {
     /// 直连模式：不走 daemon，单进程内拉 clangd 并直调（PLAN Task 10 / ARCH §2 A7）。
     #[arg(long)]
@@ -102,7 +106,9 @@ async fn main() -> ExitCode {
         Err(e) => {
             let exit = match &e {
                 ToolError::NotInstalled { language, hint } => {
-                    eprintln!("language server for `{language}` not installed; install_hint: {hint}");
+                    eprintln!(
+                        "language server for `{language}` not installed; install_hint: {hint}"
+                    );
                     1
                 }
                 ToolError::BadArgs { detail } => {

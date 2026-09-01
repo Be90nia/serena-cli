@@ -20,12 +20,12 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lsp_core::error::CoreError;
 use lsp_core::docsync::path_to_uri_str;
-use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
+use lsp_core::error::CoreError;
 use lsp_core::init_params::base_initialize_params;
-use lsp_core::types::{SymbolHit, SymbolKindTag};
+use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
 use lsp_core::session::Session;
+use lsp_core::types::{SymbolHit, SymbolKindTag};
 use lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position};
 use serde_json::json;
 use thiserror::Error;
@@ -117,8 +117,9 @@ impl Supervisor {
         }
 
         // 慢路径：拉起 adapter → spawn → 握手 → Ready。
-        let adapter = ls_registry::adapter_for(lang)
-            .ok_or_else(|| ToolError::BadArgs { detail: format!("unknown language: {lang}") })?;
+        let adapter = ls_registry::adapter_for(lang).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("unknown language: {lang}"),
+        })?;
 
         let ctx = ls_adapters::ProjectCtx {
             project_root: key.root.clone(),
@@ -128,7 +129,7 @@ impl Supervisor {
             let msg = format!("{e:#}");
             if msg.contains("not found in PATH") {
                 ToolError::NotInstalled {
-                language: lang.to_string(),
+                    language: lang.to_string(),
                     hint: extract_install_hint(&msg),
                 }
             } else {
@@ -138,12 +139,20 @@ impl Supervisor {
         let child = ls_runtime::process::Child::spawn(launch)
             .map_err(|e| ToolError::Launch(anyhow::anyhow!("runtime spawn error: {e}")))?;
         let mut params = base_initialize_params();
-        let uri = lsp_types::Uri::from_str(&path_to_uri_str(&key.root))
-            .map_err(|e| ToolError::BadArgs { detail: format!("root not URI: {e}") })?;
+        let uri = lsp_types::Uri::from_str(&path_to_uri_str(&key.root)).map_err(|e| {
+            ToolError::BadArgs {
+                detail: format!("root not URI: {e}"),
+            }
+        })?;
         // LSP 3.17 deprecates `root_uri` in favor of `workspace_folders`.
         params.workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
             uri: uri.clone(),
-            name: key.root.file_name().and_then(|s| s.to_str()).unwrap_or("root").to_string(),
+            name: key
+                .root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("root")
+                .to_string(),
         }]);
         // adapter patch（clangd 加 utf-16 / hierarchical 等）。
         adapter.initialize_patches(&mut params);
@@ -157,8 +166,9 @@ impl Supervisor {
     ///
     /// 上游语义（PLAN Task 10 step 2）：position-free；只传 file。M1 才补 name 过滤。
     pub async fn tool_overview(&self, root: &Path, file: &str) -> ToolResult<Vec<SymbolHit>> {
-        let lang = ls_registry::resolve(Path::new(file))
-            .ok_or_else(|| ToolError::BadArgs { detail: format!("file not supported: {file}") })?;
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
         let lang_str: &'static str = lang.as_str();
 
         let session = self.session_for(root, lang_str).await?;
@@ -185,8 +195,9 @@ impl Supervisor {
         line: u32,
         col: u32,
     ) -> ToolResult<Option<Location>> {
-        let lang = ls_registry::resolve(Path::new(file))
-            .ok_or_else(|| ToolError::BadArgs { detail: format!("file not supported: {file}") })?;
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
         let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
@@ -214,8 +225,9 @@ impl Supervisor {
         line: u32,
         col: u32,
     ) -> ToolResult<Vec<Location>> {
-        let lang = ls_registry::resolve(Path::new(file))
-            .ok_or_else(|| ToolError::BadArgs { detail: format!("file not supported: {file}") })?;
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
         let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
@@ -266,7 +278,12 @@ fn flatten_symbols(resp: DocumentSymbolResponse, file_uri: &str) -> Vec<SymbolHi
     out
 }
 
-fn push_nested(sym: &DocumentSymbol, container: Option<String>, file_uri: &str, out: &mut Vec<SymbolHit>) {
+fn push_nested(
+    sym: &DocumentSymbol,
+    container: Option<String>,
+    file_uri: &str,
+    out: &mut Vec<SymbolHit>,
+) {
     let container = container.or_else(|| Some(sym.name.clone()));
     out.push(SymbolHit {
         name: sym.name.clone(),
@@ -296,10 +313,15 @@ async fn lsp_position_from_byte(
     col: u32,
     enc: OffsetEncoding,
 ) -> ToolResult<Position> {
-    let text = tokio::fs::read_to_string(path).await.map_err(|e| ToolError::BadArgs {
-        detail: format!("read {}: {e}", path.display()),
-    })?;
-    let pos = LspPos { line, character: col };
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| ToolError::BadArgs {
+            detail: format!("read {}: {e}", path.display()),
+        })?;
+    let pos = LspPos {
+        line,
+        character: col,
+    };
     lsp_core::offsets::position_to_byte(&text, pos, enc).map_err(|e| ToolError::BadArgs {
         detail: format!("position {line}:{col} out of range: {e}"),
     })?;
