@@ -2,3 +2,17 @@
 name = "ls-adapters"
 edition.workspace = true
 version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde_json.workspace = true
+lsp-core = { path = "../lsp-core" }
+lsp-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+ls-runtime = { path = "../ls-runtime" }
+dunce.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
