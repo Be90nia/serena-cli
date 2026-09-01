@@ -7,7 +7,7 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "time", "fs", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "io-std", "sync", "time", "fs", "macros"] }
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

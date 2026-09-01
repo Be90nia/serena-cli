@@ -3,8 +3,16 @@ name = "lsp-core"
 edition.workspace = true
 version.workspace = true
 [dependencies]
+bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 lsp-types.workspace = true
 thiserror.workspace = true
-bytes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ls-runtime = { path = "../ls-runtime" }
+win32job.workspace = true
+
+[[bin]]
+name = "mock_ls"
+path = "tests/bin/mock_ls.rs"

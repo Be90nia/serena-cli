@@ -2,3 +2,7 @@
 name = "ls-runtime"
 edition.workspace = true
 version.workspace = true
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+win32job.workspace = true
