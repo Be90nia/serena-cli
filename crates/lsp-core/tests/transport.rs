@@ -21,18 +21,17 @@ async fn pumps_roundtrip_requests() {
     .unwrap();
 
     let (tx, rx) = mpsc::channel::<JsonRpc>(64);
+    let (reply_tx, reply_rx) = mpsc::channel::<JsonRpc>(8);
     let (resp_tx, mut resp_rx) = mpsc::channel::<JsonRpc>(8);
-    let on_msg: Arc<dyn Fn(JsonRpc) + Send + Sync> = {
-        let resp_tx = resp_tx.clone();
-        Arc::new(move |msg| {
-            // 响应帧（有 id 无 method）即本任务的断言通道
-            if msg.id.is_some() && msg.method.is_none() {
-                let _ = resp_tx.try_send(msg);
-            }
-        })
-    };
+    let on_msg: Arc<dyn Fn(JsonRpc) -> Option<JsonRpc> + Send + Sync> = Arc::new(move |msg| {
+        if msg.id.is_some() && msg.method.is_none() {
+            let _ = resp_tx.try_send(msg);
+        }
+        None
+    });
+    let on_eof: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
 
-    let mut pumps = pump(child, rx, on_msg);
+    let mut pumps = pump(child, rx, reply_rx, reply_tx, on_msg, on_eof);
 
     // ① initialize 往返：mock 回 capabilities
     tx.send(JsonRpc::request(

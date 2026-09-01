@@ -6,6 +6,10 @@
 //! - stdout 泵跑同一 Content-Length 帧循环，**内联保序分发**（不转发无界 channel，
 //!   防诊断代际倒序）；
 //! - stderr 泵逐行 → tracing 分级（缺省 info；Task 8 接 logmap 表：clangd `I[..]/E[..]`）。
+//!
+//! Task 5 接管分发表（消除 `todo!()`）：响应帧走 Client `pending` 表完成 oneshot；
+//! 服务器→客户端请求默认回 null 成功（未注册 handler 时），或交注册 handler；
+//! 通知按 method 派发；泵 EOF 时调 `on_eof` 让 Client drain pending → Terminated。
 
 use bytes::BytesMut;
 use std::sync::Arc;
@@ -17,8 +21,14 @@ use tokio::task::JoinHandle;
 
 use crate::framing::{JsonRpc, decode, encode};
 
-/// 内联分发回调（保序；Task 5 起响应帧改走 pending 表，本回调留予通知/服务器事件）。
-pub type OnMsg = Arc<dyn Fn(JsonRpc) + Send + Sync>;
+/// 内联分发回调（保序；Task 5：返回 `Some(reply)` 表示 server→client request 需回执）。
+///
+/// 收到响应帧/通知时返回 `None`（不需回写 LS）；收到 server→client 请求时返回
+/// 默认/handler 计算的响应帧，由 pump 经 `reply_tx` → writer 写回 LS。
+pub type OnMsg = Arc<dyn Fn(JsonRpc) -> Option<JsonRpc> + Send + Sync>;
+
+/// 泵 stdout EOF 时的回调。让上层（Client）drain pending 并对所有等待者回 Terminated。
+pub type OnEof = Arc<dyn Fn() + Send + Sync>;
 
 /// 泵集合：三个常驻 task 的 JoinHandle + Job 保活句柄。
 ///
@@ -38,9 +48,20 @@ impl Pumps {
     }
 }
 
-/// 拆解 `ChildHandle` 并起 3 个泵 task。`outbound_rx` 关闭后 writer 丢 stdin
-/// （LS 看到 EOF，自行走退出流程；优雅 shutdown 序列属 Task 6）。
-pub fn pump(child: ChildHandle, outbound_rx: mpsc::Receiver<JsonRpc>, on_msg: OnMsg) -> Pumps {
+/// 拆解 `ChildHandle` 并起 3 个泵 task。
+///
+/// - `outbound_rx`：调用方写入的请求/通知帧。drop → writer 丢 stdin（LS 走 EOF 退出）。
+/// - `reply_rx` + `reply_tx`：服务器→客户端请求的回执通道；writer `select!` 此与 outbound_rx。
+/// - `on_msg`：每帧到达时调用；返回 `Some(reply)` 即经 `reply_tx` 写回 LS。
+/// - `on_eof`：stdout 读到 EOF 时调用；典型实现 = `Client::abort_all`。
+pub fn pump(
+    child: ChildHandle,
+    outbound_rx: mpsc::Receiver<JsonRpc>,
+    reply_rx: mpsc::Receiver<JsonRpc>,
+    reply_tx: mpsc::Sender<JsonRpc>,
+    on_msg: OnMsg,
+    on_eof: OnEof,
+) -> Pumps {
     let ChildHandle {
         stdin,
         stdout,
@@ -48,46 +69,81 @@ pub fn pump(child: ChildHandle, outbound_rx: mpsc::Receiver<JsonRpc>, on_msg: On
         job,
     } = child;
 
+    let reply_tx_for_dispatch = reply_tx.clone();
+
     // writer：独占 stdin，单一所有者天然串行（Δ 等价替换上游 `_stdin_lock`）。
     let writer = tokio::spawn(async move {
         let mut stdin = stdin;
-        let mut rx = outbound_rx;
-        while let Some(msg) = rx.recv().await {
-            let frame = encode(&msg);
-            if let Err(e) = stdin.write_all(&frame).await {
-                tracing::warn!(error = %e, "stdin write failed; LS process likely dead");
-                break;
-            }
-        }
-        // rx 关闭：stdin 在此 drop → LS 读到 EOF
-    });
-
-    // stdout 泵：帧解析 + 内联分发。
-    let stdout_task = tokio::spawn(async move {
-        let mut stdout = stdout;
-        let mut buf = BytesMut::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match stdout.read(&mut chunk).await {
-                Ok(0) => break, // EOF；崩溃 drain pending 语义 = Task 5
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(e) => {
-                    tracing::warn!(error = %e, "stdout read failed; aborting pump");
-                    break;
+        let mut out_rx = outbound_rx;
+        let mut rep_rx = reply_rx;
+        let mut buf_out = Vec::with_capacity(4096);
+        let mut out_closed = false;
+        let mut rep_closed = false;
+        while !(out_closed && rep_closed) {
+            tokio::select! {
+                biased;
+                msg = out_rx.recv(), if !out_closed => {
+                    match msg {
+                        Some(msg) => {
+                            let frame = encode(&msg);
+                            buf_out.clear();
+                            buf_out.extend_from_slice(&frame);
+                            if let Err(e) = stdin.write_all(&buf_out).await {
+                                tracing::warn!(error = %e, "stdin write failed; LS process likely dead");
+                                break;
+                            }
+                        }
+                        None => out_closed = true,
+                    }
                 }
-            }
-            loop {
-                match decode(&mut buf) {
-                    Ok(Some(msg)) => dispatch(msg, &on_msg),
-                    Ok(None) => break, // 半帧，继续读
-                    Err(e) => {
-                        // 帧损坏无法重同步，弃泵保命；Task 5 起此处升级为 Terminated 语义
-                        tracing::error!(error = %e, "frame decode failed; aborting stdout pump");
-                        return;
+                msg = rep_rx.recv(), if !rep_closed => {
+                    match msg {
+                        Some(msg) => {
+                            let frame = encode(&msg);
+                            buf_out.clear();
+                            buf_out.extend_from_slice(&frame);
+                            if let Err(e) = stdin.write_all(&buf_out).await {
+                                tracing::warn!(error = %e, "stdin write failed; LS process likely dead");
+                                break;
+                            }
+                        }
+                        None => rep_closed = true,
                     }
                 }
             }
         }
+    });
+
+    // stdout 泵：帧解析 + 内联分发。EOF → on_eof（drain pending）。
+    let stdout_task = tokio::spawn(async move {
+        let mut stdout = stdout;
+        let mut buf = BytesMut::new();
+        let mut chunk = [0u8; 8192];
+        let mut saw_eof = false;
+        while !saw_eof {
+            match stdout.read(&mut chunk).await {
+                Ok(0) => {
+                    saw_eof = true;
+                }
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e) => {
+                    tracing::warn!(error = %e, "stdout read failed; aborting pump");
+                    saw_eof = true;
+                }
+            }
+            loop {
+                match decode(&mut buf) {
+                    Ok(Some(msg)) => dispatch(msg, &on_msg, &reply_tx_for_dispatch),
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::error!(error = %e, "frame decode failed; aborting stdout pump");
+                        saw_eof = true;
+                        break;
+                    }
+                }
+            }
+        }
+        (on_eof)();
     });
 
     // stderr 泵：逐行分级写日志。
@@ -96,7 +152,6 @@ pub fn pump(child: ChildHandle, outbound_rx: mpsc::Receiver<JsonRpc>, on_msg: On
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    // 缺省分级 info；Task 8 接 logmap（clangd `I[..]/E[..]` 前缀 → 级别）
                     tracing::info!(target: "lsp_stderr", "{line}");
                 }
                 Ok(None) => break,
@@ -117,18 +172,13 @@ pub fn pump(child: ChildHandle, outbound_rx: mpsc::Receiver<JsonRpc>, on_msg: On
 }
 
 /// stdout 泵的内联分发（按到达顺序，保序）。
-fn dispatch(msg: JsonRpc, on_msg: &OnMsg) {
-    if msg.method.is_none() {
-        // 响应帧：Task 5 起 pending 表在此 pop 并完成对应 oneshot；
-        // 本任务 pending 表未进场，响应帧直达回调（集成测试断言点）。
-        on_msg(msg);
-    } else if msg.id.is_some() {
-        // 服务器→客户端请求：Task 5 挂点——pending 表进场后此处回默认 null 成功
-        // 响应（vscode-languageserver-node 系把 registerCapability 错误当致命，
-        // ARCHITECTURE §3.2）或交 adapter 注册的 handler。mock_ls 不触达此分支。
-        todo!("Task 5: server→client request dispatch (null-success reply / handler)");
-    } else {
-        // 通知（publishDiagnostics 等）：内联按序分发。
-        on_msg(msg);
+///
+/// 响应帧 / 通知 / server→client request 三种入站形态由 `OnMsg`（= Client）自行处理；
+/// server→client request 产生的回执由 pump 经 `reply_tx` → writer 写回 LS。
+fn dispatch(msg: JsonRpc, on_msg: &OnMsg, reply_tx: &mpsc::Sender<JsonRpc>) {
+    if let Some(reply) = (on_msg)(msg)
+        && let Err(e) = reply_tx.try_send(reply)
+    {
+        tracing::warn!(error = %e, "reply_tx 满/关，丢弃 server→client request 回执");
     }
 }
