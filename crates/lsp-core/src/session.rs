@@ -64,11 +64,11 @@ pub enum SessionState {
 
 /// 单 LS 进程的完整 LSP 会话。`Arc<Session>` 是 supervisor 实例池的最小单元。
 pub struct Session {
-    state: Mutex<SessionState>,
+    pub(crate) state: Mutex<SessionState>,
     /// Ready 前 `request()` 在此门上阻塞。`Session::start` 握手成功时 `notify_waiters()`。
-    initialized_notify: Notify,
+    pub(crate) initialized_notify: Notify,
     /// JSON-RPC 客户端（共享 Arc，可 Clone）。
-    client: Client,
+    pub(crate) client: Client,
     /// 出站 mpsc 的发送端。`Client` 也持一份；channel 在 `Arc<Session>` 全部 drop 时
     /// 关闭 → writer task EOF。本字段保留仅为「Session 独占一份 sender」的契约表达。
     ///
@@ -80,6 +80,9 @@ pub struct Session {
     pumps: Mutex<Option<Pumps>>,
     /// stdout EOF 通知：stdout 泵读到 EOF 时 `notify_waiters()`；`shutdown` 等此门确认进程退。
     stdout_eof: Notify,
+    /// docsync 缓冲池：`ensure_open` / `FileGuard::drop` 用（PLAN Task 7，§3.4 锁表）。
+    pub(crate) buffers:
+        Mutex<std::collections::HashMap<lsp_types::Uri, crate::docsync::FileBuffer>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -133,6 +136,7 @@ impl Session {
             outbound_tx: out_tx,
             pumps: Mutex::new(Some(pumps)),
             stdout_eof,
+            buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         // 握手：发 initialize → 等响应（最多 HANDSHAKE_TIMEOUT）→ 发 initialized 通知。
@@ -200,6 +204,16 @@ impl Session {
     /// 客户端句柄（供 supervisor 内部复用，比如发送 `$/cancelRequest`）。
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// docsync 缓冲池引用（PLAN Task 7）。仅 `crate::docsync` 使用 —— 该 crate 通过
+    /// `pub(crate)` 字段直访更经济；这里留一个最小访问器便于未来「关闭文件」等工具调用。
+    #[allow(dead_code)]
+    pub(crate) fn buffers(
+        &self,
+    ) -> &std::sync::Mutex<std::collections::HashMap<lsp_types::Uri, crate::docsync::FileBuffer>>
+    {
+        &self.buffers
     }
 
     /// LSP 请求转发。Ready 前到达则等就绪门，门开且 state == Ready 后才放行；

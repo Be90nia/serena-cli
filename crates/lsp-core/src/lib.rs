@@ -1,4 +1,5 @@
 pub mod client;
+pub mod docsync;
 pub mod error;
 pub mod framing;
 pub mod init_params;

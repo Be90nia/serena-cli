@@ -7,12 +7,18 @@
 //!
 //! 其余带 id 的请求回 null 结果（防对端挂死），通知忽略。
 //!
-//! 环境变量驱动测试钩子（Task 5）：
+//! 环境变量驱动测试钩子（Task 5 + 7）：
 //! - `MOCK_LS_STRING_ID_METHODS=initialize,foo` → 这些方法的回执 id 改为字符串。
 //! - `MOCK_LS_SILENT_METHODS=nonexistent/method` → 这些方法不回执（用于超时用例）。
 //! - `MOCK_LS_SEND_SERVER_REQUESTS=1` → 初始化后发 `client/registerCapability` 请求。
 //! - `MOCK_LS_CONTENTMODIFIED_METHODS=documentSymbol` → 这些方法头 N 次回 -32801。
 //! - `MOCK_LS_CONTENTMODIFIED_FAILS=2` → 配合上一项：前 N 次回 -32801，第 N+1 次成功。
+//! - `MOCK_LS_TRACK_FILE_EVENTS=/path/to/track.log` → 把收到的
+//!   `textDocument/didOpen` / `didChange` / `didClose` 通知按收到顺序追加写一行
+//!   JSON：`{"event":"didOpen|didChange|didClose","uri":"...","version":N}`（Task 7）。
+//!
+//! `didOpen`/`didChange`/`didClose` 通知：**不**是请求（无 id），所以默认「忽略」
+//! 路径会丢。`track_file_events` 钩子负责把这些通知记下来给测试断言。
 
 use bytes::BytesMut;
 use lsp_core::framing::{JsonRpc, RpcError, decode, encode};
@@ -29,6 +35,8 @@ struct Config {
     contentmodified_methods: HashSet<String>,
     contentmodified_fails: u32,
     send_server_requests: bool,
+    /// 文档事件跟踪日志路径（Task 7）。设了就把 didOpen/didChange/didClose 追加写入。
+    track_file_events: Option<std::path::PathBuf>,
 }
 
 /// 各方法已回 ContentModified 次数（仅 `contentmodified_methods` 内的方法计入）。
@@ -51,6 +59,64 @@ fn load_config() -> Config {
         send_server_requests: std::env::var("MOCK_LS_SEND_SERVER_REQUESTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
+        track_file_events: std::env::var("MOCK_LS_TRACK_FILE_EVENTS")
+            .ok()
+            .map(std::path::PathBuf::from),
+    }
+}
+
+/// 把文档事件追加写到跟踪日志（Task 7 docsync 测试断言用）。一行 JSON，
+/// 测试线程读 tail 时一行一事件，断言事件序列。
+///
+/// 写入失败不致命（测试 flaky 时这里炸会掩盖真因）；只 tracing::warn。
+async fn track_event(track: &Option<std::path::PathBuf>, msg: &JsonRpc) {
+    let Some(path) = track else { return };
+    let Some(method) = msg.method.as_deref() else {
+        return;
+    };
+    let event = match method {
+        "textDocument/didOpen" => "didOpen",
+        "textDocument/didChange" => "didChange",
+        "textDocument/didClose" => "didClose",
+        _ => return,
+    };
+    let params = msg.params.clone().unwrap_or(Value::Null);
+    let uri = params
+        .pointer("/textDocument/uri")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // version 留作 JSON 数字（i64），与 docsync 测试断言 `as_i64()` 兼容。
+    let version = params
+        .pointer("/textDocument/version")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let line = json!({
+        "event": event,
+        "uri": uri,
+        "version": version,
+    })
+    .to_string();
+    let mut f = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(?e, path = ?path.display(), "打开 file-event 跟踪日志失败");
+            return;
+        }
+    };
+    if let Err(e) = async {
+        f.write_all(line.as_bytes()).await?;
+        f.write_all(b"\n").await?;
+        f.flush().await
+    }
+    .await
+    {
+        tracing::warn!(?e, path = ?path.display(), "写入 file-event 跟踪日志失败");
     }
 }
 
@@ -68,6 +134,10 @@ async fn main() {
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
         while let Ok(Some(msg)) = decode(&mut buf) {
+            // 文件事件跟踪：didOpen/didChange/didClose 是通知（无 id），默认「忽略」
+            // 路径会丢；这里按方法名前缀判断追加写日志。
+            track_event(&config.track_file_events, &msg).await;
+
             // silent 方法不回执
             let is_silent = msg
                 .method
