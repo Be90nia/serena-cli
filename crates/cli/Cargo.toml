@@ -12,6 +12,9 @@ anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 lsp-core = { path = "../lsp-core" }
 serde_json.workspace = true
+daemon = { path = "../daemon" }
+reqwest = { workspace = true }
+serde.workspace = true
 supervisor = { path = "../supervisor" }
 tokio.workspace = true
 dunce.workspace = true
