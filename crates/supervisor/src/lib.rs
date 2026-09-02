@@ -28,6 +28,7 @@ pub mod write_gate;
 use lsp_core::session::Session;
 use lsp_core::types::{SymbolHit, SymbolKindTag};
 use lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position};
+use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 
@@ -489,6 +490,174 @@ impl Supervisor {
         let _ = old_hash;
         Ok(())
     }
+
+    /// 全 codebase grep（AI 替代"读全文件"）。
+    ///
+    /// 设计要点（Task 19）：
+    /// - 走 `ignore` crate：自动尊重 `.gitignore` / `.ignore` / global ignores
+    /// - 默认排除 binary / >5MB 大文件（合理启发）
+    /// - `path_glob`：可选 glob 过滤（如 `"*.cpp"` `"src/**/*.py"`）
+    /// - `max_results` 默认 100：超过返回 truncated 标记
+    /// - 不动 LS —— 这是 fs 工具，不需要 LSP
+    pub async fn tool_search_for_pattern(
+        &self,
+        root: &Path,
+        pattern: &str,
+        path_glob: Option<&str>,
+        max_results: usize,
+        case_sensitive: bool,
+    ) -> ToolResult<SearchResponse> {
+        use ignore::WalkBuilder;
+        use regex::RegexBuilder;
+
+        let regex = RegexBuilder::new(pattern)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("bad regex: {e}"),
+            })?;
+        let glob_re = match path_glob {
+            Some(g) => {
+                let mut r = String::from("^");
+                // glob 不含 `/` 时，前后加 `.*`，让 `*.cpp` 也匹配 `src/a.cpp`。
+                if !g.contains('/') {
+                    r.push_str(".*");
+                }
+                // 把 glob 转 regex —— 支持 `**` 跨任意段 + `*` 单段 + `?` 单字符。
+
+                let mut i = 0;
+                let chars: Vec<char> = g.chars().collect();
+                while i < chars.len() {
+                    let c = chars[i];
+
+                    // `**` 跨任意段（包括 `/`）。
+                    if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                        r.push_str(".*");
+                        i += 2;
+                        // 吞掉紧跟的 `/`（`src/**/foo` 等价 `src/foo`）。
+                        if i < chars.len() && chars[i] == '/' {
+                            i += 1;
+                        }
+                        continue;
+                    }
+
+                    match c {
+                        '*' => r.push_str("[^/]*"),
+                        '?' => r.push('.'),
+                        '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '\\' => {
+                            r.push('\\');
+                            r.push(c);
+                        }
+                        '[' | ']' => r.push(c),
+                        _ => r.push(c),
+                    }
+                    i += 1;
+                }
+                r.push('$');
+                Some(
+                    RegexBuilder::new(&r)
+                        .case_insensitive(!case_sensitive)
+                        .build()
+                        .map_err(|e| ToolError::BadArgs {
+                            detail: format!("bad glob: {e}"),
+                        })?,
+                )
+            }
+            None => None,
+        };
+
+        let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let mut walker = WalkBuilder::new(&root);
+        walker
+            .standard_filters(true)
+            .hidden(false)
+            .require_git(false);
+
+        let mut hits: Vec<SearchHit> = Vec::new();
+        let mut truncated = false;
+        let mut files_scanned: usize = 0;
+
+        for entry in walker.build() {
+            if truncated {
+                break;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let rel = path.strip_prefix(&root).unwrap_or(path);
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+            if let Some(g) = &glob_re
+                && !g.is_match(&rel_str)
+            {
+                continue;
+            }
+
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if metadata.len() > 5 * 1024 * 1024 {
+                continue;
+            }
+
+            files_scanned += 1;
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            for (line_idx, line) in content.lines().enumerate() {
+                if truncated {
+                    break;
+                }
+                for m in regex.find_iter(line) {
+                    if hits.len() >= max_results {
+                        truncated = true;
+                        break;
+                    }
+                    hits.push(SearchHit {
+                        file: rel_str.clone(),
+                        line: (line_idx + 1) as u32,
+                        col: (m.start() + 1) as u32,
+                        text: line.trim_end().to_string(),
+                        match_start: m.start() as u32,
+                        match_end: m.end() as u32,
+                    });
+                }
+            }
+        }
+
+        Ok(SearchResponse {
+            hits,
+            truncated,
+            files_scanned,
+        })
+    }
+}
+
+/// 单个搜索命中。
+#[derive(Debug, Serialize)]
+pub struct SearchHit {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+    pub text: String,
+    pub match_start: u32,
+    pub match_end: u32,
+}
+
+/// 搜索响应。
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    pub hits: Vec<SearchHit>,
+    pub truncated: bool,
+    pub files_scanned: usize,
 }
 
 /// 拍平 `DocumentSymbolResponse` → `Vec<SymbolHit>`。
@@ -610,6 +779,36 @@ fn required_position(args: &serde_json::Value) -> ToolResult<(String, u32, u32)>
     Ok((file, line, col))
 }
 
+fn required_symbol_body_args(args: &serde_json::Value) -> ToolResult<(String, String)> {
+    let file = required_file(args)?;
+    let symbol = args
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing 'symbol'".into(),
+        })?
+        .to_owned();
+    Ok((file, symbol))
+}
+
+fn required_replace_args(args: &serde_json::Value) -> ToolResult<(String, String, String)> {
+    let file = required_file(args)?;
+    let symbol = args
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing 'symbol'".into(),
+        })?
+        .to_owned();
+    let new_body = args
+        .get("new_body")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing 'new_body'".into(),
+        })?
+        .to_owned();
+    Ok((file, symbol, new_body))
+}
 #[async_trait::async_trait]
 impl SupervisorTrait for Supervisor {
     async fn execute_tool(
@@ -634,6 +833,39 @@ impl SupervisorTrait for Supervisor {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(self.tool_refs(root, &file, line, col).await?)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "search" => {
+                let pattern = args
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'pattern'".into(),
+                    })?;
+                let path_glob = args.get("path_glob").and_then(|v| v.as_str());
+                let max_results = args
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(100) as usize;
+                let case_sensitive = args
+                    .get("case_sensitive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let resp = self
+                    .tool_search_for_pattern(root, pattern, path_glob, max_results, case_sensitive)
+                    .await?;
+                serde_json::to_value(resp)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "symbol-body" => {
+                let (file, symbol) = required_symbol_body_args(&args)?;
+                serde_json::to_value(self.tool_symbol_body(root, &file, &symbol).await?)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "replace-body" => {
+                let (file, symbol, new_body) = required_replace_args(&args)?;
+                self.tool_replace_body(root, &file, &symbol, &new_body)
+                    .await?;
+                Ok(serde_json::Value::Null)
             }
             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
