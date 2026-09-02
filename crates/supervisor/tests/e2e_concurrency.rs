@@ -117,8 +117,7 @@ async fn three_concurrent_reads_and_one_write_serialize() {
     let r3 = r3.await.expect("r3 join");
     let w = w.await.expect("w join");
 
-    // 写一定成功（写门串行保证最终写完）。
-    let _ = w.expect("writer should succeed");
+    w.expect("writer should succeed");
 
     // 3 读都成功（不阻塞）—— 各自看到 100 或 999 都合理（写时序）。
     let bodies = vec![

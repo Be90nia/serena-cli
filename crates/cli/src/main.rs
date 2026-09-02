@@ -71,6 +71,8 @@ enum Cmd {
     Status,
     /// 停掉 daemon（draining + 删 lock）。
     StopAll,
+    /// 长连接 shell（stdin/stdout JSONL）。Task 18。
+    Shell,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -105,12 +107,18 @@ async fn main() -> ExitCode {
     match &cli.cmd {
         Some(Cmd::Status) => return cmd_status(&lock_path).await,
         Some(Cmd::StopAll) => return cmd_stop_all(&lock_path).await,
+        Some(Cmd::Shell) => {}
         _ => {}
     }
 
     // ---- --direct：进程内直调（原 M0 路径）----
     if cli.direct {
         return run_direct(&cli).await;
+    }
+
+    // ---- shell：长连接 stdin/stdout JSONL ----
+    if matches!(&cli.cmd, Some(Cmd::Shell)) {
+        return cmd_shell(&cli).await;
     }
 
     // ---- 默认：转发模式（lazy-spawn）----
@@ -281,7 +289,9 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
             "replace-body",
             json!({"file": file, "symbol": symbol, "new_body": new_body}),
         ),
-        Some(Cmd::Status) | Some(Cmd::StopAll) | None => unreachable!("handled earlier"),
+        Some(Cmd::Status) | Some(Cmd::StopAll) | Some(Cmd::Shell) | None => {
+            unreachable!("handled earlier")
+        }
     };
     let project_root = cli
         .project
@@ -389,6 +399,189 @@ fn print_json(v: &serde_json::Value) -> Result<(), ToolError> {
             .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))?
     );
     Ok(())
+}
+// ============== shell 模式 (Task 18) ==============
+
+/// 长连接 shell：stdin/stdout JSONL。
+///
+/// 输入（一行 JSON）：
+///   `{"id":<n>,"cmd":"<tool>","args":{...}}`  —— 调用 LSP 工具
+///   `{"id":<n>,"cmd":"status"}`                —— daemon 状态
+///   `{"id":<n>,"cmd":"exit"}`                  —— 退出 shell
+///
+/// 输出（一行 JSON）：
+///   `{"id":<n>,"ok":true,"data":<v>}`
+///   `{"id":<n>,"ok":false,"error":<msg>}`
+///   EOF / `exit` 后退出 0。
+async fn cmd_shell(cli: &Cli) -> ExitCode {
+    let lock_path = daemon::serve::default_lock_path();
+    let base_token = match ensure_daemon(&lock_path).await {
+        Ok(b) => b,
+        Err(e) => {
+            // shell 启动失败也要在 stdout 留 JSON，便于 agent 解析。
+            println!(r#"{{"id":null,"ok":false,"error":"{}"}}"#, json_escape(&e));
+            return ExitCode::from(3);
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let project_root = cli
+        .project
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let stdin = tokio::io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // 解析 input。
+        let input: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                println!(
+                    r#"{{"id":null,"ok":false,"error":"bad json: {}"}}"#,
+                    json_escape(&e.to_string())
+                );
+                continue;
+            }
+        };
+
+        let id = input.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let cmd = input.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+
+        // exit: 退出。
+        if cmd == "exit" {
+            println!(
+                r#"{{"id":{},"ok":true,"data":null,"bye":true}}"#,
+                serde_json::to_string(&id).unwrap_or("null".into())
+            );
+            break;
+        }
+
+        // 处理单条命令。
+        let resp = dispatch_shell_cmd(
+            &client,
+            &base_token,
+            &project_root,
+            cmd,
+            input.get("args").cloned().unwrap_or(json!({})),
+        )
+        .await;
+        println!("{}", resp_with_id(&id, resp));
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// 探活 + lazy-spawn，返回 (base_url, token)。
+async fn ensure_daemon(lock_path: &Path) -> Result<(String, String), String> {
+    let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
+    let base = match entry {
+        Some(e) if probe(e.port) => format!("http://127.0.0.1:{}", e.port),
+        _ => {
+            let _ = daemon::lockfile::remove(lock_path);
+            let port = spawn_daemon_child()?;
+            wait_ready(port, SPAWN_WAIT).await?;
+            format!("http://127.0.0.1:{port}")
+        }
+    };
+    let token = daemon::lockfile::read(lock_path)
+        .map_err(|e| format!("read lock: {e}"))?
+        .map(|e| e.token)
+        .unwrap_or_default();
+    Ok((base, token))
+}
+
+/// 单条 shell 命令：HTTP 转发到 daemon。
+async fn dispatch_shell_cmd(
+    client: &reqwest::Client,
+    base_token: &(String, String),
+    project_root: &Path,
+    cmd: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    // 管理命令。
+    if cmd == "status" {
+        let resp = client
+            .get(format!("{}/status", base_token.0))
+            .header("X-Serena-Token", &base_token.1)
+            .timeout(MGMT_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("status: {e}"))?;
+        let status = resp.status();
+        let data: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+        if !status.is_success() {
+            return Err(format!("daemon transport {status}: {data}"));
+        }
+        return Ok(data);
+    }
+
+    // LSP 工具：透传到 /tools/{name}。
+    let tool = match cmd {
+        "overview" | "def" | "refs" | "symbol-body" | "replace-body" | "completion" => cmd,
+        other => return Err(format!("unknown cmd: {other}")),
+    };
+    let body = json!({
+        "project_root": project_root.to_string_lossy(),
+        "args": args,
+    });
+    let resp = client
+        .post(format!("{}/tools/{tool}", base_token.0))
+        .header("X-Serena-Token", &base_token.1)
+        .json(&body)
+        .timeout(FORWARD_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("forward {tool}: {e}"))?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("daemon transport {status}: {payload}"));
+    }
+    match payload.get("ok").and_then(|v| v.as_bool()) {
+        Some(true) => Ok(payload
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)),
+        _ => Err(payload.get("error").cloned().unwrap_or(payload).to_string()),
+    }
+}
+
+/// 把 (id, result) 序列化成一行 JSON 输出。
+fn resp_with_id(id: &serde_json::Value, r: Result<serde_json::Value, String>) -> String {
+    let id_str = serde_json::to_string(id).unwrap_or_else(|_| "null".into());
+    match r {
+        Ok(data) => format!(r#"{{"id":{},"ok":true,"data":{}}}"#, id_str, data),
+        Err(e) => format!(
+            r#"{{"id":{},"ok":false,"error":"{}"}}"#,
+            id_str,
+            json_escape(&e)
+        ),
+    }
+}
+
+/// JSON string 转义（仅控制 + 引号 + 反斜杠 —— 不全但够错误消息用）。
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            '\t' => out.push_str(r"\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!(r"\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // 常量用途占位（避免 unused 警告）；真实语义见各常量定义处。
