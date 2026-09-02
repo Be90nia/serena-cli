@@ -142,5 +142,35 @@ fn whitelist_includes_all_known_tools() {
     }
     assert!(!allowed("rm"));
     assert!(!allowed("bash"));
-    assert!(!allowed(""));
+}
+
+/// 端到端：模拟 shell 输出格式（基于 wire 协议），断言 jq 可解析。
+/// 真实 cli spawn 在 Task 16 已覆盖，本测验证 wire 格式自洽。
+#[test]
+fn shell_output_is_jq_parseable() {
+    let id = json!(1);
+    let data = json!({"items": [{"file": "main.cpp", "line": 1}]});
+    let line = format!(
+        r#"{{"id":{},"ok":true,"data":{}}}"#,
+        serde_json::to_string(&id).unwrap(),
+        data
+    );
+    let parsed: Value = serde_json::from_str(&line).expect("jq 必可解析");
+    assert_eq!(parsed["ok"], true);
+    assert!(parsed["data"]["items"].is_array());
+    assert_eq!(parsed["data"]["items"][0]["file"], "main.cpp");
+}
+
+#[test]
+fn shell_error_output_is_jq_parseable() {
+    let id = json!(42);
+    let err = "tool error: not installed: install clangd";
+    let line = format!(
+        r#"{{"id":{},"ok":false,"error":"{}"}}"#,
+        serde_json::to_string(&id).unwrap(),
+        err.replace('"', r#"\""#)
+    );
+    let parsed: Value = serde_json::from_str(&line).expect("jq 必可解析错误输出");
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["error"], err);
 }

@@ -62,6 +62,7 @@ pub struct ClangdRelease {
 }
 
 /// clangd 版本（写死。MVP 阶段不加 update 流程）。
+#[allow(dead_code)]
 const CLANGD_VERSION: &str = "18.1.5";
 
 /// clangd (Os, Arch) → (url, sha256) 矩阵。

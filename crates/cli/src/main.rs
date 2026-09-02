@@ -44,6 +44,9 @@ struct Cli {
     #[arg(long, value_name = "ROOT")]
     project: Option<PathBuf>,
 
+    /// JSON 输出：所有子命令输出可被 jq 解析的 JSON（默认人类可读文本）。
+    #[arg(long, global = true)]
+    json: bool,
     /// 子命令；`--daemon` 模式下可省略。
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -51,9 +54,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// 列出文件顶层符号（递归 children）。
+    /// 列出文件顶层符号。
     Overview { file: String },
-    /// 跳转到定义。line/col 0-based。
     Def { file: String, line: u32, col: u32 },
     /// 列出引用。line/col 0-based。
     Refs { file: String, line: u32, col: u32 },
