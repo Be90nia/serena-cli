@@ -26,6 +26,7 @@ use lsp_core::init_params::base_initialize_params;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
 use lsp_core::session::Session;
 pub mod edit_tools;
+pub mod root_finder;
 pub mod fs_tools;
 
 pub mod ref_tools;
