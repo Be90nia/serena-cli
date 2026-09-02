@@ -525,9 +525,15 @@ async fn dispatch_shell_cmd(
 
     // LSP 工具：透传到 /tools/{name}。
     let tool = match cmd {
-        "overview" | "def" | "refs" | "symbol-body" | "replace-body" | "completion" | "search" => {
-            cmd
-        }
+        "overview"
+        | "def"
+        | "refs"
+        | "symbol-body"
+        | "replace-body"
+        | "completion"
+        | "search"
+        | "find-symbol"
+        | "find-implementations" => cmd,
         other => return Err(format!("unknown cmd: {other}")),
     };
     let body = json!({

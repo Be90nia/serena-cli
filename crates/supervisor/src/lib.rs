@@ -372,6 +372,37 @@ impl Supervisor {
         Ok(resp)
     }
 
+    /// `textDocument/implementation` → 全部实现位置（Task 21）。
+    ///
+    /// 与 `tool_def` 类似但返 `Vec<Location>`（一个 interface 多处实现）。
+    /// clangd 22 默认回 `LocationLink[]`；LSP 3.17 还允 `null | Location | Location[]`。
+    /// 全部走 `normalize_implementations` 折叠为统一 `Vec<Location>`。
+    pub async fn tool_find_implementations(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+    ) -> ToolResult<Vec<Location>> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let pos = lsp_position_from_byte(&path, line, col, OffsetEncoding::Utf16).await?;
+
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "position": { "line": pos.line, "character": pos.character },
+        });
+        let raw: Option<serde_json::Value> = session
+            .request("textDocument/implementation", params, TOOL_TIMEOUT)
+            .await?;
+        Ok(normalize_implementations(raw.as_ref()))
+    }
     /// `textDocument/references` → 全部引用 `Location[]`。
     pub async fn tool_refs(
         &self,
@@ -913,6 +944,14 @@ impl SupervisorTrait for Supervisor {
                 serde_json::to_value(self.tool_refs(root, &file, line, col).await?)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
+            "find-implementations" => {
+                let (file, line, col) = required_position(&args)?;
+                serde_json::to_value(
+                    self.tool_find_implementations(root, &file, line, col)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
             "search" => {
                 let pattern = args
                     .get("pattern")
@@ -983,6 +1022,39 @@ fn normalize_definition(raw: Option<&serde_json::Value>) -> Option<Location> {
     serde_json::from_value::<Location>(first.clone()).ok()
 }
 
+/// LSP 3.17 `textDocument/implementation` 响应允多种形态：
+/// `null | Location | Location[] | LocationLink[]`。归一化为 `Vec<Location>`：
+/// 数组逐元素归一化；单 Location 包成单元素 vec；null → 空 vec。
+fn normalize_implementations(raw: Option<&serde_json::Value>) -> Vec<Location> {
+    let mut out = Vec::new();
+    let Some(v) = raw else { return out };
+    if v.is_null() {
+        return out;
+    }
+    let items: &[serde_json::Value] = if v.is_array() {
+        v.as_array().expect("just checked")
+    } else {
+        std::slice::from_ref(v)
+    };
+    for it in items {
+        // LocationLink 形态：{ targetUri, targetRange, ... } → 转 Location。
+
+        if let (Some(target_uri), Some(target_range)) = (
+            it.get("targetUri").and_then(|x| x.as_str()),
+            it.get("targetRange"),
+        ) && let Ok(range) = serde_json::from_value::<lsp_types::Range>(target_range.clone())
+            && let Ok(uri) = lsp_types::Uri::from_str(target_uri)
+        {
+            out.push(Location { uri, range });
+            continue;
+        }
+        // 标准 Location：{ uri, range }。
+        if let Ok(loc) = serde_json::from_value::<Location>(it.clone()) {
+            out.push(loc);
+        }
+    }
+    out
+}
 /// 递归在 Nested documentSymbol 里找第一个 name == `symbol` 的 range。
 /// Flat 形态（SymbolInformation）不含子符号，这里只处理 Nested —— clangd/mock_ls 都是 Nested。
 fn find_symbol_range(resp: &DocumentSymbolResponse, symbol: &str) -> Option<lsp_types::Range> {
