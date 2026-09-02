@@ -35,7 +35,8 @@ use thiserror::Error;
 /// Read-only tool timeout. overview/def/refs on small files complete in ms; clangd
 /// cold-start of a project may take seconds. 30s mirrors `READY_PROBE_TIMEOUT`.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
-
+/// workspace/symbol / background-index 长操作。clangd 首次索引大项目可能 >30s。
+const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
 /// 工具层错误（ARCH §6.1 supervisor thiserror 边界）。
 ///
 /// 变体与 wire contract 一一对应；调用方（CLI / daemon）按变体决定 exit code 或 HTTP body。
@@ -268,7 +269,74 @@ impl Supervisor {
         Ok(flatten_symbols(resp, &uri))
     }
 
-    /// `textDocument/definition` → 第一个 `Location`（server 可能回 `LocationLink[]` 或
+    /// `workspace/symbol` → 全 workspace 跨文件符号查找（Task 20）。
+    ///
+    /// 设计要点：
+    /// - **不传 file**：position-free + workspace scope，AI 找符号定义的标准入口。
+    /// - lang 探测：root 下任一 `.cpp` / `.c` / `.h` → cpp。MVP 不支持混合多语言 root。
+    /// - 触发索引：本次首调会拉起 `didOpen` 任一文件让 clangd 开 background index。
+    ///   索引可能慢（>10s），用 `INDEX_TIMEOUT` 而不是 `TOOL_TIMEOUT`。
+    /// - 输出与 `tool_overview` 形状一致 (`Vec<SymbolHit>`)，便于 agent 用同一段代码处理。
+    pub async fn tool_find_symbol(
+        &self,
+        root: &Path,
+        query: &str,
+        limit: usize,
+    ) -> ToolResult<Vec<SymbolHit>> {
+        use ignore::WalkBuilder;
+
+        if query.is_empty() {
+            return Err(ToolError::BadArgs {
+                detail: "query must not be empty".into(),
+            });
+        }
+
+        // 探测 root 下任一 cpp 文件以确定 lang。
+        let mut probe: Option<PathBuf> = None;
+        for entry in WalkBuilder::new(root)
+            .standard_filters(true)
+            .max_depth(Some(3))
+            .build()
+            .flatten()
+        {
+            if entry.file_type().is_some_and(|t| t.is_file())
+                && let Some(lang) = ls_registry::resolve(entry.path())
+                && lang.as_str() == "cpp"
+            {
+                probe = Some(entry.path().to_path_buf());
+                break;
+            }
+        }
+        let probe = probe.ok_or_else(|| ToolError::BadArgs {
+            detail: "no cpp/c/h files under root; workspace/symbol requires a known language"
+                .into(),
+        })?;
+
+        let lang = ls_registry::resolve(&probe).unwrap();
+        let session = self.session_for(root, lang.as_str()).await?;
+        // 触发背景索引：把 probe 文件 didOpen 一次。
+        let _ = session.ensure_open(&probe).await.map_err(ToolError::Core)?;
+
+        let params = json!({ "query": query });
+        // clangd 索引可能慢，30s 太短。
+        let resp: Vec<lsp_types::SymbolInformation> = session
+            .request("workspace/symbol", params, INDEX_TIMEOUT)
+            .await?;
+
+        // 裁剪 + 转 SymbolHit。
+        let hits: Vec<SymbolHit> = resp
+            .into_iter()
+            .take(limit)
+            .map(|si| SymbolHit {
+                name: si.name,
+                kind: kind_from_lsp(&si.kind),
+                uri: si.location.uri.to_string(),
+                range: si.location.range,
+                container: si.container_name,
+            })
+            .collect();
+        Ok(hits)
+    }
     /// `Location[]`，lsp-types 在 capability 上声明多形态——M0 只解 `Option<Location>`）。
     ///
     /// line/col 1-based 还是 0-based？LSP `Position` 是 0-based；上层 CLI 必须传 0-based。
@@ -822,6 +890,17 @@ impl SupervisorTrait for Supervisor {
             "overview" => {
                 let file = required_file(&args)?;
                 serde_json::to_value(self.tool_overview(root, &file).await?)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "find-symbol" => {
+                let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::BadArgs {
+                        detail: "missing 'query'".into(),
+                    }
+                })?;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+                let resp = self.tool_find_symbol(root, query, limit).await?;
+                serde_json::to_value(resp)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             "def" => {
