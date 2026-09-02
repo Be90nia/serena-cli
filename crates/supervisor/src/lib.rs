@@ -20,7 +20,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lsp_core::docsync::path_to_uri_str;
+use lsp_core::docsync::{path_to_uri, path_to_uri_str};
 use lsp_core::error::CoreError;
 use lsp_core::init_params::base_initialize_params;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
@@ -93,6 +93,8 @@ pub struct Supervisor {
     load_gates: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
     last_used: Mutex<HashMap<Key, std::time::Instant>>,
     direct_mode: bool,
+    /// publishDiagnostics 通知缓存：key = (root, uri)，value = items 数组。
+    diag_cache: std::sync::Arc<Mutex<HashMap<(PathBuf, String), Vec<serde_json::Value>>>>,
 }
 /// 实例键：canonicalize、去尾分隔符并大小写折叠的 root + language。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -115,6 +117,7 @@ impl Supervisor {
             load_gates: Mutex::new(HashMap::new()),
             last_used: Mutex::new(HashMap::new()),
             direct_mode: true,
+            diag_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -243,7 +246,17 @@ impl Supervisor {
         }]);
         adapter.initialize_patches(&mut params);
 
-        let session = Session::start(child, params).await?;
+        let session = Session::start(Some(child), params).await?;
+        // 注册 publishDiagnostics handler → 写 diag_cache。
+        let cache_root = key.root.clone();
+        let cache = std::sync::Arc::clone(&self.diag_cache);
+        session.client().on_notification("textDocument/publishDiagnostics", move |msg| {
+        session.client().on_notification("textDocument/publishDiagnostics", move |msg| {
+            let Some(uri) = msg.params.as_ref().and_then(|p| p.get("uri")).and_then(|u| u.as_str()) else { eprintln!("[sup] publish: no uri"); return; };
+            let Some(items) = msg.params.as_ref().and_then(|p| p.get("diagnostics")).and_then(|d| d.as_array()).cloned() else { eprintln!("[sup] publish: no items for {uri}"); return; };
+            eprintln!("[sup] publish uri={uri} items={}", items.len());
+            if !items.is_empty() { cache.lock().unwrap().insert((cache_root.clone(), uri.to_string()), items); }
+        });
         self.instances
             .lock()
             .unwrap()
@@ -252,9 +265,77 @@ impl Supervisor {
         Ok(session)
     }
 
+    /// `textDocument/diagnostic` 诊断：依赖 LS `publishDiagnostics` 推送缓存。
+    /// clangd 对 pull 式 `textDocument/diagnostic` 返 -32601，故走通知缓存 +
+    /// 轮询等待（打开文件即推，100ms × 50 次 = 5s 上限），返 `{ items: [...] }`。
+    pub async fn tool_diagnostics(
+        &self,
+        root: &Path,
+        file: &str,
+    ) -> ToolResult<serde_json::Value> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let path = root.join(file);
+        let uri = path_to_uri(&path)
+            .map_err(|e| ToolError::BadArgs { detail: format!("path to uri: {e}") })?
+            .as_str()
+            .to_string();
+        eprintln!("[sup] tool_diagnostics uri={uri} root={}", root.display());
+        let session = self.session_for(root, lang.as_str()).await?;
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+        // 连续 2 次 items 长度相同即认稳；上限 50 × 100ms = 5s。
+        // 等 cache 命中 + 再 200ms 确认（防止清空推送被误判为"无错"）。
+        // 上限 50 × 100ms = 5s；空 cache（无错）也只等 5s 返空数组。
+        let key = Self::key(root, lang.as_str());
+        for i in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if i >= 4 {
+                let present = self
+                    .diag_cache
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(key.root.clone(), uri.clone()));
+                if present {
+                    break;
+                }
+            }
+        }
+        let items = self
+            .diag_cache
+            .lock()
+            .unwrap()
+            .get(&(key.root.clone(), uri.clone()))
+            .cloned()
+            .unwrap_or_default();
+        Ok(json!({ "items": items }))
+    }
+
+     pub async fn tool_hover(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+    ) -> ToolResult<Option<lsp_types::Hover>> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "position": { "line": line, "character": col },
+        });
+        let resp: Option<lsp_types::Hover> = session
+            .request("textDocument/hover", params, TOOL_TIMEOUT)
+            .await?;
+        Ok(resp)
+    }
+
     /// `textDocument/documentSymbol` → 平铺递归 `DocumentSymbol::children` → `Vec<SymbolHit>`。
-    ///
-    /// 上游语义（PLAN Task 10 step 2）：position-free；只传 file。M1 才补 name 过滤。
     pub async fn tool_overview(&self, root: &Path, file: &str) -> ToolResult<Vec<SymbolHit>> {
         let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
             detail: format!("file not supported: {file}"),
@@ -1302,6 +1383,16 @@ impl SupervisorTrait for Supervisor {
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
                 let resp = self.tool_find_symbol(root, query, limit).await?;
                 serde_json::to_value(resp)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "hover" => {
+                let (file, line, col) = required_position(&args)?;
+                serde_json::to_value(self.tool_hover(root, &file, line, col).await?)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "diagnostics" => {
+                let file = required_file(&args)?;
+                serde_json::to_value(self.tool_diagnostics(root, &file).await?)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             "def" => {

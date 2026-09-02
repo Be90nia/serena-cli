@@ -526,6 +526,8 @@ async fn dispatch_shell_cmd(
     // LSP 工具：透传到 /tools/{name}。
     let tool = match cmd {
         "overview"
+        | "hover"
+        | "diagnostics"
         | "def"
         | "refs"
         | "symbol-body"

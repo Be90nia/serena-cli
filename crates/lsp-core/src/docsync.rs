@@ -159,7 +159,7 @@ pub fn path_to_uri_str(path: &Path) -> String {
     }
 }
 
-fn path_to_uri(path: &Path) -> Result<Uri> {
+pub fn path_to_uri(path: &Path) -> Result<Uri> {
     let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let raw = path_to_uri_str(&canonical);
     Uri::from_str(&raw).map_err(|e| {
