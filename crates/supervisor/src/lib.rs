@@ -26,6 +26,8 @@ use lsp_core::init_params::base_initialize_params;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
 use lsp_core::session::Session;
 pub mod fs_tools;
+
+pub mod ref_tools;
 pub mod write_gate;
 
 use lsp_core::types::{SymbolHit, SymbolKindTag};
@@ -434,6 +436,59 @@ impl Supervisor {
         Ok(resp)
     }
 
+    /// `find_referencing_symbols`：所有引用 + 每个 ref 落在哪个外层符号里（Task 24）。
+    pub async fn tool_referencing_symbols(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+    ) -> ToolResult<Vec<ref_tools::RefSymbolHit>> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        ref_tools::find_referencing_symbols(&session, root, file, line, col)
+            .await
+            .map_err(|e| {
+                ToolError::Core(CoreError::Rpc {
+                    code: -1,
+                    message: format!("find_referencing_symbols: {e}"),
+                })
+            })
+    }
+
+    /// `find_referencing_code_snippets`：所有引用 + 每个 ref 前后 N 行（Task 24）。
+    pub async fn tool_referencing_code_snippets(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        context_lines: u32,
+        max_results: usize,
+    ) -> ToolResult<Vec<ref_tools::RefSnippetHit>> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        ref_tools::find_referencing_code_snippets(
+            &session,
+            root,
+            file,
+            line,
+            col,
+            context_lines,
+            max_results,
+        )
+        .await
+        .map_err(|e| {
+            ToolError::Core(CoreError::Rpc {
+                code: -1,
+                message: format!("find_referencing_code_snippets: {e}"),
+            })
+        })
+    }
     /// `symbol-body`：按符号名取函数/类体切片（PLAN Task 15）。
     ///
     /// 流程：ensure_open → documentSymbol 定位 name 匹配的符号 range →
@@ -1264,6 +1319,58 @@ impl SupervisorTrait for Supervisor {
                     .map_err(|e| ToolError::BadArgs {
                         detail: format!("find_file: {e}"),
                     })?;
+                serde_json::to_value(hits)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "find-referencing-symbols" => {
+                let (file, line, col) = required_position(&args)?;
+                let lang =
+                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
+                        detail: format!("file not supported: {file}"),
+                    })?;
+                let session = self.session_for(root, lang.as_str()).await?;
+                let hits = ref_tools::find_referencing_symbols(&session, root, &file, line, col)
+                    .await
+                    .map_err(|e| {
+                        ToolError::Core(CoreError::Rpc {
+                            code: -1,
+                            message: format!("find_referencing_symbols: {e}"),
+                        })
+                    })?;
+                serde_json::to_value(hits)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "find-referencing-code-snippets" => {
+                let (file, line, col) = required_position(&args)?;
+                let context_lines = args
+                    .get("context_lines")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3) as u32;
+                let max_results = args
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(50) as usize;
+                let lang =
+                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
+                        detail: format!("file not supported: {file}"),
+                    })?;
+                let session = self.session_for(root, lang.as_str()).await?;
+                let hits = ref_tools::find_referencing_code_snippets(
+                    &session,
+                    root,
+                    &file,
+                    line,
+                    col,
+                    context_lines,
+                    max_results,
+                )
+                .await
+                .map_err(|e| {
+                    ToolError::Core(CoreError::Rpc {
+                        code: -1,
+                        message: format!("find_referencing_code_snippets: {e}"),
+                    })
+                })?;
                 serde_json::to_value(hits)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }

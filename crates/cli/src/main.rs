@@ -537,7 +537,9 @@ async fn dispatch_shell_cmd(
         | "rename-symbol"
         | "read-file"
         | "list-dir"
-        | "find-file" => cmd,
+        | "find-file"
+        | "find-referencing-symbols"
+        | "find-referencing-code-snippets" => cmd,
 
         other => return Err(format!("unknown cmd: {other}")),
     };
