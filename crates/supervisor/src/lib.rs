@@ -251,10 +251,8 @@ impl Supervisor {
         let cache_root = key.root.clone();
         let cache = std::sync::Arc::clone(&self.diag_cache);
         session.client().on_notification("textDocument/publishDiagnostics", move |msg| {
-        session.client().on_notification("textDocument/publishDiagnostics", move |msg| {
-            let Some(uri) = msg.params.as_ref().and_then(|p| p.get("uri")).and_then(|u| u.as_str()) else { eprintln!("[sup] publish: no uri"); return; };
-            let Some(items) = msg.params.as_ref().and_then(|p| p.get("diagnostics")).and_then(|d| d.as_array()).cloned() else { eprintln!("[sup] publish: no items for {uri}"); return; };
-            eprintln!("[sup] publish uri={uri} items={}", items.len());
+            let Some(uri) = msg.params.as_ref().and_then(|p| p.get("uri")).and_then(|u| u.as_str()) else { return; };
+            let Some(items) = msg.params.as_ref().and_then(|p| p.get("diagnostics")).and_then(|d| d.as_array()).cloned() else { return; };
             if !items.is_empty() { cache.lock().unwrap().insert((cache_root.clone(), uri.to_string()), items); }
         });
         self.instances
@@ -281,7 +279,6 @@ impl Supervisor {
             .map_err(|e| ToolError::BadArgs { detail: format!("path to uri: {e}") })?
             .as_str()
             .to_string();
-        eprintln!("[sup] tool_diagnostics uri={uri} root={}", root.display());
         let session = self.session_for(root, lang.as_str()).await?;
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
         // 连续 2 次 items 长度相同即认稳；上限 50 × 100ms = 5s。
