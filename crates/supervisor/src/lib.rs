@@ -24,8 +24,10 @@ use lsp_core::docsync::path_to_uri_str;
 use lsp_core::error::CoreError;
 use lsp_core::init_params::base_initialize_params;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
-pub mod write_gate;
 use lsp_core::session::Session;
+pub mod fs_tools;
+pub mod write_gate;
+
 use lsp_core::types::{SymbolHit, SymbolKindTag};
 use lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position};
 use serde::Serialize;
@@ -1204,6 +1206,66 @@ impl SupervisorTrait for Supervisor {
                         .await?,
                 )
                 .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "read-file" => {
+                let file = required_file(&args)?;
+                let start_line = args
+                    .get("start_line")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let end_line = args
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let report = fs_tools::read_file(root, &file, start_line, end_line)
+                    .await
+                    .map_err(|e| ToolError::BadArgs {
+                        detail: format!("read_file: {e}"),
+                    })?;
+                serde_json::to_value(report)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "list-dir" => {
+                let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::BadArgs {
+                        detail: "missing 'path'".into(),
+                    }
+                })?;
+                let max_depth = args
+                    .get("max_depth")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                let max_entries = args
+                    .get("max_entries")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(500) as usize;
+                let entries =
+                    fs_tools::list_dir(root, path, max_depth, max_entries).map_err(|e| {
+                        ToolError::BadArgs {
+                            detail: format!("list_dir: {e}"),
+                        }
+                    })?;
+                serde_json::to_value(entries)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "find-file" => {
+                let name_pattern = args
+                    .get("name_pattern")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'name_pattern'".into(),
+                    })?;
+                let path_glob = args.get("path_glob").and_then(|v| v.as_str());
+                let max_results = args
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200) as usize;
+                let hits = fs_tools::find_file(root, name_pattern, path_glob, max_results)
+                    .map_err(|e| ToolError::BadArgs {
+                        detail: format!("find_file: {e}"),
+                    })?;
+                serde_json::to_value(hits)
+                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
