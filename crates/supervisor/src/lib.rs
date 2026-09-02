@@ -25,6 +25,7 @@ use lsp_core::error::CoreError;
 use lsp_core::init_params::base_initialize_params;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
 use lsp_core::session::Session;
+pub mod edit_tools;
 pub mod fs_tools;
 
 pub mod ref_tools;
@@ -488,6 +489,88 @@ impl Supervisor {
                 message: format!("find_referencing_code_snippets: {e}"),
             })
         })
+    }
+
+    /// `replace_text_in_symbol`：在 symbol 体内替换 old→new（Task 25）。
+    pub async fn tool_edit_replace_text(
+        &self,
+        root: &Path,
+        file: &str,
+        symbol: &str,
+        old_text: &str,
+        new_text: &str,
+    ) -> ToolResult<()> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let abs = root.join(file);
+        edit_tools::replace_text_in_symbol(&session, root, &abs, symbol, old_text, new_text)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("replace_text_in_symbol: {e}"),
+            })
+    }
+
+    /// `insert_text_before_symbol`：在 symbol 开头插入 text（Task 25）。
+    pub async fn tool_edit_insert_before_symbol(
+        &self,
+        root: &Path,
+        file: &str,
+        symbol: &str,
+        text: &str,
+    ) -> ToolResult<()> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let abs = root.join(file);
+        edit_tools::insert_text_before_symbol(&session, root, &abs, symbol, text)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("insert_text_before_symbol: {e}"),
+            })
+    }
+
+    /// `insert_text_after_symbol`：在 symbol 末尾插入 text（Task 25）。
+    pub async fn tool_edit_insert_after_symbol(
+        &self,
+        root: &Path,
+        file: &str,
+        symbol: &str,
+        text: &str,
+    ) -> ToolResult<()> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let abs = root.join(file);
+        edit_tools::insert_text_after_symbol(&session, root, &abs, symbol, text)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("insert_text_after_symbol: {e}"),
+            })
+    }
+
+    /// `delete_text_in_symbol`：在 symbol 体内删除 [start_line, end_line] 切片（1-based 含端，Task 25）。
+    pub async fn tool_edit_delete_text(
+        &self,
+        root: &Path,
+        file: &str,
+        symbol: &str,
+        start_line: u32,
+        end_line: u32,
+    ) -> ToolResult<()> {
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let abs = root.join(file);
+        edit_tools::delete_text_in_symbol(&session, root, &abs, symbol, start_line, end_line)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("delete_text_in_symbol: {e}"),
+            })
     }
     /// `symbol-body`：按符号名取函数/类体切片（PLAN Task 15）。
     ///
@@ -1176,7 +1259,25 @@ fn required_rename_args(args: &serde_json::Value) -> ToolResult<(String, u32, u3
         .to_owned();
     Ok((file, line, col, new_name))
 }
-
+/// edit_* 工具通用 helper：(file, symbol, text)。
+fn required_edit_args(args: &serde_json::Value) -> ToolResult<(String, String, String)> {
+    let file = required_file(args)?;
+    let symbol = args
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing 'symbol'".into(),
+        })?
+        .to_owned();
+    let text = args
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing 'text'".into(),
+        })?
+        .to_owned();
+    Ok((file, symbol, text))
+}
 #[async_trait::async_trait]
 impl SupervisorTrait for Supervisor {
     async fn execute_tool(
@@ -1373,6 +1474,110 @@ impl SupervisorTrait for Supervisor {
                 })?;
                 serde_json::to_value(hits)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+            }
+            "replace-text-in-symbol" => {
+                let file = required_file(&args)?;
+                let symbol = args
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'symbol'".into(),
+                    })?
+                    .to_owned();
+                let old_text = args
+                    .get("old_text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'old_text'".into(),
+                    })?
+                    .to_owned();
+                let new_text = args
+                    .get("new_text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'new_text'".into(),
+                    })?
+                    .to_owned();
+                let lang =
+                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
+                        detail: format!("file not supported: {file}"),
+                    })?;
+                let session = self.session_for(root, lang.as_str()).await?;
+                let abs = root.join(&file);
+                edit_tools::replace_text_in_symbol(
+                    &session, root, &abs, &symbol, &old_text, &new_text,
+                )
+                .await
+                .map_err(|e| ToolError::BadArgs {
+                    detail: format!("replace_text_in_symbol: {e}"),
+                })?;
+                Ok(serde_json::Value::Null)
+            }
+            "insert-text-after-symbol" => {
+                let (file, symbol, text) = required_edit_args(&args)?;
+                let lang =
+                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
+                        detail: format!("file not supported: {file}"),
+                    })?;
+                let session = self.session_for(root, lang.as_str()).await?;
+                let abs = root.join(&file);
+                edit_tools::insert_text_after_symbol(&session, root, &abs, &symbol, &text)
+                    .await
+                    .map_err(|e| ToolError::BadArgs {
+                        detail: format!("insert_text_after_symbol: {e}"),
+                    })?;
+                Ok(serde_json::Value::Null)
+            }
+            "insert-text-before-symbol" => {
+                let (file, symbol, text) = required_edit_args(&args)?;
+                let lang =
+                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
+                        detail: format!("file not supported: {file}"),
+                    })?;
+                let session = self.session_for(root, lang.as_str()).await?;
+                let abs = root.join(&file);
+                edit_tools::insert_text_before_symbol(&session, root, &abs, &symbol, &text)
+                    .await
+                    .map_err(|e| ToolError::BadArgs {
+                        detail: format!("insert_text_before_symbol: {e}"),
+                    })?;
+                Ok(serde_json::Value::Null)
+            }
+            "delete-text-in-symbol" => {
+                let file = required_file(&args)?;
+                let symbol = args
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'symbol'".into(),
+                    })?
+                    .to_owned();
+                let start_line =
+                    args.get("start_line")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| ToolError::BadArgs {
+                            detail: "missing 'start_line'".into(),
+                        })? as u32;
+                let end_line = args
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'end_line'".into(),
+                    })? as u32;
+                let lang =
+                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
+                        detail: format!("file not supported: {file}"),
+                    })?;
+                let session = self.session_for(root, lang.as_str()).await?;
+                let abs = root.join(&file);
+                edit_tools::delete_text_in_symbol(
+                    &session, root, &abs, &symbol, start_line, end_line,
+                )
+                .await
+                .map_err(|e| ToolError::BadArgs {
+                    detail: format!("delete_text_in_symbol: {e}"),
+                })?;
+                Ok(serde_json::Value::Null)
             }
             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),

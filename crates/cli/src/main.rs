@@ -539,7 +539,11 @@ async fn dispatch_shell_cmd(
         | "list-dir"
         | "find-file"
         | "find-referencing-symbols"
-        | "find-referencing-code-snippets" => cmd,
+        | "find-referencing-code-snippets"
+        | "replace-text-in-symbol"
+        | "insert-text-after-symbol"
+        | "insert-text-before-symbol"
+        | "delete-text-in-symbol" => cmd,
 
         other => return Err(format!("unknown cmd: {other}")),
     };
