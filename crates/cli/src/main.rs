@@ -533,7 +533,9 @@ async fn dispatch_shell_cmd(
         | "completion"
         | "search"
         | "find-symbol"
-        | "find-implementations" => cmd,
+        | "find-implementations"
+        | "rename-symbol" => cmd,
+
         other => return Err(format!("unknown cmd: {other}")),
     };
     let body = json!({

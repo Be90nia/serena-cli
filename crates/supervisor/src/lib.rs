@@ -738,6 +738,205 @@ impl Supervisor {
             files_scanned,
         })
     }
+    /// `textDocument/rename` 跨文件重命名（Task 22）。
+    ///
+    /// 设计要点：
+    /// - **写门全程持锁**：rename 涉及多文件，跨文件不能并行；与 replace-body 共用全局写门。
+    /// - **复用 LSP WorkspaceEdit**：LS 决定 edit 范围（textDocument/rename），
+    ///   我们把 `changes: {uri: [TextEdit]}` 应用到盘上 + 全量 didChange。
+    /// - **位置倒序 apply**：每文件 edits 按 `range.end` 倒序处理，避免偏移漂移。
+    /// - **不支持 `documentChanges`**：clangd 默认走 `changes` map，简化 MVP。
+    pub async fn tool_rename_symbol(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        new_name: &str,
+    ) -> ToolResult<RenameReport> {
+        if new_name.is_empty() || new_name.contains(' ') {
+            return Err(ToolError::BadArgs {
+                detail: "new_name must be non-empty, no whitespace".into(),
+            });
+        }
+
+        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri_str = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let _gate = write_gate::acquire().await;
+
+        let pos = lsp_position_from_byte(&path, line, col, OffsetEncoding::Utf16).await?;
+        let pos_params = json!({
+            "textDocument": { "uri": uri_str },
+            "position": { "line": pos.line, "character": pos.character },
+        });
+
+        // 1) prepareRename —— null = 不能 rename。
+        let prep: Option<serde_json::Value> = session
+            .request(
+                "textDocument/prepareRename",
+                pos_params.clone(),
+                TOOL_TIMEOUT,
+            )
+            .await?;
+        if prep.is_none() || prep.as_ref().is_some_and(|v| v.is_null()) {
+            return Err(ToolError::BadArgs {
+                detail: "prepareRename rejected this position".into(),
+            });
+        }
+
+        // 2) textDocument/rename → WorkspaceEdit JSON。
+        let edit_params = json!({
+            "textDocument": { "uri": uri_str },
+            "position": { "line": pos.line, "character": pos.character },
+            "newName": new_name,
+        });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/rename", edit_params, TOOL_TIMEOUT)
+            .await?;
+        let resp =
+            resp.ok_or_else(|| ToolError::Launch(anyhow::anyhow!("rename returned null")))?;
+
+        // 3) 拆 `changes` map → 按文件分组 + 倒序排序。
+        let changes = resp
+            .get("changes")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| ToolError::Launch(anyhow::anyhow!(
+                "rename response has no `changes` map (M2 only supports changes, not documentChanges)"
+            )))?;
+
+        type EditSpec = (u64, lsp_types::Range, String); // (sort_key, range, new_text)
+        let mut by_uri: Vec<(String, Vec<EditSpec>)> = Vec::new();
+        for (uri, edits) in changes {
+            let file_edits: Vec<(u64, lsp_types::Range, String)> = edits
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| {
+                            let range: lsp_types::Range =
+                                serde_json::from_value(e.get("range")?.clone()).ok()?;
+                            let new_text = e.get("newText")?.as_str()?.to_string();
+                            // 排序 key：end 的 linear index（粗略）。
+                            let key = (range.end.line as u64) << 32 | range.end.character as u64;
+                            Some((key, range, new_text))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            by_uri.push((uri.clone(), file_edits));
+        }
+
+        // 4) 对每个文件应用 edits。
+        let mut report = RenameReport::default();
+        let root_canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        for (uri, mut edits) in by_uri {
+            edits.sort_by_key(|e| std::cmp::Reverse(e.0)); // 倒序
+            let abs = match uri_to_path(&uri) {
+                Some(p) => p,
+                None => continue,
+            };
+            // 必须在 root 内（防 path traversal 风险）。
+            if !abs.starts_with(&root_canon) {
+                continue;
+            }
+
+            let content = match tokio::fs::read_to_string(&abs).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let mut new_content = content.clone();
+            for (_key, range, new_text) in &edits {
+                let start_byte = match lsp_core::offsets::position_to_byte(
+                    &new_content,
+                    lsp_core::offsets::Position {
+                        line: range.start.line,
+                        character: range.start.character,
+                    },
+                    OffsetEncoding::Utf16,
+                ) {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                let end_byte = match lsp_core::offsets::position_to_byte(
+                    &new_content,
+                    lsp_core::offsets::Position {
+                        line: range.end.line,
+                        character: range.end.character,
+                    },
+                    OffsetEncoding::Utf16,
+                ) {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                new_content = format!(
+                    "{}{}{}",
+                    &new_content[..start_byte],
+                    new_text,
+                    &new_content[end_byte..]
+                );
+            }
+
+            if new_content == content {
+                continue;
+            }
+
+            atomic_write(&abs, &new_content)
+                .await
+                .map_err(|e| ToolError::WriteConflict {
+                    path: abs.display().to_string(),
+                    reason: format!("atomic write failed: {e}"),
+                })?;
+
+            // 全量 didChange 让 LS 跟上。
+            let change_params = json!({
+                "textDocument": { "uri": uri },
+                "contentChanges": [{ "text": new_content }],
+            });
+            session
+                .notify("textDocument/didChange", change_params)
+                .await
+                .map_err(ToolError::Core)?;
+
+            report.files_modified += 1;
+            report.edits_applied += edits.len();
+            let rel = abs
+                .strip_prefix(&root_canon)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .replace('\\', "/");
+            report.files.push(rel);
+        }
+
+        Ok(report)
+    }
+}
+
+/// rename_symbol 结果报告。
+#[derive(Debug, Default, Serialize)]
+pub struct RenameReport {
+    /// 修改的文件数。
+    pub files_modified: usize,
+    /// 应用的总 edit 数（每个文件所有 edits 之和）。
+    pub edits_applied: usize,
+    /// 相对 root 路径列表（agent 审计用）。
+    pub files: Vec<String>,
+}
+
+/// 把 `file://...` URL 转回 PathBuf。
+fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let stripped = uri.strip_prefix("file://")?;
+    // Windows: `file:///C:/foo` → `C:/foo`
+    let s = if cfg!(windows) && stripped.starts_with('/') {
+        &stripped[1..]
+    } else {
+        stripped
+    };
+    Some(std::path::PathBuf::from(s.replace('\\', "/")))
 }
 
 /// 单个搜索命中。
@@ -908,6 +1107,19 @@ fn required_replace_args(args: &serde_json::Value) -> ToolResult<(String, String
         .to_owned();
     Ok((file, symbol, new_body))
 }
+
+fn required_rename_args(args: &serde_json::Value) -> ToolResult<(String, u32, u32, String)> {
+    let (file, line, col) = required_position(args)?;
+    let new_name = args
+        .get("new_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing 'new_name'".into(),
+        })?
+        .to_owned();
+    Ok((file, line, col, new_name))
+}
+
 #[async_trait::async_trait]
 impl SupervisorTrait for Supervisor {
     async fn execute_tool(
@@ -984,6 +1196,14 @@ impl SupervisorTrait for Supervisor {
                 self.tool_replace_body(root, &file, &symbol, &new_body)
                     .await?;
                 Ok(serde_json::Value::Null)
+            }
+            "rename-symbol" => {
+                let (file, line, col, new_name) = required_rename_args(&args)?;
+                serde_json::to_value(
+                    self.tool_rename_symbol(root, &file, line, col, &new_name)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
