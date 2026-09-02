@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::framing::{JsonRpc, decode, encode};
+use crate::recording::Recorder;
 
 /// 内联分发回调（保序；Task 5：返回 `Some(reply)` 表示 server→client request 需回执）。
 ///
@@ -179,4 +180,138 @@ fn dispatch(msg: JsonRpc, on_msg: &OnMsg, reply_tx: &mpsc::Sender<JsonRpc>) {
     {
         tracing::warn!(error = %e, "reply_tx 满/关，丢弃 server→client request 回执");
     }
+}
+
+/// record 模式 pump（PLAN Task 26）：透传 + 写盘所有出/入帧。
+pub fn record_pump(
+    child: ChildHandle,
+    outbound_rx: mpsc::Receiver<JsonRpc>,
+    reply_rx: mpsc::Receiver<JsonRpc>,
+    reply_tx: mpsc::Sender<JsonRpc>,
+    on_msg: OnMsg,
+    on_eof: OnEof,
+    recorder: Recorder,
+) -> Pumps {
+    let ChildHandle { stdin, stdout, stderr, job } = child;
+    let reply_tx_for_dispatch = reply_tx.clone();
+    let rec_w = recorder.clone();
+    let rec_r = recorder;
+    let writer = tokio::spawn(async move {
+        let mut stdin = stdin;
+        let mut out_rx = outbound_rx;
+        let mut rep_rx = reply_rx;
+        let mut buf_out = Vec::with_capacity(4096);
+        let mut out_closed = false;
+        let mut rep_closed = false;
+        while !(out_closed && rep_closed) {
+            tokio::select! {
+                biased;
+                msg = out_rx.recv(), if !out_closed => match msg {
+                    Some(m) => {
+                        rec_w.record_outbound(&m);
+                        let frame = encode(&m);
+                        buf_out.clear();
+                        buf_out.extend_from_slice(&frame);
+                        if let Err(e) = stdin.write_all(&buf_out).await {
+                            tracing::warn!(error = %e, "stdin write failed; LS process likely dead");
+                            break;
+                        }
+                    }
+                    None => out_closed = true,
+                },
+                msg = rep_rx.recv(), if !rep_closed => match msg {
+                    Some(m) => {
+                        rec_w.record_outbound(&m);
+                        let frame = encode(&m);
+                        buf_out.clear();
+                        buf_out.extend_from_slice(&frame);
+                        if let Err(e) = stdin.write_all(&buf_out).await {
+                            tracing::warn!(error = %e, "stdin write failed; LS process likely dead");
+                            break;
+                        }
+                    }
+                    None => rep_closed = true,
+                },
+            }
+        }
+    });
+    let stdout_task = tokio::spawn(async move {
+        let mut stdout = stdout;
+        let mut buf = BytesMut::new();
+        let mut chunk = [0u8; 8192];
+        let mut saw_eof = false;
+        while !saw_eof {
+            match stdout.read(&mut chunk).await {
+                Ok(0) => saw_eof = true,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e) => { tracing::warn!(error = %e, "stdout read failed; aborting pump"); saw_eof = true; }
+            }
+            loop {
+                match decode(&mut buf) {
+                    Ok(Some(m)) => {
+                        rec_r.record_inbound(&m);
+                        dispatch(m, &on_msg, &reply_tx_for_dispatch);
+                    }
+                    Ok(None) => break,
+                    Err(e) => { tracing::error!(error = %e, "frame decode failed; aborting stdout pump"); saw_eof = true; break; }
+                }
+            }
+        }
+        (on_eof)();
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => tracing::info!(target: "lsp_stderr", "{line}"),
+                Ok(None) => break,
+                Err(e) => { tracing::debug!(error = %e, "stderr pump read error"); break; }
+            }
+        }
+    });
+    Pumps { writer, stdout: stdout_task, stderr: stderr_task, job }
+}
+
+/// replay 模式 pump（PLAN Task 26）：不接真 LS。
+pub fn replay_pump(
+    outbound_rx: mpsc::Receiver<JsonRpc>,
+    reply_rx: mpsc::Receiver<JsonRpc>,
+    reply_tx: mpsc::Sender<JsonRpc>,
+    on_msg: OnMsg,
+    on_eof: OnEof,
+    recorder: Recorder,
+) -> Pumps {
+    let reply_tx_for_dispatch = reply_tx.clone();
+    let rec_w = recorder.clone();
+    let rec_r = recorder;
+    let writer = tokio::spawn(async move {
+        let mut out_rx = outbound_rx;
+        let mut rep_rx = reply_rx;
+        let mut out_closed = false;
+        let mut rep_closed = false;
+        while !(out_closed && rep_closed) {
+            tokio::select! {
+                biased;
+                msg = out_rx.recv(), if !out_closed => match msg {
+                    Some(m) => { rec_w.record_outbound(&m); }
+                    None => out_closed = true,
+                },
+                msg = rep_rx.recv(), if !rep_closed => match msg {
+                    Some(m) => { rec_w.record_outbound(&m); }
+                    None => rep_closed = true,
+                },
+            }
+        }
+    });
+    let stdout_task = tokio::spawn(async move {
+        loop {
+            match rec_r.next_inbound() {
+                Some(m) => dispatch(m, &on_msg, &reply_tx_for_dispatch),
+                None => break,
+            }
+        }
+        (on_eof)();
+    });
+    let stderr_task = tokio::spawn(async move {});
+    Pumps { writer, stdout: stdout_task, stderr: stderr_task, job: None }
 }

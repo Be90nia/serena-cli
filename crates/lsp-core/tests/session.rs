@@ -36,7 +36,7 @@ fn dummy_init_params() -> InitializeParams {
 #[tokio::test]
 async fn session_hits_ready_and_serves_requests() {
     let child = Child::spawn(launch_mock_ls()).unwrap();
-    let session = Session::start(child, dummy_init_params())
+    let session = Session::start(Some(child), dummy_init_params())
         .await
         .expect("Session::start 应在 handshake 超时内返回 Ready");
 
@@ -65,7 +65,7 @@ async fn session_hits_ready_and_serves_requests() {
 #[tokio::test]
 async fn session_shutdown_terminates_child() {
     let child = Child::spawn(launch_mock_ls()).unwrap();
-    let session = Session::start(child, dummy_init_params())
+    let session = Session::start(Some(child), dummy_init_params())
         .await
         .expect("Session::start 应成功");
 
@@ -84,7 +84,7 @@ async fn session_shutdown_terminates_child() {
 async fn request_after_ready_completes_quickly() {
     let child = Child::spawn(launch_mock_ls()).unwrap();
     let session = std::sync::Arc::new(
-        Session::start(child, dummy_init_params())
+        Session::start(Some(child), dummy_init_params())
             .await
             .expect("Session::start 应成功"),
     );
@@ -123,7 +123,7 @@ async fn session_start_failure_returns_core_error() {
     // Session::start 内部 10s 超时；外层 12s 兜底 —— ping 不会回任何 LSP 帧，必超时。
     let res = tokio::time::timeout(
         Duration::from_secs(12),
-        Session::start(child, dummy_init_params()),
+        Session::start(Some(child), dummy_init_params()),
     )
     .await
     .expect("Session::start 本身 12s 内必须返回（不能永远挂死）");

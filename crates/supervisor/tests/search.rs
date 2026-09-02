@@ -105,7 +105,6 @@ async fn binary_file_skipped_silently() {
     std::fs::write(root.join("text.txt"), "match here\n").unwrap();
     std::fs::write(root.join("blob.bin"), [0xff, 0xfe, 0x00, 0x01, 0x02]).unwrap();
 
-
     let sup = new_sup().await;
     let resp = sup
         .tool_search_for_pattern(&root, "match", None, 100, false)

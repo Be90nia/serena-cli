@@ -27,19 +27,21 @@ mod tests {
         let gate_task1 = tokio::spawn(async {
             let _g = acquire().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
-            Instant::now()
         });
+        // 等 task1 真正拿门后再 spawn task2：测 task2 等待 ≥80ms。
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let start2 = Instant::now();
         let gate_task2 = tokio::spawn(async {
             let _g = acquire().await;
             Instant::now()
         });
-        // task1 先持门 100ms；task2 应在 task1 释放后才拿到（差 ≥80ms）。
-        let t1 = gate_task1.await.unwrap();
+        let _ = gate_task1.await.unwrap();
         let t2 = gate_task2.await.unwrap();
+        let waited = t2.duration_since(start2);
         assert!(
-            t2.duration_since(t1).as_millis() >= 80,
-            "task2 应在 task1 释放后才进临界区，实际差 {:?}",
-            t2.duration_since(t1)
+            waited.as_millis() >= 80,
+            "task2 应等 task1 释放后才拿到门，实际等了 {:?}",
+            waited
         );
     }
 

@@ -5,5 +5,6 @@ pub mod framing;
 pub mod init_params;
 pub mod offsets;
 pub mod session;
+pub mod recording;
 pub mod transport;
 pub mod types;

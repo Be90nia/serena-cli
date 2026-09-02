@@ -31,7 +31,8 @@ use tokio::time;
 use crate::client::Client;
 use crate::error::{CoreError, Result};
 use crate::framing::JsonRpc;
-use crate::transport::stdio::{OnEof, OnMsg, Pumps, pump};
+use crate::recording::Recorder;
+use crate::transport::stdio::{OnEof, OnMsg, Pumps, pump, record_pump, replay_pump};
 
 /// 握手超时上限（10s）。真实 clangd 多在 1s 内回 initialize；mock_ls 同样。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -45,6 +46,37 @@ const SHUTDOWN_REQ_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// ↖ mirror: ls.py@43ae021 5s wait 上限（语义：本项目是 EOF 通知，不是 wait()）。
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 录制文件路径环境变量。设置后 Session::start 透传 + 落盘所有帧。
+const ENV_RECORD: &str = "SERENA_RECORD";
+/// 回放文件路径环境变量。设置后 Session::start 不接真 LS，从录文件喂虚拟入站。
+const ENV_REPLAY: &str = "SERENA_REPLAY";
+
+/// 从 env 解析 Recorder（PLAN Task 26）。
+///
+/// 优先级：`SERENA_REPLAY` → replay；`SERENA_RECORD` → record；二者皆无 → passthrough。
+/// 路径错误 → stderr 打 warning 后回退 passthrough（不阻塞生产路径）。
+fn recorder_from_env() -> Recorder {
+    if let Ok(path) = std::env::var(ENV_REPLAY) {
+        match Recorder::open_replay(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[serena] SERENA_REPLAY={path:?} 打开失败: {e}; 降级 passthrough");
+                Recorder::passthrough()
+            }
+        }
+    } else if let Ok(path) = std::env::var(ENV_RECORD) {
+        match Recorder::open(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[serena] SERENA_RECORD={path:?} 打开失败: {e}; 降级 passthrough");
+                Recorder::passthrough()
+            }
+        }
+    } else {
+        Recorder::passthrough()
+    }
+}
 
 /// Session 状态（ARCHITECTURE §5 状态机图权威）。
 ///
@@ -103,7 +135,7 @@ impl Session {
     /// - 失败 → `CoreError`，无 Arc（child 由 pumps 持 Job 保活，pumps drop 灭树）。
     ///
     /// 不重试：失败语义由 supervisor 决策（PLAN Global Constraints）。
-    pub async fn start(child: ChildHandle, params: InitializeParams) -> Result<Arc<Self>> {
+    pub async fn start(child: Option<ChildHandle>, params: InitializeParams) -> Result<Arc<Self>> {
         // 拆 child + 起 3 泵（架构要求 writer 独占 stdin、stdout 泵内联分发、stderr 泵日志）。
         let (out_tx, out_rx) = mpsc::channel::<JsonRpc>(64);
         let (reply_tx, reply_rx) = mpsc::channel::<JsonRpc>(8);
@@ -125,8 +157,22 @@ impl Session {
                 stdout_eof_for_pump.notify_waiters();
             })
         };
-        let pumps = pump(child, out_rx, reply_rx, reply_tx, on_msg, on_eof);
-        // stdout_eof 在闭包外独占（Notify::new 直接拿走 Arc 内容）。
+        let recorder = recorder_from_env();
+        let pumps = match (child, &recorder) {
+            (Some(c), r) if !r.is_passthrough() && !r.is_replay() => {
+                record_pump(c, out_rx, reply_rx, reply_tx, on_msg, on_eof, recorder)
+            }
+            (None, r) if r.is_replay() => {
+                replay_pump(out_rx, reply_rx, reply_tx, on_msg, on_eof, recorder)
+            }
+            (Some(c), _) => pump(c, out_rx, reply_rx, reply_tx, on_msg, on_eof),
+            (None, _) => {
+                return Err(CoreError::Io(std::io::Error::other(
+                    "Session::start: no child and no SERENA_REPLAY env",
+                )));
+            }
+        };
+         // stdout_eof 在闭包外独占
         let stdout_eof = Arc::try_unwrap(stdout_eof).unwrap_or_else(|_| Notify::new());
 
         let session = Arc::new(Self {

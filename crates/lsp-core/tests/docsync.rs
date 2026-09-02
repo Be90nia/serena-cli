@@ -77,7 +77,7 @@ async fn ensure_open_emits_did_open_with_full_text() {
         .expect("write fixture");
 
     let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
-    let session = Session::start(child, dummy_init_params())
+    let session = Session::start(Some(child), dummy_init_params())
         .await
         .expect("Session::start 应在握手超时内 Ready");
 
@@ -114,7 +114,7 @@ async fn ensure_open_after_external_edit_emits_did_change() {
         .expect("write fixture v1");
 
     let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
-    let session = Session::start(child, dummy_init_params())
+    let session = Session::start(Some(child), dummy_init_params())
         .await
         .expect("Session::start Ready");
 
@@ -171,7 +171,7 @@ async fn nested_guards_emit_did_open_once() {
         .expect("write fixture");
 
     let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
-    let session = Session::start(child, dummy_init_params())
+    let session = Session::start(Some(child), dummy_init_params())
         .await
         .expect("Session::start Ready");
 
