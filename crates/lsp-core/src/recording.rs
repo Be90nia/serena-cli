@@ -121,13 +121,13 @@ impl Recorder {
     /// 记录一帧出站（client → LS）。replay 模式下吞掉。
     pub fn record_outbound(&self, msg: &JsonRpc) {
         let mut guard = self.inner.lock().unwrap();
-        if let RecorderInner::Record { file } = &mut *guard {
-            if let Ok(s) = serde_json::to_string(msg) {
-                let _ = file.write_all(DIR_OUT);
-                let _ = file.write_all(s.as_bytes());
-                let _ = file.write_all(b"\n");
-                let _ = file.flush();
-            }
+        if let RecorderInner::Record { file } = &mut *guard
+            && let Ok(s) = serde_json::to_string(msg)
+        {
+            let _ = file.write_all(DIR_OUT);
+            let _ = file.write_all(s.as_bytes());
+            let _ = file.write_all(b"\n");
+            let _ = file.flush();
         }
     }
 
@@ -135,13 +135,13 @@ impl Recorder {
     /// （入站帧由 next_inbound 直接从预读队列返回）。
     pub fn record_inbound(&self, msg: &JsonRpc) {
         let mut guard = self.inner.lock().unwrap();
-        if let RecorderInner::Record { file } = &mut *guard {
-            if let Ok(s) = serde_json::to_string(msg) {
-                let _ = file.write_all(DIR_IN);
-                let _ = file.write_all(s.as_bytes());
-                let _ = file.write_all(b"\n");
-                let _ = file.flush();
-            }
+        if let RecorderInner::Record { file } = &mut *guard
+            && let Ok(s) = serde_json::to_string(msg)
+        {
+            let _ = file.write_all(DIR_IN);
+            let _ = file.write_all(s.as_bytes());
+            let _ = file.write_all(b"\n");
+            let _ = file.flush();
         }
     }
 

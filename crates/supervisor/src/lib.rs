@@ -70,6 +70,8 @@ pub enum ToolError {
 }
 
 /// supervisor 公共结果类型（库层 Result 别名）。
+/// diagnostics 缓存条目类型：uri -> items。
+pub type DiagCache = std::sync::Arc<Mutex<HashMap<(PathBuf, String), Vec<serde_json::Value>>>>;
 pub type ToolResult<T> = std::result::Result<T, ToolError>;
 
 /// Daemon 工具语义层抽象；实现负责按工具名分派只读请求。
@@ -95,7 +97,7 @@ pub struct Supervisor {
     last_used: Mutex<HashMap<Key, std::time::Instant>>,
     direct_mode: bool,
     /// publishDiagnostics 通知缓存：key = (root, uri)，value = items 数组。
-    diag_cache: std::sync::Arc<Mutex<HashMap<(PathBuf, String), Vec<serde_json::Value>>>>,
+    diag_cache: DiagCache,
 }
 /// 实例键：canonicalize、去尾分隔符并大小写折叠的 root + language。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

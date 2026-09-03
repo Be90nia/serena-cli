@@ -56,10 +56,78 @@ struct Cli {
 enum Cmd {
     /// 列出文件顶层符号。
     Overview { file: String },
+    /// 跳转到符号定义（textDocument/definition）。
     Def { file: String, line: u32, col: u32 },
-    /// 列出引用。line/col 0-based。
+    /// 列出引用（textDocument/references）。line/col 0-based。
     Refs { file: String, line: u32, col: u32 },
-    /// 取符号体切片。
+    /// 鼠标位置符号的 type / doc（textDocument/hover）。
+    Hover { file: String, line: u32, col: u32 },
+    /// 当前文件错误/警告（textDocument/diagnostic）。
+    Diagnostics { file: String },
+    /// 全 workspace 跨文件符号查找（workspace/symbol）。
+    FindSymbol {
+        /// 子串或正则（取决于 LSP server 行为，clangd 默认子串）。
+        query: String,
+        /// 上限。
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// 符号的所有实现位置（textDocument/implementation）。
+    FindImplementations { file: String, line: u32, col: u32 },
+    /// 跨文件 rename（textDocument/rename）。
+    RenameSymbol {
+        file: String,
+        line: u32,
+        col: u32,
+        /// 新名。
+        #[arg(long = "to")]
+        new_name: String,
+    },
+    /// workspace/search：跨文件正则搜索。
+    Search {
+        pattern: String,
+        /// glob 过滤文件路径（如 **/*.cpp）。
+        #[arg(long)]
+        path_glob: Option<String>,
+        /// 最大结果数。
+        #[arg(long, default_value_t = 100)]
+        max_results: u32,
+        /// 大小写敏感（默认不敏感）。
+        #[arg(long, default_value_t = false)]
+        case_sensitive: bool,
+    },
+    /// 按行范围读文件（1-based 含端）。
+    ReadFile {
+        file: String,
+        /// 起始行（1-based，默认 1）。
+        #[arg(long)]
+        start_line: Option<u32>,
+        /// 结束行（1-based 含端，默认 EOF）。
+        #[arg(long)]
+        end_line: Option<u32>,
+    },
+    /// 列出目录项（不递归）。
+    ListDir { path: String },
+    /// 按文件名 glob 查找文件（限深 5）。
+    FindFile {
+        /// glob 模式（如 main.cpp）。
+        name_pattern: String,
+    },
+    /// 所有引用 + 每个 ref 落在哪个外层符号里。
+    FindReferencingSymbols { file: String, line: u32, col: u32 },
+    /// 所有引用 + 每个 ref 前后 N 行。
+    FindReferencingCodeSnippets {
+        file: String,
+        line: u32,
+        col: u32,
+        /// 每个 ref 上下文行数（前后对称）。
+        #[arg(long, default_value_t = 3)]
+        context_lines: u32,
+        /// 上限。
+        #[arg(long, default_value_t = 20)]
+        max_results: u32,
+    },
+    /// 取符号体切片（position-free；documentSymbol 定位）。
     SymbolBody { file: String, symbol: String },
     /// 替换符号体（写门 + hash 对账 + 原子写）。
     ReplaceBody {
@@ -68,6 +136,34 @@ enum Cmd {
         /// 新符号体完整文本。
         #[arg(long = "with")]
         new_body: String,
+    },
+    /// 在 symbol 体内替换 old → new（行级字节切片）。
+    ReplaceTextInSymbol {
+        file: String,
+        symbol: String,
+        /// 待替换原文。
+        old_text: String,
+        /// 新文。
+        new_text: String,
+    },
+    /// 在 symbol 开头插入 text。
+    InsertTextBeforeSymbol {
+        file: String,
+        symbol: String,
+        text: String,
+    },
+    /// 在 symbol 末尾插入 text。
+    InsertTextAfterSymbol {
+        file: String,
+        symbol: String,
+        text: String,
+    },
+    /// 在 symbol 体内删除 [start_line, end_line] 切片（1-based 含端）。
+    DeleteTextInSymbol {
+        file: String,
+        symbol: String,
+        start_line: u32,
+        end_line: u32,
     },
     /// daemon 状态（uptime / pid / loaded LS）。
     Status,
@@ -290,16 +386,79 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
         Some(Cmd::Refs { file, line, col }) => {
             ("refs", json!({"file": file, "line": line, "col": col}))
         }
+        Some(Cmd::Hover { file, line, col }) => {
+            ("hover", json!({"file": file, "line": line, "col": col}))
+        }
+        Some(Cmd::Diagnostics { file }) => ("diagnostics", json!({"file": file})),
+        Some(Cmd::FindSymbol { query, limit }) => (
+            "find-symbol",
+            json!({"query": query, "limit": limit}),
+        ),
+        Some(Cmd::FindImplementations { file, line, col }) => (
+            "find-implementations",
+            json!({"file": file, "line": line, "col": col}),
+        ),
+        Some(Cmd::RenameSymbol { file, line, col, new_name }) => (
+            "rename-symbol",
+            json!({"file": file, "line": line, "col": col, "new_name": new_name}),
+        ),
+        Some(Cmd::Search { pattern, path_glob, max_results, case_sensitive }) => (
+            "search",
+            json!({
+                "pattern": pattern,
+                "path_glob": path_glob,
+                "max_results": max_results,
+                "case_sensitive": case_sensitive,
+            }),
+        ),
+        Some(Cmd::ReadFile { file, start_line, end_line }) => (
+            "read-file",
+            json!({
+                "file": file,
+                "start_line": start_line,
+                "end_line": end_line,
+            }),
+        ),
+        Some(Cmd::ListDir { path }) => ("list-dir", json!({"path": path})),
+        Some(Cmd::FindFile { name_pattern }) => {
+            ("find-file", json!({"name_pattern": name_pattern}))
+        }
+        Some(Cmd::FindReferencingSymbols { file, line, col }) => (
+            "find-referencing-symbols",
+            json!({"file": file, "line": line, "col": col}),
+        ),
+        Some(Cmd::FindReferencingCodeSnippets { file, line, col, context_lines, max_results }) => (
+            "find-referencing-code-snippets",
+            json!({
+                "file": file,
+                "line": line,
+                "col": col,
+                "context_lines": context_lines,
+                "max_results": max_results,
+            }),
+        ),
         Some(Cmd::SymbolBody { file, symbol }) => {
             ("symbol-body", json!({"file": file, "symbol": symbol}))
         }
-        Some(Cmd::ReplaceBody {
-            file,
-            symbol,
-            new_body,
-        }) => (
+        Some(Cmd::ReplaceBody { file, symbol, new_body }) => (
             "replace-body",
             json!({"file": file, "symbol": symbol, "new_body": new_body}),
+        ),
+        Some(Cmd::ReplaceTextInSymbol { file, symbol, old_text, new_text }) => (
+            "replace-text-in-symbol",
+            json!({"file": file, "symbol": symbol, "old_text": old_text, "new_text": new_text}),
+        ),
+        Some(Cmd::InsertTextBeforeSymbol { file, symbol, text }) => (
+            "insert-text-before-symbol",
+            json!({"file": file, "symbol": symbol, "text": text}),
+        ),
+        Some(Cmd::InsertTextAfterSymbol { file, symbol, text }) => (
+            "insert-text-after-symbol",
+            json!({"file": file, "symbol": symbol, "text": text}),
+        ),
+        Some(Cmd::DeleteTextInSymbol { file, symbol, start_line, end_line }) => (
+            "delete-text-in-symbol",
+            json!({"file": file, "symbol": symbol, "start_line": start_line, "end_line": end_line}),
         ),
         Some(Cmd::Status) | Some(Cmd::StopAll) | Some(Cmd::Shell) | Some(Cmd::Mcp { .. }) | None => {
             unreachable!("handled earlier")
@@ -614,8 +773,6 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-// 常量用途占位（避免 unused 警告）；真实语义见各常量定义处。
-#[allow(dead_code)]
 // ============== MCP stdio server (Claude Desktop / MCP 客户端通用) ==============
 
 /// MCP 协议工具列表（每个工具 + inputSchema）。MCP spec 2025-06-18 版本。

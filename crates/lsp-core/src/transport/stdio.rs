@@ -304,11 +304,8 @@ pub fn replay_pump(
         }
     });
     let stdout_task = tokio::spawn(async move {
-        loop {
-            match rec_r.next_inbound() {
-                Some(m) => dispatch(m, &on_msg, &reply_tx_for_dispatch),
-                None => break,
-            }
+        while let Some(m) = rec_r.next_inbound() {
+            dispatch(m, &on_msg, &reply_tx_for_dispatch);
         }
         (on_eof)();
     });

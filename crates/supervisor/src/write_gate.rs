@@ -35,7 +35,7 @@ mod tests {
             let _g = acquire().await;
             Instant::now()
         });
-        let _ = gate_task1.await.unwrap();
+        gate_task1.await.unwrap();
         let t2 = gate_task2.await.unwrap();
         let waited = t2.duration_since(start2);
         assert!(
