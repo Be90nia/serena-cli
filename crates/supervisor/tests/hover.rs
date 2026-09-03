@@ -37,7 +37,7 @@ async fn hover_returns_type_info_on_symbol() {
     let root = scratch("symbol");
     let sup = Supervisor::direct().await.expect("supervisor");
     // `answer` 在第 1 行（0-based line=0），col=4（0-based "answer" 起始）。
-    let hover = sup.tool_hover(&root, "demo.cpp", 0, 4).await.expect("hover");
+    let hover = sup.tool_hover(&root, "demo.cpp", 0, 4, None).await.expect("hover");
     assert!(hover.is_some(), "expected Some(hover) on 'answer'");
     let hover = hover.unwrap();
     let text = match &hover.contents {
@@ -73,7 +73,7 @@ async fn hover_on_whitespace_returns_none() {
     let sup = Supervisor::direct().await.expect("supervisor");
 
     // 文件末尾空行区域（line 3 超出 2 行内容 + 末尾 newline），无符号。
-    let hover = sup.tool_hover(&root, "demo.cpp", 3, 0).await.expect("hover");
+    let hover = sup.tool_hover(&root, "demo.cpp", 3, 0, None).await.expect("hover");
     assert!(
         hover.is_none(),
         "expected None on whitespace, got: {:?}",

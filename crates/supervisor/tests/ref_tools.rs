@@ -70,12 +70,12 @@ async fn find_referencing_symbols_returns_callers_with_containers() {
 
     // 触发索引：开所有相关 cpp/h。
     for f in ["foo.h", "foo.cpp", "caller.cpp"] {
-        let _ = sup.tool_overview(&root, f).await.expect("overview");
+        let _ = sup.tool_overview(&root, f, None).await.expect("overview");
     }
 
     // 在 foo.h:1 "foo" 第一次出现处（col=5，0-based=4）。
     let hits = sup
-        .tool_referencing_symbols(&root, "foo.h", 0, 4)
+        .tool_referencing_symbols(&root, "foo.h", 0, 4, None)
         .await
         .expect("refs syms");
 
@@ -102,11 +102,11 @@ async fn find_referencing_code_snippets_returns_snippets() {
     let sup = Supervisor::direct().await.expect("supervisor");
 
     for f in ["foo.h", "foo.cpp", "caller.cpp"] {
-        let _ = sup.tool_overview(&root, f).await.expect("overview");
+        let _ = sup.tool_overview(&root, f, None).await.expect("overview");
     }
 
     let hits = sup
-        .tool_referencing_code_snippets(&root, "foo.h", 0, 4, 2, 50)
+        .tool_referencing_code_snippets(&root, "foo.h", 0, 4, 2, 50, None)
         .await
         .expect("refs snips");
 

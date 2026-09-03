@@ -68,11 +68,11 @@ async fn rename_foo_to_bar_across_files() {
 
     // 触发索引：开所有相关 cpp/h 文件让 clangd 把 TU 都加进索引。
     for f in ["foo.h", "foo.cpp", "caller.cpp"] {
-        let _ = sup.tool_overview(&root, f).await.expect("overview");
+        let _ = sup.tool_overview(&root, f, None).await.expect("overview");
     }
 
     let report = sup
-        .tool_rename_symbol(&root, "foo.h", 0, 4, "bar")
+        .tool_rename_symbol(&root, "foo.h", 0, 4, "bar", None)
         .await
         .expect("rename");
     assert!(
@@ -107,10 +107,10 @@ async fn rename_foo_to_bar_across_files() {
 async fn empty_new_name_returns_bad_args() {
     let root = scratch("empty");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "foo.h").await.expect("overview");
+    let _ = sup.tool_overview(&root, "foo.h", None).await.expect("overview");
 
     let err = sup
-        .tool_rename_symbol(&root, "foo.h", 0, 4, "")
+        .tool_rename_symbol(&root, "foo.h", 0, 4, "", None)
         .await
         .expect_err("empty new_name");
     assert!(
@@ -125,10 +125,10 @@ async fn empty_new_name_returns_bad_args() {
 async fn whitespace_new_name_returns_bad_args() {
     let root = scratch("ws");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "foo.h").await.expect("overview");
+    let _ = sup.tool_overview(&root, "foo.h", None).await.expect("overview");
 
     let err = sup
-        .tool_rename_symbol(&root, "foo.h", 0, 4, "bad name")
+        .tool_rename_symbol(&root, "foo.h", 0, 4, "bad name", None)
         .await
         .expect_err("whitespace new_name");
     assert!(

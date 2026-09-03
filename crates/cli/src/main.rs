@@ -261,15 +261,15 @@ async fn run_direct(cli: &Cli) -> ExitCode {
     };
     let res: Result<(), ToolError> = match &cli.cmd {
         Some(Cmd::Overview { file }) => sup
-            .tool_overview(&root, file)
+            .tool_overview(&root, file, cli.lang.as_deref())
             .await
             .and_then(|hits| print_json(&json!(hits))),
         Some(Cmd::Def { file, line, col }) => sup
-            .tool_def(&root, file, *line, *col)
+            .tool_def(&root, file, *line, *col, cli.lang.as_deref())
             .await
             .and_then(|opt| print_json(&json!(opt))),
         Some(Cmd::Refs { file, line, col }) => sup
-            .tool_refs(&root, file, *line, *col)
+            .tool_refs(&root, file, *line, *col, cli.lang.as_deref())
             .await
             .and_then(|vec| print_json(&json!(vec))),
         other => {

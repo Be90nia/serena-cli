@@ -55,7 +55,7 @@ async fn m0_overview_def_refs_over_real_clangd() {
 
     // overview: hit `main` in main.cpp
     let overview = sup
-        .tool_overview(&root, "main.cpp")
+        .tool_overview(&root, "main.cpp", None)
         .await
         .expect("overview request");
     let main_hit = overview
@@ -76,7 +76,7 @@ async fn m0_overview_def_refs_over_real_clangd() {
     let main_cpp = std::fs::read_to_string(root.join("main.cpp")).unwrap();
     let (line, col) = main_cpp_line_of(&main_cpp, "add(");
     let def = sup
-        .tool_def(&root, "main.cpp", line, col)
+        .tool_def(&root, "main.cpp", line, col, None)
         .await
         .expect("def request")
         .expect("def should resolve `add` call to a Location");
@@ -90,7 +90,7 @@ async fn m0_overview_def_refs_over_real_clangd() {
     let math_h = std::fs::read_to_string(root.join("math.h")).unwrap();
     let (decl_line, decl_col) = main_cpp_line_of(&math_h, "add");
     let refs = sup
-        .tool_refs(&root, "math.h", decl_line, decl_col)
+        .tool_refs(&root, "math.h", decl_line, decl_col, None)
         .await
         .expect("refs request");
     assert!(

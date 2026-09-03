@@ -61,11 +61,11 @@ async fn insert_text_before_symbol_adds_prefix() {
     let (root, file) = scratch("before");
     let sup = Supervisor::direct().await.expect("supervisor");
     let _ = sup
-        .tool_overview(&root, "demo.cpp")
+        .tool_overview(&root, "demo.cpp", None)
         .await
         .expect("overview");
 
-    sup.tool_edit_insert_before_symbol(&root, "demo.cpp", "main", "// header comment\n")
+    sup.tool_edit_insert_before_symbol(&root, "demo.cpp", "main", "// header comment\n", None)
         .await
         .expect("insert before");
 
@@ -87,11 +87,11 @@ async fn insert_text_after_symbol_adds_suffix() {
     let (root, file) = scratch("after");
     let sup = Supervisor::direct().await.expect("supervisor");
     let _ = sup
-        .tool_overview(&root, "demo.cpp")
+        .tool_overview(&root, "demo.cpp", None)
         .await
         .expect("overview");
 
-    sup.tool_edit_insert_after_symbol(&root, "demo.cpp", "keep_me", " // tail comment")
+    sup.tool_edit_insert_after_symbol(&root, "demo.cpp", "keep_me", " // tail comment", None)
         .await
         .expect("insert after");
 
@@ -113,7 +113,7 @@ async fn replace_text_in_symbol_swaps_substring() {
     let (root, file) = scratch("replace");
     let sup = Supervisor::direct().await.expect("supervisor");
     let _ = sup
-        .tool_overview(&root, "demo.cpp")
+        .tool_overview(&root, "demo.cpp", None)
         .await
         .expect("overview");
 
@@ -123,6 +123,7 @@ async fn replace_text_in_symbol_swaps_substring() {
         "main",
         "return old_value",
         "return old_value + 100",
+        None,
     )
     .await
     .expect("replace");
@@ -145,12 +146,12 @@ async fn delete_text_in_symbol_removes_range() {
     let (root, file) = scratch("delete");
     let sup = Supervisor::direct().await.expect("supervisor");
     let _ = sup
-        .tool_overview(&root, "demo.cpp")
+        .tool_overview(&root, "demo.cpp", None)
         .await
         .expect("overview");
 
     // main 是文件第 3 行（1-based）。删 3..=3。
-    sup.tool_edit_delete_text(&root, "demo.cpp", "main", 3, 3)
+    sup.tool_edit_delete_text(&root, "demo.cpp", "main", 3, 3, None)
         .await
         .expect("delete");
 
@@ -174,9 +175,9 @@ async fn delete_text_in_symbol_rejects_start_gt_end() {
     }
     let (root, _file) = scratch("delflip");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "demo.cpp").await.expect("overview");
+    let _ = sup.tool_overview(&root, "demo.cpp", None).await.expect("overview");
     let err = sup
-        .tool_edit_delete_text(&root, "demo.cpp", "main", 5, 3)
+        .tool_edit_delete_text(&root, "demo.cpp", "main", 5, 3, None)
         .await
         .expect_err("start_line > end_line 应 error");
     assert!(matches!(err, supervisor::ToolError::BadArgs { .. }), "got: {err:?}");
@@ -191,9 +192,9 @@ async fn edit_tools_reject_unknown_symbol() {
     }
     let (root, _file) = scratch("nosym");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "demo.cpp").await.expect("overview");
+    let _ = sup.tool_overview(&root, "demo.cpp", None).await.expect("overview");
     let err = sup
-        .tool_edit_replace_text(&root, "demo.cpp", "nonexistent_symbol", "x", "y")
+        .tool_edit_replace_text(&root, "demo.cpp", "nonexistent_symbol", "x", "y", None)
         .await
         .expect_err("未知 symbol 应 error");
     assert!(matches!(err, supervisor::ToolError::BadArgs { .. }), "got: {err:?}");
@@ -208,7 +209,7 @@ async fn concurrent_writes_serialize_in_order() {
     }
     let (root, file) = scratch("concurrent");
     let sup = std::sync::Arc::new(Supervisor::direct().await.expect("supervisor"));
-    let _ = sup.tool_overview(&root, "demo.cpp").await.expect("overview");
+    let _ = sup.tool_overview(&root, "demo.cpp", None).await.expect("overview");
     let sup2 = std::sync::Arc::clone(&sup);
     let root2 = root.clone();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -216,7 +217,7 @@ async fn concurrent_writes_serialize_in_order() {
     let b2 = std::sync::Arc::clone(&barrier);
     let t1 = tokio::spawn(async move {
         b1.wait();
-        sup2.tool_edit_insert_after_symbol(&root2, "demo.cpp", "old_value", " // t1")
+        sup2.tool_edit_insert_after_symbol(&root2, "demo.cpp", "old_value", " // t1", None)
             .await
             .expect("t1 insert");
     });
@@ -224,7 +225,7 @@ async fn concurrent_writes_serialize_in_order() {
     let root3 = root.clone();
     let t2 = tokio::spawn(async move {
         b2.wait();
-        sup3.tool_edit_insert_before_symbol(&root3, "demo.cpp", "old_value", "// t2\n")
+        sup3.tool_edit_insert_before_symbol(&root3, "demo.cpp", "old_value", "// t2\n", None)
             .await
             .expect("t2 insert");
     });
@@ -249,13 +250,14 @@ async fn write_then_read_consistency() {
     }
     let (root, file) = scratch("rr");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "demo.cpp").await.expect("overview");
+    let _ = sup.tool_overview(&root, "demo.cpp", None).await.expect("overview");
     sup.tool_edit_replace_text(
         &root,
         "demo.cpp",
         "main",
         "return old_value",
         "return old_value * 2",
+        None,
     )
     .await
     .expect("replace");

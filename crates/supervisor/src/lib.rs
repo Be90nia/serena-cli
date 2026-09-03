@@ -302,10 +302,9 @@ impl Supervisor {
         &self,
         root: &Path,
         file: &str,
+        lang_override: Option<&str>,
     ) -> ToolResult<serde_json::Value> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let path = root.join(file);
         let uri = path_to_uri(&path)
             .map_err(|e| ToolError::BadArgs { detail: format!("path to uri: {e}") })?
@@ -346,10 +345,9 @@ impl Supervisor {
         file: &str,
         line: u32,
         col: u32,
+        lang_override: Option<&str>,
     ) -> ToolResult<Option<lsp_types::Hover>> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
@@ -365,13 +363,14 @@ impl Supervisor {
     }
 
     /// `textDocument/documentSymbol` → 平铺递归 `DocumentSymbol::children` → `Vec<SymbolHit>`。
-    pub async fn tool_overview(&self, root: &Path, file: &str) -> ToolResult<Vec<SymbolHit>> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
-        let lang_str: &'static str = lang.as_str();
-
-        let session = self.session_for(root, lang_str).await?;
+    pub async fn tool_overview(
+        &self,
+        root: &Path,
+        file: &str,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<SymbolHit>> {
+        let lang_str = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, &lang_str).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
@@ -482,10 +481,9 @@ impl Supervisor {
         file: &str,
         line: u32,
         col: u32,
+        lang_override: Option<&str>,
     ) -> ToolResult<Option<Location>> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
@@ -519,10 +517,9 @@ impl Supervisor {
         file: &str,
         line: u32,
         col: u32,
+        lang_override: Option<&str>,
     ) -> ToolResult<Vec<Location>> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
@@ -546,10 +543,9 @@ impl Supervisor {
         file: &str,
         line: u32,
         col: u32,
+        lang_override: Option<&str>,
     ) -> ToolResult<Vec<Location>> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
@@ -575,10 +571,9 @@ impl Supervisor {
         file: &str,
         line: u32,
         col: u32,
+        lang_override: Option<&str>,
     ) -> ToolResult<Vec<ref_tools::RefSymbolHit>> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         ref_tools::find_referencing_symbols(&session, root, file, line, col)
             .await
@@ -591,6 +586,7 @@ impl Supervisor {
     }
 
     /// `find_referencing_code_snippets`：所有引用 + 每个 ref 前后 N 行（Task 24）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn tool_referencing_code_snippets(
         &self,
         root: &Path,
@@ -599,10 +595,9 @@ impl Supervisor {
         col: u32,
         context_lines: u32,
         max_results: usize,
+        lang_override: Option<&str>,
     ) -> ToolResult<Vec<ref_tools::RefSnippetHit>> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         ref_tools::find_referencing_code_snippets(
             &session,
@@ -630,10 +625,9 @@ impl Supervisor {
         symbol: &str,
         old_text: &str,
         new_text: &str,
+        lang_override: Option<&str>,
     ) -> ToolResult<()> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs = root.join(file);
         edit_tools::replace_text_in_symbol(&session, root, &abs, symbol, old_text, new_text)
@@ -650,10 +644,9 @@ impl Supervisor {
         file: &str,
         symbol: &str,
         text: &str,
+        lang_override: Option<&str>,
     ) -> ToolResult<()> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs = root.join(file);
         edit_tools::insert_text_before_symbol(&session, root, &abs, symbol, text)
@@ -670,10 +663,9 @@ impl Supervisor {
         file: &str,
         symbol: &str,
         text: &str,
+        lang_override: Option<&str>,
     ) -> ToolResult<()> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs = root.join(file);
         edit_tools::insert_text_after_symbol(&session, root, &abs, symbol, text)
@@ -691,10 +683,9 @@ impl Supervisor {
         symbol: &str,
         start_line: u32,
         end_line: u32,
+        lang_override: Option<&str>,
     ) -> ToolResult<()> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs = root.join(file);
         edit_tools::delete_text_in_symbol(&session, root, &abs, symbol, start_line, end_line)
@@ -712,10 +703,9 @@ impl Supervisor {
         root: &Path,
         file: &str,
         symbol: &str,
+        lang_override: Option<&str>,
     ) -> ToolResult<String> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
@@ -765,10 +755,9 @@ impl Supervisor {
         file: &str,
         symbol: &str,
         new_body: &str,
+        lang_override: Option<&str>,
     ) -> ToolResult<()> {
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri_str = path_to_uri_str(&path);
@@ -1017,6 +1006,7 @@ impl Supervisor {
     ///   我们把 `changes: {uri: [TextEdit]}` 应用到盘上 + 全量 didChange。
     /// - **位置倒序 apply**：每文件 edits 按 `range.end` 倒序处理，避免偏移漂移。
     /// - **不支持 `documentChanges`**：clangd 默认走 `changes` map，简化 MVP。
+    #[allow(clippy::too_many_arguments)]
     pub async fn tool_rename_symbol(
         &self,
         root: &Path,
@@ -1024,6 +1014,7 @@ impl Supervisor {
         line: u32,
         col: u32,
         new_name: &str,
+        lang_override: Option<&str>,
     ) -> ToolResult<RenameReport> {
         if new_name.is_empty() || new_name.contains(' ') {
             return Err(ToolError::BadArgs {
@@ -1031,9 +1022,7 @@ impl Supervisor {
             });
         }
 
-        let lang = ls_registry::resolve(Path::new(file)).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
-        })?;
+        let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri_str = path_to_uri_str(&path);
@@ -1310,6 +1299,18 @@ async fn lsp_position_from_byte(
     Ok(Position::new(pos.line, pos.character))
 }
 
+/// 解析 lang: 有 override 直接用 (大小写折叠), 否则按文件扩展名探测。
+fn resolve_lang_for_file(file: &str, lang_override: Option<&str>) -> ToolResult<String> {
+    if let Some(l) = lang_override {
+        return Ok(l.to_ascii_lowercase());
+    }
+    ls_registry::resolve(Path::new(file))
+        .map(|l| l.as_str().to_string())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: format!("file not supported: {file}"),
+        })
+}
+
 /// 从 anyhow 错消息里抠 install_hint。`ls-adapters::not_installed_error` 模板：
 /// `language server \`{name}\` not found in PATH; install_hint: {hint}`
 fn extract_install_hint(msg: &str) -> String {
@@ -1422,7 +1423,7 @@ impl SupervisorTrait for Supervisor {
         match tool {
             "overview" => {
                 let file = required_file(&args)?;
-                serde_json::to_value(self.tool_overview(root, &file).await?)
+                serde_json::to_value(self.tool_overview(root, &file, lang).await?)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             "find-symbol" => {
@@ -1438,28 +1439,28 @@ impl SupervisorTrait for Supervisor {
             }
             "hover" => {
                 let (file, line, col) = required_position(&args)?;
-                serde_json::to_value(self.tool_hover(root, &file, line, col).await?)
+                serde_json::to_value(self.tool_hover(root, &file, line, col, lang).await?)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             "diagnostics" => {
                 let file = required_file(&args)?;
-                serde_json::to_value(self.tool_diagnostics(root, &file).await?)
+                serde_json::to_value(self.tool_diagnostics(root, &file, lang).await?)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             "def" => {
                 let (file, line, col) = required_position(&args)?;
-                serde_json::to_value(self.tool_def(root, &file, line, col).await?)
+                serde_json::to_value(self.tool_def(root, &file, line, col, lang).await?)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             "refs" => {
                 let (file, line, col) = required_position(&args)?;
-                serde_json::to_value(self.tool_refs(root, &file, line, col).await?)
+                serde_json::to_value(self.tool_refs(root, &file, line, col, lang).await?)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             "find-implementations" => {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(
-                    self.tool_find_implementations(root, &file, line, col)
+                    self.tool_find_implementations(root, &file, line, col, lang)
                         .await?,
                 )
                 .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
@@ -1488,19 +1489,19 @@ impl SupervisorTrait for Supervisor {
             }
             "symbol-body" => {
                 let (file, symbol) = required_symbol_body_args(&args)?;
-                serde_json::to_value(self.tool_symbol_body(root, &file, &symbol).await?)
+                serde_json::to_value(self.tool_symbol_body(root, &file, &symbol, lang).await?)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
             "replace-body" => {
                 let (file, symbol, new_body) = required_replace_args(&args)?;
-                self.tool_replace_body(root, &file, &symbol, &new_body)
+                self.tool_replace_body(root, &file, &symbol, &new_body, lang)
                     .await?;
                 Ok(serde_json::Value::Null)
             }
             "rename-symbol" => {
                 let (file, line, col, new_name) = required_rename_args(&args)?;
                 serde_json::to_value(
-                    self.tool_rename_symbol(root, &file, line, col, &new_name)
+                    self.tool_rename_symbol(root, &file, line, col, &new_name, lang)
                         .await?,
                 )
                 .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
@@ -1567,19 +1568,9 @@ impl SupervisorTrait for Supervisor {
             }
             "find-referencing-symbols" => {
                 let (file, line, col) = required_position(&args)?;
-                let lang =
-                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
-                        detail: format!("file not supported: {file}"),
-                    })?;
-                let session = self.session_for(root, lang.as_str()).await?;
-                let hits = ref_tools::find_referencing_symbols(&session, root, &file, line, col)
-                    .await
-                    .map_err(|e| {
-                        ToolError::Core(CoreError::Rpc {
-                            code: -1,
-                            message: format!("find_referencing_symbols: {e}"),
-                        })
-                    })?;
+                let hits = self
+                    .tool_referencing_symbols(root, &file, line, col, lang)
+                    .await?;
                 serde_json::to_value(hits)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
@@ -1593,27 +1584,17 @@ impl SupervisorTrait for Supervisor {
                     .get("max_results")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(50) as usize;
-                let lang =
-                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
-                        detail: format!("file not supported: {file}"),
-                    })?;
-                let session = self.session_for(root, lang.as_str()).await?;
-                let hits = ref_tools::find_referencing_code_snippets(
-                    &session,
-                    root,
-                    &file,
-                    line,
-                    col,
-                    context_lines,
-                    max_results,
-                )
-                .await
-                .map_err(|e| {
-                    ToolError::Core(CoreError::Rpc {
-                        code: -1,
-                        message: format!("find_referencing_code_snippets: {e}"),
-                    })
-                })?;
+                let hits = self
+                    .tool_referencing_code_snippets(
+                        root,
+                        &file,
+                        line,
+                        col,
+                        context_lines,
+                        max_results,
+                        lang,
+                    )
+                    .await?;
                 serde_json::to_value(hits)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }
@@ -1640,49 +1621,20 @@ impl SupervisorTrait for Supervisor {
                         detail: "missing 'new_text'".into(),
                     })?
                     .to_owned();
-                let lang =
-                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
-                        detail: format!("file not supported: {file}"),
-                    })?;
-                let session = self.session_for(root, lang.as_str()).await?;
-                let abs = root.join(&file);
-                edit_tools::replace_text_in_symbol(
-                    &session, root, &abs, &symbol, &old_text, &new_text,
-                )
-                .await
-                .map_err(|e| ToolError::BadArgs {
-                    detail: format!("replace_text_in_symbol: {e}"),
-                })?;
+                self.tool_edit_replace_text(root, &file, &symbol, &old_text, &new_text, lang)
+                    .await?;
                 Ok(serde_json::Value::Null)
             }
             "insert-text-after-symbol" => {
                 let (file, symbol, text) = required_edit_args(&args)?;
-                let lang =
-                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
-                        detail: format!("file not supported: {file}"),
-                    })?;
-                let session = self.session_for(root, lang.as_str()).await?;
-                let abs = root.join(&file);
-                edit_tools::insert_text_after_symbol(&session, root, &abs, &symbol, &text)
-                    .await
-                    .map_err(|e| ToolError::BadArgs {
-                        detail: format!("insert_text_after_symbol: {e}"),
-                    })?;
+                self.tool_edit_insert_after_symbol(root, &file, &symbol, &text, lang)
+                    .await?;
                 Ok(serde_json::Value::Null)
             }
             "insert-text-before-symbol" => {
                 let (file, symbol, text) = required_edit_args(&args)?;
-                let lang =
-                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
-                        detail: format!("file not supported: {file}"),
-                    })?;
-                let session = self.session_for(root, lang.as_str()).await?;
-                let abs = root.join(&file);
-                edit_tools::insert_text_before_symbol(&session, root, &abs, &symbol, &text)
-                    .await
-                    .map_err(|e| ToolError::BadArgs {
-                        detail: format!("insert_text_before_symbol: {e}"),
-                    })?;
+                self.tool_edit_insert_before_symbol(root, &file, &symbol, &text, lang)
+                    .await?;
                 Ok(serde_json::Value::Null)
             }
             "delete-text-in-symbol" => {
@@ -1706,22 +1658,11 @@ impl SupervisorTrait for Supervisor {
                     .ok_or_else(|| ToolError::BadArgs {
                         detail: "missing 'end_line'".into(),
                     })? as u32;
-                let lang =
-                    ls_registry::resolve(Path::new(&file)).ok_or_else(|| ToolError::BadArgs {
-                        detail: format!("file not supported: {file}"),
-                    })?;
-                let session = self.session_for(root, lang.as_str()).await?;
-                let abs = root.join(&file);
-                edit_tools::delete_text_in_symbol(
-                    &session, root, &abs, &symbol, start_line, end_line,
-                )
-                .await
-                .map_err(|e| ToolError::BadArgs {
-                    detail: format!("delete_text_in_symbol: {e}"),
-                })?;
+                self.tool_edit_delete_text(root, &file, &symbol, start_line, end_line, lang)
+                    .await?;
                 Ok(serde_json::Value::Null)
             }
-            other => Err(ToolError::BadArgs {
+             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
             }),
         }

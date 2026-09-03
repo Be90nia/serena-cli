@@ -81,6 +81,7 @@ async fn three_concurrent_reads_and_one_write_serialize() {
         "impl.cpp",
         "add",
         "int add(int a, int b) {\n    return 100;\n}\n",
+        None,
     )
     .await
     .expect("baseline");
@@ -89,15 +90,15 @@ async fn three_concurrent_reads_and_one_write_serialize() {
     let sup_r1 = sup.clone();
     let root_r1 = root.clone();
     let r1 =
-        tokio::spawn(async move { sup_r1.tool_symbol_body(&root_r1, "impl.cpp", "add").await });
+        tokio::spawn(async move { sup_r1.tool_symbol_body(&root_r1, "impl.cpp", "add", None).await });
     let sup_r2 = sup.clone();
     let root_r2 = root.clone();
     let r2 =
-        tokio::spawn(async move { sup_r2.tool_symbol_body(&root_r2, "impl.cpp", "add").await });
+        tokio::spawn(async move { sup_r2.tool_symbol_body(&root_r2, "impl.cpp", "add", None).await });
     let sup_r3 = sup.clone();
     let root_r3 = root.clone();
     let r3 =
-        tokio::spawn(async move { sup_r3.tool_symbol_body(&root_r3, "impl.cpp", "add").await });
+        tokio::spawn(async move { sup_r3.tool_symbol_body(&root_r3, "impl.cpp", "add", None).await });
 
     let sup_w = sup.clone();
     let root_w = root.clone();
@@ -108,6 +109,7 @@ async fn three_concurrent_reads_and_one_write_serialize() {
                 "impl.cpp",
                 "add",
                 "int add(int a, int b) {\n    return 999;\n}\n",
+                None,
             )
             .await
     });
@@ -134,7 +136,7 @@ async fn three_concurrent_reads_and_one_write_serialize() {
 
     // 最终一致性：再读一次 = 写完状态（999）。
     let final_body = sup
-        .tool_symbol_body(&root, "impl.cpp", "add")
+        .tool_symbol_body(&root, "impl.cpp", "add", None)
         .await
         .expect("final read");
     assert!(

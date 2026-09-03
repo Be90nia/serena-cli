@@ -73,7 +73,7 @@ async fn workspace_symbol_finds_known_functions() {
 
     // 先 overview 一个文件 → 触发 didOpen → 让 clangd 把 TU 加进索引。
     let _ = sup
-        .tool_overview(&root, "alpha.cpp")
+        .tool_overview(&root, "alpha.cpp", None)
         .await
         .expect("overview");
 
@@ -150,7 +150,7 @@ async fn lang_override_skips_root_probe() {
     let sup = Supervisor::direct().await.expect("supervisor");
     // 先 overview 触发 clangd 索引, 同 workspace_symbol_finds_known_functions。
     let _ = sup
-        .tool_overview(&root, "alpha.cpp")
+        .tool_overview(&root, "alpha.cpp", None)
         .await
         .expect("overview");
 

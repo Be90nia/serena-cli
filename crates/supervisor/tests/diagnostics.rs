@@ -34,7 +34,7 @@ async fn diagnostics_returns_error_on_bad_code() {
     std::fs::write(dir.join("bad.cpp"), "const char* s = 12345;\n").unwrap();
 
     let sup = Supervisor::direct().await.expect("supervisor");
-    let diag = sup.tool_diagnostics(&dir, "bad.cpp").await.expect("diagnostics");
+    let diag = sup.tool_diagnostics(&dir, "bad.cpp", None).await.expect("diagnostics");
 
     let items = diag.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
     assert!(
@@ -62,7 +62,7 @@ async fn diagnostics_returns_empty_on_clean_code() {
     std::fs::write(dir.join("ok.cpp"), "int main() { return 0; }\n").unwrap();
 
     let sup = Supervisor::direct().await.expect("supervisor");
-    let diag = sup.tool_diagnostics(&dir, "ok.cpp").await.expect("diagnostics");
+    let diag = sup.tool_diagnostics(&dir, "ok.cpp", None).await.expect("diagnostics");
 
     let items = diag.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
     assert!(

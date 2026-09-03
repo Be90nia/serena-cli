@@ -91,7 +91,7 @@ async fn symbol_body_returns_add_definition_body() {
     let sup = Supervisor::direct().await.expect("supervisor");
 
     let body = sup
-        .tool_symbol_body(&root, "impl.cpp", "add")
+        .tool_symbol_body(&root, "impl.cpp", "add", None)
         .await
         .expect("symbol-body add");
     assert!(
@@ -111,7 +111,7 @@ async fn replace_body_updates_file_and_ls_syncs() {
     let sup = Supervisor::direct().await.expect("supervisor");
 
     let new_body = "int add(int a, int b) {\n    // replaced by test\n    return a + b + 0;\n}\n";
-    sup.tool_replace_body(&root, "impl.cpp", "add", new_body)
+    sup.tool_replace_body(&root, "impl.cpp", "add", new_body, None)
         .await
         .expect("replace-body");
 
@@ -123,7 +123,7 @@ async fn replace_body_updates_file_and_ls_syncs() {
 
     // 再取 symbol-body —— LS 状态应与盘一致（didChange 全量已同步）。
     let body_after = sup
-        .tool_symbol_body(&root, "impl.cpp", "add")
+        .tool_symbol_body(&root, "impl.cpp", "add", None)
         .await
         .expect("symbol-body after replace");
     assert!(
@@ -148,6 +148,7 @@ async fn replace_body_handles_external_disk_write() {
         "impl.cpp",
         "add",
         "int add(int a, int b) {\n    return a + b;\n}\n",
+        None,
     )
     .await
     .expect("baseline replace");
@@ -160,13 +161,13 @@ async fn replace_body_handles_external_disk_write() {
     std::fs::write(&impl_cpp, mutated).expect("external write");
 
     // 再次 replace：LS 侧 range 已过期。链路正确时：didChange 先同步老内容 →
-    // documentSymbol 拿到新 range → 替换成功；或明确 WRITE_CONFLICT 且文件不半写。
     let result = sup
         .tool_replace_body(
             &root,
             "impl.cpp",
             "add",
             "int add(int a, int b) {\n    return 42;\n}\n",
+            None,
         )
         .await;
     match result {
@@ -174,7 +175,7 @@ async fn replace_body_handles_external_disk_write() {
             let on_disk = std::fs::read_to_string(&impl_cpp).unwrap();
             assert!(on_disk.contains("return 42;"), "成功替换后盘上应含 42");
             let body = sup
-                .tool_symbol_body(&root, "impl.cpp", "add")
+                .tool_symbol_body(&root, "impl.cpp", "add", None)
                 .await
                 .expect("body after");
             assert!(body.contains("return 42;"), "LS 侧应同步");
@@ -203,26 +204,29 @@ async fn concurrent_replace_serializes_via_gate() {
     let sup1 = sup.clone();
     let root1 = root.clone();
     let t1 = tokio::spawn(async move {
-        sup1.tool_replace_body(
-            &root1,
-            "impl.cpp",
-            "add",
-            "int add(int a, int b) {\n    return a + b + 100;\n}\n",
-        )
-        .await
+        sup1
+            .tool_replace_body(
+                &root1,
+                "impl.cpp",
+                "add",
+                "int add(int a, int b) {\n    return a + b + 100;\n}\n",
+                None,
+            )
+            .await
     });
     let sup2 = sup.clone();
     let root2 = root.clone();
     let t2 = tokio::spawn(async move {
-        sup2.tool_replace_body(
-            &root2,
-            "impl.cpp",
-            "add",
-            "int add(int a, int b) {\n    return a + b + 200;\n}\n",
-        )
-        .await
+        sup2
+            .tool_replace_body(
+                &root2,
+                "impl.cpp",
+                "add",
+                "int add(int a, int b) {\n    return a + b + 200;\n}\n",
+                None,
+            )
+            .await
     });
-
     let (r1, r2) = tokio::join!(t1, t2);
     let _ = r1.expect("task1 join");
     let _ = r2.expect("task2 join");
