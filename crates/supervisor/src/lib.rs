@@ -267,6 +267,13 @@ impl Supervisor {
                 detail: format!("root not URI: {e}"),
             }
         })?;
+        // 设 root_uri (即使 deprecated): typescript-language-server 等需要
+        // root_uri 定位 workspace 的 node_modules (workspaceFolders 不够)。
+        // 用 allow(deprecated) 不影响其它 LS (clangd / rust-analyzer 忽略 root_uri)。
+        #[allow(deprecated)]
+        {
+            params.root_uri = Some(uri.clone());
+        }
         params.workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
             uri: uri.clone(),
             name: key

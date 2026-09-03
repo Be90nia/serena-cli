@@ -47,45 +47,30 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
                 "install TypeScript LS (`npm i -g typescript typescript-language-server`) and ensure `typescript-language-server` on PATH",
             )
         })?;
-        // Windows: npm shim 可能以 `typescript-language-server` (.sh) 或 `typescript-language-server.cmd`
-        // 形式存在。.sh 文件 Windows spawn 返 os error 193 (非 PE), .cmd 应直接 spawn。
-        // ponytail: 只解 typescript-language-server 当前 npm shim 模式; 其它 .sh LS
-        // (pyright/vscode-langservers-extracted) 后续再加。
-        // 检测 .sh: 既看路径扩展, 也看无扩展时头几个字节是否 `#!/bin/sh`。
-        let is_sh = {
-            let by_ext = exe.extension().and_then(|s| s.to_str()) == Some("sh");
-            let by_magic = if !by_ext {
-                std::fs::read(&exe)
-                    .ok()
-                    .and_then(|b| b.get(..7).map(|s| s.to_vec()))
-                    .map(|h| h.starts_with(b"#!/bin"))
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-            by_ext || by_magic
-        };
-        if cfg!(windows) && is_sh {
-            let cli_mjs = exe
-                .parent()
-                .map(|p| p.join("node_modules/typescript-language-server/lib/cli.mjs"));
-            // cli_mjs 找不到时: 测试环境 / 包装 dev install / 不完整 shim;
-            // 仍返 shim + --stdio, 让 runtime spawn 报清楚错 (比 adapter 假装知错更诚实)。
-            if let Some(cli_mjs) = cli_mjs.filter(|p| p.is_file()) {
-                let node = which_no_unc("node").ok_or_else(|| {
-                    anyhow::anyhow!("node not on PATH; required to run typescript-language-server shim")
-                })?;
-                return Ok(LaunchInfo {
-                    cmd: vec![
-                        node.into_os_string(),
-                        cli_mjs.into_os_string(),
-                        "--stdio".into(),
-                    ],
-                    cwd: ctx.project_root.clone(),
-                    env: vec![],
-                    transport: TransportKind::Stdio,
-                });
-            }
+        // Windows: 绕开 npm shim (无论 .cmd / .sh)。shim 会 cd 到自己所在目录
+        // (npm global dir) 然后 exec node,导致 cli.mjs cwd 丢失 workspace 的
+        // node_modules/typescript。直接 node + cli.mjs (cli.mjs 在 exe 同包
+        // node_modules 里) —— cwd 由 LaunchInfo 的 cwd 字段交给 runtime。
+        // ponytail: 此 workaround 仅 typescript-language-server,其它 .sh LS
+        // (pyright / vscode-langservers-extracted) 留待真撞上再加。
+        if cfg!(windows) && let Some(cli_mjs) = exe
+            .parent()
+            .map(|p| p.join("node_modules/typescript-language-server/lib/cli.mjs"))
+            .filter(|p| p.is_file())
+        {
+            let node = which_no_unc("node").ok_or_else(|| {
+                anyhow::anyhow!("node not on PATH; required to run typescript-language-server")
+            })?;
+            return Ok(LaunchInfo {
+                cmd: vec![
+                    node.into_os_string(),
+                    cli_mjs.into_os_string(),
+                    "--stdio".into(),
+                ],
+                cwd: ctx.project_root.clone(),
+                env: vec![],
+                transport: TransportKind::Stdio,
+            });
         }
         Ok(LaunchInfo {
             cmd: vec![exe.into_os_string(), "--stdio".into()],
