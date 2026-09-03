@@ -1,7 +1,4 @@
-// rust fixture (M3 verify) — single function `add` callable from main.
-fn add(a: i32, b: i32) -> i32 {
-    a + b
-}
+fn add(a: i32, b: i32) -> i32 { a + b + 999 }
 
 fn main() {
     let s = add(1, 2);

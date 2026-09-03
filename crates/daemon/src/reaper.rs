@@ -79,8 +79,15 @@ async fn reaper_loop(
             finish_shutdown(&sup, &state, &lock_path).await;
             return;
         }
-
         let now = Instant::now();
+
+        // 0) Failed LS 驱逐：LS 死后 state 变 Failed, 下次工具调用才被动 evict.
+        //    这里主动驱逐, 下次调用 session_for 慢路径自动 spawn 新实例。
+        let evicted_failed = sup.evict_failed_instances().await;
+        if evicted_failed > 0 {
+            tracing::info!(count = evicted_failed, "evicted failed LS instances");
+        }
+
         let entries = sup.loaded_entries();
 
         // 1) 全局空闲判定：最新活动（LS 或全局时钟）距今超阈值。

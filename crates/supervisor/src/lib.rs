@@ -83,10 +83,15 @@ pub trait SupervisorTrait: Send + Sync {
         project_root: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError>;
-
     /// 当前已加载的 (root, lang) 实例键列表。daemon 用它填 status 字段。
     fn loaded_entries(&self) -> Vec<Key> {
         Vec::new()
+    }
+
+    /// 巡检：找出 state==Failed 的 session，从池中驱逐（shutdown+remove）。
+    /// reaper 常驻调用，O(n) 扫描；返回驱逐数量用于打点。
+    async fn evict_failed(&self) -> usize {
+        0
     }
 }
 
@@ -193,6 +198,25 @@ impl Supervisor {
             }
             None => Ok(false),
         }
+    }
+
+    /// 巡检：扫所有 session, Failed 状态驱逐。返回驱逐数。
+    /// 复用 `evict`, 后台 reaper 常驻调用。
+    pub async fn evict_failed_instances(&self) -> usize {
+        // 先 clone 出所有失败 key (避免持锁 await shutdown)。
+        let failed_keys: Vec<Key> = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .iter()
+                .filter(|(_, s)| matches!(s.state(), lsp_core::session::SessionState::Failed(_)))
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        let n = failed_keys.len();
+        for key in failed_keys {
+            let _ = self.evict(&key).await;
+        }
+        n
     }
 
     /// 拿到/创建 (root, lang) 对应的 Session，同 key 只允许一次冷启动。
@@ -1688,6 +1712,10 @@ impl SupervisorTrait for Supervisor {
 
     fn loaded_entries(&self) -> Vec<Key> {
         self.last_used.lock().unwrap().keys().cloned().collect()
+    }
+
+    async fn evict_failed(&self) -> usize {
+        Self::evict_failed_instances(self).await
     }
 }
 
