@@ -82,8 +82,8 @@ pub trait SupervisorTrait: Send + Sync {
         tool: &str,
         project_root: &str,
         args: serde_json::Value,
+        lang: Option<&str>,
     ) -> Result<serde_json::Value, ToolError>;
-    /// 当前已加载的 (root, lang) 实例键列表。daemon 用它填 status 字段。
     fn loaded_entries(&self) -> Vec<Key> {
         Vec::new()
     }
@@ -220,7 +220,7 @@ impl Supervisor {
     }
 
     /// 拿到/创建 (root, lang) 对应的 Session，同 key 只允许一次冷启动。
-    async fn session_for(&self, root: &Path, lang: &'static str) -> ToolResult<Arc<Session>> {
+    async fn session_for(&self, root: &Path, lang: &str) -> ToolResult<Arc<Session>> {
         let key = Self::key(root, lang);
         // 快路径：缓存命中（Failed 状态视为 miss 触发懒重启）。
         if let Some(session) = self.instances.lock().unwrap().get(&key).cloned() {
@@ -386,19 +386,20 @@ impl Supervisor {
 
     /// `workspace/symbol` → 全 workspace 跨文件符号查找（Task 20）。
     ///
-    /// 设计要点：
-    /// - **不传 file**：position-free + workspace scope，AI 找符号定义的标准入口。
-    /// - lang 探测：root 下任一 `.cpp` / `.c` / `.h` → cpp。MVP 不支持混合多语言 root。
-    /// - 触发索引：本次首调会拉起 `didOpen` 任一文件让 clangd 开 background index。
-    ///   索引可能慢（>10s），用 `INDEX_TIMEOUT` 而不是 `TOOL_TIMEOUT`。
-    /// - 输出与 `tool_overview` 形状一致 (`Vec<SymbolHit>`)，便于 agent 用同一段代码处理。
+    /// 多语言支持：
+    /// - 指定 `lang_override`：仅查该 LS（不依赖 root 文件探测）。
+    /// - 不指定：扫 root 找所有 lang, 每个 lang 各起 LS 并行查 + merge (去重已排序后截断)。
+    ///
+    /// 索引可能慢（>10s），用 `INDEX_TIMEOUT` 而不是 `TOOL_TIMEOUT`。
     pub async fn tool_find_symbol(
         &self,
         root: &Path,
         query: &str,
         limit: usize,
+        lang_override: Option<&str>,
     ) -> ToolResult<Vec<SymbolHit>> {
         use ignore::WalkBuilder;
+        use std::collections::BTreeSet;
 
         if query.is_empty() {
             return Err(ToolError::BadArgs {
@@ -406,56 +407,71 @@ impl Supervisor {
             });
         }
 
-        // 探测 root 下任一**已知语言**文件以确定 lang。
-        // ponytail(M1 残留): 原版硬要 cpp — 多语言项目会误拒。改为探测任一已知 lang。
-        let mut probe: Option<PathBuf> = None;
-        let mut probe_lang: Option<ls_adapters::LanguageId> = None;
-        for entry in WalkBuilder::new(root)
-            .standard_filters(true)
-            .max_depth(Some(3))
-            .build()
-            .flatten()
-        {
-            if entry.file_type().is_some_and(|t| t.is_file())
-                && let Some(lang) = ls_registry::resolve(entry.path())
+        // 决定要查的 lang 集合 (BTreeSet = 字母序, 顺序稳定)。
+        let langs: BTreeSet<String> = if let Some(l) = lang_override {
+            [l.to_ascii_lowercase()].into()
+        } else {
+            let mut set: BTreeSet<String> = BTreeSet::new();
+            for entry in WalkBuilder::new(root)
+                .standard_filters(true)
+                .max_depth(Some(3))
+                .build()
+                .flatten()
             {
-                probe = Some(entry.path().to_path_buf());
-                probe_lang = Some(lang);
-                break;
+                if entry.file_type().is_some_and(|t| t.is_file())
+                    && let Some(l) = ls_registry::resolve(entry.path())
+                {
+                    set.insert(l.as_str().to_string());
+                }
+            }
+            set
+        };
+        if langs.is_empty() {
+            return Err(ToolError::BadArgs {
+                detail: format!("no known-language files under root {root:?}"),
+            });
+        }
+
+        // ponytail: 串行拿 session (load_gate_for 防双 spawn), 然后并行 fan-out 请求。
+        let mut sessions = Vec::with_capacity(langs.len());
+        for lang in &langs {
+            match self.session_for(root, lang).await {
+                Ok(s) => sessions.push(s),
+                Err(_) => continue, // 单 LS 拉起失败不阻塞其它
             }
         }
-        let (probe, lang) = match (probe, probe_lang) {
-            (Some(p), Some(l)) => (p, l),
-            _ => {
-                return Err(ToolError::BadArgs {
-                    detail: format!("no known-language files under root {root:?}"),
-                });
+        let query = query.to_string();
+        let mut tasks = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let q = query.clone();
+            tasks.push(tokio::spawn(async move {
+                let params = json!({ "query": q });
+                let resp: Vec<lsp_types::SymbolInformation> = match session
+                    .request("workspace/symbol", params, INDEX_TIMEOUT)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => return Vec::<SymbolHit>::new(),
+                };
+                resp.into_iter()
+                    .map(|si| SymbolHit {
+                        name: si.name,
+                        kind: kind_from_lsp(&si.kind),
+                        uri: si.location.uri.to_string(),
+                        range: si.location.range,
+                        container: si.container_name,
+                    })
+                    .collect()
+            }));
+        }
+        let mut merged: Vec<SymbolHit> = Vec::new();
+        for t in tasks {
+            if let Ok(v) = t.await {
+                merged.extend(v);
             }
-        };
-        let _ = ls_registry::resolve(&probe).unwrap();
-        let session = self.session_for(root, lang.as_str()).await?;
-        // 触发背景索引：把 probe 文件 didOpen 一次。
-        let _ = session.ensure_open(&probe).await.map_err(ToolError::Core)?;
-
-        let params = json!({ "query": query });
-        // clangd 索引可能慢，30s 太短。
-        let resp: Vec<lsp_types::SymbolInformation> = session
-            .request("workspace/symbol", params, INDEX_TIMEOUT)
-            .await?;
-
-        // 裁剪 + 转 SymbolHit。
-        let hits: Vec<SymbolHit> = resp
-            .into_iter()
-            .take(limit)
-            .map(|si| SymbolHit {
-                name: si.name,
-                kind: kind_from_lsp(&si.kind),
-                uri: si.location.uri.to_string(),
-                range: si.location.range,
-                container: si.container_name,
-            })
-            .collect();
-        Ok(hits)
+        }
+        merged.truncate(limit);
+        Ok(merged)
     }
     /// `Location[]`，lsp-types 在 capability 上声明多形态——M0 只解 `Option<Location>`）。
     ///
@@ -1400,6 +1416,7 @@ impl SupervisorTrait for Supervisor {
         tool: &str,
         project_root: &str,
         args: serde_json::Value,
+        lang: Option<&str>,
     ) -> Result<serde_json::Value, ToolError> {
         let root = Path::new(project_root);
         match tool {
@@ -1415,7 +1432,7 @@ impl SupervisorTrait for Supervisor {
                     }
                 })?;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-                let resp = self.tool_find_symbol(root, query, limit).await?;
+                let resp = self.tool_find_symbol(root, query, limit, lang).await?;
                 serde_json::to_value(resp)
                     .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
             }

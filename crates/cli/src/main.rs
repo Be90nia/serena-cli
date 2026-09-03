@@ -47,10 +47,16 @@ struct Cli {
     /// JSON 输出：所有子命令输出可被 jq 解析的 JSON（默认人类可读文本）。
     #[arg(long, global = true)]
     json: bool,
+
+    /// 覆盖文件扩展名探测：多语言项目用 (如 --lang typescript 在 .ts 项目里用 TS LS)。
+    /// find-symbol 不指定时也用它过滤到单 LS。
+    #[arg(long, global = true, value_name = "LANG")]
+    lang: Option<String>,
+
     /// 子命令；`--daemon` 模式下可省略。
     #[command(subcommand)]
     cmd: Option<Cmd>,
-}
+ }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
@@ -468,6 +474,7 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
     let body = json!({
         "project_root": project_root.to_string_lossy(),
         "args": args,
+        "lang": cli.lang,
     });
 
     let resp = client
@@ -967,7 +974,7 @@ async fn handle_mcp(sup: &Supervisor, root: &Path, msg: JsonRpc) -> JsonRpc {
 async fn call_mcp_tool(sup: &Supervisor, root: &Path, params: &serde_json::Value) -> Result<serde_json::Value, String> {
     let name = params.get("name").and_then(|v| v.as_str()).ok_or("missing 'name'")?;
     let args = params.get("arguments").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
-    let resp = sup.execute_tool(name, &root.to_string_lossy(), args)
+    let resp = sup.execute_tool(name, &root.to_string_lossy(), args, None)
         .await
         .map_err(|e| format!("{e:?}"))?;
     Ok(serde_json::json!({

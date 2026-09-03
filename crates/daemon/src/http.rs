@@ -106,7 +106,7 @@ async fn tools_post(
 
     match state
         .supervisor
-        .execute_tool(&name, &req.project_root, req.args)
+        .execute_tool(&name, &req.project_root, req.args, req.lang.as_deref())
         .await
     {
         Ok(data) => {
@@ -213,6 +213,7 @@ mod tests {
             _tool: &str,
             _root: &str,
             _args: serde_json::Value,
+            _lang: Option<&str>,
         ) -> Result<serde_json::Value, supervisor::ToolError> {
             let f = self.result.lock().await.take().expect("mock called once");
             f()

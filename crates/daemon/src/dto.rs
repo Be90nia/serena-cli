@@ -13,6 +13,9 @@ pub struct ToolRequest {
     pub project_root: String,
     /// 工具参数（serde_json::Value 让各工具自行解析）。
     pub args: serde_json::Value,
+    /// 多语言项目用：覆盖文件扩展名探测（如 `--lang typescript`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
 }
 
 /// 响应包装：`{ok, data|error}` 或 `data`+`format`。
@@ -138,6 +141,7 @@ mod tests {
         let req = ToolRequest {
             project_root: "D:/proj".into(),
             args: serde_json::json!({"pattern": "Foo"}),
+            lang: Some("rust".into()),
         };
         let j = serde_json::to_string(&req).unwrap();
         let back: ToolRequest = serde_json::from_str(&j).unwrap();

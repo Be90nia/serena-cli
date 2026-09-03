@@ -164,6 +164,7 @@ mod tests {
             _tool: &str,
             _root: &str,
             _args: serde_json::Value,
+            _lang: Option<&str>,
         ) -> Result<serde_json::Value, supervisor::ToolError> {
             Ok(serde_json::json!(null))
         }
