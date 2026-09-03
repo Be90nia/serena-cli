@@ -23,6 +23,12 @@ use async_trait::async_trait;
 use lsp_types::InitializeParams;
 
 pub mod clangd;
+pub mod csharp_ls;
+pub mod gopls;
+pub mod jdtls;
+pub mod pyright;
+pub mod rust_analyzer;
+pub mod typescript;
 
 /// 语言标识：与 `servers.toml` `languages` 字段、claude 端 ProjectCtx.language 一一对应。
 ///
@@ -31,12 +37,37 @@ pub mod clangd;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LanguageId {
     Cpp,
+    Rust,
+    Python,
+    Go,
+    TypeScript,
+    CSharp,
+    Java,
 }
 
 impl LanguageId {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Cpp => "cpp",
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::TypeScript => "typescript",
+            Self::CSharp => "csharp",
+            Self::Java => "java",
+        }
+    }
+    /// 反向：lang 字符串 → LanguageId。未知返 None。
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "cpp" => Some(Self::Cpp),
+            "rust" => Some(Self::Rust),
+            "python" => Some(Self::Python),
+            "go" => Some(Self::Go),
+            "typescript" | "javascript" => Some(Self::TypeScript),
+            "csharp" => Some(Self::CSharp),
+            "java" => Some(Self::Java),
+            _ => None,
         }
     }
 }

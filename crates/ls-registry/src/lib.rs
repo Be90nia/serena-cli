@@ -15,23 +15,58 @@
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
-use ls_adapters::{LanguageId, LanguageServerAdapter, clangd::ClangdAdapter};
+use ls_adapters::{
+    LanguageId, LanguageServerAdapter, clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter,
+    gopls::GoplsAdapter, jdtls::JdtlsAdapter, pyright::PyrightAdapter,
+    rust_analyzer::RustAnalyzerAdapter, typescript::TypescriptLanguageServerAdapter,
+};
 
 /// 扩展名 → LanguageId 静态表（小写键）。
 ///
-/// M0 仅 cpp 系；M2 扩展为 servers.toml 驱动的查表结构。
+/// M3 覆盖 7 个 LanguageId（M0 仅 cpp 系）。
+/// ts/js 同走 TypeScript LS —— 解析时归到 TypeScript；adapter_for 按 lang 维度分。
 const EXT_TABLE: &[(&str, LanguageId)] = &[
+    // C / C++
     ("c", LanguageId::Cpp),
     ("cpp", LanguageId::Cpp),
     ("cc", LanguageId::Cpp),
     ("cxx", LanguageId::Cpp),
     ("h", LanguageId::Cpp),
     ("hpp", LanguageId::Cpp),
+    // Rust
+    ("rs", LanguageId::Rust),
+    // Python
+    ("py", LanguageId::Python),
+    ("pyi", LanguageId::Python),
+    // Go
+    ("go", LanguageId::Go),
+    // TypeScript / JavaScript（同 adapter 服务）
+    ("ts", LanguageId::TypeScript),
+    ("tsx", LanguageId::TypeScript),
+    ("js", LanguageId::TypeScript),
+    ("jsx", LanguageId::TypeScript),
+    ("mjs", LanguageId::TypeScript),
+    ("cjs", LanguageId::TypeScript),
+    // C#
+    ("cs", LanguageId::CSharp),
+    // Java
+    ("java", LanguageId::Java),
 ];
 
-/// ClangdAdapter 单例 —— LazyLock 内置初始化，标准库替代 once_cell / OnceLock（rs-lazylock）。
-static CLANGD_SINGLETON: LazyLock<Arc<dyn LanguageServerAdapter>> =
-    LazyLock::new(|| Arc::new(ClangdAdapter));
+/// 各 LanguageId 对应的 adapter 单例。
+macro_rules! singleton {
+    ($name:ident, $ty:ty) => {
+        static $name: LazyLock<Arc<dyn LanguageServerAdapter>> =
+            LazyLock::new(|| Arc::new(<$ty>::default()));
+    };
+}
+singleton!(CLANGD, ClangdAdapter);
+singleton!(RUST_ANALYZER, RustAnalyzerAdapter);
+singleton!(PYRIGHT, PyrightAdapter);
+singleton!(GOPLS, GoplsAdapter);
+singleton!(TYPESCRIPT, TypescriptLanguageServerAdapter);
+singleton!(CSHARP_LS, CsharpLsAdapter);
+singleton!(JDTLS, JdtlsAdapter);
 
 /// 路径 → 语言。扩展名小写后查表，命中即返回；其余 None。
 ///
@@ -44,15 +79,21 @@ pub fn resolve(path: &Path) -> Option<LanguageId> {
         .map(|(_, lang)| *lang)
 }
 
-/// 语言字符串 → adapter 单例。M0 只认 `"cpp"` → `ClangdAdapter`。
+/// 语言字符串 → adapter 单例。M3 覆盖 7 语言。
 ///
 /// 返回 `Arc` 让调用方按 trait 对象持有；`Arc::ptr_eq` 在两次调用间成立（LazyLock 单例）。
 /// 未知语言 / 空串返回 `None`。
 pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
-    match lang {
-        "cpp" => Some(CLANGD_SINGLETON.clone()),
-        _ => None,
-    }
+    let id = LanguageId::from_str_opt(lang)?;
+    Some(match id {
+        LanguageId::Cpp => CLANGD.clone(),
+        LanguageId::Rust => RUST_ANALYZER.clone(),
+        LanguageId::Python => PYRIGHT.clone(),
+        LanguageId::Go => GOPLS.clone(),
+        LanguageId::TypeScript => TYPESCRIPT.clone(),
+        LanguageId::CSharp => CSHARP_LS.clone(),
+        LanguageId::Java => JDTLS.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -80,5 +121,33 @@ mod tests {
     #[test]
     fn resolve_handles_uppercase_extension() {
         assert_eq!(resolve(&PathBuf::from("Foo.CPP")), Some(LanguageId::Cpp));
+    }
+
+    #[test]
+    fn resolve_all_m3_languages() {
+        // M3 表覆盖 7 语言；改表必同步改此断言。
+        assert_eq!(resolve(&PathBuf::from("a.rs")), Some(LanguageId::Rust));
+        assert_eq!(resolve(&PathBuf::from("a.py")), Some(LanguageId::Python));
+        assert_eq!(resolve(&PathBuf::from("a.pyi")), Some(LanguageId::Python));
+        assert_eq!(resolve(&PathBuf::from("a.go")), Some(LanguageId::Go));
+        assert_eq!(resolve(&PathBuf::from("a.ts")), Some(LanguageId::TypeScript));
+        assert_eq!(resolve(&PathBuf::from("a.tsx")), Some(LanguageId::TypeScript));
+        assert_eq!(resolve(&PathBuf::from("a.js")), Some(LanguageId::TypeScript));
+        assert_eq!(resolve(&PathBuf::from("a.jsx")), Some(LanguageId::TypeScript));
+        assert_eq!(resolve(&PathBuf::from("a.cs")), Some(LanguageId::CSharp));
+        assert_eq!(resolve(&PathBuf::from("a.java")), Some(LanguageId::Java));
+        assert_eq!(resolve(&PathBuf::from("a.lua")), None);
+    }
+
+    #[test]
+    fn adapter_for_all_m3_languages() {
+        // 每个 lang 字符串都应返 Some 单例；Arc::ptr_eq 在两次调用间成立。
+        for lang in ["cpp", "rust", "python", "go", "typescript", "javascript", "csharp", "java"] {
+            let a = adapter_for(lang).unwrap_or_else(|| panic!("missing adapter for {lang}"));
+            let b = adapter_for(lang).unwrap();
+            assert!(Arc::ptr_eq(&a, &b), "singleton broken for {lang}");
+            let _ = a.id();
+        }
+        assert!(adapter_for("lua").is_none());
     }
 }

@@ -1,12 +1,12 @@
-//! ls-registry 最小版测试（PLAN Task 9 / ARCHITECTURE §4.2）。
+//! ls-registry 测试（PLAN Task 9 / ARCHITECTURE §4.2）。
 //!
-//! 覆盖：
-//! 1. `resolve("x.cpp") == Some(Cpp)` 等六种 C++ 扩展名。
-//! 2. `resolve("x.py") == None` —— M2 前不认识 python。
-//! 3. 大小写不敏感：`resolve("x.CPP") == Some(Cpp)`。
-//! 4. `adapter_for("cpp")` 返回 `Arc<dyn LanguageServerAdapter>` 且 id == "clangd"。
-//! 5. `adapter_for("python") == None`，`adapter_for("rust") == None`。
-//! 6. 无扩展名 / 空路径 / 目录都不爆，返回 `None`。
+//! M3 覆盖 7 个 LanguageId（M0 仅 cpp）：
+//! 1. resolve(.cpp 等六种 C++ 扩展名) → Cpp。
+//! 2. resolve(.rs/.py/.go/.ts/.cs/.java 等) → 对应 LanguageId。
+//! 3. 大小写不敏感：resolve("x.CPP") → Cpp。
+//! 4. adapter_for("cpp"/"rust"/"python"/"go"/"typescript"/"csharp"/"java") → 对应 adapter id。
+//! 5. adapter_for("lua"/"") → None。
+//! 6. 无扩展名 / 空路径 / 目录 / 真未知后缀都不爆，返回 None。
 
 use std::path::Path;
 
@@ -26,16 +26,29 @@ fn resolve_cpp_extensions() {
 }
 
 #[test]
+fn resolve_all_m3_languages() {
+    assert_eq!(ls_registry::resolve(Path::new("foo.rs")), Some(LanguageId::Rust));
+    assert_eq!(ls_registry::resolve(Path::new("foo.py")), Some(LanguageId::Python));
+    assert_eq!(ls_registry::resolve(Path::new("foo.pyi")), Some(LanguageId::Python));
+    assert_eq!(ls_registry::resolve(Path::new("foo.go")), Some(LanguageId::Go));
+    assert_eq!(ls_registry::resolve(Path::new("foo.ts")), Some(LanguageId::TypeScript));
+    assert_eq!(ls_registry::resolve(Path::new("foo.tsx")), Some(LanguageId::TypeScript));
+    assert_eq!(ls_registry::resolve(Path::new("foo.js")), Some(LanguageId::TypeScript));
+    assert_eq!(ls_registry::resolve(Path::new("foo.jsx")), Some(LanguageId::TypeScript));
+    assert_eq!(ls_registry::resolve(Path::new("foo.cs")), Some(LanguageId::CSharp));
+    assert_eq!(ls_registry::resolve(Path::new("foo.java")), Some(LanguageId::Java));
+}
+
+#[test]
 fn resolve_unknown_extension_is_none() {
-    // M2 之前只认 cpp 系；python 走 servers.toml 的 pylsp 才上。
-    assert_eq!(ls_registry::resolve(Path::new("foo.py")), None);
-    assert_eq!(ls_registry::resolve(Path::new("foo.rs")), None);
-    assert_eq!(ls_registry::resolve(Path::new("foo.go")), None);
+    // 真正未知后缀（不在 M3 表里）。
+    assert_eq!(ls_registry::resolve(Path::new("foo.lua")), None);
+    assert_eq!(ls_registry::resolve(Path::new("foo.rb")), None);
+    assert_eq!(ls_registry::resolve(Path::new("foo.zig")), None);
 }
 
 #[test]
 fn resolve_is_case_insensitive() {
-    // 大小写不敏感 —— Windows 文件系统天然行为；扩展名表全小写，匹配时 to_lowercase。
     assert_eq!(
         ls_registry::resolve(Path::new("MAIN.CPP")),
         Some(LanguageId::Cpp)
@@ -48,33 +61,48 @@ fn resolve_is_case_insensitive() {
         ls_registry::resolve(Path::new("mix.Cc")),
         Some(LanguageId::Cpp)
     );
+    assert_eq!(
+        ls_registry::resolve(Path::new("MAIN.RS")),
+        Some(LanguageId::Rust)
+    );
 }
-
 #[test]
 fn resolve_path_without_extension_is_none() {
-    // 无扩展名 → None（不是错误）。
     assert_eq!(ls_registry::resolve(Path::new("Makefile")), None);
     assert_eq!(ls_registry::resolve(Path::new("README")), None);
 }
 
 #[test]
-fn adapter_for_cpp_returns_clangd() {
-    let ad = ls_registry::adapter_for("cpp").expect("cpp 必须能取到 adapter");
-    assert_eq!(ad.id(), "clangd");
+fn adapter_for_each_m3_language() {
+    let cases: &[(&str, &str)] = &[
+        ("cpp", "clangd"),
+        ("rust", "rust-analyzer"),
+        ("python", "pyright"),
+        ("go", "gopls"),
+        ("typescript", "typescript-language-server"),
+        ("javascript", "typescript-language-server"),
+        ("csharp", "csharp-ls"),
+        ("java", "jdtls"),
+    ];
+    for (lang, expected_id) in cases {
+        let ad = ls_registry::adapter_for(lang).unwrap_or_else(|| panic!("missing adapter for {lang}"));
+        assert_eq!(ad.id(), *expected_id, "adapter id mismatch for {lang}");
+    }
 }
 
 #[test]
 fn adapter_for_unknown_language_is_none() {
-    // M0 只硬编码 "cpp"；M2 servers.toml 接管后此函数换为表查找。
-    assert!(ls_registry::adapter_for("python").is_none());
-    assert!(ls_registry::adapter_for("rust").is_none());
+    // 真正未知语言。
+    assert!(ls_registry::adapter_for("lua").is_none());
+    assert!(ls_registry::adapter_for("ruby").is_none());
     assert!(ls_registry::adapter_for("").is_none());
 }
 
 #[test]
 fn adapter_for_is_idempotent() {
-    // 多次调用返回 Arc 同一份实例 —— Single 实例化（ponyxtail: OnceLock 内单例）。
-    let a1 = ls_registry::adapter_for("cpp").unwrap();
-    let a2 = ls_registry::adapter_for("cpp").unwrap();
-    assert!(std::sync::Arc::ptr_eq(&a1, &a2));
+    for lang in ["cpp", "rust", "python", "go", "typescript", "csharp", "java"] {
+        let a1 = ls_registry::adapter_for(lang).unwrap();
+        let a2 = ls_registry::adapter_for(lang).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a1, &a2), "singleton broken for {lang}");
+    }
 }
