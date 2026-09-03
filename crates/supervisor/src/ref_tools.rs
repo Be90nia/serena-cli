@@ -74,7 +74,7 @@ async fn fetch_references(
         "position": { "line": line, "character": col },
         "context": { "includeDeclaration": true },
     });
-    let resp: Vec<Location> = session
+    let raw: Option<serde_json::Value> = session
         .request(
             "textDocument/references",
             params,
@@ -82,7 +82,7 @@ async fn fetch_references(
         )
         .await
         .map_err(|e| RefError::Core(format!("references: {e}")))?;
-    Ok(resp)
+    Ok(crate::normalize_implementations(raw.as_ref()))
 }
 
 async fn fetch_document_symbols(

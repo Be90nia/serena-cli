@@ -327,11 +327,11 @@ fn spawn_daemon_child() -> Result<u16, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // ponytail: DETACHED_PROCESS 让父进程退出不影响子进程 —— 缺这个 daemon 退随父 CLI。
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-
     cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
     Ok(7860) // M1 固定端口；M2 起 OS 分配 + lock 回填
 }

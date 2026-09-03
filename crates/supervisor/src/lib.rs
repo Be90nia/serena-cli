@@ -83,6 +83,11 @@ pub trait SupervisorTrait: Send + Sync {
         project_root: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError>;
+
+    /// 当前已加载的 (root, lang) 实例键列表。daemon 用它填 status 字段。
+    fn loaded_entries(&self) -> Vec<Key> {
+        Vec::new()
+    }
 }
 
 /// M0 单实例 supervisor。
@@ -377,8 +382,10 @@ impl Supervisor {
             });
         }
 
-        // 探测 root 下任一 cpp 文件以确定 lang。
+        // 探测 root 下任一**已知语言**文件以确定 lang。
+        // ponytail(M1 残留): 原版硬要 cpp — 多语言项目会误拒。改为探测任一已知 lang。
         let mut probe: Option<PathBuf> = None;
+        let mut probe_lang: Option<ls_adapters::LanguageId> = None;
         for entry in WalkBuilder::new(root)
             .standard_filters(true)
             .max_depth(Some(3))
@@ -387,18 +394,21 @@ impl Supervisor {
         {
             if entry.file_type().is_some_and(|t| t.is_file())
                 && let Some(lang) = ls_registry::resolve(entry.path())
-                && lang.as_str() == "cpp"
             {
                 probe = Some(entry.path().to_path_buf());
+                probe_lang = Some(lang);
                 break;
             }
         }
-        let probe = probe.ok_or_else(|| ToolError::BadArgs {
-            detail: "no cpp/c/h files under root; workspace/symbol requires a known language"
-                .into(),
-        })?;
-
-        let lang = ls_registry::resolve(&probe).unwrap();
+        let (probe, lang) = match (probe, probe_lang) {
+            (Some(p), Some(l)) => (p, l),
+            _ => {
+                return Err(ToolError::BadArgs {
+                    detail: format!("no known-language files under root {root:?}"),
+                });
+            }
+        };
+        let _ = ls_registry::resolve(&probe).unwrap();
         let session = self.session_for(root, lang.as_str()).await?;
         // 触发背景索引：把 probe 文件 didOpen 一次。
         let _ = session.ensure_open(&probe).await.map_err(ToolError::Core)?;
@@ -512,10 +522,10 @@ impl Supervisor {
             "position": { "line": pos.line, "character": pos.character },
             "context": { "includeDeclaration": true },
         });
-        let resp: Vec<Location> = session
+        let raw: Option<serde_json::Value> = session
             .request("textDocument/references", params, TOOL_TIMEOUT)
             .await?;
-        Ok(resp)
+        Ok(normalize_implementations(raw.as_ref()))
     }
 
     /// `find_referencing_symbols`：所有引用 + 每个 ref 落在哪个外层符号里（Task 24）。
@@ -1675,6 +1685,10 @@ impl SupervisorTrait for Supervisor {
             }),
         }
     }
+
+    fn loaded_entries(&self) -> Vec<Key> {
+        self.last_used.lock().unwrap().keys().cloned().collect()
+    }
 }
 
 /// LSP 3.17 `textDocument/definition` 响应允四种形态：
@@ -1710,7 +1724,7 @@ fn normalize_definition(raw: Option<&serde_json::Value>) -> Option<Location> {
 /// LSP 3.17 `textDocument/implementation` 响应允多种形态：
 /// `null | Location | Location[] | LocationLink[]`。归一化为 `Vec<Location>`：
 /// 数组逐元素归一化；单 Location 包成单元素 vec；null → 空 vec。
-fn normalize_implementations(raw: Option<&serde_json::Value>) -> Vec<Location> {
+pub(crate) fn normalize_implementations(raw: Option<&serde_json::Value>) -> Vec<Location> {
     let mut out = Vec::new();
     let Some(v) = raw else { return out };
     if v.is_null() {

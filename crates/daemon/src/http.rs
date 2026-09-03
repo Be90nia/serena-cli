@@ -130,7 +130,12 @@ async fn tools_post(
 }
 
 async fn status_get(State(state): State<AppState>) -> Response {
-    let loaded = state.loaded_ls.lock().unwrap().clone();
+    let loaded = state
+        .supervisor
+        .loaded_entries()
+        .into_iter()
+        .map(|k| k.lang.to_string())
+        .collect::<Vec<_>>();
     let resp = StatusResponse {
         uptime_secs: state.uptime_secs(),
         pid: std::process::id(),
@@ -211,8 +216,15 @@ mod tests {
         ) -> Result<serde_json::Value, supervisor::ToolError> {
             let f = self.result.lock().await.take().expect("mock called once");
             f()
+         }
+
+        fn loaded_entries(&self) -> Vec<supervisor::Key> {
+            vec![supervisor::Key {
+                root: std::path::PathBuf::from("/mock"),
+                lang: Box::from("rust"),
+            }]
         }
-    }
+     }
 
     fn state(token: &str, mock: MockSupervisor) -> AppState {
         AppState {
@@ -336,7 +348,7 @@ mod tests {
         assert_eq!(status, AxStatus::OK);
         let body = body.expect("json body");
         assert!(body["uptime_secs"].is_u64());
-        assert_eq!(body["loaded_ls"], json!(["clangd"]));
+        assert_eq!(body["loaded_ls"], json!(["rust"]));
         assert_eq!(body["draining"], false);
     }
 
