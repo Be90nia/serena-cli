@@ -57,12 +57,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     // lock 仲裁：败者直接退出（正常路径 CLI 已探活转发，不会走到这）。
     let outcome = lockfile::try_become_daemon(&cfg.lock_path, cfg.port)?;
     let (port, token) = match outcome {
-        Outcome::Won { port, .. } => {
-            let token = lockfile::read(&cfg.lock_path)?
-                .map(|e| e.token)
-                .unwrap_or_default();
-            (port, token)
-        }
+        Outcome::Won { port, token, .. } => (port, token),
         Outcome::Lost { addr } => {
             anyhow::bail!("another daemon already at {addr}; not starting a second one")
         }
@@ -77,13 +72,21 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    // reaper 常驻：global idle → draining → 删 lock → task 退出 → 进程自然退。
-    let _reaper = spawn_reaper(
+    // reaper 常驻：global idle / POST /shutdown → draining → 删 lock → task 结束。
+    // 注意：reaper task 结束并不会退出阻塞在 accept loop 的 axum::serve（无
+    // graceful shutdown）——由下方 watcher 在 reaper 结束后显式退进程；
+    // Windows 下 Job 句柄随进程关闭，LS 进程树陪葬（ARCH §3.2）。
+    let reaper = spawn_reaper(
         sup,
         state.clone(),
         cfg.intervals,
         Some(cfg.lock_path.clone()),
     );
+    tokio::spawn(async move {
+        let _ = reaper.await;
+        tracing::info!("daemon shutdown complete; exiting process");
+        std::process::exit(0);
+    });
 
     let app = router(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));

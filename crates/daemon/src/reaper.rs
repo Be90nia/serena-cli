@@ -145,7 +145,7 @@ async fn finish_shutdown(
         let _ = lockfile::remove(p);
     }
     let _ = state;
-    tracing::info!("daemon shutdown complete; exiting");
+    tracing::info!("daemon shutdown complete; lock removed");
 }
 
 #[cfg(test)]

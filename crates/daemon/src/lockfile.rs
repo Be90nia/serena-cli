@@ -39,8 +39,12 @@ pub enum LockError {
 /// `try_become_daemon` 的结果。
 #[derive(Debug)]
 pub enum Outcome {
-    /// 胜者：lock 已建，需要监听 `port` 并把 lock 文件回填为最终内容。
-    Won { port: u16, file: PathBuf },
+    /// 胜者：lock 已建，需要监听 `port`；token 为本次生成的鉴权令牌（不回读文件）。
+    Won {
+        port: u16,
+        file: PathBuf,
+        token: String,
+    },
     /// 败者：现成 daemon 已在 `addr` 监听，CLI 转发给它。
     Lost { addr: SocketAddr },
 }
@@ -118,6 +122,7 @@ fn try_become_daemon_impl(lock_path: &Path, candidate_port: u16) -> Result<Outco
             Ok(Outcome::Won {
                 port: candidate_port,
                 file: lock_path.to_path_buf(),
+                token,
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
