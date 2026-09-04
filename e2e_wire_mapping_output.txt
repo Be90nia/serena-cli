@@ -1,0 +1,40 @@
+== [0] cargo build -p cli ==
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.34s
+build exit=0
+== [1] stop pre-existing daemon (graceful) ==
+shutdown probe failed: Err(reqwest::Error { kind: Request, url: "http://127.0.0.1:7860/shutdown", source: hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:7860, Os { code: 10061, kind: ConnectionRefused, message: "由于目标计算机积极拒绝，无法连接。" })) }); stale lock removed
+stop-all exit=3
+== [2] start fresh daemon (new binary, with Serialize/Protocol variants) ==
+daemon up=1 port=7860
+== [3] curl POST /tools/find-symbol 非法 args（缺 query）==
+{"error":{"code":"BAD_ARGS","message":"missing 'query'","retryable":false},"ok":false}
+HTTP_STATUS:200
+curl exit=0
+== [4] curl POST /tools/find-symbol 非法 args（query 非字符串）==
+{"error":{"code":"BAD_ARGS","message":"missing 'query'","retryable":false},"ok":false}
+HTTP_STATUS:200
+== [5] CLI read-file 不存在文件 → wire BAD_ARGS → 期望 exit 2（旧版硬编码恒 exit 1）==
+tool error: {"code":"BAD_ARGS","message":"read_file: io: 系统找不到指定的文件。 (os error 2)","retryable":false}
+cli exit=2
+== [6] CLI find-symbol 缺参（clap 层，对照组）==
+For more information, try '--help'.
+cli exit=2
+== [7] cleanup ==
+daemon draining (pid 10696); lock will be removed by reaper
+stop-all exit=0
+== done ==
+SCRIPT_EXIT=0
+
+---
+补充证据（2026-09-04）：
+- cargo clippy --workspace --all-targets -- -D warnings → exit 0
+- cargo test --workspace → exit 0 全绿（daemon lib 24→27，+3 新测试）
+- cargo test -p daemon --lib 过滤结果：
+  test dto::tests::wire_error_from_protocol_is_rpc_error ... ok
+  test dto::tests::wire_error_from_serialize_is_internal ... ok
+  test dto::tests::wire_error_from_launch_is_retryable_spawn_failed ... ok
+- 全仓 grep 'ToolError::Launch\(anyhow::anyhow!' 残留 = 1（crates/supervisor/src/lib.rs:263，启动期真 Child::spawn 失败，按工单保留）
+- 说明：步骤 [3][4] 非法 args 落 BAD_ARGS 是 supervisor/lib.rs find-symbol 臂的既有正确分类
+  （用法错、不可重试）；Serialize→Internal / Protocol→RpcError 的 wire 映射由上述 3 个
+  dto 单测证明（code + retryable + exit）。步骤 [5] 证明 forward 模式 CLI exit 码已按
+  wire code 取值（原代码恒 exit 1）。

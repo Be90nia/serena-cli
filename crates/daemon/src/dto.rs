@@ -104,6 +104,12 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
             // `Io` / `Framing` 走 INTERNAL 兜底（调用方无法按 IO/Framing 区分重试）。
             other => (WireErrorCode::Internal, format!("{}: {:?}", other, other)),
         },
+        // Δ 43ae021：从 Launch 兜底拆出 Serialize/Protocol —— 确定性失败（daemon 序列化
+        // bug、LS 违反协议语义）不再伪装成 retryable 的 LS_SPAWN_FAILED 诱发无意义重试。
+        ToolError::Serialize(re) => (WireErrorCode::Internal, format!("serialize failed: {re}")),
+        ToolError::Protocol { tool, reason } => {
+            (WireErrorCode::RpcError, format!("{tool}: {reason}"))
+        }
         ToolError::Launch(re) => (WireErrorCode::LsSpawnFailed, format!("{re}")),
         ToolError::WriteConflict { path, reason } => {
             (WireErrorCode::WriteConflict, format!("{path}: {reason}"))
@@ -230,6 +236,40 @@ mod tests {
         });
         let w = wire_error_from_tool_error(&e);
         assert_eq!(w.code, WireErrorCode::LsTimeout);
+        assert!(w.retryable);
+    }
+
+    #[test]
+    fn wire_error_from_serialize_is_internal() {
+        let e = supervisor::ToolError::Serialize(anyhow::anyhow!("map key is not a string"));
+        let w = wire_error_from_tool_error(&e);
+        assert_eq!(w.code, WireErrorCode::Internal);
+        assert!(!w.retryable);
+        assert_eq!(wire_error_code_to_exit(w.code), 3);
+    }
+
+    #[test]
+    fn wire_error_from_protocol_is_rpc_error() {
+        let e = supervisor::ToolError::Protocol {
+            tool: "rename_symbol".into(),
+            reason: "rename returned null".into(),
+        };
+        let w = wire_error_from_tool_error(&e);
+        assert_eq!(w.code, WireErrorCode::RpcError);
+        assert!(!w.retryable);
+        assert_eq!(wire_error_code_to_exit(w.code), 1);
+        assert!(
+            w.message.contains("rename returned null"),
+            "got: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    fn wire_error_from_launch_is_retryable_spawn_failed() {
+        let e = supervisor::ToolError::Launch(anyhow::anyhow!("runtime spawn error: boom"));
+        let w = wire_error_from_tool_error(&e);
+        assert_eq!(w.code, WireErrorCode::LsSpawnFailed);
         assert!(w.retryable);
     }
 }

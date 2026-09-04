@@ -10,7 +10,7 @@
 //! 错误模型（ARCH §6.1）：库层用 thiserror 具名类型 `ToolError`；adapters 是被编排末端
 //! 用 anyhow 内部传（`launch_info` 错误冒泡上来），包装成 `ToolError::NotInstalled` 等。
 //!
-//! ponylabel: 单实例 ≠ `Mutex<HashMap>` —— 真正的「同 root 多 lang」也只装得下 1 个 lang
+//! ponytail: 单实例 ≠ `Mutex<HashMap>` —— 真正的「同 root 多 lang」也只装得下 1 个 lang
 //! (clangd)，单 `Mutex<HashMap>` 比 `Arc<Mutex<OnceCell>>` 简单。Task 13 把池换进来时本
 //! 公共 API 不变。
 
@@ -26,8 +26,8 @@ use lsp_core::init_params::base_initialize_params;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
 use lsp_core::session::Session;
 pub mod edit_tools;
-pub mod root_finder;
 pub mod fs_tools;
+pub mod root_finder;
 
 pub mod ref_tools;
 pub mod write_gate;
@@ -67,6 +67,17 @@ pub enum ToolError {
     /// 适配器启动期错误（anyhow 上抛统一收口）。
     #[error("adapter launch failed: {0}")]
     Launch(#[from] anyhow::Error),
+
+    /// 工具结果序列化失败 —— daemon 内部确定性 bug。wire INTERNAL（不可重试，exit 3）。
+    /// Δ 43ae021：从 Launch 兜底拆出，避免确定性失败被误映射为 retryable 的
+    /// LS_SPAWN_FAILED 让 agent 无意义重试。
+    #[error("serialize failed: {0}")]
+    Serialize(anyhow::Error),
+
+    /// LSP 协议语义错（server 违反协议约定，如 rename 返回 null / 缺 changes map）。
+    /// wire RPC_ERROR（不可重试，exit 1）。tool 标识出错的上层工具语义。
+    #[error("protocol error from `{tool}`: {reason}")]
+    Protocol { tool: String, reason: String },
 }
 
 /// supervisor 公共结果类型（库层 Result 别名）。
@@ -289,11 +300,33 @@ impl Supervisor {
         // 注册 publishDiagnostics handler → 写 diag_cache。
         let cache_root = key.root.clone();
         let cache = std::sync::Arc::clone(&self.diag_cache);
-        session.client().on_notification("textDocument/publishDiagnostics", move |msg| {
-            let Some(uri) = msg.params.as_ref().and_then(|p| p.get("uri")).and_then(|u| u.as_str()) else { return; };
-            let Some(items) = msg.params.as_ref().and_then(|p| p.get("diagnostics")).and_then(|d| d.as_array()).cloned() else { return; };
-            if !items.is_empty() { cache.lock().unwrap().insert((cache_root.clone(), uri.to_string()), items); }
-        });
+        session
+            .client()
+            .on_notification("textDocument/publishDiagnostics", move |msg| {
+                let Some(uri) = msg
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("uri"))
+                    .and_then(|u| u.as_str())
+                else {
+                    return;
+                };
+                let Some(items) = msg
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("diagnostics"))
+                    .and_then(|d| d.as_array())
+                    .cloned()
+                else {
+                    return;
+                };
+                if !items.is_empty() {
+                    cache
+                        .lock()
+                        .unwrap()
+                        .insert((cache_root.clone(), uri.to_string()), items);
+                }
+            });
         self.instances
             .lock()
             .unwrap()
@@ -314,7 +347,9 @@ impl Supervisor {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let path = root.join(file);
         let uri = path_to_uri(&path)
-            .map_err(|e| ToolError::BadArgs { detail: format!("path to uri: {e}") })?
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("path to uri: {e}"),
+            })?
             .as_str()
             .to_string();
         let session = self.session_for(root, lang.as_str()).await?;
@@ -346,7 +381,7 @@ impl Supervisor {
         Ok(json!({ "items": items }))
     }
 
-     pub async fn tool_hover(
+    pub async fn tool_hover(
         &self,
         root: &Path,
         file: &str,
@@ -1066,16 +1101,15 @@ impl Supervisor {
         let resp: Option<serde_json::Value> = session
             .request("textDocument/rename", edit_params, TOOL_TIMEOUT)
             .await?;
-        let resp =
-            resp.ok_or_else(|| ToolError::Launch(anyhow::anyhow!("rename returned null")))?;
+        let resp = resp.ok_or_else(|| ToolError::Protocol {
+            tool: "rename_symbol".into(),
+            reason: "rename returned null".into(),
+        })?;
 
         // 3) 拆 `changes` map → 按文件分组 + 倒序排序。
         let changes = resp
             .get("changes")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| ToolError::Launch(anyhow::anyhow!(
-                "rename response has no `changes` map (M2 only supports changes, not documentChanges)"
-            )))?;
+            .and_then(|v| v.as_object()).ok_or_else(|| ToolError::Protocol { tool: "rename_symbol".into(), reason: "rename response has no `changes` map (M2 only supports changes, not documentChanges)".into() })?;
 
         type EditSpec = (u64, lsp_types::Range, String); // (sort_key, range, new_text)
         let mut by_uri: Vec<(String, Vec<EditSpec>)> = Vec::new();
@@ -1431,7 +1465,7 @@ impl SupervisorTrait for Supervisor {
             "overview" => {
                 let file = required_file(&args)?;
                 serde_json::to_value(self.tool_overview(root, &file, lang).await?)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                    .map_err(|e| ToolError::Serialize(e.into()))
             }
             "find-symbol" => {
                 let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -1441,28 +1475,27 @@ impl SupervisorTrait for Supervisor {
                 })?;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
                 let resp = self.tool_find_symbol(root, query, limit, lang).await?;
-                serde_json::to_value(resp)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
             }
             "hover" => {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(self.tool_hover(root, &file, line, col, lang).await?)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                    .map_err(|e| ToolError::Serialize(e.into()))
             }
             "diagnostics" => {
                 let file = required_file(&args)?;
                 serde_json::to_value(self.tool_diagnostics(root, &file, lang).await?)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                    .map_err(|e| ToolError::Serialize(e.into()))
             }
             "def" => {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(self.tool_def(root, &file, line, col, lang).await?)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                    .map_err(|e| ToolError::Serialize(e.into()))
             }
             "refs" => {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(self.tool_refs(root, &file, line, col, lang).await?)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                    .map_err(|e| ToolError::Serialize(e.into()))
             }
             "find-implementations" => {
                 let (file, line, col) = required_position(&args)?;
@@ -1470,7 +1503,7 @@ impl SupervisorTrait for Supervisor {
                     self.tool_find_implementations(root, &file, line, col, lang)
                         .await?,
                 )
-                .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                .map_err(|e| ToolError::Serialize(e.into()))
             }
             "search" => {
                 let pattern = args
@@ -1491,13 +1524,12 @@ impl SupervisorTrait for Supervisor {
                 let resp = self
                     .tool_search_for_pattern(root, pattern, path_glob, max_results, case_sensitive)
                     .await?;
-                serde_json::to_value(resp)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
             }
             "symbol-body" => {
                 let (file, symbol) = required_symbol_body_args(&args)?;
                 serde_json::to_value(self.tool_symbol_body(root, &file, &symbol, lang).await?)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                    .map_err(|e| ToolError::Serialize(e.into()))
             }
             "replace-body" => {
                 let (file, symbol, new_body) = required_replace_args(&args)?;
@@ -1511,7 +1543,7 @@ impl SupervisorTrait for Supervisor {
                     self.tool_rename_symbol(root, &file, line, col, &new_name, lang)
                         .await?,
                 )
-                .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                .map_err(|e| ToolError::Serialize(e.into()))
             }
             "read-file" => {
                 let file = required_file(&args)?;
@@ -1528,8 +1560,7 @@ impl SupervisorTrait for Supervisor {
                     .map_err(|e| ToolError::BadArgs {
                         detail: format!("read_file: {e}"),
                     })?;
-                serde_json::to_value(report)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
             }
             "list-dir" => {
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -1551,8 +1582,7 @@ impl SupervisorTrait for Supervisor {
                             detail: format!("list_dir: {e}"),
                         }
                     })?;
-                serde_json::to_value(entries)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                serde_json::to_value(entries).map_err(|e| ToolError::Serialize(e.into()))
             }
             "find-file" => {
                 let name_pattern = args
@@ -1570,16 +1600,14 @@ impl SupervisorTrait for Supervisor {
                     .map_err(|e| ToolError::BadArgs {
                         detail: format!("find_file: {e}"),
                     })?;
-                serde_json::to_value(hits)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                serde_json::to_value(hits).map_err(|e| ToolError::Serialize(e.into()))
             }
             "find-referencing-symbols" => {
                 let (file, line, col) = required_position(&args)?;
                 let hits = self
                     .tool_referencing_symbols(root, &file, line, col, lang)
                     .await?;
-                serde_json::to_value(hits)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                serde_json::to_value(hits).map_err(|e| ToolError::Serialize(e.into()))
             }
             "find-referencing-code-snippets" => {
                 let (file, line, col) = required_position(&args)?;
@@ -1602,8 +1630,7 @@ impl SupervisorTrait for Supervisor {
                         lang,
                     )
                     .await?;
-                serde_json::to_value(hits)
-                    .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))
+                serde_json::to_value(hits).map_err(|e| ToolError::Serialize(e.into()))
             }
             "replace-text-in-symbol" => {
                 let file = required_file(&args)?;
@@ -1669,7 +1696,7 @@ impl SupervisorTrait for Supervisor {
                     .await?;
                 Ok(serde_json::Value::Null)
             }
-             other => Err(ToolError::BadArgs {
+            other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
             }),
         }

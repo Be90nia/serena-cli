@@ -18,10 +18,9 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use serde_json::json;
 use lsp_core::framing::{JsonRpc, decode, encode};
+use serde_json::json;
 use supervisor::{Supervisor, SupervisorTrait, ToolError};
-
 
 /// 转发超时（工具请求 300s；管理命令 5s）。
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -56,7 +55,7 @@ struct Cli {
     /// 子命令；`--daemon` 模式下可省略。
     #[command(subcommand)]
     cmd: Option<Cmd>,
- }
+}
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
@@ -292,6 +291,8 @@ fn tool_error_exit(e: &ToolError) -> u8 {
     match e {
         ToolError::BadArgs { .. } => 2,
         ToolError::WriteConflict { .. } | ToolError::NotInstalled { .. } => 1,
+        ToolError::Protocol { .. } => 1,
+        ToolError::Serialize(_) => 3,
         ToolError::Core(_) | ToolError::Launch(_) => 3,
     }
 }
@@ -396,19 +397,28 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
             ("hover", json!({"file": file, "line": line, "col": col}))
         }
         Some(Cmd::Diagnostics { file }) => ("diagnostics", json!({"file": file})),
-        Some(Cmd::FindSymbol { query, limit }) => (
-            "find-symbol",
-            json!({"query": query, "limit": limit}),
-        ),
+        Some(Cmd::FindSymbol { query, limit }) => {
+            ("find-symbol", json!({"query": query, "limit": limit}))
+        }
         Some(Cmd::FindImplementations { file, line, col }) => (
             "find-implementations",
             json!({"file": file, "line": line, "col": col}),
         ),
-        Some(Cmd::RenameSymbol { file, line, col, new_name }) => (
+        Some(Cmd::RenameSymbol {
+            file,
+            line,
+            col,
+            new_name,
+        }) => (
             "rename-symbol",
             json!({"file": file, "line": line, "col": col, "new_name": new_name}),
         ),
-        Some(Cmd::Search { pattern, path_glob, max_results, case_sensitive }) => (
+        Some(Cmd::Search {
+            pattern,
+            path_glob,
+            max_results,
+            case_sensitive,
+        }) => (
             "search",
             json!({
                 "pattern": pattern,
@@ -417,7 +427,11 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
                 "case_sensitive": case_sensitive,
             }),
         ),
-        Some(Cmd::ReadFile { file, start_line, end_line }) => (
+        Some(Cmd::ReadFile {
+            file,
+            start_line,
+            end_line,
+        }) => (
             "read-file",
             json!({
                 "file": file,
@@ -433,7 +447,13 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
             "find-referencing-symbols",
             json!({"file": file, "line": line, "col": col}),
         ),
-        Some(Cmd::FindReferencingCodeSnippets { file, line, col, context_lines, max_results }) => (
+        Some(Cmd::FindReferencingCodeSnippets {
+            file,
+            line,
+            col,
+            context_lines,
+            max_results,
+        }) => (
             "find-referencing-code-snippets",
             json!({
                 "file": file,
@@ -446,11 +466,20 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
         Some(Cmd::SymbolBody { file, symbol }) => {
             ("symbol-body", json!({"file": file, "symbol": symbol}))
         }
-        Some(Cmd::ReplaceBody { file, symbol, new_body }) => (
+        Some(Cmd::ReplaceBody {
+            file,
+            symbol,
+            new_body,
+        }) => (
             "replace-body",
             json!({"file": file, "symbol": symbol, "new_body": new_body}),
         ),
-        Some(Cmd::ReplaceTextInSymbol { file, symbol, old_text, new_text }) => (
+        Some(Cmd::ReplaceTextInSymbol {
+            file,
+            symbol,
+            old_text,
+            new_text,
+        }) => (
             "replace-text-in-symbol",
             json!({"file": file, "symbol": symbol, "old_text": old_text, "new_text": new_text}),
         ),
@@ -462,11 +491,20 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
             "insert-text-after-symbol",
             json!({"file": file, "symbol": symbol, "text": text}),
         ),
-        Some(Cmd::DeleteTextInSymbol { file, symbol, start_line, end_line }) => (
+        Some(Cmd::DeleteTextInSymbol {
+            file,
+            symbol,
+            start_line,
+            end_line,
+        }) => (
             "delete-text-in-symbol",
             json!({"file": file, "symbol": symbol, "start_line": start_line, "end_line": end_line}),
         ),
-        Some(Cmd::Status) | Some(Cmd::StopAll) | Some(Cmd::Shell) | Some(Cmd::Mcp { .. }) | None => {
+        Some(Cmd::Status)
+        | Some(Cmd::StopAll)
+        | Some(Cmd::Shell)
+        | Some(Cmd::Mcp { .. })
+        | None => {
             unreachable!("handled earlier")
         }
     };
@@ -502,7 +540,12 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
         _ => {
             let err = payload.get("error").cloned().unwrap_or(payload);
             eprintln!("tool error: {err}");
-            std::process::exit(1);
+            // Δ 43ae021：exit 码按 wire code 取（ARCH §6.3 / dto::wire_error_code_to_exit），
+            // 不再一律 1 —— Internal→3、BadArgs→2，agent 据此免重试确定性失败。
+            let code = err
+                .get("code")
+                .and_then(|c| serde_json::from_value::<daemon::dto::WireErrorCode>(c.clone()).ok());
+            std::process::exit(i32::from(code.map_or(1u8, daemon::dto::wire_error_code_to_exit)));
         }
     }
 }
@@ -566,12 +609,11 @@ async fn cmd_stop_all(lock_path: &Path) -> ExitCode {
     }
 }
 
-/// Print JSON pretty; map serde_json errors to ToolError::Launch (uniform exit 3 path).
+/// Print JSON pretty; map serde_json errors to ToolError::Serialize (uniform exit 3 path).
 fn print_json(v: &serde_json::Value) -> Result<(), ToolError> {
     println!(
         "{}",
-        serde_json::to_string_pretty(v)
-            .map_err(|e| ToolError::Launch(anyhow::anyhow!("serialize: {e}")))?
+        serde_json::to_string_pretty(v).map_err(|e| ToolError::Serialize(e.into()))?
     );
     Ok(())
 }
@@ -971,10 +1013,21 @@ async fn handle_mcp(sup: &Supervisor, root: &Path, msg: JsonRpc) -> JsonRpc {
 }
 
 /// 单个 tools/call → MCP content 数组。
-async fn call_mcp_tool(sup: &Supervisor, root: &Path, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let name = params.get("name").and_then(|v| v.as_str()).ok_or("missing 'name'")?;
-    let args = params.get("arguments").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
-    let resp = sup.execute_tool(name, &root.to_string_lossy(), args, None)
+async fn call_mcp_tool(
+    sup: &Supervisor,
+    root: &Path,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'name'")?;
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let resp = sup
+        .execute_tool(name, &root.to_string_lossy(), args, None)
         .await
         .map_err(|e| format!("{e:?}"))?;
     Ok(serde_json::json!({
