@@ -45,5 +45,5 @@ PM 推荐：**手动 `git commit --allow-empty -m "feat(m1): daemon+cli product 
 1. **代码补全（completion）** —— 给 AI agent 用，省 token（用户已要求）
 2. `--json` / `--record` 输出（PLAN §326）
 3. 多语言适配器（pyright / gopls / typescript）
-4. MCP endpoint（ARCH §3.2）
-5. 缓存（M4）
+4. 缓存（M4）
+

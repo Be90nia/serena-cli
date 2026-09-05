@@ -1,7 +1,6 @@
 # serena-rust 设计文档（v0.2）
 
 > 目标：用 Rust 复刻 solidlsp + 薄 CLI，产出单个 `serena-cli.exe`。
-> skill 调用时自动拉起常驻 daemon，空闲自动退出。主形态 CLI（工具描述不占模型上下文）；daemon 可选暴露 MCP endpoint，供 MCP-only 客户端复用。
 > 复刻来源：oraios/serena（MIT），只抄代码和 quirk，不复用其 Python 运行时。
 
 > **v0.2 变更**（2026-09-01）：三路评审完成——① momus 审计 verdict「打回」：4 Critical + 8 Important，全部修复/处置（见 §10）；② oracle 架构细化产出 `ARCHITECTURE.md` v0.1（565 行：7 crate 布局、8 张经渲染验证的 mermaid 图、锁权威表、错误码表、上游逐行追溯锚 `43ae0211`）；③ librarian 竞品调研 10 家（无 Rust 全量复刻先例，立项前提安全），融入机制 Top 10（见 §9）。
@@ -22,9 +21,12 @@
 3. 生命周期自治：调用时 lazy-spawn daemon → 常驻 → 空闲 N 分钟自杀。
 4. 语言覆盖路线图覆盖上游全部 73 个适配器（分层推进，见 §5）。
 
+
 **非目标**
-- 不以 MCP stdio 为主形态（每客户端一套进程树，多代理场景内存/冷启动翻倍）；MCP 仅作为 daemon 的可选前端端点（见 §3.2）。
-- 不复刻 serena 的 agent 层（memories、prompts、tool 编排）——只复刻 solidlsp 检索/编辑能力 + CLI 壳。
+
+
+- 不复刻 serena 的 agent 层（memories、prompts、tool 编排）——只复刻 solidlsp 检索/编辑能力 + CLI 壳
+
 - 不承诺与上游 100% 行为一致：追 quirk 修复，不追功能演进（见 §7 风险）。
 
 ## 3. 总体架构
@@ -73,15 +75,6 @@ serena-cli.exe（Rust，单二进制，双模式）
 - **replace-body 一致性链路（C3 修复）**：① 锁内原子——读最新 body 与写入在同一写门临界区，杜绝 stale 覆盖；② mtime 对账——操作前比对磁盘 mtime 与 daemon 持有的 didOpen buffer（抄 ls.py LSPFileBuffer@43ae021），外部修改先重同步；③ 写后读回 diff，不符则从写前临时副本回滚并报错。
 - **实例键规范化（I6 修复）**：project_root 入键前经 dunce 规范化 + Windows 大小写折叠 + 去尾分隔符，杜绝同项目多实例。
 
-### 3.2 前端协议：CLI 与 MCP 共存
-
-MCP/CLI 只是前端，底层 LSP 编排同一套。axum daemon 可同时暴露：
-
-- HTTP `/tools/*` —— `serena-cli` 用（agent 上下文零工具描述开销，主形态）
-- MCP endpoint（streamable-http）—— 给 MCP-only 客户端（如 Claude Code）复用同一 daemon，后期加，约 1 天
-
-不采用 MCP stdio 作为主形态：每客户端一套进程树（serena + 各语言服务器），多子代理场景内存与冷启动开销翻倍。
-
 ## 4. crate 划分
 
 | crate | 内容 | 对应上游 |
@@ -91,7 +84,7 @@ MCP/CLI 只是前端，底层 LSP 编排同一套。axum daemon 可同时暴露�
 | `ls-adapters` | adapter trait + T2 手写模块 | `language_servers/*.py` 大户 |
 | `ls-registry` | `servers.toml`（schema 抄 nvim-lspconfig：cmd/filetypes/root_markers 嵌套/settings/init_options/capabilities/initialize_params/required_root_patterns）+ 语言解析 + 根发现算法（抄 helix find_lsp_workspace） | 简单适配器 + `ls_config.py` |
 | `supervisor` | 实例池 (root,lang) / LRU / 写门 / **符号解析组合层**（I3：上游在未复刻的 agent 层 symbol_tools.py，需自建） | `project_server.py` 形态 + `symbol_tools.py` 语义 |
-| `daemon` | axum HTTP / lock 仲裁 / IdleReaper / 管理命令 / 可选 MCP endpoint | `project_server.py` |
+| `daemon` | axum HTTP / lock 仲裁 / IdleReaper / 管理命令 | `project_server.py` |
 | `cli`（唯一 bin） | clap / lazy-spawn / 转发 / 文本输出 | — |
 
 **适配器 trait（v0.2 定稿）**：v0.1 草稿经审计 I1（缺 server→client 应答钩子、notification 订阅、过程式依赖管理——jdtls 的 DependencyProvider 实证为版本 pin + 多平台矩阵 + JDK 探测，非静态清单）后修订，定稿见 **ARCHITECTURE.md §4.1-4.2**：`launch_info` async 化、`request_hooks()` 值对象、`ServerSpec(TOML) → ConfigAdapter` 实现 T0 零代码。M0 按修订版定型，防 T2 阶段返工。

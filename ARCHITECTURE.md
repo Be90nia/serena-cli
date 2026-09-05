@@ -106,7 +106,7 @@ serena-rust/
 | `daemon` | HTTP 前端、lazy-spawn 探测协议、空闲自杀 | 无（本项目新增形态） |
 | `cli` | 单 exe 入口：解析、转发、拉起、渲染 | 无 |
 
-**分层铁律**：`lsp-core` 不 import `ls-adapters`/`ls-registry`（协议层不知晓任何具体服务器）；`supervisor` 不 import axum；`daemon` 不含 LSP 语义。这是后续 MCP endpoint（DESIGN §3.2）能直接复用 supervisor 的前提。
+**分层铁律**：`lsp-core` 不 import `ls-adapters`/`ls-registry`（协议层不知晓任何具体服务器）；`supervisor` 不 import axum；`daemon` 不含 LSP 语义。这保证 supervisor 可被任何前端（CLI / HTTP / 未来扩展）直接复用。
 
 ---
 
@@ -557,7 +557,7 @@ HTTP 层错误保留给传输语义：`404` 未知工具名、`503` daemon 关�
 
 | # | 决策 | 理由与代价 |
 |---|---|---|
-| A1 | DESIGN §4 的 5 crate 细化为 7（拆出 `supervisor`；daemon 拆 lib + 唯一 bin `cli`） | supervisor 承载实例池+工具语义，若埋在 daemon 则 MCP endpoint（§3.2 后期）被迫依赖 axum；拆分代价是多一个薄 crate |
+| A1 | DESIGN §4 的 5 crate 细化为 7（拆出 `supervisor`；daemon 拆 lib + 唯一 bin `cli`） | supervisor 承载实例池+工具语义，若埋在 daemon 则未来任何 HTTP 端点被迫依赖 axum；拆分代价是多一个薄 crate |
 | A2 | trait `launch_info` 改 async、`pre_request` 改 `request_hooks()`、默认方法全部空实现 | T0 零代码的前提是默认方法完整；代价是 hook 组合需要一个小值类型 |
 | A3 | 上游"线程+每请求 Queue"映射为"3 task 泵 + oneshot"，stdin 用单 writer task 独占（无锁写） | 上游 serena 自身已放弃写线程（`_stdin_lock` 直写）；tokio 下单所有者优于跨 task 互斥锁 |
 | A4 | 写互斥实现为 supervisor 一把全局 `tokio::Mutex`（无独立队列结构） | Mutex 的 FIFO 等待即 DESIGN §3.1 的"互斥队列"；分项目分键留作升级路径（已标 ponytail） |

@@ -18,9 +18,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use lsp_core::framing::{JsonRpc, decode, encode};
 use serde_json::json;
-use supervisor::{Supervisor, SupervisorTrait, ToolError};
+use supervisor::{Supervisor, ToolError};
 
 /// 转发超时（工具请求 300s；管理命令 5s）。
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -174,12 +173,6 @@ enum Cmd {
     Status,
     /// 停掉 daemon（draining + 删 lock）。
     StopAll,
-    /// MCP stdio server（Claude Desktop / MCP 客户端连通用）。
-    Mcp {
-        /// 项目根（必填）。
-        #[arg(long, value_name = "ROOT")]
-        project: PathBuf,
-    },
     /// 长连接 shell（stdin/stdout JSONL）。Task 18。
     Shell,
 }
@@ -216,7 +209,7 @@ async fn main() -> ExitCode {
     match &cli.cmd {
         Some(Cmd::Status) => return cmd_status(&lock_path).await,
         Some(Cmd::StopAll) => return cmd_stop_all(&lock_path).await,
-        Some(Cmd::Shell) | Some(Cmd::Mcp { .. }) => {}
+        Some(Cmd::Shell) => {}
         _ => {}
     }
 
@@ -229,11 +222,6 @@ async fn main() -> ExitCode {
     if matches!(&cli.cmd, Some(Cmd::Shell)) {
         return cmd_shell(&cli).await;
     }
-
-    if let Some(Cmd::Mcp { project }) = &cli.cmd {
-        return cmd_mcp(project).await;
-    }
-
     // ---- 默认：转发模式（lazy-spawn）----
     match forward_or_spawn(&cli, &lock_path).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -500,10 +488,9 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
             "delete-text-in-symbol",
             json!({"file": file, "symbol": symbol, "start_line": start_line, "end_line": end_line}),
         ),
-        Some(Cmd::Status)
+        | Some(Cmd::Status)
         | Some(Cmd::StopAll)
         | Some(Cmd::Shell)
-        | Some(Cmd::Mcp { .. })
         | None => {
             unreachable!("handled earlier")
         }
@@ -822,218 +809,3 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-// ============== MCP stdio server (Claude Desktop / MCP 客户端通用) ==============
-
-/// MCP 协议工具列表（每个工具 + inputSchema）。MCP spec 2025-06-18 版本。
-fn mcp_tools() -> serde_json::Value {
-    serde_json::json!([
-        {
-            "name": "overview",
-            "description": "列出文件顶层符号（递归 children）。position-free；只传 file。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]},
-        },
-        {
-            "name": "find-symbol",
-            "description": "workspace/symbol：全 workspace 跨文件符号查找。",
-            "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]},
-        },
-        {
-            "name": "def",
-            "description": "textDocument/definition：跳转到符号定义。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "col": {"type": "integer"}}, "required": ["file", "line", "col"]},
-        },
-        {
-            "name": "refs",
-            "description": "textDocument/references：列出所有引用。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "col": {"type": "integer"}}, "required": ["file", "line", "col"]},
-        },
-        {
-            "name": "hover",
-            "description": "textDocument/hover：鼠标位置符号的 type / doc 注释。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "col": {"type": "integer"}}, "required": ["file", "line", "col"]},
-        },
-        {
-            "name": "find-implementations",
-            "description": "textDocument/implementation：符号的所有实现位置。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "col": {"type": "integer"}}, "required": ["file", "line", "col"]},
-        },
-        {
-            "name": "search",
-            "description": "workspace/search：跨文件正则搜索。",
-            "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}, "path_glob": {"type": "string"}, "max_results": {"type": "integer"}, "case_sensitive": {"type": "boolean"}}, "required": ["pattern"]},
-        },
-        {
-            "name": "diagnostics",
-            "description": "textDocument/diagnostic：当前文件错误/警告列表。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]},
-        },
-        {
-            "name": "symbol-body",
-            "description": "按符号名取函数/类体切片（position-free）。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "symbol": {"type": "string"}}, "required": ["file", "symbol"]},
-        },
-        {
-            "name": "replace-body",
-            "description": "替换符号体（写门 + hash 对账 + 原子写 + didChange）。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "symbol": {"type": "string"}, "new_body": {"type": "string"}}, "required": ["file", "symbol", "new_body"]},
-        },
-        {
-            "name": "rename-symbol",
-            "description": "textDocument/rename：rename symbol 跨文件变更。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "col": {"type": "integer"}, "new_name": {"type": "string"}}, "required": ["file", "line", "col", "new_name"]},
-        },
-        {
-            "name": "read-file",
-            "description": "按行范围读文件（1-based 含端）。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["file"]},
-        },
-        {
-            "name": "list-dir",
-            "description": "列出目录项（不递归）。",
-            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
-        },
-        {
-            "name": "find-file",
-            "description": "按文件名 glob 查找文件（限深 5）。",
-            "inputSchema": {"type": "object", "properties": {"name_pattern": {"type": "string"}}, "required": ["name_pattern"]},
-        },
-        {
-            "name": "find-referencing-symbols",
-            "description": "所有引用 + 每个 ref 落在哪个外层符号里。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "col": {"type": "integer"}}, "required": ["file", "line", "col"]},
-        },
-        {
-            "name": "find-referencing-code-snippets",
-            "description": "所有引用 + 每个 ref 前后 N 行。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "col": {"type": "integer"}, "context_lines": {"type": "integer"}, "max_results": {"type": "integer"}}, "required": ["file", "line", "col"]},
-        },
-        {
-            "name": "replace-text-in-symbol",
-            "description": "在 symbol 体内替换 old → new（行级字节切片）。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "symbol": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["file", "symbol", "old_text", "new_text"]},
-        },
-        {
-            "name": "insert-text-before-symbol",
-            "description": "在 symbol 开头插入 text。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "symbol": {"type": "string"}, "text": {"type": "string"}}, "required": ["file", "symbol", "text"]},
-        },
-        {
-            "name": "insert-text-after-symbol",
-            "description": "在 symbol 末尾插入 text。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "symbol": {"type": "string"}, "text": {"type": "string"}}, "required": ["file", "symbol", "text"]},
-        },
-        {
-            "name": "delete-text-in-symbol",
-            "description": "在 symbol 体内删除 [start_line, end_line] 切片（1-based 含端）。",
-            "inputSchema": {"type": "object", "properties": {"file": {"type": "string"}, "symbol": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["file", "symbol", "start_line", "end_line"]},
-        },
-    ])
-}
-
-/// MCP stdio server：长连接 stdin/stdout Content-Length 帧。
-async fn cmd_mcp(project_root: &PathBuf) -> ExitCode {
-    let root = dunce::canonicalize(project_root).unwrap_or_else(|_| project_root.clone());
-    let sup = match Supervisor::direct().await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("supervisor init failed: {e:#}");
-            return ExitCode::from(1);
-        }
-    };
-
-    use bytes::BytesMut;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut buf = BytesMut::new();
-    let mut chunk = [0u8; 4096];
-
-    loop {
-        let n = match stdin.read(&mut chunk).await {
-            Ok(0) => return ExitCode::SUCCESS,
-            Ok(n) => n,
-            Err(_) => return ExitCode::from(3),
-        };
-        buf.extend_from_slice(&chunk[..n]);
-        while let Ok(Some(msg)) = decode(&mut buf) {
-            let resp = handle_mcp(&sup, &root, msg).await;
-            let frame = encode(&resp);
-            if stdout.write_all(&frame).await.is_err() {
-                return ExitCode::from(3);
-            }
-            if stdout.flush().await.is_err() {
-                return ExitCode::from(3);
-            }
-        }
-    }
-}
-
-/// 单帧 MCP 请求 → 响应帧。
-async fn handle_mcp(sup: &Supervisor, root: &Path, msg: JsonRpc) -> JsonRpc {
-    let id = msg.id.clone();
-    let method = msg.method.clone().unwrap_or_default();
-    let params = msg.params.clone().unwrap_or(serde_json::Value::Null);
-
-    let result = match method.as_str() {
-        "initialize" => Ok(serde_json::json!({
-            "protocolVersion": "2025-06-18",
-            "serverInfo": {"name": "serena-rust", "version": env!("CARGO_PKG_VERSION")},
-            "capabilities": {"tools": {}},
-        })),
-        "tools/list" => Ok(serde_json::json!({"tools": mcp_tools()})),
-        "tools/call" => match call_mcp_tool(sup, root, &params).await {
-            Ok(v) => Ok(v),
-            Err(e) => Err(e),
-        },
-        _ => Err(format!("unknown method: {method}")),
-    };
-
-    match result {
-        Ok(value) => JsonRpc {
-            jsonrpc: "2.0".into(),
-            id,
-            method: None,
-            params: None,
-            result: Some(value),
-            error: None,
-        },
-        Err(e) => JsonRpc {
-            jsonrpc: "2.0".into(),
-            id,
-            method: None,
-            params: None,
-            result: None,
-            error: Some(lsp_core::framing::RpcError {
-                code: -32000,
-                message: e,
-                data: None,
-            }),
-        },
-    }
-}
-
-/// 单个 tools/call → MCP content 数组。
-async fn call_mcp_tool(
-    sup: &Supervisor,
-    root: &Path,
-    params: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let name = params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or("missing 'name'")?;
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or(serde_json::Value::Object(Default::default()));
-    let resp = sup
-        .execute_tool(name, &root.to_string_lossy(), args, None)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    Ok(serde_json::json!({
-        "content": [{"type": "text", "text": serde_json::to_string(&resp).unwrap_or_default()}],
-        "isError": false,
-    }))
-}
-
-// 未用占位避免警告

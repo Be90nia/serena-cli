@@ -329,7 +329,7 @@ fn split_across_reads() { // 半帧不解码，拼齐才出
 | 22-24 | T2 大户逐个（jdtls→rust_analyzer→vue→al…按用户频率） | 每个：对照上游 pytest 全绿 + `--record` 对拍 | 26（对拍工具前置） |
 | 25 | symbols 磁盘缓存（fingerprint 每次校验，I4 统一） | 重启后 overview 命中缓存（LS 冷启绕过） | M1 |
 | 26 | `--record` JSON-RPC 录制/回放（**先于 22-24 执行**：M3 验收依赖它，clangd 会话 M0 即可录制） | 录制 clangd 会话并回放比对 | M1 |
-| 27 | `--json` 输出 + MCP endpoint（axum 复用 supervisor，§3.2） | MCP-only 客户端连通用 | M1 |
+| 27 | `--json` 输出（保证所有工具输出可被 agent 经 jq 解析） | 文本输出对人友好，JSON 给 agent；MCP 不在本项目范围内 |
 
 ---
 
