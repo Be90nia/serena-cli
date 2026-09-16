@@ -1,102 +1,142 @@
-# Serena 原版工具 vs serena-rust 实现对照
+# Serena 上游工具 vs serena-rust 覆盖对照（v4，2026-09-15：工具层缺口闭合，新增 SolidLSP 层账本）
 
-> 用户问题：原版功能是不是全部学过来了？
-> 答案：**部分**——M1/M2 已覆盖核心工具与文件/搜索层，Memory/项目管理暂未做（DESIGN §非目标）。
+> 锚：oraios/serena@43ae0211，`src/serena/tools/` 7 个工具文件逐类核实（jetbrains_tools 为 IDE 桥，不适用 CLI，不计）。
+> 旧版"16%"/"56%"均过时：旧版把 `find_referencing_code_snippets` / `replace_text_in_symbol` 误记为上游工具（它们不在 43ae0211 工具表内，属我们的 Δ 增强），且上游实为 **39 工具**非 32。
+> 本项目 CLI 面核实：`crates/cli/src/main.rs` Cmd 枚举 23 子命令 + `--project/--direct/--daemon` flags。
 
-> 上次更新：2026-09-04（审计后重生成；旧版"16%"已过时）
+## 状态图例
 
-CLI 子命令总数：24。覆盖分类：
+✅ 直接等价 ｜ ◐ 部分等价（组合可达） ｜ 🔁 用法替代（0 CLI，更省 token） ｜ ✂ 刻意不做 ｜ ❌ 真缺口（待实现）
 
-## LSP 符号级工具（核心）
+## symbol_tools（13）
 
-| 原版工具 | serena-rust 状态 | CLI 子命令 | 备注 |
-|---|---|---|---|
-| `get_symbols_overview` | ✅ | `overview <file>` | M0 |
-| `find_symbol` (file) | ✅ | `find-symbol <query>` 默认 file 维度的 workspace/symbol | M2 |
-| `find_symbol(include_body=true)` | ✅ | `symbol-body <file> <symbol>` 独立取 body | M2 |
-| `find_declaration` | ✅ | `def <file> <line> <col>` | M0 |
-| `find_referencing_symbols` | ✅ | `refs` / `find-referencing-symbols` | M0 |
-| `find_implementations` | ✅ | `find-implementations <file> <line> <col>` | M2 |
-| `replace_symbol_body` | ✅ | `replace-body` | M1（Task 15 C3 链路） |
-| `insert_before_symbol` | ✅ | `insert-text-before-symbol` | M2 |
-| `insert_after_symbol` | ✅ | `insert-text-after-symbol` | M2 |
-| `rename_symbol` | ✅ | `rename-symbol <file> <line> <col> --to NEW` | M2 |
-| `safe_delete_symbol` | ❌ | — | M3 候选 |
-| `restart_language_server` | ❌ | — | M3 候选（可经 stop+新请求懒触发） |
-| `find_referencing_code_snippets` | ✅ | `find-referencing-code-snippets` 带 context_lines | M2 |
-| `replace_text_in_symbol` | ✅ | `replace-text-in-symbol` | M2 |
-
-## 文件级工具
-
-| 原版工具 | serena-rust 状态 | CLI 子命令 | 备注 |
-|---|---|---|---|
-| `read_file` | ✅ | `read-file [start_line] [end_line]` | M2 |
-| `list_dir` | ✅ | `list-dir <path>` | M2 |
-| `find_file` | ✅ | `find-file <name_pattern>` glob（限深 5） | M2 |
-| `create_text_file` | ❌ | — | 整文件创建；可由 ls-runtime 写门补 |
-| `edit_file` | ✅ | 行级由 `replace-text-in-symbol` 覆盖；整文件编辑未做 | partial |
-| `delete_lines` | ❌ | 行级删除可由 `delete-text-in-symbol` 替代 | partial |
-| `insert_at_line` | ❌ | 整文件行级；同 `delete_lines` | partial |
-
-## 搜索工具
-
-| 原版工具 | serena-rust 状态 | CLI 子命令 | 备注 |
-|---|---|---|---|
-| `search_for_pattern` | ✅ | `search <pattern> [--path-glob] [--max-results] [--case-sensitive]` | M2 |
-| `find_referencing_symbols_with_pattern` | ❌ | — | search + refs 组合，可作下一步 |
-
-## Memory 系统
-
-| 原版工具 | serena-rust 状态 | 备注 |
+| 上游工具 | 状态 | serena-rust |
 |---|---|---|
-| `list_memories` / `write_memory` / `read_memory` / `edit_memory` / `delete_memory`（5 个） | ❌ | DESIGN §非目标："不复刻 serena 的 agent 层（memories、prompts、tool 编排）"。如需 M5 范畴 |
+| GetSymbolsOverview | ✅ | `overview <file>` |
+| FindSymbol | ✅ | `find-symbol <query>`；`include_body` 拆为独立 `symbol-body`（position-free，Δ） |
+| FindReferencingSymbols | ✅ | `refs` / `find-referencing-symbols` |
+| FindImplementations | ✅ | `find-implementations` |
+| FindDeclaration | ✅ | `def` |
+| GetDiagnosticsForFile | ✅ | `diagnostics <file>` |
+| GetDiagnosticsForSymbol（optional） | ◐ | symbol-body 定位 + `diagnostics` 行范围组合 |
+| ReplaceSymbolBody | ✅ | `replace-body`（写门+hash 对账） |
+| InsertAfterSymbol / InsertBeforeSymbol | ✅ | `insert-text-after/before-symbol` |
+| RenameSymbol | ✅ | `rename-symbol`（prepareRename 前置+倒序 apply+写门） |
+| SafeDeleteSymbol | ✅ | `safe-delete-symbol`（写门+引用计数检查，M3 已落地） |
+| RestartLanguageServer | ◐ | `stop-all` + 懒重生等价；不单做子命令 |
 
-## 项目管理
+## file_tools（10）
 
-| 原版工具 | serena-rust 状态 | 备注 |
+| 上游工具 | 状态 | serena-rust |
 |---|---|---|
-| `activate_project` | ✅（部分） | `--project` flag 等价 |
-| `get_active_project` | ❌ | `status` 仅返回 daemon 态，无 active project |
-| `list_projects` | ❌ | |
-| `initial_project_setup` | ❌ | |
-| `check_onboarding_performed` | ❌ | |
+| ReadFile | ✅ | `read-file [start] [end]` |
+| ListDir | ✅ | `list-dir` |
+| FindFile | ✅ | `find-file <glob>`（限深 5） |
+| SearchForPattern | ✅ | `search [--path-glob] [--max-results]` |
+| CreateTextFile | 🔁 | agent 原生 write 覆盖（新文件无写门冲突面，不 CLI 化） |
+| ReplaceContent（文内 regex 替换） | ◐ | `replace-text-in-symbol` 只覆盖符号体内；**全文行级 regex 替换缺** |
+| DeleteLines / ReplaceLines / InsertAtLine | ✅ | `delete-lines` / `replace-lines` / `insert-at-line`（全文行级，走写门；M3 已落地） |
+| ReplaceInFiles（跨文件批量替换） | ◐ | `search --json` + agent 原生批量编辑组合；不单做 CLI |
 
-## 系统/调试
+## memory_tools（6）→ 🔁 全部原生文件替代
 
-| 原版工具 | serena-rust 状态 | 备注 |
+| 上游 | 状态 | 替代 |
 |---|---|---|
-| `execute_shell_command` | ❌ | **不应有**：agent 滥用风险，CLI 不实现 |
-| `think` | ❌ | **不应有** |
-| `prepare_for_new_conversation` | ❌ | 简易：清缓存 |
-| `switch_chat_model` | ❌ | **不应有**：CLI 不管 chat model |
+| Write/Read/List/Delete/Rename/Edit Memory | 🔁 | `.serena/memories/*.md` 纯文件；agent 用**自己的文件工具**直读直写，0 个 CLI 子命令。Rename 的 `mem:` 引用更新 = skill 一条纪律（改名时 grep 引用） |
+
+## workflow_tools（3）→ 🔁 全部 skill 文本替代
+
+| 上游 | 状态 | 替代 |
+|---|---|---|
+| InitialInstructions | 🔁 | **skill 文件本体**（CLI+skill 方案的核心替代物） |
+| Onboarding | 🔁 | skill 惯例：首见项目 → 写 `.serena/memories/project_overview.md` |
+| SerenaInfo | 🔁 | skill/README 按需读（同为 context-efficiency 设计） |
+
+## cmd/config/query/config 其余（7）
+
+| 上游 | 状态 | serena-rust |
+|---|---|---|
+| ExecuteShellCommand | ✅（形态不同） | `shell` JSONL 长连接（多命令共享 LS 热缓存；agent 亦可原生 shell） |
+| ActivateProject | ◐ | `--project` flag（等价单项目激活） |
+| GetCurrentConfig | ◐ | `status`（uptime/pid/loaded LS；缺 active project 名，M3 补） |
+| OpenDashboard | ✂ | 无 web dashboard |
+| RemoveProject | ✂ | 无项目注册表 |
+| ListQueryableProjects / QueryProject | ✂→🔁 | 跨项目 = 对另一目录直接跑 `serena-cli --project <dir>`，skill 一句话 |
+
+## Δ 我们多出（上游没有）
+
+`hover`、`symbol-body`（position-free 取体）、`find-referencing-code-snippets`（引用+上下文行）、`replace-text-in-symbol` / `delete-text-in-symbol`（符号体内行级切片）、daemon `--direct/--daemon/shell/mcp` 多形态。
+
+## 总账（39 工具）
+
+| 状态 | 数量 | 明细 |
+|---|---|---|
+| ✅ 直接等价 | **19** | overview/find-symbol/refs/find-impl/def/diagnostics/replace-body/insert×2/rename/**safe-delete**/read-file/list-dir/find-file/search/shell/**行级三件套×3** |
+| ◐ 部分等价 | **5** | diag-for-symbol、ReplaceContent、ReplaceInFiles、ActivateProject、GetCurrentConfig |
+| 🔁 用法替代 | **9** | memory×6 + workflow×3 |
+| ✂ 刻意不做 | **4** | dashboard/remove-project/query×2 |
+| ❌ 真缺口 | **2** | RestartLS 独立子命令（stop-all+懒重生已等价，刻意不单做）、GetCurrentConfig 补 active project |
+| 合计 | 39 | 复刻覆盖 = (19+5+9)/39 ≈ **85%**；剔除刻意不做 = 33/35 ≈ **94%** |
+
+**工具层编辑闭环已闭合**（safe-delete + 行级三件套 M3 落地）。剩余缺口全部下沉到 **SolidLSP 层**（ls-runtime/lsp-core/supervisor 深度），见下节与 `local/solidlsp-gap-matrix.md`。
 
 ---
 
-## 总计（去掉刻意不做的）
+## SolidLSP 层（ls-runtime / lsp-core / supervisor 深度，2026-09-15 审计）
 
-| 类别 | 应做 | 已实现 | 缺口 |
-|---|---|---|---|
-| 符号级 LSP | 13 | 13 | 0 |
-| 文件级 | 7 | 4 | 3（create_text_file / 整文件 edit_file / insert_at_line） |
-| 搜索 | 2 | 1 | 1（refs+pattern 组合） |
-| Memory | 5 | 0 | 5（DESIGN 非目标，未排期） |
-| 项目管理 | 5 | 1（partial） | 4 |
-| 系统/调试 | 5 | 0 | 0（4 个刻意不做） |
-| **应做小计** | **32** | **18** | **14** |
+工具层 74%→85% 只是 CLI 面；上游 `src/solidlsp/`（ls.py 3256 行 / 55 公开方法 / 73 适配器）对照本项目的**引擎层**缺口另行成账：
 
-**应做覆盖率约 56%**（Memory 与整文件操作缺口集中）。如剔除 Memory 与项目管理（DESIGN 排除），实质可达 **20/22 ≈ 91%**。
+- **悬空接线**：`completion` 在 CLI 透传名单 + 设计文档已定稿（`local/completion-design.md`），supervisor 无 `tool_completion` 分支——调用必失败，M3 最高优
+- **wrapper 缺口**：signature-help、containing-symbol、defining-symbol、跨文件 symbol-tree、诊断 generation、pull diagnostics
+- **基建缺口**：文档符号缓存（每次重跑 documentSymbol）、per-LS 索引等待（rename 30s 超时 / replace-body 就绪错位的根）、ignore spec、deps.rs sha256 假校验
+- **适配器深度**：7 个全 T0 浅壳（84-217 行 vs 上游 11-77KB）；73 适配器落地 7 个
+
+开发计划（Phase 0 稳定性 → Phase 1 接线 → Phase 2 wrapper → Phase 3 基建 → Phase 4 适配器）：**`local/solidlsp-development-plan.md`**（权威）；缺口矩阵：**`local/solidlsp-gap-matrix.md`**；上游 API 面：`local/solidlsp-upstream-api.md`。
 
 ---
 
-## M3 候选（按 ROI）
+## Token 高效适配设计（CLI+skill vs MCP——为何换用法）
 
-1. `safe_delete_symbol` — 写门 + 安全删除 ~100 行
-2. `create_text_file` + `insert_at_line` + `delete_lines`（行级） — 50 行各
-3. `find_referencing_symbols_with_pattern` — search + refs 组合 ~30 行
-4. `restart_language_server` — 30 行（甚至可省略，靠 supervisor 懒重启）
-5. `get_active_project` / `list_projects` — `status` / `daemon::list` ~50 行
+### 1. 常驻成本对比（大头）
 
-## 与上版的差异
+| | MCP（上游） | CLI+skill（我们） |
+|---|---|---|
+| 常驻 system prompt | 39 个 tool schema + docstring ≈ **6-15K token 常驻** | **0**（CLI 不进 prompt） |
+| 一次性加载 | — | skill 文件 ≤2K token |
+| 每次调用包装 | JSON-RPC tool call 往返 | 裸 stdout JSON |
+| 长会话 N 任务 | 常驻 × 全程 | skill 只付一次 |
 
-- **旧版**：把工具数混算（含 5 个故意不做的），覆盖率 16%
-- **新版**：按"应做 vs 不应做"拆分，去掉刻意不做的后真实缺口为 M3 候选的 5-7 个
+### 2. Skill 文件 = InitialInstructions 替代（写什么）
+
+黄金路径 8 命令覆盖 90% 场景，附 token 纪律：
+1. `overview <file>` 先看结构——**禁止整读文件**
+2. `find-symbol <query>` 定位
+3. `symbol-body <file> <symbol>` 按名取体（免 read 定位往返）
+4. `replace-body` / `replace-text-in-symbol` 改
+5. `refs` / `find-referencing-code-snippets` 验影响面
+6. `search` 跨文件
+7. `diagnostics` 收尾
+8. 失败读 `error.message` 即可，**不探索 --help**
+
+### 3. 用法替代原则：文件能力不 CLI 化
+
+- **Memory**：`.serena/memories/*.md` + agent 原生文件工具（写/读/列全免）——upstream 6 工具 = 我们 0 子命令，且无 JSON 包装 token
+- **CreateTextFile**：原生 write
+- **QueryProject**：换个 `--project` 目录再跑
+- **CLI 只留需要 LSP/写门语义的操作**（符号级读 + 编辑写门 + rename/safe-delete）
+
+### 4. 输出纪律（已就绪/低成本补）
+
+- 结构化 JSON 单行输出、`--max-results` 上限（search 已有）
+- 符号寻址（by name）代替行号寻址：省"先 read 找行号"的整个往返
+- `shell` JSONL 长连接：多次操作免重复进程 banner/LS 冷启动
+- daemon 常驻：LS 热缓存让 find/refs 毫秒级——"持续使用"的延迟底座
+
+### 5. 待做排期（v4 修订，2026-09-15）
+
+1. ~~SafeDelete~~ ✅ M3 落地（`safe-delete-symbol`）
+2. ~~行级三件套~~ ✅ M3 落地（`insert-at-line` / `replace-lines` / `delete-lines`）
+3. `status` 补 active project 名 ~10 行（→ solidlsp plan Phase 1.2）
+4. skill 文件（`serena-skill.md`，≤2K token）——纯文档
+5. RestartLS 独立子命令：不做（stop-all+懒重生已等价）
+6. **SolidLSP 层开发**（completion 接线 / wrapper 缺口 / 缓存与索引等待 / 适配器深度）→ `local/solidlsp-development-plan.md`
