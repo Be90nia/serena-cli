@@ -45,6 +45,11 @@ use thiserror::Error;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// workspace/symbol / background-index 长操作。clangd 首次索引大项目可能 >30s。
 const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 写类工具（rename / replace-body）入口的索引等待上限，与 on_server_ready 的 30s
+/// 对齐（PLAN Phase 3.2）。超时只 warn 不阻断 —— 工具自身请求负责最终报错。
+const INDEX_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 工具层错误（ARCH §6.1 supervisor thiserror 边界）。
 ///
 /// 变体与 wire contract 一一对应；调用方（CLI / daemon）按变体决定 exit code 或 HTTP body。
@@ -1255,6 +1260,26 @@ impl Supervisor {
         let path = root.join(file);
         let uri_str = path_to_uri_str(&path);
 
+        // 0) 索引等待（PLAN Phase 3.2）：cold-start 下 LS 未索引时 documentSymbol 会
+        //    给过期/错位 range —— replace-body 错位的根因。先 didOpen + documentSymbol
+        //    探针等就绪再进写门；探针超时只 warn 不阻断（回退契约同 on_server_ready）。
+        let _probe_open = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+        let adapter = ls_registry::adapter_for(lang.as_str()).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("unknown language: {lang}"),
+        })?;
+        if let Err(e) = tokio::time::timeout(
+            INDEX_WAIT_TIMEOUT,
+            adapter.wait_for_index(&session, &path, INDEX_WAIT_TIMEOUT),
+        )
+        .await
+        {
+            tracing::warn!(
+                adapter = adapter.id(),
+                error = %e,
+                "wait_for_index failed/timed out; continuing"
+            );
+        }
+
         // ===== 全局写门：以下所有步骤持锁（A4 FIFO）=====
         let _gate = write_gate::acquire().await;
 
@@ -1520,6 +1545,25 @@ impl Supervisor {
         let path = root.join(file);
         let uri_str = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        // 索引等待（PLAN Phase 3.2）：cold-start 下未索引的 LS 会让 prepareRename /
+        // rename 打满 TOOL_TIMEOUT —— 30s 超时的根因。探针就绪后才进写门；探针超时
+        // 只 warn 不阻断（回退契约同 on_server_ready）。
+        let adapter = ls_registry::adapter_for(lang.as_str()).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("unknown language: {lang}"),
+        })?;
+        if let Err(e) = tokio::time::timeout(
+            INDEX_WAIT_TIMEOUT,
+            adapter.wait_for_index(&session, &path, INDEX_WAIT_TIMEOUT),
+        )
+        .await
+        {
+            tracing::warn!(
+                adapter = adapter.id(),
+                error = %e,
+                "wait_for_index failed/timed out; continuing"
+            );
+        }
 
         let _gate = write_gate::acquire().await;
 

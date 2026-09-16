@@ -4,8 +4,9 @@
 //!
 //! ## trait `LanguageServerAdapter`（ARCHITECTURE §4.1 定稿）
 //!
-//! 8 个方法：id / languages / launch_info(async) / initialize_patches /
-//! set_project_root / on_server_ready / request_hooks / supports_implementation。
+//! 9 个方法：id / languages / launch_info(async) / initialize_patches /
+//! set_project_root / on_server_ready / wait_for_index / request_hooks /
+//! supports_implementation。
 //! `launch_info` 改 async 是 ARCH 相对 DESIGN §4 草稿的修订（A2）—— 慢 IO 探测
 //! 不再强迫调用方起 `spawn_blocking`。
 //!
@@ -18,6 +19,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lsp_types::InitializeParams;
@@ -114,6 +116,9 @@ const PROBE_CANDIDATES: &[&str] = &[
     "go.mod",
 ];
 
+/// `wait_for_index` 默认实现探针的重试间隔。
+const RETRY_PAUSE: Duration = Duration::from_millis(250);
+
 /// root 下选就绪探针 URI：优先真实存在的小文件 —— 虚拟 URI 不会触发 LS 的项目
 /// lazy-load，首个真实工具请求就得独自承担全量索引（cold-start hang 根因，见
 /// local/cold-start-hang-diagnosis.md）。root 未设置 / 无候选文件时退 `fallback`
@@ -130,8 +135,9 @@ pub(crate) fn probe_uri_for_root(root: &Path, fallback: &str) -> String {
 
 /// 适配器 trait 签名（ARCHITECTURE §4.1 完整定稿）。
 ///
-/// 八个方法 —— 任何 `T0`（配置驱动）或 `T2`（手写）实现都覆盖。`set_project_root` /
-/// `on_server_ready` / `supports_implementation` 给默认实现，让 T0 模板零代码可用。
+/// 九个方法 —— 任何 `T0`（配置驱动）或 `T2`（手写）实现都覆盖。`set_project_root` /
+/// `on_server_ready` / `wait_for_index` / `supports_implementation` 给默认实现，
+/// 让 T0 模板零代码可用。
 #[async_trait]
 pub trait LanguageServerAdapter: Send + Sync {
     /// 稳定标识（"clangd" / "rust-analyzer" / ...），对应 `servers.toml` 的 key 与
@@ -159,6 +165,44 @@ pub trait LanguageServerAdapter: Send + Sync {
     /// ↖ mirror: ls.py@43ae021 `on_server_started` / `start` 中的子类等待逻辑。
     async fn on_server_ready(&self, _session: &lsp_core::session::Session) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// 写类工具（rename / replace-body）入口的索引等待（PLAN Phase 3.2）。
+    ///
+    /// 默认实现：对被操作文件 `file` 反复发 `textDocument/documentSymbol` 探针，直到
+    /// LS 应答或 `timeout` 耗尽；未确认就绪也返回 `Ok` —— 失败回退与 `on_server_ready`
+    /// 一致（放行，工具自身请求负责最终报错）。探针必须打在目标文件上：`on_server_ready`
+    /// 的根探针（.gitignore/README）不保证该文件符号数据已就绪 —— cold-start 下 rename
+    /// 命中 TOOL_TIMEOUT / replace-body 拿到错位 range 的对症点。
+    ///
+    /// ↖ mirror: ls.py@43ae021 `request_rename` / `replace_text_in_symbol`（上游无此
+    /// 等待，索引未就绪时失败或超时）。
+    async fn wait_for_index(
+        &self,
+        session: &lsp_core::session::Session,
+        file: &Path,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let uri = lsp_core::docsync::path_to_uri_str(file);
+        let params = serde_json::json!({ "textDocument": { "uri": uri } });
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(()); // 未确认就绪也放行 —— 回退契约同 on_server_ready
+            }
+            match session
+                .request::<serde_json::Value>(
+                    "textDocument/documentSymbol",
+                    params.clone(),
+                    remaining,
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(_) => tokio::time::sleep(RETRY_PAUSE).await,
+            }
+        }
     }
 
     /// 记录当前项目 root，供 `on_server_ready` 选真实文件探针（触发 LS 项目索引）。
@@ -301,6 +345,98 @@ mod tests {
     fn default_set_project_root_is_noop() {
         // 默认空实现可调用 —— 现有/未来不覆盖 set_project_root 的 adapter 不破坏。
         DummyAdapter.set_project_root(Path::new("D:/anywhere"));
+    }
+
+    // === wait_for_index 默认实现（SERENA_REPLAY 手写 JSONL 驱动，不依赖外部进程）===
+    //
+    // env 是进程全局的：两个用例共用一把 tokio Mutex 串行化，防止互相污染。
+
+    static REPLAY_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// 手写回放文件：只含 initialize 应答。documentSymbol 响应不排队 —— replay 泵
+    /// 启动即排空入站队列，先到的帧会因请求尚未 pending 而被丢弃；happy path 用例
+    /// 改经 `Client::handle_message` 延迟注入。
+    fn write_replay(dir: &Path) -> PathBuf {
+        let lines = [
+            r#"--> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"<-- {"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#,
+        ];
+        let path = dir.join("replay.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    }
+
+    async fn boot_replay_session(replay: &Path) -> std::sync::Arc<lsp_core::session::Session> {
+        // SAFETY: REPLAY_ENV 保证本进程内独占访问 SERENA_REPLAY。
+        unsafe { std::env::set_var("SERENA_REPLAY", replay) };
+        let session = lsp_core::session::Session::start(
+            None,
+            lsp_core::init_params::base_initialize_params(),
+        )
+        .await
+        .expect("replay session Ready");
+        // SAFETY: 同上 —— 用完即清，不污染同进程其他用例。
+        unsafe { std::env::remove_var("SERENA_REPLAY") };
+        session
+    }
+
+    #[tokio::test]
+    async fn default_wait_for_index_returns_once_ls_answers_document_symbol() {
+        let _env = REPLAY_ENV.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = boot_replay_session(&write_replay(dir.path())).await;
+        let file = dir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        // 假 LS：200ms 后补投 documentSymbol 响应（id 2 —— client next_id 从 1 起，
+        // initialize 占 1）。handle_message 与真泵同一条分发路径。
+        let fake_ls = {
+            let client = session.client().clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                client.handle_message(lsp_core::framing::JsonRpc::response_ok(
+                    serde_json::Value::Number(2.into()),
+                    serde_json::json!([]),
+                ));
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let res = DummyAdapter
+            .wait_for_index(&session, &file, Duration::from_secs(5))
+            .await;
+        assert!(res.is_ok(), "LS 已应答 documentSymbol → Ok");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "响应注入后探针应立即成功，实际 {:?}",
+            started.elapsed()
+        );
+        fake_ls.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_wait_for_index_gives_up_after_deadline_still_ok() {
+        let _env = REPLAY_ENV.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        // documentSymbol 永远无回执（= LS 一直索引中）。
+        let session = boot_replay_session(&write_replay(dir.path())).await;
+        let file = dir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let started = std::time::Instant::now();
+        // 外层 5s 护栏：默认实现必须在 deadline（600ms）附近返回，不允许挂死。
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            DummyAdapter.wait_for_index(&session, &file, Duration::from_millis(600)),
+        )
+        .await
+        .expect("deadline 后必须返回");
+        assert!(res.is_ok(), "超时也放行 —— 回退契约同 on_server_ready");
+        assert!(
+            started.elapsed() >= Duration::from_millis(550),
+            "应熬满 deadline 而非立即返回，实际 {:?}",
+            started.elapsed()
+        );
     }
 }
 
