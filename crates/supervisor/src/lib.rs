@@ -470,6 +470,36 @@ impl Supervisor {
 
         Ok(flatten_symbols(resp, &uri))
     }
+    /// `textDocument/documentSymbol` → 在树中按 (line, col) 反查最深包含符号 → `Vec<SymbolHit>`。
+    ///
+    /// Phase 2.1（local/solidlsp-development-plan.md §2.1）：位置已知，从 grep/搜索结果直接
+    /// 跳进符号工作流，无需按名字再扫一遍。无命中时返空数组（区别于 `tool_def` 的 BadArgs——
+    /// 「位置无覆盖"是合法的"）。
+    ///
+    /// 与 `tool_overview` 一样走 `DocumentSymbolResponse`，不引入新 LSP method：
+    /// 上游 `request_containing_symbol` 用 `request_symbol_at_location`（走位置查符号），
+    /// 我们用 documentSymbol walk 实现等价语义（ARCH §6.x Δ 标注）。
+    pub async fn tool_containing_symbol(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<SymbolHit>> {
+        let lang_str = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, &lang_str).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({ "textDocument": { "uri": uri.clone() } });
+        let resp: DocumentSymbolResponse = session
+            .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
+            .await?;
+
+        Ok(collect_containing_hits(&resp, &uri, line, col))
+    }
 
     /// `workspace/symbol` → 全 workspace 跨文件符号查找（Task 20）。
     ///
@@ -1657,6 +1687,85 @@ fn push_nested(
         }
     }
 }
+
+/// 按 (line, col) 在 `DocumentSymbolResponse` 树中反查所有包含该位置的符号（Phase 2.1）。
+///
+/// 规则：位置在符号的 [start.line, end.line] 闭区间内；
+/// - `line == start.line` 时 `col >= start.character`；
+/// - `line == end.line`   时 `col <= end.character`；
+/// - 中间行默认命中（不查 col，LSP 自身规范）。
+///
+/// 返回从最外层到最深命中的 `SymbolHit` 链（所有命中的祖先）。无命中返空 Vec。
+/// Nested 形态递归 `children`；Flat 形态只按顶层项判断（mock_ls 路径）。
+fn collect_containing_hits(
+    resp: &DocumentSymbolResponse,
+    file_uri: &str,
+    line: u32,
+    col: u32,
+) -> Vec<SymbolHit> {
+    fn walk(
+        items: &[DocumentSymbol],
+        file_uri: &str,
+        line: u32,
+        col: u32,
+        container: Option<&str>,
+        out: &mut Vec<SymbolHit>,
+    ) {
+        for it in items {
+            if position_in_range(it.range, line, col) {
+                out.push(SymbolHit {
+                    name: it.name.clone(),
+                    kind: kind_from_lsp(&it.kind),
+                    uri: file_uri.to_owned(),
+                    range: it.range,
+                    container: container.map(str::to_owned),
+                });
+                if let Some(children) = it.children.as_ref() {
+                    walk(children, file_uri, line, col, Some(&it.name), out);
+                }
+            } else if let Some(children) = it.children.as_ref() {
+                // 父节点不命中但子节点仍可能命中（罕见：嵌套树里父 range 比子 range 大）。
+                walk(children, file_uri, line, col, container, out);
+            }
+        }
+    }
+
+    match resp {
+        DocumentSymbolResponse::Nested(items) => {
+            let mut out = Vec::new();
+            walk(items, file_uri, line, col, None, &mut out);
+            out
+        }
+        DocumentSymbolResponse::Flat(items) => {
+            // Flat：每项自带 location & container_name；无层级。
+            items
+                .iter()
+                .filter(|it| position_in_range(it.location.range, line, col))
+                .map(|it| SymbolHit {
+                    name: it.name.clone(),
+                    kind: kind_from_lsp(&it.kind),
+                    uri: it.location.uri.to_string(),
+                    range: it.location.range,
+                    container: it.container_name.clone(),
+                })
+                .collect()
+        }
+    }
+}
+
+/// `line/col` 是否落在 `range` 闭区间内（见 collect_containing_hits 注释）。
+fn position_in_range(r: lsp_types::Range, line: u32, col: u32) -> bool {
+    if line < r.start.line || line > r.end.line {
+        return false;
+    }
+    if line == r.start.line && col < r.start.character {
+        return false;
+    }
+    if line == r.end.line && col > r.end.character {
+        return false;
+    }
+    true
+}
 /// `lsp_types::SymbolKind.0` is private. Round-trip via JSON: `SymbolKind` is
 /// `#[serde(transparent)]` over `i32`, so deserializing into i32 yields the wire number.
 fn kind_from_lsp(k: &lsp_types::SymbolKind) -> SymbolKindTag {
@@ -1863,6 +1972,15 @@ impl SupervisorTrait for Supervisor {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(self.tool_def(root, &file, line, col, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
+            }
+
+            "containing-symbol" => {
+                let (file, line, col) = required_position(&args)?;
+                serde_json::to_value(
+                    self.tool_containing_symbol(root, &file, line, col, lang)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
             }
             "refs" => {
                 let (file, line, col) = required_position(&args)?;
@@ -2567,5 +2685,145 @@ mod completion_tests {
         assert_eq!(extract_doc_string(&m).as_deref(), Some("**bold**"));
         let none = serde_json::json!(null);
         assert_eq!(extract_doc_string(&none), None);
+    }
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod containing_symbol_tests {
+
+    //! Phase 2.1: 按位置反查符号（documentSymbol walk 路径）。
+    //!
+    //! 不拉起 LS，直接喂 `DocumentSymbolResponse` 验核心规则：
+    //! - 位置 [start.line, end.line] 闭区间 + 行内 col 边界。
+    //! - 嵌套取最深命中链。
+    //! - 无命中返空 Vec（不是 BadArgs）。
+    use super::*;
+
+    fn range(sl: u32, sc: u32, el: u32, ec: u32) -> lsp_types::Range {
+        lsp_types::Range {
+            start: Position::new(sl, sc),
+            end: Position::new(el, ec),
+        }
+    }
+
+    /// 构造一棵嵌套符号树：mod 外层 → fn 内层。
+    fn nested_two_level() -> DocumentSymbolResponse {
+        // outer: mod add @ line 0-10
+        // inner: fn call @ line 4-5
+        let outer = DocumentSymbol {
+            name: "outer".into(),
+            detail: None,
+            kind: lsp_types::SymbolKind::MODULE,
+            tags: None,
+            range: range(0, 0, 10, 0),
+            selection_range: range(0, 4, 0, 9),
+            children: Some(vec![DocumentSymbol {
+                name: "inner".into(),
+                detail: None,
+                kind: lsp_types::SymbolKind::FUNCTION,
+                tags: None,
+                range: range(4, 0, 5, 1),
+                selection_range: range(4, 3, 4, 8),
+                children: None,
+                deprecated: None,
+            }]),
+            deprecated: None,
+        };
+        DocumentSymbolResponse::Nested(vec![outer])
+    }
+
+    /// 单层（仅 module）：验 col 在起始/结束行的边界。
+    fn single_module() -> DocumentSymbolResponse {
+        let mod_ = DocumentSymbol {
+            name: "outer".into(),
+            detail: None,
+            kind: lsp_types::SymbolKind::MODULE,
+            tags: None,
+            range: range(0, 0, 10, 5),
+            selection_range: range(0, 4, 0, 9),
+            children: None,
+            deprecated: None,
+        };
+        DocumentSymbolResponse::Nested(vec![mod_])
+    }
+
+    #[test]
+    fn position_in_range_respects_col_at_start_and_end_lines() {
+        // range = line 4 col 5 .. line 6 col 10
+        let r = range(4, 5, 6, 10);
+        // 中间行：col 无所谓。
+        assert!(position_in_range(r, 5, 0));
+        assert!(position_in_range(r, 5, 100));
+        // 起始行：col < start.character 越界。
+        assert!(!position_in_range(r, 4, 4));
+        assert!(position_in_range(r, 4, 5));
+        assert!(position_in_range(r, 4, 99));
+        // 结束行：col > end.character 越界。
+        assert!(position_in_range(r, 6, 10));
+        assert!(!position_in_range(r, 6, 11));
+        // 行号 < start 或 > end 直接越界。
+        assert!(!position_in_range(r, 3, 0));
+        assert!(!position_in_range(r, 7, 0));
+    }
+
+    #[test]
+    fn deepest_match_wins_inside_nested_function_body() {
+        let resp = nested_two_level();
+        // inner @ 4-5；位置 line=4 col=10 落在 inner 内（且在 outer 内）。
+        let hits = collect_containing_hits(&resp, "file://x", 4, 10);
+        assert_eq!(hits.len(), 2, "expected outer+inner chain, got {hits:?}");
+        assert_eq!(hits[0].name, "outer");
+        assert_eq!(hits[0].container, None);
+        assert_eq!(hits[1].name, "inner");
+        assert_eq!(hits[1].container.as_deref(), Some("outer"));
+    }
+
+    #[test]
+    fn position_outside_any_symbol_returns_empty() {
+        let resp = single_module();
+        // outer @ line 0-10；line=20 越过 end.line。
+        let hits = collect_containing_hits(&resp, "file://x", 20, 0);
+        assert!(hits.is_empty(), "expected empty, got {hits:?}");
+    }
+
+    #[test]
+    fn position_at_first_char_of_first_line_hits_only_outer() {
+        let resp = nested_two_level();
+        // outer @ 0-10；inner @ 4-5；line=0 落在 outer（不在 inner）。
+        let hits = collect_containing_hits(&resp, "file://x", 0, 0);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "outer");
+    }
+
+    #[test]
+    fn flat_response_skips_unmatched_and_returns_only_hits() {
+        // flat: foo (l 0-2) + bar (l 5-8)；line=6 在 bar 内。
+        let foo = lsp_types::SymbolInformation {
+            name: "foo".into(),
+            kind: lsp_types::SymbolKind::FUNCTION,
+            tags: None,
+            deprecated: None,
+            location: lsp_types::Location {
+                uri: "file://x".parse().unwrap(),
+                range: range(0, 0, 2, 0),
+            },
+            container_name: None,
+        };
+        let bar = lsp_types::SymbolInformation {
+            name: "bar".into(),
+            kind: lsp_types::SymbolKind::FUNCTION,
+            tags: None,
+            deprecated: None,
+            location: lsp_types::Location {
+                uri: "file://x".parse().unwrap(),
+                range: range(5, 0, 8, 0),
+            },
+            container_name: None,
+        };
+        let resp = DocumentSymbolResponse::Flat(vec![foo, bar]);
+        let hits = collect_containing_hits(&resp, "file://x", 6, 0);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "bar");
     }
 }

@@ -211,6 +211,8 @@ enum Cmd {
         #[arg(long)]
         trigger: Option<String>,
     },
+    /// 按位置反查最深层包含符号（documentSymbol walk）。无命中返空数组（合法）。
+    ContainingSymbol { file: String, line: u32, col: u32 },
     /// daemon 状态（uptime / pid / loaded LS）。
     Status,
     /// 停掉 daemon（draining + 删 lock）。
@@ -622,6 +624,14 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
                 }),
             )
         }
+        Some(Cmd::ContainingSymbol { file, line, col }) => (
+            "containing-symbol",
+            json!({
+                "file": file,
+                "line": line,
+                "col": col,
+            }),
+        ),
         Some(Cmd::Status) | Some(Cmd::StopAll) | Some(Cmd::Shell) | None => {
             unreachable!("handled earlier")
         }
@@ -862,6 +872,7 @@ async fn dispatch_shell_cmd(
         | "diagnostics"
         | "def"
         | "refs"
+        | "containing-symbol"
         | "symbol-body"
         | "replace-body"
         | "completion"
