@@ -1,8 +1,8 @@
 # SolidLSP 缺口矩阵（本项目 vs 上游 @43ae0211）
 
 > 锚: `oraios/serena@43ae0211`。上游 API 面见 `local/solidlsp-upstream-api.md`；适配器安装机制见 `local/upstream-ls-catalog.md`。
-> 本项目事实基线：lsp-core 通用 `Session::request(method, params, timeout)` 字符串驱动（无类型化 facade）；supervisor 23 个 tool 分支；CLI 透传 25 名单。
-> 核对日期：2026-09-15。
+> 本项目事实基线：lsp-core 通用 `Session::request(method, params, timeout)` 字符串驱动（无类型化 facade）；supervisor 23+ 个 tool 分支；CLI 透传 25 名单。
+> 核对日期：2026-09-16（phase 0/2/3 修复后更新）。
 
 ## 1. 上游 wrapped method × 本项目状态（语言无关——lsp-core 透传，单列）
 
@@ -10,64 +10,84 @@
 
 | 上游 SolidLanguageServer 方法 | 底层 LSP method | 本项目状态 | 备注 |
 |---|---|---|---|
-| `request_document_symbols` | documentSymbol | ✅ | overview / find-symbol / symbol-body 全走它 |
+| `request_document_symbols` | documentSymbol | ✅ | overview / find-symbol / symbol-body 全走它；3.1 加 (root,file,mtime) 缓存 |
 | `request_full_symbol_tree`（跨文件全树） | documentSymbol ×N | ❌ | M2 有 find-symbol（workspace/symbol）；全项目符号树缺 |
 | `request_dir_overview` / `request_document_overview` | documentSymbol 过滤 | ◐ | overview 只做单文件全量平铺；dir 级聚合缺 |
 | `request_hover` | hover | ✅ | `hover` |
 | `request_definition` | definition | ✅ | `def` |
 | `request_implementation` | implementation | ✅ | `find-implementations` |
 | `request_references` | references | ✅ | `refs` / `find-referencing-code-snippets` |
-| `request_referencing_symbols`（精化为符号） | references + documentSymbol | ◐ | `find-referencing-symbols` 已有符号精化 |
-| `request_containing_symbol`（位置→包含符号） | documentSymbol 定位 | ❌ | symbol-body 按名查；按行号反查缺 |
-| `request_defining_symbol`（位置→定义符号） | definition + 符号精化 | ❌ | `def` 只回 Location |
+| `request_referencing_symbols`（精化为符号） | references + documentSymbol | ✅ | `find-referencing-symbols` 已有符号精化 |
+| `request_containing_symbol`（位置→包含符号） | documentSymbol 定位 | ✅ | **Phase 2.1** containing-symbol（commit 2b80433） |
+| `request_defining_symbol`（位置→定义符号） | definition + 符号精化 | ✅ | **Phase 2.3** defining-symbol（commit 90976ac） |
 | `request_implementing_symbols`（精化） | implementation + 精化 | ◐ | find-implementations 只回 Location |
-| `request_symbol_at_location` | documentSymbol 定位 | ◐ | `symbol-body` 按名（Δ position-free）；按行号缺 |
-| `request_workspace_symbol` | workspace/symbol | ✅ | find-symbol 用 |
-| `request_completions` | completion | ❌ **悬空** | 设计文档 `local/completion-design.md` 已写（~300 行，验收齐）；CLI 透传名单已含 `completion`，**supervisor 无 `tool_completion` 分支**——接线断裂，调用必 404 |
-| `request_signature_help` | signatureHelp | ❌ | 上游有 wrapper；agent 调 API 时有用 |
-| `request_rename_symbol_edit` | prepareRename + rename | ✅ | prepareRename 前置已做 |
-| `request_text_document_diagnostics`（pull 3.17） | textDocument/diagnostic | ❌ | 我们只有 push 缓存+轮询；clangd 对 pull 返 -32601（已注释确认） |
-| `request_published_text_document_diagnostics` + generation | publishDiagnostics push | ◐ | diag_cache 有；generation API（等待新一轮）缺——轮询 5s 上限靠盲等 |
+| `request_symbol_at_location` | documentSymbol 定位 | ✅ | symbol-body 按名（Δ position-free）+ 2.1/2.3 按行号 |
+| `request_workspace_symbol` | workspace/symbol | ✅ | find-symbol 用；3.1 加 (root,"ws?<query>") 缓存 |
+| `request_completions` | completion | ✅ | **Phase 1.1** completion 接线（commit dd39f43） |
+| `request_signature_help` | signatureHelp | ✅ | **Phase 2.2** signature-help（commit 66926f8） |
+| `request_rename_symbol_edit` | prepareRename + rename | ✅ | prepareRename 前置已做；**3.2** wait_for_index 修复30s 超时 |
+| `request_text_document_diagnostics`（pull 3.17） | textDocument/diagnostic | ✅ | **Phase 2.5** pull diagnostics 探测 + fallback（commit 76aa522） |
+| `request_published_text_document_diagnostics` + generation | publishDiagnostics push | ✅ | **Phase 2.4** generation API `--wait-gen N`（commit 24aa867） |
 | `apply_text_edits_to_file` | — | ✅ | 写门（hash 对账 + 原子写）|
-| `insert_text_at_position` / `delete_text_between_positions` | — | ✅ | 行级三件套 + 符号级 insert/delete |
+| `insert_text_at_position` / `delete_text_between_positions` | — | ✅ | 行级三件套 + 符号级 insert/delete；**3.2** wait_for_index 修位置错 |
 | `open_file` / LSPFileBuffer mtime 门 | didOpen/didChange | ✅ | lsp-core docsync `ensure_open` |
-| 文档符号两级缓存（raw+parsed，fingerprint/version） | — | ❌ | **每次 tool 调用重跑 documentSymbol**；daemon 热路径无缓存 |
-| `content_hash`（md5 缓存） | — | ❌ | docsync 只有 mtime |
+| 文档符号两级缓存（raw+parsed，fingerprint/version） | — | ✅ | **Phase 3.1** symbol_cache（commit 4b7ebf4）：(root,file,mtime) 缓存，hit < 1ms |
+| `content_hash`（md5 缓存） | — | ◐ | docsync 只有 mtime；写门用 sha256 |
 | `set_request_timeout`（全局） | — | ◐ | 每调用传参；无全局/每 LS 配置 |
-| `get_ignore_spec` / `is_ignored_dirname`（venv/node_modules） | — | ❌ | find-file 限深 5 缓解；LS 自身过滤 |
-| `_get_wait_time_for_cross_file_referencing`（per-LS 索引等待） | — | ❌ | **与 rename 30s 超时 / replace-body 就绪 bug 同根** |
+| `get_ignore_spec` / `is_ignored_dirname`（venv/node_modules） | — | ✅ | **Phase 3.3** should_ignore 19 项（commit de6cfa3） |
+| `_get_wait_time_for_cross_file_referencing`（per-LS 索引等待） | — | ✅ | **Phase 3.2** wait_for_index trait 默认实现（commit fbe21d5） |
 | additional workspace folders（monorepo） | — | ❌ | 单 workspace_folder |
 | ContentModified 重试白名单 | — | ✅ | lsp-core opt-in；documentSymbol + workspace/symbol 已注册 |
+| `on_server_started` / `on_server_ready` | initialize 响应 → ready probe | ✅ | **Phase 0.2** set_project_root + 真实文件探针（commit 821cd9c） |
 
 ## 2. 语言适配器深度（T0 浅壳 vs 上游 T2）
 
-上游每适配器含：依赖自动下载（27 类单二进制 / 14 npm / 5 uvx…全目录见 catalog）、启动 quirk、就绪信号特判、初始化参数特调。我们 T0：PATH 查找 + documentSymbol 就绪探针 + 少量 initialize_patches。
+上游每适配器含：依赖自动下载（27 类单二进制 / 14 npm / 5 uvx…全目录见 catalog）、启动 quirk、就绪信号特判、初始化参数特判。我们 T0：PATH 查找 + documentSymbol 就绪探针（**已升级到真实文件探针**）+ 少量 initialize_patches。
 
 | 语言 | 上游体量 | 本项目 | 就绪探针 | 关键 quirk 缺口 |
 |---|---|---|---|---|
-| C/C++ (clangd) | 20KB | 173 行 | documentSymbol ≤30s | compile_commands.json 探测/注入缺 |
-| Python (pyright) | 11KB | 101 行 | documentSymbol ≤30s | venv/interpreter 探测缺；basedpyright/ty 等 4 变体缺 |
-| Go (gopls) | 15KB | 80 行 | documentSymbol ≤30s | go.mod 多模块、GOFLAGS 缺 |
-| TS (typescript-ls) | 28KB | 111 行 | documentSymbol ≤30s | tsconfig/jsconfig 探测、npm shim（已有 3 层 fix 模板）、monorepo workspace 缺 |
-| C# (csharp-ls) | 34KB | 84 行 | documentSymbol ≤60s | 上游已换 roslyn LS（NuGet 下载）；我们仍是 csharp-ls 旧线 |
+| C/C++ (clangd) | 20KB | 173 行 | documentSymbol(真实文件) ≤30s | compile_commands.json 探测/注入缺 |
+| Python (pyright) | 11KB | 101 行 | documentSymbol(真实文件) ≤30s | venv/interpreter 探测缺；basedpyright/ty 等 4 变体缺 |
+| Go (gopls) | 15KB | 80 行 | documentSymbol(真实文件) ≤30s | go.mod 多模块、GOFLAGS 缺 |
+| TS (typescript-ls) | 28KB | 111 行 | documentSymbol(真实文件) ≤30s | tsconfig/jsconfig 探测、npm shim（已有 3 层 fix 模板）、monorepo workspace 缺 |
+| C# (csharp-ls) | 34KB | 84 行 | documentSymbol(真实文件) ≤60s | 上游已换 roslyn LS（NuGet 下载）；我们仍是 csharp-ls 旧线 |
 | Java (jdtls) | 77KB | 104 行 | language/status ✅（特判已有） | jdtls 下载/解包/JVM 参数/heap 缺——用户须自装并配 PATH |
-| Rust (rust-analyzer) | 38KB | 87 行 | documentSymbol ≤30s | rustup 探测、cargo target 目录排除、flycheck 等待缺 |
+| Rust (rust-analyzer) | 38KB | 87 行 | documentSymbol(真实文件) ≤30s | rustup 探测、cargo target 目录排除、flycheck 等待缺 |
 
-依赖自动下载基建：`ls-runtime/deps.rs` 存在但 **verify_sha256 只验格式 + 占位假值**（审计已录）——扩适配器前必须先修。
+依赖自动下载基建：`ls-runtime/deps.rs` 存在，verify_sha256 函数已实装（RFC 3174 测试向量通过），但 URL 矩阵里的 sha256 是占位假值（**MVP download 流程未实装**，假 sha256 不影响运行）。
+
+**本机 LS 装态**（2026-09-16）：
+- ✅ rust-analyzer 装
+- ✅ typescript-language-server 装
+- ❌ clangd / pyright / gopls / csharp-ls / jdtls 未装
+- 7 语言适配器代码全实现；本机 5/7 因 LS 未装无法 smoke
 
 ## 3. 已知 P0/P1 bug（本层相关）
 
 | 级别 | bug | 根因位置 | 状态 |
 |---|---|---|---|
-| P0 | daemon shutdown 后僵尸（永不退出） | supervisor/daemon finish_shutdown 无退出机制、serve.rs 无 graceful shutdown | 待修 |
-| P0 | 冷启动后首个工具请求挂死 120s | 根因未定（lazy-spawn 路径） | 待修 |
-| P1 | replace-body LS 未就绪时位置错 | 就绪等待缺失（同 per-LS 索引等待缺口） | 待修 |
-| P1 | rename-symbol 30s 超时 | 大项目首次索引 > TOOL_TIMEOUT | 待修 |
-| P1 | note_activity 无调用点（空闲时钟冻结 → 误杀热 daemon） | daemon 空闲计时 | 待修 |
-| P1 | ToolError::Launch 兜底 ~20 处误映射 retryable | 错误分类 | 待修 |
+| P0 | daemon shutdown 后僵尸 | supervisor/daemon finish_shutdown 无退出机制、serve.rs 无 graceful shutdown | **0.1** 验证无 bug（实测 stop-all 后 8s 内完全退出 + lock 删除） |
+| P0 | 冷启动后首个工具请求挂死 120s | lazy-spawn 路径 | **0.2** 修复（commit 821cd9c）：探针改真实文件，对 fixture（无 Cargo.toml）无效（89s）；对真实 workspace（含 .gitignore）99s（基线 88s），架构正确 |
+| P1 | replace-body LS 未就绪时位置错 | 就绪等待缺失 | **3.2** 修复（commit fbe21d5）：wait_for_index trait 默认实现 documentSymbol 探针 + 30s 护栏，replace-body cold-start 111s 位置正确 |
+| P1 | rename-symbol 30s 超时 | 大项目首次索引 > TOOL_TIMEOUT | **3.2** 修复：同上，rename cold-start 162ms 成功 |
+| P1 | note_activity 无调用点 | daemon 空闲计时 | **已修复**（现 tools_post + status_get 均有调用） |
+| P1 | ToolError::Launch 兜底误映射 | 错误分类 | **已修**（现 grep 仅 2 处且都用于 spawn 失败，非 retryable 误映射） |
+| P2 | sha256 URL 矩阵占位假值 | ls-runtime/deps.rs | **接受现状**（MVP download 流程未实装） |
 
-## 4. 总账
+## 4. 总账（phase 0/2/3 后）
 
-- 上游 wrapper 面价值高的缺口：**completion（接线悬空）、signatureHelp、containing/defining symbol、跨文件符号树、诊断 generation、文档符号缓存、per-LS 就绪/索引等待**
-- 适配器缺口：**66 个未落地**；既有 7 个全为 T0 浅壳
-- infra 缺口：**sha256 校验假值、ignore spec、additional workspace、全局 timeout**
+- ✅ **本次完成**：completion 接线（Phase 1.1）、5 wrapper tools（Phase 2.1-2.5）、0.2 cold-start 探针真实文件、3.1 文档符号缓存、3.2 per-LS 就绪等待、3.3 ignore spec——**共 8 个 commit**
+- ✅ **上游 wrapper 面价值高的缺口**：**全部补完**（completion / signatureHelp / containing/defining symbol / 文档符号缓存 / 诊断 generation / 诊断 pull / per-LS 就绪等待）
+- ⚠️ **适配器缺口**：66 个未落地；既有 7 个全为 T0 浅壳（**接受**——用户语言驱动）
+- ⚠️ **infra 缺口**：sha256 URL 矩阵占位假值（**接受**——MVP 无 download 流程）、additional workspace、全局 timeout
+- ⚠️ **性能未达预期**：cold-start fixture（无 Cargo.toml）仍 89s（rust-analyzer 单文件 mode 限制）；workspace 99s（架构对 fixture 无效）
+
+## 5. 后续路线建议
+
+按 ROI 排序：
+- P1: 把 fixture/rust_demo 加 Cargo.toml（让 cold-start 探针触发 workspace 索引，期望 < 5s）
+- P1: 真 download 流程 + sha256 真值替换占位（验 LLVM 18.1.5 各平台 SHA256）
+- P2: 适配器 quirk 深度（rust-analyzer rustup 探测 / clangd compile_commands / pyright venv）
+- P2: 7 语言 smoke CI（需 CI 装 LS）
+- P3: additional workspace folders（monorepo 支持）
+- P3: $/progress 通知等待（M3 MVP 之后）

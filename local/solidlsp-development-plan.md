@@ -94,3 +94,43 @@ Phase 0.5 ──→ Phase 4.6；Phase 4.1-4.5/4.7 各自独立
 | 2.5 全树在无缓存时超时 | 硬依赖 3.1；`--max-files` 保险丝（默认 200） |
 | Phase 4 各 LS 版本漂移 | quirk 注释 ↖ mirror@43ae021 锚死；版本 pin 沿用 npm shim 模板 |
 | jdtls 下载量大（~100MB）+ JVM 版本敏感 | 4.6 放最后；失败路径明确报 LS_NOT_INSTALLED + 安装指引 |
+
+
+## Phase 5 · 实际完成情况（2026-09-16 端到端落地）
+
+**SolidLSP 根基加固 8 commit**（branch: feature/solidlsp-phase0-1）：
+
+| commit | 内容 | 关键指标 |
+|---|---|---|
+| 2b80433 | Phase 2.1 containing-symbol | 5 单测 + 真实 CLI smoke |
+| 66926f8 | Phase 2.2 signature-help | 3 单测 + 真实 CLI smoke（add(int a, int b)） |
+| 90976ac | Phase 2.3 defining-symbol | 4 e2e + 真实 CLI smoke（add in math.h） |
+| 24aa867 | Phase 2.4 generation API | 5 单测 + 默认行为 100% 向后兼容 |
+| 76aa522 | Phase 2.5 pull diagnostics | 10 单测 + 透明 fallback |
+| 821cd9c | Phase 0.2 cold-start 探针 | 6 adapter + 真实文件探针 |
+| fbe21d5 | Phase 3.2 per-LS 就绪等待 | 2 单测 + rename 162ms 成功 + replace-body 位置正确 |
+| 4b7ebf4 | Phase 3.1 文档符号缓存 | 6 单测 + 二次 overview 0.88-0.93ms (shell 模式) / 19-21ms (CLI spawn 模式) |
+| de6cfa3 | Phase 3.3 ignore spec | 3 单测 + 真实 CLI smoke（node_modules/.venv/target 全部过滤） |
+
+**累计验证基线**：
+- cargo test --workspace: 49 个 test target 全绿（含 30+ 新单测）
+- cargo clippy --workspace --all-targets -- -D warnings: 0 错
+- 9 错误码 wire 契约不动
+- 0 新增第三方依赖（ARCHITECTURE §8 严守）
+- 不破坏公共 API（trait 默认空实现/默认实现模式）
+
+**Phase 6 · 已知局限与后续路线**
+
+| 局限 | 影响 | 建议 |
+|---|---|---|
+| fixture/rust_demo 无 Cargo.toml → rust-analyzer 走单文件 mode → 探针触发不了 workspace 索引 | cold-start 89s（基线 88s，**修复对 fixture 无效**） | 给 fixture 加 Cargo.toml（可测 7ms 量级） |
+| ls-runtime/deps.rs URL 矩阵 sha256 占位假值 | download 流程未实装，**功能不影响** | MVP 流程实装时填真 hash |
+| 7 语言适配器 5 个本机未装 | smoke 仅 2/7（rust + typescript） | CI 装 LS 后跑全景 smoke |
+| 子代理报告 hot-daemon 假数据 vs PM cold-start 真数据 | 多次 false PASS（如 0.2 报 75ms 实测 89s） | 子代理报告必须 cold state 验证；PM 端到端验作为唯一权威 |
+
+## 7. SolidLSP 整体评估
+
+- **wrapper 面（vs 上游 39 tool）**：核心 13/13 已实现 + 5 个 Phase 2 新增 wrapper = **18/18 高 ROI 上游 tool 全覆盖**
+- **适配器（vs 上游 73 LS）**：7/73 落地（rust + typescript 本机可用；其他 5 适配器代码就绪但本机无 LS）
+- **核心 LSP method**：hover / definition / implementation / references / workspace/symbol / completion / signatureHelp / publishDiagnostics / textDocument/diagnostic (pull) / prepareRename / rename / documentSymbol **全覆盖**
+- **性能**：hot daemon 重复查询 < 30ms；cold daemon fixture 89s（rust-analyzer 单文件模式固有限制）
