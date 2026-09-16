@@ -21,8 +21,8 @@ static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ls_adapters::{LanguageId, LanguageServerAdapter, ProjectCtx};
-use std::path::PathBuf;
 use std::future::Future;
+use std::path::PathBuf;
 
 pub fn dummy_ctx() -> ProjectCtx {
     ProjectCtx {
@@ -83,15 +83,13 @@ pub fn empty_path() -> (tempfile::TempDir, std::ffi::OsString) {
 }
 
 /// 通用断言：`launch_info` 在 PATH 含 fake binary 时返回 ok 且 cmd[0] 指向 fake。
-pub async fn assert_launch_finds_binary<A: LanguageServerAdapter>(
-    adapter: A,
-    bin_name: &str,
-) {
+pub async fn assert_launch_finds_binary<A: LanguageServerAdapter>(adapter: A, bin_name: &str) {
     let (dir, _bin) = fake_binary_dir(bin_name);
     let dir_path = dir.path().to_path_buf();
     let bin_name_owned = bin_name.to_string();
-    let info_holder: std::sync::Arc<std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let info_holder: std::sync::Arc<
+        std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let info_holder_c = info_holder.clone();
     let sep = if cfg!(windows) { ";" } else { ":" };
     let _ = sep;
@@ -114,8 +112,7 @@ pub async fn assert_launch_finds_binary<A: LanguageServerAdapter>(
     assert!(!info.cmd.is_empty(), "launch_info 必须返回非空 cmd");
     let first = info.cmd[0].to_string_lossy();
     assert!(
-        first.contains(bin_name_owned.trim_end_matches(".exe"))
-            || first.contains(&bin_name_owned),
+        first.contains(bin_name_owned.trim_end_matches(".exe")) || first.contains(&bin_name_owned),
         "cmd[0] 应指向 fake binary，实际：{first}"
     );
     let first_path = std::path::Path::new(&info.cmd[0]);
@@ -127,12 +124,10 @@ pub async fn assert_launch_finds_binary<A: LanguageServerAdapter>(
 }
 
 /// 通用断言：`launch_info` 在 PATH 为空时返回语义错误（NotInstalled），无 panic。
-pub async fn assert_launch_missing_binary<A: LanguageServerAdapter>(
-    adapter: A,
-    name_hint: &str,
-) {
-    let err_holder: std::sync::Arc<std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
+pub async fn assert_launch_missing_binary<A: LanguageServerAdapter>(adapter: A, name_hint: &str) {
+    let err_holder: std::sync::Arc<
+        std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let err_holder_c = err_holder.clone();
     with_path_lock(|| async move {
         let dir = tempfile::tempdir().expect("tempdir");

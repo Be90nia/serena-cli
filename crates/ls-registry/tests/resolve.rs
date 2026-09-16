@@ -27,16 +27,46 @@ fn resolve_cpp_extensions() {
 
 #[test]
 fn resolve_all_m3_languages() {
-    assert_eq!(ls_registry::resolve(Path::new("foo.rs")), Some(LanguageId::Rust));
-    assert_eq!(ls_registry::resolve(Path::new("foo.py")), Some(LanguageId::Python));
-    assert_eq!(ls_registry::resolve(Path::new("foo.pyi")), Some(LanguageId::Python));
-    assert_eq!(ls_registry::resolve(Path::new("foo.go")), Some(LanguageId::Go));
-    assert_eq!(ls_registry::resolve(Path::new("foo.ts")), Some(LanguageId::TypeScript));
-    assert_eq!(ls_registry::resolve(Path::new("foo.tsx")), Some(LanguageId::TypeScript));
-    assert_eq!(ls_registry::resolve(Path::new("foo.js")), Some(LanguageId::TypeScript));
-    assert_eq!(ls_registry::resolve(Path::new("foo.jsx")), Some(LanguageId::TypeScript));
-    assert_eq!(ls_registry::resolve(Path::new("foo.cs")), Some(LanguageId::CSharp));
-    assert_eq!(ls_registry::resolve(Path::new("foo.java")), Some(LanguageId::Java));
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.rs")),
+        Some(LanguageId::Rust)
+    );
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.py")),
+        Some(LanguageId::Python)
+    );
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.pyi")),
+        Some(LanguageId::Python)
+    );
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.go")),
+        Some(LanguageId::Go)
+    );
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.ts")),
+        Some(LanguageId::TypeScript)
+    );
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.tsx")),
+        Some(LanguageId::TypeScript)
+    );
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.js")),
+        Some(LanguageId::TypeScript)
+    );
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.jsx")),
+        Some(LanguageId::TypeScript)
+    );
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.cs")),
+        Some(LanguageId::CSharp)
+    );
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.java")),
+        Some(LanguageId::Java)
+    );
 }
 
 #[test]
@@ -85,7 +115,8 @@ fn adapter_for_each_m3_language() {
         ("java", "jdtls"),
     ];
     for (lang, expected_id) in cases {
-        let ad = ls_registry::adapter_for(lang).unwrap_or_else(|| panic!("missing adapter for {lang}"));
+        let ad =
+            ls_registry::adapter_for(lang).unwrap_or_else(|| panic!("missing adapter for {lang}"));
         assert_eq!(ad.id(), *expected_id, "adapter id mismatch for {lang}");
     }
 }
@@ -100,9 +131,20 @@ fn adapter_for_unknown_language_is_none() {
 
 #[test]
 fn adapter_for_is_idempotent() {
-    for lang in ["cpp", "rust", "python", "go", "typescript", "csharp", "java"] {
+    for lang in [
+        "cpp",
+        "rust",
+        "python",
+        "go",
+        "typescript",
+        "csharp",
+        "java",
+    ] {
         let a1 = ls_registry::adapter_for(lang).unwrap();
         let a2 = ls_registry::adapter_for(lang).unwrap();
-        assert!(std::sync::Arc::ptr_eq(&a1, &a2), "singleton broken for {lang}");
+        assert!(
+            std::sync::Arc::ptr_eq(&a1, &a2),
+            "singleton broken for {lang}"
+        );
     }
 }

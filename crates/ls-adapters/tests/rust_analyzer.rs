@@ -11,17 +11,17 @@ use ls_adapters::rust_analyzer::RustAnalyzerAdapter;
 
 #[test]
 fn metadata() {
-    common::assert_basic_metadata(
-        RustAnalyzerAdapter,
-        "rust-analyzer",
-        &[LanguageId::Rust],
-    );
+    common::assert_basic_metadata(RustAnalyzerAdapter, "rust-analyzer", &[LanguageId::Rust]);
     assert!(RustAnalyzerAdapter.supports_implementation());
 }
 
 #[tokio::test]
 async fn launch_finds_rust_analyzer_in_path() {
-    let bin = if cfg!(windows) { "rust-analyzer.exe" } else { "rust-analyzer" };
+    let bin = if cfg!(windows) {
+        "rust-analyzer.exe"
+    } else {
+        "rust-analyzer"
+    };
     common::assert_launch_finds_binary(RustAnalyzerAdapter, bin).await;
 }
 

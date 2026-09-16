@@ -68,10 +68,7 @@ impl LanguageServerAdapter for JdtlsAdapter {
         // jdtls 不需要 client capability quirk；它自己 advertise 自己的能力。
     }
 
-    async fn on_server_ready(
-        &self,
-        session: &lsp_core::session::Session,
-    ) -> anyhow::Result<()> {
+    async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
         // jdtls 启动后第一个文档请求会触发 `language/status` 事件 —— 我们不在此处
         // 等待该事件（M3 MVP），因为 Session 的 lazy `ensure_open` 已经会在首次
         // 工具调用时阻塞到 workspace 初始化完成。直接返回 Ok 让 supervisor 放行。

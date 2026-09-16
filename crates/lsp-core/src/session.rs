@@ -172,7 +172,7 @@ impl Session {
                 )));
             }
         };
-         // stdout_eof 在闭包外独占
+        // stdout_eof 在闭包外独占
         let stdout_eof = Arc::try_unwrap(stdout_eof).unwrap_or_else(|_| Notify::new());
 
         let session = Arc::new(Self {

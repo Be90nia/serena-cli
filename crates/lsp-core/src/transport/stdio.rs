@@ -192,7 +192,12 @@ pub fn record_pump(
     on_eof: OnEof,
     recorder: Recorder,
 ) -> Pumps {
-    let ChildHandle { stdin, stdout, stderr, job } = child;
+    let ChildHandle {
+        stdin,
+        stdout,
+        stderr,
+        job,
+    } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
     let rec_w = recorder.clone();
     let rec_r = recorder;
@@ -244,7 +249,10 @@ pub fn record_pump(
             match stdout.read(&mut chunk).await {
                 Ok(0) => saw_eof = true,
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(e) => { tracing::warn!(error = %e, "stdout read failed; aborting pump"); saw_eof = true; }
+                Err(e) => {
+                    tracing::warn!(error = %e, "stdout read failed; aborting pump");
+                    saw_eof = true;
+                }
             }
             loop {
                 match decode(&mut buf) {
@@ -253,7 +261,11 @@ pub fn record_pump(
                         dispatch(m, &on_msg, &reply_tx_for_dispatch);
                     }
                     Ok(None) => break,
-                    Err(e) => { tracing::error!(error = %e, "frame decode failed; aborting stdout pump"); saw_eof = true; break; }
+                    Err(e) => {
+                        tracing::error!(error = %e, "frame decode failed; aborting stdout pump");
+                        saw_eof = true;
+                        break;
+                    }
                 }
             }
         }
@@ -265,11 +277,19 @@ pub fn record_pump(
             match lines.next_line().await {
                 Ok(Some(line)) => tracing::info!(target: "lsp_stderr", "{line}"),
                 Ok(None) => break,
-                Err(e) => { tracing::debug!(error = %e, "stderr pump read error"); break; }
+                Err(e) => {
+                    tracing::debug!(error = %e, "stderr pump read error");
+                    break;
+                }
             }
         }
     });
-    Pumps { writer, stdout: stdout_task, stderr: stderr_task, job }
+    Pumps {
+        writer,
+        stdout: stdout_task,
+        stderr: stderr_task,
+        job,
+    }
 }
 
 /// replay 模式 pump（PLAN Task 26）：不接真 LS。
@@ -310,5 +330,10 @@ pub fn replay_pump(
         (on_eof)();
     });
     let stderr_task = tokio::spawn(async move {});
-    Pumps { writer, stdout: stdout_task, stderr: stderr_task, job: None }
+    Pumps {
+        writer,
+        stdout: stdout_task,
+        stderr: stderr_task,
+        job: None,
+    }
 }

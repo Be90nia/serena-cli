@@ -50,9 +50,7 @@ pub struct Recorder {
 
 enum RecorderInner {
     /// 录制模式：所有帧追加写到文件。
-    Record {
-        file: File,
-    },
+    Record { file: File },
     /// 回放模式：从文件读，逐行还原。
     Replay {
         /// 预读的所有入站帧（按出现顺序）。
@@ -82,15 +80,16 @@ impl Recorder {
                 continue;
             }
             // 至少 4 字节前缀 + 至少 1 字节 JSON。
-            let Some(rest) = line.strip_prefix("--> ").or_else(|| line.strip_prefix("<-- "))
+            let Some(rest) = line
+                .strip_prefix("--> ")
+                .or_else(|| line.strip_prefix("<-- "))
             else {
                 return Err(std::io::Error::other(format!(
                     "record file line missing direction prefix: {line:?}"
                 )));
             };
-            let frame: JsonRpc = serde_json::from_str(rest).map_err(|e| {
-                std::io::Error::other(format!("record file JSON decode: {e}"))
-            })?;
+            let frame: JsonRpc = serde_json::from_str(rest)
+                .map_err(|e| std::io::Error::other(format!("record file JSON decode: {e}")))?;
             // 出站帧在回放模式下"吞掉" —— 计数由调用方不需要，直接丢。
             if line.starts_with("<-- ") {
                 inbound.push_back(frame);

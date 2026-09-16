@@ -1,8 +1,8 @@
 //! gopls adapter 测试（PLAN M3）。
 
 mod common;
-use ls_adapters::LanguageServerAdapter;
 use ls_adapters::LanguageId;
+use ls_adapters::LanguageServerAdapter;
 use ls_adapters::gopls::GoplsAdapter;
 
 #[test]

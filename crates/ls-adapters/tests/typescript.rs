@@ -4,8 +4,8 @@
 
 mod common;
 
-use ls_adapters::LanguageServerAdapter;
 use ls_adapters::LanguageId;
+use ls_adapters::LanguageServerAdapter;
 use ls_adapters::typescript::TypescriptLanguageServerAdapter;
 
 #[test]
@@ -32,8 +32,9 @@ async fn launch_finds_typescript_ls_in_path_with_stdio_flag() {
     let bin = dir.path().join(bin_name);
     std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write fake");
     let dir_path = dir.path().to_path_buf();
-    let info_holder: std::sync::Arc<std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let info_holder: std::sync::Arc<
+        std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let info_holder_c = info_holder.clone();
     common::with_path_lock(move || {
         let info_holder_c = info_holder_c.clone();
@@ -46,7 +47,9 @@ async fn launch_finds_typescript_ls_in_path_with_stdio_flag() {
                 new_path.push(original.clone());
             }
             unsafe { std::env::set_var("PATH", &new_path) };
-            let info = TypescriptLanguageServerAdapter.launch_info(&common::dummy_ctx()).await;
+            let info = TypescriptLanguageServerAdapter
+                .launch_info(&common::dummy_ctx())
+                .await;
             *info_holder_c.lock().unwrap() = Some(info);
             unsafe { std::env::set_var("PATH", original) };
         }
@@ -55,10 +58,18 @@ async fn launch_finds_typescript_ls_in_path_with_stdio_flag() {
     let info = info_holder.lock().unwrap().take().unwrap();
     let info = info.expect("PATH 含 fake typescript-language-server 时 launch_info 必须成功");
     let has_stdio = info.cmd.iter().any(|a| a == "--stdio");
-    assert!(has_stdio, "typescript-language-server 必须加 --stdio flag, cmd={:?}", info.cmd);
+    assert!(
+        has_stdio,
+        "typescript-language-server 必须加 --stdio flag, cmd={:?}",
+        info.cmd
+    );
 }
 
 #[tokio::test]
 async fn launch_errors_when_missing() {
-    common::assert_launch_missing_binary(TypescriptLanguageServerAdapter, "typescript-language-server").await;
+    common::assert_launch_missing_binary(
+        TypescriptLanguageServerAdapter,
+        "typescript-language-server",
+    )
+    .await;
 }

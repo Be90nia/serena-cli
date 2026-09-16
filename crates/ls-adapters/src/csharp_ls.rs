@@ -58,10 +58,7 @@ impl LanguageServerAdapter for CsharpLsAdapter {
         // 无 quirk。
     }
 
-    async fn on_server_ready(
-        &self,
-        session: &lsp_core::session::Session,
-    ) -> anyhow::Result<()> {
+    async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
         use serde_json::json;
         let probe = session
             .request::<serde_json::Value>(

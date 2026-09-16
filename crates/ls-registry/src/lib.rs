@@ -130,10 +130,22 @@ mod tests {
         assert_eq!(resolve(&PathBuf::from("a.py")), Some(LanguageId::Python));
         assert_eq!(resolve(&PathBuf::from("a.pyi")), Some(LanguageId::Python));
         assert_eq!(resolve(&PathBuf::from("a.go")), Some(LanguageId::Go));
-        assert_eq!(resolve(&PathBuf::from("a.ts")), Some(LanguageId::TypeScript));
-        assert_eq!(resolve(&PathBuf::from("a.tsx")), Some(LanguageId::TypeScript));
-        assert_eq!(resolve(&PathBuf::from("a.js")), Some(LanguageId::TypeScript));
-        assert_eq!(resolve(&PathBuf::from("a.jsx")), Some(LanguageId::TypeScript));
+        assert_eq!(
+            resolve(&PathBuf::from("a.ts")),
+            Some(LanguageId::TypeScript)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("a.tsx")),
+            Some(LanguageId::TypeScript)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("a.js")),
+            Some(LanguageId::TypeScript)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("a.jsx")),
+            Some(LanguageId::TypeScript)
+        );
         assert_eq!(resolve(&PathBuf::from("a.cs")), Some(LanguageId::CSharp));
         assert_eq!(resolve(&PathBuf::from("a.java")), Some(LanguageId::Java));
         assert_eq!(resolve(&PathBuf::from("a.lua")), None);
@@ -142,7 +154,16 @@ mod tests {
     #[test]
     fn adapter_for_all_m3_languages() {
         // 每个 lang 字符串都应返 Some 单例；Arc::ptr_eq 在两次调用间成立。
-        for lang in ["cpp", "rust", "python", "go", "typescript", "javascript", "csharp", "java"] {
+        for lang in [
+            "cpp",
+            "rust",
+            "python",
+            "go",
+            "typescript",
+            "javascript",
+            "csharp",
+            "java",
+        ] {
             let a = adapter_for(lang).unwrap_or_else(|| panic!("missing adapter for {lang}"));
             let b = adapter_for(lang).unwrap();
             assert!(Arc::ptr_eq(&a, &b), "singleton broken for {lang}");

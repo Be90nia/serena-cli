@@ -15,9 +15,9 @@
 use std::ffi::OsString;
 use std::time::Duration;
 
+use ls_runtime::process::{Child, LaunchInfo};
 use lsp_core::recording::Recorder;
 use lsp_core::session::Session;
-use ls_runtime::process::{Child, LaunchInfo};
 use lsp_types::InitializeParams;
 
 fn launch_mock_ls() -> LaunchInfo {
@@ -54,7 +54,11 @@ async fn record_then_verify_jsonl() {
 
     let _resp: serde_json::Value = tokio::time::timeout(
         Duration::from_secs(5),
-        session.request::<serde_json::Value>("initialize", serde_json::json!({}), Duration::from_secs(5)),
+        session.request::<serde_json::Value>(
+            "initialize",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        ),
     )
     .await
     .expect("initialize 必返回")
@@ -68,16 +72,20 @@ async fn record_then_verify_jsonl() {
     // 验证录文件
     let content = std::fs::read_to_string(&record_path).expect("录文件存在");
     let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-    assert!(lines.len() >= 2, "至少应有 initialize + 响应 2 帧, got {} 行", lines.len());
+    assert!(
+        lines.len() >= 2,
+        "至少应有 initialize + 响应 2 帧, got {} 行",
+        lines.len()
+    );
 
     // 第一帧应是 initialize 请求
-    let first: serde_json::Value = serde_json::from_str(lines[0].trim_start_matches("--> "))
-        .expect("第一帧 JSON 合法");
+    let first: serde_json::Value =
+        serde_json::from_str(lines[0].trim_start_matches("--> ")).expect("第一帧 JSON 合法");
     assert_eq!(first["method"], "initialize");
 
     // 第二帧应是响应
-    let second: serde_json::Value = serde_json::from_str(lines[1].trim_start_matches("<-- "))
-        .expect("第二帧 JSON 合法");
+    let second: serde_json::Value =
+        serde_json::from_str(lines[1].trim_start_matches("<-- ")).expect("第二帧 JSON 合法");
     assert_eq!(second["result"]["serverInfo"]["name"], "mock_ls");
 
     let _ = std::fs::remove_file(&record_path);

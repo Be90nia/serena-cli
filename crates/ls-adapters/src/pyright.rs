@@ -75,10 +75,7 @@ impl LanguageServerAdapter for PyrightAdapter {
         // pyright 不需要 client capability quirk。
     }
 
-    async fn on_server_ready(
-        &self,
-        session: &lsp_core::session::Session,
-    ) -> anyhow::Result<()> {
+    async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
         use serde_json::json;
         let probe = session
             .request::<serde_json::Value>(

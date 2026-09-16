@@ -53,10 +53,11 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
         // node_modules 里) —— cwd 由 LaunchInfo 的 cwd 字段交给 runtime。
         // ponytail: 此 workaround 仅 typescript-language-server,其它 .sh LS
         // (pyright / vscode-langservers-extracted) 留待真撞上再加。
-        if cfg!(windows) && let Some(cli_mjs) = exe
-            .parent()
-            .map(|p| p.join("node_modules/typescript-language-server/lib/cli.mjs"))
-            .filter(|p| p.is_file())
+        if cfg!(windows)
+            && let Some(cli_mjs) = exe
+                .parent()
+                .map(|p| p.join("node_modules/typescript-language-server/lib/cli.mjs"))
+                .filter(|p| p.is_file())
         {
             let node = which_no_unc("node").ok_or_else(|| {
                 anyhow::anyhow!("node not on PATH; required to run typescript-language-server")
@@ -84,10 +85,7 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
         // 无 quirk。
     }
 
-    async fn on_server_ready(
-        &self,
-        session: &lsp_core::session::Session,
-    ) -> anyhow::Result<()> {
+    async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
         use serde_json::json;
         let probe = session
             .request::<serde_json::Value>(

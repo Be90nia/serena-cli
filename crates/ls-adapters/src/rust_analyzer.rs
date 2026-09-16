@@ -59,10 +59,7 @@ impl LanguageServerAdapter for RustAnalyzerAdapter {
         // client capability 留默认即可。
     }
 
-    async fn on_server_ready(
-        &self,
-        session: &lsp_core::session::Session,
-    ) -> anyhow::Result<()> {
+    async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
         // 探测：首次请求触发 rust-analyzer 索引加载；失败也返回 Ok 让 supervisor 放行。
         use serde_json::json;
         let probe = session

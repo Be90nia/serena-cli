@@ -2,8 +2,8 @@
 
 mod common;
 
-use ls_adapters::LanguageServerAdapter;
 use ls_adapters::LanguageId;
+use ls_adapters::LanguageServerAdapter;
 use ls_adapters::pyright::PyrightAdapter;
 
 #[test]
@@ -15,7 +15,11 @@ fn metadata() {
 
 #[tokio::test]
 async fn launch_finds_pyright_langserver_in_path() {
-    let bin = if cfg!(windows) { "pyright-langserver.exe" } else { "pyright-langserver" };
+    let bin = if cfg!(windows) {
+        "pyright-langserver.exe"
+    } else {
+        "pyright-langserver"
+    };
     common::assert_launch_finds_binary(PyrightAdapter, bin).await;
 }
 
@@ -24,12 +28,17 @@ async fn launch_finds_pyright_in_path_when_pyright_langserver_absent() {
     // fallback 探测 pyright；fake binary 名为 pyright，locate_pyright 应找到 + 加 --stdio。
     use ls_adapters::LanguageServerAdapter;
     let dir = tempfile::tempdir().expect("tempdir");
-    let bin_name = if cfg!(windows) { "pyright.exe" } else { "pyright" };
+    let bin_name = if cfg!(windows) {
+        "pyright.exe"
+    } else {
+        "pyright"
+    };
     let bin = dir.path().join(bin_name);
     std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write fake pyright");
     let dir_path = dir.path().to_path_buf();
-    let info_holder: std::sync::Arc<std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let info_holder: std::sync::Arc<
+        std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let info_holder_c = info_holder.clone();
     common::with_path_lock(move || {
         let info_holder_c = info_holder_c.clone();
@@ -51,7 +60,11 @@ async fn launch_finds_pyright_in_path_when_pyright_langserver_absent() {
     let info = info_holder.lock().unwrap().take().unwrap();
     let info = info.expect("PATH 含 fake pyright 时 launch_info 必须成功");
     let has_stdio = info.cmd.iter().any(|a| a == "--stdio");
-    assert!(has_stdio, "pyright fallback 必须加 --stdio flag, cmd={:?}", info.cmd);
+    assert!(
+        has_stdio,
+        "pyright fallback 必须加 --stdio flag, cmd={:?}",
+        info.cmd
+    );
 }
 
 #[tokio::test]
