@@ -449,6 +449,35 @@ impl Supervisor {
             .await?;
         Ok(resp)
     }
+    /// `textDocument/signatureHelp` → 函数调用位置上的参数签名提示。
+    ///
+    /// 与 `tool_hover` 同形态：cursor 落在函数调用括号内时返 `Option<SignatureHelp>`（含 signatures[]、
+    /// activeSignature / activeParameter）；落在非调用位置时返 `None`，与 hover 的"无悬停"语义一致。
+    ///
+    /// 不裁剪字段：agent 据 LSP 原生结构（label / parameters[] / activeParameter 等）自行决策；
+    /// 与 hover 不裁剪保持一致。Phase 2.2（local/solidlsp-development-plan.md §2.2）。
+    pub async fn tool_signature_help(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Option<lsp_types::SignatureHelp>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "position": { "line": line, "character": col },
+        });
+        let resp: Option<lsp_types::SignatureHelp> = session
+            .request("textDocument/signatureHelp", params, TOOL_TIMEOUT)
+            .await?;
+        Ok(resp)
+    }
 
     /// `textDocument/documentSymbol` → 平铺递归 `DocumentSymbol::children` → `Vec<SymbolHit>`。
     pub async fn tool_overview(
@@ -1958,6 +1987,14 @@ impl SupervisorTrait for Supervisor {
                 let resp = self.tool_find_symbol(root, query, limit, lang).await?;
                 serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
             }
+            "signature-help" => {
+                let (file, line, col) = required_position(&args)?;
+                serde_json::to_value(
+                    self.tool_signature_help(root, &file, line, col, lang)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
+            }
             "hover" => {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(self.tool_hover(root, &file, line, col, lang).await?)
@@ -2825,5 +2862,81 @@ mod containing_symbol_tests {
         let hits = collect_containing_hits(&resp, "file://x", 6, 0);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "bar");
+    }
+}
+
+#[cfg(test)]
+mod signature_help_tests {
+    //! Phase 2.2: `textDocument/signatureHelp` 协议形状。
+    //! 不拉起 LS，直接测：把构造的 LSP `SignatureHelp` JSON round-trip 到
+    //! `lsp_types::SignatureHelp`（即 supervisor 透传时反序列化的目标类型），确认字段全保
+    //! 留（label / parameters[] / activeSignature / activeParameter）。
+
+    /// clangd on `add(1, 2)` 在括号内的典型响应：单一 signature, 两个参数，active=0（第一个参数）。
+    fn add_call_signature_json() -> serde_json::Value {
+        serde_json::json!({
+            "signatures": [{
+                "label": "add(int, int)",
+                "documentation": "Adds two integers.",
+                "parameters": [
+                    { "label": "int a" },
+                    { "label": "int b" }
+                ],
+                "activeParameter": 0
+            }],
+            "activeSignature": 0
+        })
+    }
+
+    #[test]
+    fn lsp_signature_help_round_trip_preserves_all_fields() {
+        let raw = add_call_signature_json();
+        let parsed: lsp_types::SignatureHelp = serde_json::from_value(raw.clone())
+            .expect("LSP signatureHelp should round-trip into lsp_types::SignatureHelp");
+        // signatures[0].label 必须保留（agent 据此识别函数签名）
+        assert_eq!(parsed.signatures.len(), 1);
+        assert_eq!(parsed.signatures[0].label, "add(int, int)");
+        // parameters[] 保留两个
+        let params = parsed.signatures[0].parameters.as_ref()
+            .expect("parameters should be present");
+        assert_eq!(params.len(), 2);
+        assert_eq!(
+            params[0].label,
+            lsp_types::ParameterLabel::Simple("int a".into())
+        );
+        assert_eq!(
+            params[1].label,
+            lsp_types::ParameterLabel::Simple("int b".into())
+        );
+        // activeParameter / activeSignature 保留（agent 据此高亮当前参数）
+        assert_eq!(parsed.active_signature, Some(0));
+        assert_eq!(parsed.signatures[0].active_parameter, Some(0));
+    }
+
+    #[test]
+    fn lsp_signature_help_null_round_trips_as_none() {
+        // clangd 在非函数调用位置返 null（与 hover 行为一致）。
+        let raw = serde_json::Value::Null;
+        let parsed: Option<lsp_types::SignatureHelp> = serde_json::from_value(raw)
+            .expect("null should round-trip to None");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn lsp_signature_help_active_parameter_default_when_missing() {
+        // LSP 允许省略 activeParameter（位置未确定）。lsp-types 默认 0；这里确认字段缺失时
+        // 也能 round-trip, 不会强制要求 activeParameter 字段。
+        let raw = serde_json::json!({
+            "signatures": [{
+                "label": "f()",
+                "parameters": []
+            }]
+        });
+        let parsed: lsp_types::SignatureHelp = serde_json::from_value(raw)
+            .expect("missing activeParameter should still round-trip");
+        assert_eq!(parsed.signatures.len(), 1);
+        assert_eq!(parsed.signatures[0].label, "f()");
+        assert_eq!(parsed.signatures[0].active_parameter, None);
+        assert_eq!(parsed.active_signature, None);
     }
 }
