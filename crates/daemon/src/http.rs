@@ -33,6 +33,11 @@ pub struct AppState {
     pub start_ts: std::time::Instant,
     pub loaded_ls: Arc<std::sync::Mutex<Vec<String>>>,
     pub draining: Arc<std::sync::atomic::AtomicBool>,
+    /// 最近一次工具请求的 project_root（status 观察 + 重启定位用）。
+    pub active_project: Arc<std::sync::Mutex<Option<String>>>,
+    /// /shutdown 触发：axum::serve.with_graceful_shutdown 等此 Notify。
+    /// 一拍即过（notify_waiters 一次性广播）。
+    pub shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -103,6 +108,10 @@ async fn tools_post(
         )
             .into_response();
     }
+    crate::reaper::note_activity();
+
+    // 记录最近请求的 project_root（供 /status 观察；不区分成败，只要请求到达）。
+    *state.active_project.lock().unwrap() = Some(req.project_root.clone());
 
     match state
         .supervisor
@@ -130,6 +139,7 @@ async fn tools_post(
 }
 
 async fn status_get(State(state): State<AppState>) -> Response {
+    crate::reaper::note_activity();
     let loaded = state
         .supervisor
         .loaded_entries()
@@ -141,6 +151,7 @@ async fn status_get(State(state): State<AppState>) -> Response {
         pid: std::process::id(),
         loaded_ls: loaded,
         draining: state.draining.load(std::sync::atomic::Ordering::Acquire),
+        active_project: state.active_project.lock().unwrap().clone(),
     };
     (StatusCode::OK, Json(resp)).into_response()
 }
@@ -149,6 +160,8 @@ async fn shutdown_post(State(state): State<AppState>) -> Response {
     state
         .draining
         .store(true, std::sync::atomic::Ordering::Release);
+    // 触发 axum::serve.with_graceful_shutdown：notify_waiters 一次性广播给所有 waiter。
+    state.shutdown_notify.notify_waiters();
     (
         StatusCode::OK,
         Json(json!({"ok": true, "message": "draining set; will exit when in-flight drains"})),
@@ -217,7 +230,7 @@ mod tests {
         ) -> Result<serde_json::Value, supervisor::ToolError> {
             let f = self.result.lock().await.take().expect("mock called once");
             f()
-         }
+        }
 
         fn loaded_entries(&self) -> Vec<supervisor::Key> {
             vec![supervisor::Key {
@@ -225,7 +238,7 @@ mod tests {
                 lang: Box::from("rust"),
             }]
         }
-     }
+    }
 
     fn state(token: &str, mock: MockSupervisor) -> AppState {
         AppState {
@@ -234,6 +247,8 @@ mod tests {
             start_ts: std::time::Instant::now(),
             loaded_ls: Arc::new(std::sync::Mutex::new(vec!["clangd".into()])),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active_project: Arc::new(std::sync::Mutex::new(None)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 

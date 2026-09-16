@@ -20,3 +20,4 @@ tempfile = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 tower = { version = "0.5", features = ["util"] }
+reqwest = { workspace = true }

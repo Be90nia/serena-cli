@@ -72,14 +72,18 @@ async fn reaper_loop(
     lock_path: Option<std::path::PathBuf>,
 ) {
     loop {
-        tokio::time::sleep(iv.scan).await;
+        // sleep 与 shutdown 信号 race：/shutdown 触发后可立即跳出，不等满 scan 周期。
+        // ponytail: 不引入额外 channel，复用 AppState.shutdown_notify（Notify 单次广播）。
+        tokio::select! {
+            _ = tokio::time::sleep(iv.scan) => {}
+            _ = state.shutdown_notify.notified() => {}
+        }
 
         // 已在 draining：走收尾并退出 task（进程随后自然退出）。
         if state.draining.load(Ordering::Acquire) {
             finish_shutdown(&sup, &state, &lock_path).await;
             return;
         }
-        let now = Instant::now();
 
         // 0) Failed LS 驱逐：LS 死后 state 变 Failed, 下次工具调用才被动 evict.
         //    这里主动驱逐, 下次调用 session_for 慢路径自动 spawn 新实例。
@@ -88,6 +92,7 @@ async fn reaper_loop(
             tracing::info!(count = evicted_failed, "evicted failed LS instances");
         }
 
+        let now = Instant::now();
         let entries = sup.loaded_entries();
 
         // 1) 全局空闲判定：最新活动（LS 或全局时钟）距今超阈值。
@@ -177,6 +182,8 @@ mod tests {
             start_ts: Instant::now(),
             loaded_ls: Arc::new(Mutex::new(vec![])),
             draining: Arc::new(AtomicBool::new(false)),
+            active_project: Arc::new(Mutex::new(None)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 

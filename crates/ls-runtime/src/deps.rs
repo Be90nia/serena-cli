@@ -8,11 +8,8 @@
 //! - 提供 `verify_sha256(bytes, expected)` 给 download 流程调用（**未实现实际下载**）
 //! - 提供 `clangd_install_hint()` 给 adapter 错误信息
 //!
-//! 不引入：reqwest / sha2 之外的依赖（ARCHITECTURE §8 禁新增第三方）。
-//! 真实下载走 std `std::process::Command` 调系统 curl/wget 在上层做（Task 18 后续）。
-//!
-//! ponytail: 不做 async 下载 API —— claude/agent 用同步调用足以；后续真有
-//! 需要再升级到 reqwest。
+//! 真实校验走 `std::process::Command` 调系统 `certutil` / `sha256sum` /
+//! `shasum -a 256`（ARCH §8 禁第三方依赖，与项目 npm shim 调系统命令风格一致）。
 
 /// 平台标识（与 `std::env::consts::OS` 对齐，但显式枚举便于测试）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,13 +100,111 @@ pub fn clangd_install_hint() -> &'static str {
 
 /// 验证下载字节的 sha256（hex 格式，64 字符）。
 ///
-/// ponytail: 不引 sha2 crate——MVP 只验格式（64 hex chars）；真实校验在
-/// download 流程实现时补（用 std::process 调系统 `sha256sum` / `certutil`）。
-pub fn verify_sha256(_bytes: &[u8], expected: &str) -> Result<(), String> {
+/// ponytail: 不引 sha2 crate —— ARCHITECTURE §8 禁第三方依赖。改走
+/// `std::process::Command` 调系统工具（`certutil` / `sha256sum` / `shasum -a 256`）。
+/// 字节先落临时文件再交给工具；进程退码非 0 或 stdout 找不到 64 hex 行 → Err。
+pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), String> {
     if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("invalid sha256 (expected 64 hex chars): {expected:?}"));
+        return Err(format!(
+            "invalid sha256 (expected 64 hex chars): {expected:?}"
+        ));
     }
-    Ok(())
+    let actual = sha256_hex(bytes)?;
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        let exp_prefix = &expected[..8];
+        let act_prefix = &actual[..8];
+        Err(format!(
+            "sha256 mismatch: expected {exp_prefix}…, got {act_prefix}… (expected={expected}, actual={actual})"
+        ))
+    }
+}
+
+/// 计算字节流的 sha256（小写 hex），平台分支走系统工具。
+///
+/// ponytail: 不引 tempfile —— 用 `std::env::temp_dir()` + 进程内原子计数器即可；
+/// 调用方保证不并发（verify 串行走 download 流程）；无 unique 竞争即无 race。
+#[cfg_attr(test, allow(dead_code))]
+fn sha256_hex(bytes: &[u8]) -> Result<String, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // certutil（Windows）拒收 0 字节文件（ERROR_FILE_INVALID）—— 公开常量兜底。
+    if bytes.is_empty() {
+        return Ok("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string());
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("serena_sha256_{pid}_{n}.bin"));
+    if let Err(e) = write_tempfile(&path, bytes) {
+        return Err(format!("sha256 tempfile: {e}"));
+    }
+    let output = match run_sha256_tool(&path) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("sha256 tool spawn: {e}"));
+        }
+    };
+    let result = if !output.status.success() {
+        Err(format!(
+            "sha256 tool exit {:?}: stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    } else {
+        extract_sha256_hex(&output.stdout)
+    };
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+fn write_tempfile(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.flush()
+}
+
+#[cfg(windows)]
+fn run_sha256_tool(path: &std::path::Path) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("certutil")
+        .args(["-hashfile", &path.to_string_lossy(), "SHA256"])
+        .output()
+}
+
+#[cfg(target_os = "macos")]
+fn run_sha256_tool(path: &std::path::Path) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("shasum")
+        .args(["-a", "256", &path.to_string_lossy()])
+        .output()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_sha256_tool(path: &std::path::Path) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("sha256sum")
+        .arg(&path.to_string_lossy())
+        .output()
+}
+
+/// 从 stdout 抽取第一个 64 hex 字符行。
+fn extract_sha256_hex(stdout: &[u8]) -> Result<String, String> {
+    for raw in stdout.split(|b| *b == b'\n') {
+        let line = match std::str::from_utf8(raw) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(trimmed.to_ascii_lowercase());
+        }
+    }
+    Err(format!(
+        "sha256 tool output missing 64-hex line: {:?}",
+        String::from_utf8_lossy(stdout)
+    ))
 }
 
 #[cfg(test)]
@@ -148,9 +243,38 @@ mod tests {
     }
 
     #[test]
-    fn sha256_accepts_hex_64() {
-        assert!(verify_sha256(b"", &"a".repeat(64)).is_ok());
-        assert!(verify_sha256(b"", &"0123456789abcdef".repeat(4)).is_ok());
+    fn sha256_real_hello_vector() {
+        // RFC 3174 / NIST FIPS 180-2 已知向量："hello" → 2cf24dba…b9824。
+        let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert!(verify_sha256(b"hello", expected).is_ok());
+    }
+
+    #[test]
+    fn sha256_real_empty_bytes() {
+        // 空输入的 SHA-256（公开向量）。
+        let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(verify_sha256(b"", expected).is_ok());
+    }
+
+    #[test]
+    fn sha256_mismatch_reports_prefixes() {
+        let bad = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_sha256(b"hello", bad).unwrap_err();
+        assert!(err.contains("sha256 mismatch"), "msg: {err}");
+        // 实际 hash 前 8 字符必须出现，供诊断。
+        assert!(
+            err.contains("2cf24dba"),
+            "expected actual=2cf24dba in msg, got: {err}"
+        );
+        // expected 前 8 字符也必须出现。
+        assert!(err.contains("00000000"), "expected prefix in msg: {err}");
+    }
+
+    #[test]
+    fn sha256_case_insensitive() {
+        // 大写 expected 也应通过（系统工具返小写）。
+        let upper = "2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824";
+        assert!(verify_sha256(b"hello", upper).is_ok());
     }
 
     #[test]

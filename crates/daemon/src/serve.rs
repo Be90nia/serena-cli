@@ -70,29 +70,33 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         start_ts: Instant::now(),
         loaded_ls: Arc::new(Mutex::new(vec![])),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        active_project: Arc::new(Mutex::new(None)),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
-    // reaper 常驻：global idle / POST /shutdown → draining → 删 lock → task 结束。
-    // 注意：reaper task 结束并不会退出阻塞在 accept loop 的 axum::serve（无
-    // graceful shutdown）——由下方 watcher 在 reaper 结束后显式退进程；
-    // Windows 下 Job 句柄随进程关闭，LS 进程树陪葬（ARCH §3.2）。
+    // reaper 常驻：draining → 删 lock → 卸 LS。
+    // 末尾 await reaper 让 main 自然返回：graceful shutdown 让 axum::serve 退出，
+    // reaper 跑完 finish_shutdown 后再返。Windows Job 句柄随进程关闭，
+    // LS 进程树陪葬（ARCH §3.2）。
     let reaper = spawn_reaper(
         sup,
         state.clone(),
         cfg.intervals,
         Some(cfg.lock_path.clone()),
     );
-    tokio::spawn(async move {
-        let _ = reaper.await;
-        tracing::info!("daemon shutdown complete; exiting process");
-        std::process::exit(0);
-    });
 
-    let app = router(state);
+    let app = router(state.clone());
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("daemon listening on {addr}");
-    axum::serve(listener, app).await?;
+    // graceful shutdown 桥接：/shutdown POST 在 http::shutdown_post 中调
+    // state.shutdown_notify.notify_waiters()，此处 await notified 触发退出。
+    let shutdown_signal = state.shutdown_notify.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown_signal.notified().await })
+        .await?;
+    // axum 退 → 等 reaper 完成 finish_shutdown（删 lock + 卸 LS）→ 返回。
+    let _ = reaper.await;
     Ok(())
 }
 

@@ -74,6 +74,9 @@ pub struct StatusResponse {
     pub pid: u32,
     pub loaded_ls: Vec<String>,
     pub draining: bool,
+    /// 最近一次工具请求的 project_root（daemon 启动时不带 project，为 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_project: Option<String>,
 }
 
 /// 把 supervisor 的 `ToolError` 翻译成 wire error。
