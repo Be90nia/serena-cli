@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use lsp_core::docsync::{path_to_uri, path_to_uri_str};
 use lsp_core::error::CoreError;
@@ -91,6 +91,28 @@ pub enum ToolError {
 /// diagnostics 缓存条目类型：uri -> items。
 pub type DiagCache = std::sync::Arc<Mutex<HashMap<(PathBuf, String), Vec<serde_json::Value>>>>;
 pub type ToolResult<T> = std::result::Result<T, ToolError>;
+/// 文档符号缓存 key（Phase 3.1）：(root, file, mtime)。
+/// find-symbol（workspace 级）无单文件锚点：file 位放 `ws?{query}`、mtime 位放 None。
+type SymbolCacheKey = (PathBuf, String, Option<SystemTime>);
+
+/// overview / symbol-body 的缓存 key；mtime 取不到（文件不存在/不可 stat）→ None（确定性 key）。
+fn doc_symbol_cache_key(root: &Path, file: &str) -> SymbolCacheKey {
+    (
+        root.to_path_buf(),
+        file.to_string(),
+        std::fs::metadata(root.join(file))
+            .ok()
+            .and_then(|m| m.modified().ok()),
+    )
+}
+
+/// find-symbol（workspace/symbol）缓存 key：按 query 键控。
+/// ponytail: workspace 级结果不锚 mtime —— 文件变更后同 query 返缓存，重启 daemon 或换
+/// query 才刷新；换取索引型查询免全仓重复扫描（上游 ls.py 缓存同样按 (root, query) 键控）。
+/// `?` 是 Windows 非法文件名字符，`ws?` 前缀与真实文件 key 天然不撞。
+fn find_symbol_cache_key(root: &Path, query: &str) -> SymbolCacheKey {
+    (root.to_path_buf(), format!("ws?{query}"), None)
+}
 
 /// Daemon 工具语义层抽象；实现负责按工具名分派只读请求。
 #[async_trait::async_trait]
@@ -134,6 +156,10 @@ pub struct Supervisor {
     /// `true` = LS 声明支持；`false` = 缺字段/null → 走 push 缓存（与 2.5 之前等价）。
     /// 锁用 std::sync::Mutex —— 写一次读多次、临界区小，不值得换 parking_lot。
     pull_diag_supported: std::sync::Arc<Mutex<HashMap<Key, bool>>>,
+    /// Phase 3.1 文档符号缓存：(root, file, mtime) → 平铺 symbol list。
+    /// overview / find-symbol / symbol-body 入口前查；命中免 LS 往返。mtime 变 →
+    /// key 变 → 自然 miss 重调 LS（旧 entry 残留无害）。std Mutex：临界区仅 HashMap 读写。
+    symbol_cache: std::sync::Arc<Mutex<HashMap<SymbolCacheKey, Vec<SymbolHit>>>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -232,6 +258,7 @@ impl Supervisor {
             diag_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             diag_generation: std::sync::Arc::new(AtomicU64::new(0)),
             pull_diag_supported: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            symbol_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -626,7 +653,17 @@ impl Supervisor {
             .await?;
         Ok(resp)
     }
+    // ==== Phase 3.1 文档符号缓存存取（上游 ls.py@43ae021 文档符号缓存对应）====
 
+    /// cache 命中查询；返回克隆（平铺 list 小，克隆远便宜于 LS 往返）。
+    fn symbol_cache_get(&self, key: &SymbolCacheKey) -> Option<Vec<SymbolHit>> {
+        self.symbol_cache.lock().unwrap().get(key).cloned()
+    }
+
+    /// cache_miss 后写入。LS 错误路径不经过这里（失败不进 cache）。
+    fn symbol_cache_put(&self, key: SymbolCacheKey, hits: Vec<SymbolHit>) {
+        self.symbol_cache.lock().unwrap().insert(key, hits);
+    }
     /// `textDocument/documentSymbol` → 平铺递归 `DocumentSymbol::children` → `Vec<SymbolHit>`。
     pub async fn tool_overview(
         &self,
@@ -634,6 +671,11 @@ impl Supervisor {
         file: &str,
         lang_override: Option<&str>,
     ) -> ToolResult<Vec<SymbolHit>> {
+        // Phase 3.1 缓存：同 (root, file, mtime) 二次调用免 LS 往返（命中 <1ms）。
+        let cache_key = doc_symbol_cache_key(root, file);
+        if let Some(cached) = self.symbol_cache_get(&cache_key) {
+            return Ok(cached); // cache_hit
+        }
         let lang_str = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, &lang_str).await?;
         let path = root.join(file);
@@ -645,7 +687,9 @@ impl Supervisor {
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
 
-        Ok(flatten_symbols(resp, &uri))
+        let out = flatten_symbols(resp, &uri);
+        self.symbol_cache_put(cache_key, out.clone()); // cache_miss → 写入
+        Ok(out)
     }
     /// `textDocument/documentSymbol` → 在树中按 (line, col) 反查最深包含符号 → `Vec<SymbolHit>`。
     ///
@@ -820,6 +864,13 @@ impl Supervisor {
             });
         }
 
+        // Phase 3.1 缓存：同 (root, query) 二次调用免全仓 workspace/symbol 往返。
+        let cache_key = find_symbol_cache_key(root, query);
+        if let Some(mut cached) = self.symbol_cache_get(&cache_key) {
+            cached.truncate(limit);
+            return Ok(cached); // cache_hit
+        }
+
         // 决定要查的 lang 集合 (BTreeSet = 字母序, 顺序稳定)。
         let langs: BTreeSet<String> = if let Some(l) = lang_override {
             [l.to_ascii_lowercase()].into()
@@ -883,6 +934,7 @@ impl Supervisor {
                 merged.extend(v);
             }
         }
+        self.symbol_cache_put(cache_key, merged.clone()); // cache_miss → 写入（截断前全量）
         merged.truncate(limit);
         Ok(merged)
     }
@@ -1203,9 +1255,22 @@ impl Supervisor {
         symbol: &str,
         lang_override: Option<&str>,
     ) -> ToolResult<String> {
+        let path = root.join(file);
+        // Phase 3.1 缓存：documentSymbol 往返命中 → 直接在缓存列表找 range 切片（盘上
+        // 文本仍现读）。not-found 与 miss 路径同语义。Δ: find_symbol_range 对 Flat 形态返
+        // None 而缓存列表含 Flat 平铺项 —— 仅理论差异（本仓库 adapter 均回 Nested，见
+        // flatten_symbols 注）。
+        let cache_key = doc_symbol_cache_key(root, file);
+        if let Some(cached) = self.symbol_cache_get(&cache_key) {
+            return match cached.iter().find(|h| h.name == symbol) {
+                Some(h) => read_and_slice(&path, file, h.range).await,
+                None => Err(ToolError::BadArgs {
+                    detail: format!("symbol `{symbol}` not found in {file}"),
+                }),
+            }; // cache_hit
+        }
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let path = root.join(file);
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
@@ -1218,25 +1283,9 @@ impl Supervisor {
         let range = find_symbol_range(&resp, symbol).ok_or_else(|| ToolError::BadArgs {
             detail: format!("symbol `{symbol}` not found in {file}"),
         })?;
-
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| ToolError::BadArgs {
-                detail: format!("read {}: {e}", path.display()),
-            })?;
-        let start = LspPos {
-            line: range.start.line,
-            character: range.start.character,
-        };
-        let end = LspPos {
-            line: range.end.line,
-            character: range.end.character,
-        };
-        lsp_core::offsets::slice_at(&text, start, end, OffsetEncoding::Utf16).map_err(|e| {
-            ToolError::BadArgs {
-                detail: format!("slice {file}@{start:?}-{end:?}: {e}"),
-            }
-        })
+        let out = read_and_slice(&path, file, range).await?;
+        self.symbol_cache_put(cache_key, flatten_symbols(resp, &uri)); // cache_miss → 写入
+        Ok(out)
     }
 
     /// `replace-body`：按符号名替换函数/类体（C3 一致性链路，PLAN Task 15）。
@@ -2716,6 +2765,28 @@ fn find_symbol_range(resp: &DocumentSymbolResponse, symbol: &str) -> Option<lsp_
     }
 }
 
+/// 读盘 + 按 LSP range 切符号体（tool_symbol_body 缓存命中/miss 两路共用）。
+async fn read_and_slice(path: &Path, file: &str, range: lsp_types::Range) -> ToolResult<String> {
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| ToolError::BadArgs {
+            detail: format!("read {}: {e}", path.display()),
+        })?;
+    let start = LspPos {
+        line: range.start.line,
+        character: range.start.character,
+    };
+    let end = LspPos {
+        line: range.end.line,
+        character: range.end.character,
+    };
+    lsp_core::offsets::slice_at(&text, start, end, OffsetEncoding::Utf16).map_err(|e| {
+        ToolError::BadArgs {
+            detail: format!("slice {file}@{start:?}-{end:?}: {e}"),
+        }
+    })
+}
+
 /// 找符号的 `(range, selectionRange)`：range = 删除范围，selectionRange = 标识符
 /// 位置（references 锚点）。Flat 形态无 selectionRange，用 location.range 起点近似
 /// （SymbolInformation 的 location 即标识符所在位置）。
@@ -3354,5 +3425,150 @@ mod pull_diagnostics_tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["message"], "e1");
         assert_eq!(items[1]["message"], "e2");
+    }
+}
+// ============================================================================
+// Phase 3.1 文档符号缓存（local/solidlsp-development-plan.md §3.1）
+// ============================================================================
+
+#[cfg(test)]
+mod symbol_cache_tests {
+    //! 纪律：不拉 LS —— 命中路径在 session_for 之前返回，可对空 supervisor 做工具级
+    //! 断言；miss→写→hit 全链路由 CLI smoke（fixtures/rust_demo + rust-analyzer）覆盖。
+    use super::*;
+    use std::time::Instant;
+
+    fn hit(name: &str) -> SymbolHit {
+        SymbolHit {
+            name: name.to_string(),
+            kind: SymbolKindTag::Function,
+            uri: "file:///x/a.rs".into(),
+            range: lsp_types::Range {
+                start: Position::new(0, 0),
+                end: Position::new(3, 0),
+            },
+            container: None,
+        }
+    }
+
+    /// cache 命中：同 file 二次 overview 命中返 <1ms（命中路径不拉 LS）。
+    #[tokio::test]
+    async fn overview_cache_hit_returns_under_1ms() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs"), vec![hit("main")]);
+
+        let t0 = Instant::now();
+        let out = sup.tool_overview(root, "a.rs", Some("rust")).await.unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "main");
+        assert!(
+            elapsed < Duration::from_millis(1),
+            "cache hit took {elapsed:?}"
+        );
+    }
+
+    /// 命中必须先于 lang 解析 / session 拉起（不可解析扩展名 + 不存在 root 也命中）。
+    #[tokio::test]
+    async fn overview_cache_hit_precedes_lang_resolution() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "x.unknownext"),
+            vec![hit("weird")],
+        );
+        let out = sup.tool_overview(root, "x.unknownext", None).await.unwrap();
+        assert_eq!(out[0].name, "weird");
+    }
+
+    /// cache miss：空 supervisor 必 miss；put 后 get 命中（首次调用写入 cache 的机制）。
+    #[tokio::test]
+    async fn cache_miss_then_put_then_hit() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        let key = doc_symbol_cache_key(root, "a.rs");
+        assert!(
+            sup.symbol_cache_get(&key).is_none(),
+            "fresh supervisor must miss"
+        );
+        sup.symbol_cache_put(key.clone(), vec![hit("f")]);
+        let got = sup.symbol_cache_get(&key).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "f");
+    }
+
+    /// invalidate：mtime 变 → key 变 → miss（下次重调 LS）。std set_modified，无新依赖。
+    #[tokio::test]
+    async fn mtime_change_invalidates_entry() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "fn f() {}\n").unwrap();
+        let root = dir.path();
+
+        let key1 = doc_symbol_cache_key(root, "a.rs");
+        sup.symbol_cache_put(key1.clone(), vec![hit("f")]);
+        assert!(sup.symbol_cache_get(&key1).is_some());
+
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(42))
+            .unwrap();
+        let key2 = doc_symbol_cache_key(root, "a.rs");
+        assert_ne!(key1, key2, "mtime change must produce a new cache key");
+        assert!(
+            sup.symbol_cache_get(&key2).is_none(),
+            "new mtime must miss (invalidate)"
+        );
+    }
+
+    /// 不同 file 不同 key（不串扰）。
+    #[tokio::test]
+    async fn different_files_do_not_share_entries() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        let ka = doc_symbol_cache_key(root, "a.rs");
+        let kb = doc_symbol_cache_key(root, "b.rs");
+        assert_ne!(ka, kb);
+        sup.symbol_cache_put(ka.clone(), vec![hit("a_sym")]);
+        assert!(sup.symbol_cache_get(&ka).is_some());
+        assert!(sup.symbol_cache_get(&kb).is_none());
+    }
+
+    /// find-symbol 缓存：query 命中 + limit 对缓存全量截断；不同 query 不串扰。
+    #[tokio::test]
+    async fn find_symbol_cache_hits_by_query_and_respects_limit() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        sup.symbol_cache_put(
+            find_symbol_cache_key(root, "parse"),
+            vec![hit("parse_a"), hit("parse_b"), hit("parse_c")],
+        );
+
+        let t0 = Instant::now();
+        let out = sup
+            .tool_find_symbol(root, "parse", 2, Some("rust"))
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1),
+            "cache hit took {elapsed:?}"
+        );
+        assert_eq!(out.len(), 2, "limit must apply to cached full list");
+        assert_eq!(out[0].name, "parse_a");
+
+        // 不同 query → miss → 走真实路径：root 不存在 → 扫不到 lang → BadArgs。
+        let err = sup
+            .tool_find_symbol(root, "other", 5, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::BadArgs { .. }),
+            "unexpected: {err:?}"
+        );
     }
 }
