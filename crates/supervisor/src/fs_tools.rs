@@ -26,6 +26,44 @@ pub enum FsError {
 
 pub type FsResult<T> = std::result::Result<T, FsError>;
 
+/// 目录扫描内置 ignore 列表（Phase 3.3）。表驱动，不读 .gitignore 协议。
+pub fn should_ignore(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules"
+            | "target"
+            | "dist"
+            | ".git"
+            | ".idea"
+            | ".vscode"
+            | "__pycache__"
+            | "venv"
+            | ".venv"
+            | "build"
+            | "out"
+            | "coverage"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".tox"
+            | ".gradle"
+            | ".terraform"
+            | ".next"
+            | ".nuxt"
+    )
+}
+
+/// 构造带内置 ignore 过滤的 walker；depth 0（扫描根自身）不过滤，
+/// 以便显式列 `dist/` 等仍可行。
+fn filtered_walker(root: &Path) -> ignore::WalkBuilder {
+    let mut walker = ignore::WalkBuilder::new(root);
+    walker
+        .standard_filters(true)
+        .skip_stdout(true)
+        .max_filesize(Some(5 * 1024 * 1024))
+        .filter_entry(|e| e.depth() == 0 || !should_ignore(e.file_name().to_str().unwrap_or("")));
+    walker
+}
+
 /// `read_file` 返回的结果：内容 + 总行数（用于客户端分页显示）。
 #[derive(Debug, Serialize)]
 pub struct ReadReport {
@@ -120,11 +158,7 @@ pub fn list_dir(
         });
     }
     let mut out = Vec::new();
-    let mut walker = ignore::WalkBuilder::new(&canon_target);
-    walker
-        .standard_filters(true)
-        .skip_stdout(true)
-        .max_filesize(Some(5 * 1024 * 1024));
+    let mut walker = filtered_walker(&canon_target);
     if let Some(d) = max_depth {
         walker.max_depth(Some(d));
     }
@@ -179,11 +213,7 @@ pub fn find_file(
         None => None,
     };
     let mut out = Vec::new();
-    let mut walker = ignore::WalkBuilder::new(&canon_root);
-    walker
-        .standard_filters(true)
-        .skip_stdout(true)
-        .max_filesize(Some(5 * 1024 * 1024));
+    let walker = filtered_walker(&canon_root);
     for entry in walker.build().flatten() {
         if out.len() >= max_results {
             break;

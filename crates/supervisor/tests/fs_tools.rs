@@ -137,3 +137,52 @@ async fn find_file_respects_max_results() {
     let hits = fs_tools::find_file(&d, "*.txt", None, 3).unwrap();
     assert_eq!(hits.len(), 3, "should cap at 3, got {hits:?}");
 }
+
+#[test]
+fn should_ignore_builtin_dirs() {
+    for name in [
+        "node_modules",
+        "target",
+        "venv",
+        ".venv",
+        ".git",
+        "__pycache__",
+        "dist",
+        "build",
+        ".mypy_cache",
+    ] {
+        assert!(fs_tools::should_ignore(name), "{name} should be ignored");
+    }
+    for name in ["src", "main.rs", "output", "coverage-report", ".github"] {
+        assert!(!fs_tools::should_ignore(name), "{name} should NOT be ignored");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn list_dir_skips_builtin_ignore_dirs() {
+    let d = dir("ignore33-list");
+    fs::create_dir_all(d.join("node_modules/pkg")).unwrap();
+    fs::write(d.join("node_modules/pkg/index.js"), "x").unwrap();
+    fs::write(d.join("keep.txt"), "x").unwrap();
+
+    let r = fs_tools::list_dir(&d, ".", None, 100).unwrap();
+    let paths: Vec<_> = r.iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"keep.txt"), "got {paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.starts_with("node_modules")),
+        "node_modules should be excluded, got {paths:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn find_file_skips_builtin_ignore_dirs() {
+    let d = dir("ignore33-find");
+    fs::create_dir_all(d.join("target/debug")).unwrap();
+    fs::create_dir_all(d.join("src")).unwrap();
+    fs::write(d.join("target/debug/foo.rs"), "x").unwrap();
+    fs::write(d.join("src/foo.rs"), "x").unwrap();
+
+    let hits = fs_tools::find_file(&d, "foo.rs", None, 100).unwrap();
+    assert_eq!(hits.len(), 1, "only src/foo.rs expected, got {hits:?}");
+    assert!(hits[0].replace('\\', "/").contains("src/foo.rs"), "got {hits:?}");
+}
