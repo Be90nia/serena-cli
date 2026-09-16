@@ -170,6 +170,43 @@ pub struct CompletionResponse {
     pub truncated: Option<String>,
     pub items: Vec<CompletionItemLite>,
 }
+
+/// `defining-symbol` 工具返回的单个定义条目（Phase 2.3 / local/solidlsp-development-plan.md §2.3）。
+///
+/// 组合 `tool_def`（拿 Location）+ `tool_containing_symbol` 的 documentSymbol walk
+/// （拿完整符号元信息）+ `lsp_core::offsets::slice_at`（拿符号体）。来源上游
+/// `request_defining_symbol` 的 `UnifiedSymbolInformation`（ls_types.py@43ae021）。
+///
+/// 始终以 `Vec` 形式返回 —— 即使单定义场景也是单元素数组；C++ 重载等多定义场景
+/// 自然展开。无定义时整个工具返回 `None`，不是空数组（区别于 `containing-symbol`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DefiningSymbolHit {
+    /// 定义点 Location（来自 `textDocument/definition`），相对 root。
+    pub source: DefiningSymbolLocation,
+    /// 符号完整元信息。
+    pub symbol: DefiningSymbolInfo,
+}
+
+/// 定义点位置（`textDocument/definition` 的 Location 字段子集）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DefiningSymbolLocation {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// `UnifiedSymbolInformation` 的最小子集（name / kind / range / body）。
+///
+/// `body` 是从盘上切出来的真实源代码（不含前置 docstring / 注释）；`range` 是
+/// LSP 原生 Range（驼峰命名由 `#[serde(rename_all = "camelCase")]` 自动产出）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DefiningSymbolInfo {
+    pub name: String,
+    pub kind: SymbolKindTag,
+    pub range: lsp_types::Range,
+    pub body: String,
+}
+
 impl Supervisor {
     /// `--direct` 模式入口：创建空 supervisor（懒加载 Session）。
     pub async fn direct() -> ToolResult<Self> {
@@ -529,6 +566,125 @@ impl Supervisor {
 
         Ok(collect_containing_hits(&resp, &uri, line, col))
     }
+
+    /// `defining-symbol`：位置 → `tool_def` 拿 Location → 在该 Location 上 documentSymbol
+    /// walk → 切片出符号体 → 返回 `{source, symbol}[]`。
+    ///
+    /// Phase 2.3（local/solidlsp-development-plan.md §2.3）：组合既有 `tool_def` +
+    /// `tool_containing_symbol` 的 walk 实现等价上游 `request_defining_symbol`（ls.py@43ae021
+    /// `request_defining_symbol`，返回 `UnifiedSymbolInformation | list[UnifiedSymbolInformation]`）。
+    ///
+    /// 返回 `Option<Vec<DefiningSymbolHit>>`：
+    /// - `None`：`tool_def` 也没找到（位置无定义）—— 与 `tool_def` 同语义（合法）。
+    /// - `Some(vec![])`：罕见 —— `tool_def` 给了 Location 但目标位置不在任何符号内。
+    /// - `Some(non_empty)`：正常结果；多定义场景（C++ 重载）自然展开为多元素。
+    ///
+    /// 复用策略：直接调 `self.tool_def` 避免重写 `textDocument/definition` 请求；
+    /// 切片走 `lsp_core::offsets::slice_at` 与 `tool_symbol_body` 同源。
+    pub async fn tool_defining_symbol(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Option<Vec<DefiningSymbolHit>>> {
+        // 1) def → Location（可能 None）。
+        let def_loc = self.tool_def(root, file, line, col, lang_override).await?;
+        let Some(def_loc) = def_loc else {
+            return Ok(None);
+        };
+
+        // 2) Location.uri → 相对 root 的 file 路径。
+        let def_uri = def_loc.uri.to_string();
+        let abs_path = def_uri
+            .strip_prefix("file://")
+            .or_else(|| def_uri.strip_prefix("file:///"))
+            .unwrap_or(&def_uri);
+        // Windows 下 LSP uri 是 `file:///d:/...`（三斜杠 + 小写盘符）；还原绝对路径。
+        let abs = if cfg!(windows) && abs_path.starts_with('/') {
+            PathBuf::from(&abs_path[1..].replace('/', "\\"))
+        } else {
+            PathBuf::from(abs_path.replace('\\', "/"))
+        };
+        let def_file = abs
+            .strip_prefix(root)
+            .map_err(|_| ToolError::BadArgs {
+                detail: format!(
+                    "definition at {abs_path} is outside workspace root {root:?}"
+                ),
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // 3) 目标文件 → documentSymbol walk → 在 def_loc.range.start 找覆盖符号。
+        let target_lang = resolve_lang_for_file(&def_file, lang_override)?;
+        let session = self.session_for(root, &target_lang).await?;
+        let target_path = root.join(&def_file);
+        let target_uri = path_to_uri_str(&target_path);
+        let _guard = session
+            .ensure_open(&target_path)
+            .await
+            .map_err(ToolError::Core)?;
+        let params = json!({ "textDocument": { "uri": target_uri.clone() } });
+        let resp: DocumentSymbolResponse = session
+            .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
+            .await?;
+
+        // 用 def 的目标位置作为 walk key（注意：来自 LSP 的 line/col 是 0-based）。
+        let hits = collect_containing_hits(
+            &resp,
+            &target_uri,
+            def_loc.range.start.line,
+            def_loc.range.start.character,
+        );
+        if hits.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        // 4) 读盘 → 切片 body（OffsetEncoding::Utf16 与 tool_symbol_body 一致）。
+        let text = tokio::fs::read_to_string(&target_path)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("read {}: {e}", target_path.display()),
+            })?;
+        let source = DefiningSymbolLocation {
+            file: def_file.clone(),
+            line: def_loc.range.start.line,
+            col: def_loc.range.start.character,
+        };
+        let out: Vec<DefiningSymbolHit> = hits
+            .into_iter()
+            .map(|hit| {
+                let start = LspPos {
+                    line: hit.range.start.line,
+                    character: hit.range.start.character,
+                };
+                let end = LspPos {
+                    line: hit.range.end.line,
+                    character: hit.range.end.character,
+                };
+                let body = lsp_core::offsets::slice_at(&text, start, end, OffsetEncoding::Utf16)
+                    .unwrap_or_else(|e| {
+                        // 切片失败（罕见：LS 给的 range 异常）→ 留空 + 不中断整体响应。
+                        // 整调用返 None 会让上层误判「无定义」，代价更大。
+                        tracing::warn!(symbol = %hit.name, error = %e, "defining-symbol slice failed");
+                        String::new()
+                    });
+                DefiningSymbolHit {
+                    source: source.clone(),
+                    symbol: DefiningSymbolInfo {
+                        name: hit.name,
+                        kind: hit.kind,
+                        range: hit.range,
+                        body,
+                    },
+                }
+            })
+            .collect();
+        Ok(Some(out))
+    }
+
 
     /// `workspace/symbol` → 全 workspace 跨文件符号查找（Task 20）。
     ///
@@ -2019,6 +2175,15 @@ impl SupervisorTrait for Supervisor {
                 )
                 .map_err(|e| ToolError::Serialize(e.into()))
             }
+            "defining-symbol" => {
+                let (file, line, col) = required_position(&args)?;
+                serde_json::to_value(
+                    self.tool_defining_symbol(root, &file, line, col, lang)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
+            }
+
             "refs" => {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(self.tool_refs(root, &file, line, col, lang).await?)

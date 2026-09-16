@@ -213,6 +213,10 @@ enum Cmd {
     },
     /// 按位置反查最深层包含符号（documentSymbol walk）。无命中返空数组（合法）。
     ContainingSymbol { file: String, line: u32, col: u32 },
+    /// 跳到定义并取完整符号信息（def + documentSymbol walk + body 切片）。
+    /// def 返空 → null；定义无符号覆盖 → 空数组；C++ 重载等多定义 → 多元素。
+    DefiningSymbol { file: String, line: u32, col: u32 },
+
     /// 函数调用位置的参数签名提示（textDocument/signatureHelp）。无调用位置返 null。
     SignatureHelp { file: String, line: u32, col: u32 },
     /// daemon 状态（uptime / pid / loaded LS）。
@@ -634,6 +638,15 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
                 "col": col,
             }),
         ),
+        Some(Cmd::DefiningSymbol { file, line, col }) => (
+            "defining-symbol",
+            json!({
+                "file": file,
+                "line": line,
+                "col": col,
+            }),
+        ),
+
         Some(Cmd::SignatureHelp { file, line, col }) => (
             "signature-help",
             json!({
@@ -883,6 +896,7 @@ async fn dispatch_shell_cmd(
         | "def"
         | "refs"
         | "containing-symbol"
+        | "defining-symbol"
         | "signature-help"
         | "symbol-body"
         | "replace-body"
