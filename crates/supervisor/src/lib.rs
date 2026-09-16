@@ -132,7 +132,44 @@ pub struct Key {
 ///
 pub use lsp_core::error::CoreError as CoreErrorWire;
 pub use lsp_types::Location;
-pub use lsp_types::Range as LspRange;
+// ============================================================================
+// completion 工具类型（M2 #1, design: local/completion-design.md §5）
+// ============================================================================
+
+/// AI-friendly 补全项（supervisor 层完成字段裁剪；daemon HTTP / shell 透传）。
+///
+/// 与 `lsp_types::CompletionItem` 的差异：
+/// - 丢弃 `sortText` / `filterText` / `commitCharacters` / `command` / `data` /
+///   `tags` / `label_details` / `text_edit`（LSP 内部排序/编辑协议细节，agent 用不到）。
+/// - `kind` 由 LSP 枚举映射成人类词（"function" / "variable" / "method" 等）。
+/// - `documentation` 截断到 200 char（设计 §3）。
+/// - `insert` = `insertText`（缺则用 `label`，agent 直接用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionItemLite {
+    pub label: String,
+    /// "function" / "method" / "variable" / "keyword" / ... 全小写英文。
+    /// Unknown kind → "other"。
+    pub kind: String,
+    /// 签名行（如 `int printf(const char *fmt, ...)`）；可空。
+    pub detail: Option<String>,
+    /// 实际插入文本（insertText 或 label 兜底）；可空。
+    pub insert: Option<String>,
+    /// 文档字符串，截断到 200 字符；可空。
+    pub doc: Option<String>,
+    pub deprecated: bool,
+    /// 补全自动插入的额外文本编辑（如 import）；不裁剪，agent 需要。
+    pub additional_text_edits: Vec<lsp_types::TextEdit>,
+}
+
+/// completion 工具响应：截断标记 + 已裁剪 items。
+///
+/// 设计 §4：CLI 一行 JSON；daemon HTTP 同形态（daemon 透传 `data`，由 supervisor 裁剪）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionResponse {
+    /// 截断提示："5 of 23"；未截断为 None。
+    pub truncated: Option<String>,
+    pub items: Vec<CompletionItemLite>,
+}
 impl Supervisor {
     /// `--direct` 模式入口：创建空 supervisor（懒加载 Session）。
     pub async fn direct() -> ToolResult<Self> {
@@ -327,6 +364,15 @@ impl Supervisor {
                         .insert((cache_root.clone(), uri.to_string()), items);
                 }
             });
+        // ↖ mirror: ls.py@43ae021 on_server_started — 把"等待 LS 索引就绪"
+        // 推到 session_for 内，避免用户可见的首请求 = 索引懒加载
+        // （cold-start 120s 根因：supervisor 路径跳过就绪探针，详见
+        // local/cold-start-hang-diagnosis.md）。
+        if let Err(e) =
+            tokio::time::timeout(Duration::from_secs(30), adapter.on_server_ready(&session)).await
+        {
+            tracing::warn!(adapter = adapter.id(), error = %e, "on_server_ready probe failed/timed out; continuing");
+        }
         self.instances
             .lock()
             .unwrap()
@@ -606,6 +652,90 @@ impl Supervisor {
         Ok(normalize_implementations(raw.as_ref()))
     }
 
+    /// `textDocument/completion` → AI-friendly 裁剪后的 `CompletionResponse`。
+    ///
+    /// 设计（local/completion-design.md §3/§5）：
+    /// - `limit == 0` 表示不限（`usize::MAX`）；否则截断到 `limit`。
+    /// - 字段裁剪在 supervisor 层完成：丢弃 `sortText/filterText/commitCharacters/...`，
+    ///   `kind` 由 LSP 枚举映射为人类词，`documentation` 截断 200 char。
+    /// - `trigger` 为 Some 时带 `context.triggerKind = TriggerCharacter (2)` + `triggerCharacter`；
+    ///   为 None 时发 `Invoked (1)`（用户显式请求补全，agent 不传 trigger 的默认形态）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn tool_completion(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        limit: usize,
+        trigger: Option<&str>,
+        lang_override: Option<&str>,
+    ) -> ToolResult<CompletionResponse> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        // 越界校验（同 tool_def）—— 防止上游传错位掩盖。
+        let pos = lsp_position_from_byte(&path, line, col, OffsetEncoding::Utf16).await?;
+
+        // CompletionContext：trigger=Some → TriggerCharacter + triggerCharacter；
+        //                None → Invoked（agent 显式请求）。
+        let context = match trigger {
+            Some(ch) => json!({
+                "triggerKind": 2, // CompletionTriggerKind::TRIGGER_CHARACTER
+                "triggerCharacter": ch,
+            }),
+            None => json!({ "triggerKind": 1 }), // INVOKED
+        };
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": pos.line, "character": pos.character },
+            "context": context,
+        });
+        // CompletionResponse = Array | List（untagged enum）。
+        // raw: Option<Value> → 直接以 Value 形态解析两形态：
+        //   - Array：items 数组直接 map
+        //   - List ：{ isIncomplete, items }
+        // null（无候选）也合理：返回空 items + truncated=None。
+        let raw: Option<serde_json::Value> = session
+            .request("textDocument/completion", params, TOOL_TIMEOUT)
+            .await?;
+        let items = match raw {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(arr)) => arr,
+            Some(serde_json::Value::Object(obj)) if obj.contains_key("items") => obj
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            Some(other) => {
+                return Err(ToolError::Protocol {
+                    tool: "completion".into(),
+                    reason: format!("unexpected response shape: {other}"),
+                });
+            }
+        };
+        let total = items.len();
+        // 0 = 不限（设计 §3）。
+        let cap = if limit == 0 { usize::MAX } else { limit };
+        let lite: Vec<CompletionItemLite> = items
+            .into_iter()
+            .take(cap)
+            .map(parse_completion_item)
+            .collect();
+        // 不让排序退化：保持 LSP 已排序顺序。
+        let truncated = if lite.len() < total {
+            Some(format!("{} of {}", lite.len(), total))
+        } else {
+            None
+        };
+        Ok(CompletionResponse {
+            truncated,
+            items: lite,
+        })
+    }
     /// `find_referencing_symbols`：所有引用 + 每个 ref 落在哪个外层符号里（Task 24）。
     pub async fn tool_referencing_symbols(
         &self,
@@ -1215,6 +1345,205 @@ impl Supervisor {
 
         Ok(report)
     }
+
+    /// `safe-delete-symbol`：无引用才删，有引用拒删并返回引用位置列表。
+    ///
+    /// ↖ mirror: symbol_tools.py@43ae021 SafeDeleteSymbol
+    /// （Δ position-free：按 file + 符号名寻址，与 symbol-body 一致；
+    ///  references 不含声明本身——声明随删除一起消失；
+    ///  「有引用」是正常结果而非错误，wire 层不占错误码。）
+    ///
+    /// 流程（写门全程持锁）：documentSymbol 定位 (range, selectionRange) →
+    /// references(selectionRange, includeDeclaration=false) → 有引用返回列表；
+    /// 无引用整行删除 + atomic_write + 读回校验 + didChange 全量（C3 链路同 replace-body）。
+    pub async fn tool_safe_delete_symbol(
+        &self,
+        root: &Path,
+        file: &str,
+        symbol: &str,
+        lang_override: Option<&str>,
+    ) -> ToolResult<SafeDeleteReport> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri_str = path_to_uri_str(&path);
+
+        let _gate = write_gate::acquire().await;
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        // 1) 锁内解析符号（杜绝过期 range）。
+        let params = json!({ "textDocument": { "uri": uri_str.clone() } });
+        let resp: DocumentSymbolResponse = session
+            .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
+            .await?;
+        let (range, selection) =
+            find_symbol_node(&resp, symbol).ok_or_else(|| ToolError::BadArgs {
+                detail: format!("symbol `{symbol}` not found in {file}"),
+            })?;
+
+        // 2) references：锚定 selectionRange（标识符），排除声明本身。
+        let ref_params = json!({
+            "textDocument": { "uri": uri_str.clone() },
+            "position": {
+                "line": selection.start.line,
+                "character": selection.start.character,
+            },
+            "context": { "includeDeclaration": false },
+        });
+        let raw: Option<serde_json::Value> = session
+            .request("textDocument/references", ref_params, TOOL_TIMEOUT)
+            .await?;
+        let refs = normalize_implementations(raw.as_ref());
+
+        // 3) 有引用 → 拒删，报引用位置（相对路径 + 1-based 行号）。
+        if !refs.is_empty() {
+            let root_canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            let mut locations: Vec<SafeDeleteRef> = refs
+                .iter()
+                .filter_map(|loc| {
+                    let p = uri_to_path(loc.uri.as_str())?;
+                    let rel = p
+                        .strip_prefix(&root_canon)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    Some(SafeDeleteRef {
+                        file: rel,
+                        line: loc.range.start.line + 1,
+                    })
+                })
+                .collect();
+            locations.sort();
+            locations.dedup();
+            return Ok(SafeDeleteReport {
+                deleted: false,
+                symbol: symbol.to_string(),
+                references: locations,
+            });
+        }
+
+        // 4) 无引用 → 删除：整行语义（见 delete_symbol_text）+ C3 链路。
+        let old_text = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("read {}: {e}", path.display()),
+            })?;
+        let new_text = delete_symbol_text(&old_text, range)?;
+        atomic_write(&path, &new_text)
+            .await
+            .map_err(|e| ToolError::WriteConflict {
+                path: path.display().to_string(),
+                reason: format!("atomic write failed: {e}"),
+            })?;
+        let readback = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| ToolError::BadArgs {
+                detail: format!("readback {}: {e}", path.display()),
+            })?;
+        if readback != new_text {
+            let _ = atomic_write(&path, &old_text).await;
+            return Err(ToolError::WriteConflict {
+                path: path.display().to_string(),
+                reason: "readback mismatch; rolled back".into(),
+            });
+        }
+        static SD_VERSION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        let version = SD_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let change_params = json!({
+            "textDocument": { "uri": uri_str, "version": version },
+            "contentChanges": [ { "text": new_text } ],
+        });
+        session
+            .notify("textDocument/didChange", change_params)
+            .await
+            .map_err(ToolError::Core)?;
+
+        Ok(SafeDeleteReport {
+            deleted: true,
+            symbol: symbol.to_string(),
+            references: vec![],
+        })
+    }
+
+    /// `insert-at-line`：在 line（1-based）前插入，原行下移；line == total+1 追加 EOF。
+    /// ↖ mirror: file_tools.py@43ae021 InsertAtLineTool（0-based → 1-based Δ）。
+    pub async fn tool_insert_at_line(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        content: &str,
+        expected_hash: Option<&str>,
+        lang_override: Option<&str>,
+    ) -> ToolResult<()> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let abs = root.join(file);
+        edit_tools::insert_at_line(&session, root, &abs, line, content, expected_hash)
+            .await
+            .map_err(line_edit_err("insert_at_line"))
+    }
+
+    /// `replace-lines`：用 content 替换 [start_line, end_line]（1-based 含端）。
+    /// ↖ mirror: file_tools.py@43ae021 ReplaceLinesTool（0-based → 1-based Δ）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn tool_replace_lines(
+        &self,
+        root: &Path,
+        file: &str,
+        start_line: u32,
+        end_line: u32,
+        content: &str,
+        expected_hash: Option<&str>,
+        lang_override: Option<&str>,
+    ) -> ToolResult<()> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let abs = root.join(file);
+        edit_tools::replace_lines(
+            &session,
+            root,
+            &abs,
+            start_line,
+            end_line,
+            content,
+            expected_hash,
+        )
+        .await
+        .map_err(line_edit_err("replace_lines"))
+    }
+
+    /// `delete-lines`：删除 [start_line, end_line]（1-based 含端）。
+    /// ↖ mirror: file_tools.py@43ae021 DeleteLinesTool（0-based → 1-based Δ）。
+    pub async fn tool_delete_lines(
+        &self,
+        root: &Path,
+        file: &str,
+        start_line: u32,
+        end_line: u32,
+        expected_hash: Option<&str>,
+        lang_override: Option<&str>,
+    ) -> ToolResult<()> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let abs = root.join(file);
+        edit_tools::delete_lines(&session, root, &abs, start_line, end_line, expected_hash)
+            .await
+            .map_err(line_edit_err("delete_lines"))
+    }
+}
+
+/// 行级三件套 EditError → ToolError 映射：写冲突保留变体，其余归 BadArgs。
+fn line_edit_err(tool: &str) -> impl Fn(edit_tools::EditError) -> ToolError + '_ {
+    move |e| match e {
+        edit_tools::EditError::WriteConflict { path, reason } => {
+            ToolError::WriteConflict { path, reason }
+        }
+        edit_tools::EditError::Core(c) => ToolError::Core(c),
+        other => ToolError::BadArgs {
+            detail: format!("{tool}: {other}"),
+        },
+    }
 }
 
 /// rename_symbol 结果报告。
@@ -1240,6 +1569,25 @@ fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(s.replace('\\', "/")))
 }
 
+/// safe-delete 结果报告。
+#[derive(Debug, Serialize)]
+pub struct SafeDeleteReport {
+    /// false = 有引用拒删；true = 已删除。
+    pub deleted: bool,
+    pub symbol: String,
+    /// deleted=false 时非空：引用位置（相对路径 + 1-based 行号，按 file+line 排序去重）。
+    pub references: Vec<SafeDeleteRef>,
+}
+
+/// 单条引用位置。
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct SafeDeleteRef {
+    /// 相对 project_root 路径。
+    pub file: String,
+    /// 1-based 行号。
+    pub line: u32,
+}
+
 /// 单个搜索命中。
 #[derive(Debug, Serialize)]
 pub struct SearchHit {
@@ -1250,7 +1598,6 @@ pub struct SearchHit {
     pub match_start: u32,
     pub match_end: u32,
 }
-
 /// 搜索响应。
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
@@ -1432,6 +1779,31 @@ fn required_rename_args(args: &serde_json::Value) -> ToolResult<(String, u32, u3
         .to_owned();
     Ok((file, line, col, new_name))
 }
+
+/// 行级 replace-lines / delete-lines 的 (file, start_line, end_line)。
+fn required_line_range(args: &serde_json::Value) -> ToolResult<(String, u32, u32)> {
+    let file = required_file(args)?;
+    let start_line = args
+        .get("start_line")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing 'start_line'".into(),
+        })? as u32;
+    let end_line = args
+        .get("end_line")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ToolError::BadArgs {
+            detail: "missing 'end_line'".into(),
+        })? as u32;
+    Ok((file, start_line, end_line))
+}
+
+/// 可选 hash 对账参数（行级三件套）。
+fn opt_expected_hash(args: &serde_json::Value) -> Option<String> {
+    args.get("expected_hash")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
 /// edit_* 工具通用 helper：(file, symbol, text)。
 fn required_edit_args(args: &serde_json::Value) -> ToolResult<(String, String, String)> {
     let file = required_file(args)?;
@@ -1496,6 +1868,15 @@ impl SupervisorTrait for Supervisor {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(self.tool_refs(root, &file, line, col, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "completion" => {
+                let (file, line, col) = required_position(&args)?;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                let trigger = args.get("trigger").and_then(|v| v.as_str());
+                let resp = self
+                    .tool_completion(root, &file, line, col, limit, trigger, lang)
+                    .await?;
+                serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
             }
             "find-implementations" => {
                 let (file, line, col) = required_position(&args)?;
@@ -1696,6 +2077,74 @@ impl SupervisorTrait for Supervisor {
                     .await?;
                 Ok(serde_json::Value::Null)
             }
+            "safe-delete-symbol" => {
+                let (file, symbol) = required_symbol_body_args(&args)?;
+                serde_json::to_value(
+                    self.tool_safe_delete_symbol(root, &file, &symbol, lang)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "insert-at-line" => {
+                let file = required_file(&args)?;
+                let line =
+                    args.get("line")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| ToolError::BadArgs {
+                            detail: "missing 'line'".into(),
+                        })? as u32;
+                let content = args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'content'".into(),
+                    })?
+                    .to_owned();
+                self.tool_insert_at_line(
+                    root,
+                    &file,
+                    line,
+                    &content,
+                    opt_expected_hash(&args).as_deref(),
+                    lang,
+                )
+                .await?;
+                Ok(serde_json::Value::Null)
+            }
+            "replace-lines" => {
+                let (file, start_line, end_line) = required_line_range(&args)?;
+                let content = args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'content'".into(),
+                    })?
+                    .to_owned();
+                self.tool_replace_lines(
+                    root,
+                    &file,
+                    start_line,
+                    end_line,
+                    &content,
+                    opt_expected_hash(&args).as_deref(),
+                    lang,
+                )
+                .await?;
+                Ok(serde_json::Value::Null)
+            }
+            "delete-lines" => {
+                let (file, start_line, end_line) = required_line_range(&args)?;
+                self.tool_delete_lines(
+                    root,
+                    &file,
+                    start_line,
+                    end_line,
+                    opt_expected_hash(&args).as_deref(),
+                    lang,
+                )
+                .await?;
+                Ok(serde_json::Value::Null)
+            }
             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
             }),
@@ -1796,8 +2245,192 @@ fn find_symbol_range(resp: &DocumentSymbolResponse, symbol: &str) -> Option<lsp_
     }
 }
 
+/// 找符号的 `(range, selectionRange)`：range = 删除范围，selectionRange = 标识符
+/// 位置（references 锚点）。Flat 形态无 selectionRange，用 location.range 起点近似
+/// （SymbolInformation 的 location 即标识符所在位置）。
+fn find_symbol_node(
+    resp: &DocumentSymbolResponse,
+    symbol: &str,
+) -> Option<(lsp_types::Range, lsp_types::Range)> {
+    fn walk(
+        items: &[DocumentSymbol],
+        symbol: &str,
+    ) -> Option<(lsp_types::Range, lsp_types::Range)> {
+        for it in items {
+            if it.name == symbol {
+                return Some((it.range, it.selection_range));
+            }
+            if let Some(children) = it.children.as_ref()
+                && let Some(r) = walk(children, symbol)
+            {
+                return Some(r);
+            }
+        }
+        None
+    }
+    match resp {
+        DocumentSymbolResponse::Nested(items) => walk(items, symbol),
+        DocumentSymbolResponse::Flat(items) => items
+            .iter()
+            .find(|it| it.name == symbol)
+            .map(|it| (it.location.range, it.location.range)),
+    }
+}
+
+/// 文档截断上限（设计 §3：documentation 默认 200 字符）。
+const DOC_MAX_CHARS: usize = 200;
+
+/// 把 LSP CompletionItem（已用 serde_json::Value 形态取出）映射到 `CompletionItemLite`。
+/// 字段裁剪 / kind 映射 / doc 截断都集中在这里。
+fn parse_completion_item(raw: serde_json::Value) -> CompletionItemLite {
+    let label = raw
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let kind = raw
+        .get("kind")
+        .and_then(|v| v.as_i64())
+        .map(map_completion_kind)
+        .unwrap_or_else(|| "other".to_owned());
+    let detail = raw
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let insert = raw
+        .get("insertText")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            if label.is_empty() {
+                None
+            } else {
+                Some(label.clone())
+            }
+        });
+    let doc = raw
+        .get("documentation")
+        .and_then(extract_doc_string)
+        .map(truncate_doc);
+    let deprecated = raw
+        .get("deprecated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let additional_text_edits = raw
+        .get("additionalTextEdits")
+        .and_then(|v| serde_json::from_value::<Vec<lsp_types::TextEdit>>(v.clone()).ok())
+        .unwrap_or_default();
+    CompletionItemLite {
+        label,
+        kind,
+        detail,
+        insert,
+        doc,
+        deprecated,
+        additional_text_edits,
+    }
+}
+
+/// 把 LSP `documentation`（String | MarkupContent）展平成纯文本字符串。
+fn extract_doc_string(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_owned());
+    }
+    // MarkupContent：{ kind: "markdown" | "plaintext", value: "..." }
+    v.get("value").and_then(|x| x.as_str()).map(str::to_owned)
+}
+
+/// 截断 doc 到 200 char（codepoint 级，非字节；设计 §3/§8.1）。
+fn truncate_doc(s: String) -> String {
+    if s.chars().count() <= DOC_MAX_CHARS {
+        s
+    } else {
+        let truncated: String = s.chars().take(DOC_MAX_CHARS).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// LSP `CompletionItemKind` 整数 → 人类词。Unknown → "other"。
+/// LSP spec kind 值见 `lsp_types::CompletionItemKind::*`（1..=25）。
+fn map_completion_kind(kind_num: i64) -> String {
+    use lsp_types::CompletionItemKind as K;
+    let k = match kind_num {
+        1 => K::TEXT,
+        2 => K::METHOD,
+        3 => K::FUNCTION,
+        4 => K::CONSTRUCTOR,
+        5 => K::FIELD,
+        6 => K::VARIABLE,
+        7 => K::CLASS,
+        8 => K::INTERFACE,
+        9 => K::MODULE,
+        10 => K::PROPERTY,
+        11 => K::UNIT,
+        12 => K::VALUE,
+        13 => K::ENUM,
+        14 => K::KEYWORD,
+        15 => K::SNIPPET,
+        16 => K::COLOR,
+        17 => K::FILE,
+        18 => K::REFERENCE,
+        19 => K::FOLDER,
+        20 => K::ENUM_MEMBER,
+        21 => K::CONSTANT,
+        22 => K::STRUCT,
+        23 => K::EVENT,
+        24 => K::OPERATOR,
+        25 => K::TYPE_PARAMETER,
+        _ => return "other".to_owned(),
+    };
+    // lsp_enum! 给出的常量名 "Text" / "Method" / ... 转小写。
+    // 形如 "EnumMember" → "enum_member"；"TypeParameter" → "type_parameter"。
+    // 用 Debug 拿名字最稳（spec 表与常量名一一对应）。
+    format!("{:?}", k).to_ascii_lowercase()
+}
+/// 从文本中删除符号 range：默认整行删除（start 行首 → end 行含换行）；
+/// end 行符号之后还有非空白内容时只删到符号结尾，保留行尾余文。
+fn delete_symbol_text(text: &str, range: lsp_types::Range) -> ToolResult<String> {
+    let line_start = |line: u32| {
+        lsp_core::offsets::position_to_byte(
+            text,
+            LspPos { line, character: 0 },
+            OffsetEncoding::Utf16,
+        )
+        .map_err(|e| ToolError::BadArgs {
+            detail: format!("position {line}:0: {e}"),
+        })
+    };
+    let s = line_start(range.start.line)?;
+    let e_sym = lsp_core::offsets::position_to_byte(
+        text,
+        LspPos {
+            line: range.end.line,
+            character: range.end.character,
+        },
+        OffsetEncoding::Utf16,
+    )
+    .map_err(|e| ToolError::BadArgs {
+        detail: format!("end position: {e}"),
+    })?;
+    let e_line_start = line_start(range.end.line)?;
+    let e_line_end = text[e_line_start..]
+        .find('\n')
+        .map_or(text.len(), |i| e_line_start + i);
+    // end 行符号后只剩空白 → 整行吞掉（含换行）；否则保留行尾余文。
+    let e = if text[e_sym..e_line_end].trim().is_empty() {
+        if e_line_end < text.len() {
+            e_line_end + 1
+        } else {
+            e_line_end
+        }
+    } else {
+        e_sym
+    };
+    Ok(format!("{}{}", &text[..s], &text[e..]))
+}
+
 /// sha256(content) hex 前 16 位（对账用；碰撞概率足够低且只做提示性校验）。
-fn content_hash(text: &str) -> String {
+pub(crate) fn content_hash(text: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(text.as_bytes());
@@ -1830,5 +2463,109 @@ async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
                 return Err(e);
             }
         }
+    }
+}
+#[cfg(test)]
+mod safe_delete_tests {
+    use super::*;
+
+    fn range(sl: u32, sc: u32, el: u32, ec: u32) -> lsp_types::Range {
+        lsp_types::Range {
+            start: Position::new(sl, sc),
+            end: Position::new(el, ec),
+        }
+    }
+
+    #[test]
+    fn delete_symbol_keeps_trailing_same_line_content() {
+        // end 行符号后还有别的代码 → 只删符号本体。
+        let text = "void f() {} void g() {}\n";
+        let out = delete_symbol_text(text, range(0, 0, 0, 11)).unwrap();
+        assert_eq!(out, " void g() {}\n");
+    }
+    #[test]
+    fn delete_symbol_removes_whole_lines() {
+        let text = "int a = 1;\nint orphan() { return 1; }\nint b = 2;\n";
+        let out = delete_symbol_text(text, range(1, 0, 1, 26)).unwrap();
+        assert_eq!(out, "int a = 1;\nint b = 2;\n");
+    }
+    #[test]
+    fn delete_symbol_at_eof_without_trailing_newline() {
+        let text = "int a;\nint orphan() { return 1; }";
+        let out = delete_symbol_text(text, range(1, 0, 1, 26)).unwrap();
+        assert_eq!(out, "int a;\n");
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    /// 字段裁剪：保留 label/kind/insert；丢弃 sortText/filterText 等。
+    #[test]
+    fn parse_item_drops_lsp_internal_fields() {
+        let raw = serde_json::json!({
+            "label": "printf",
+            "kind": 3,
+            "detail": "int printf(const char *, ...)",
+            "sortText": "00001",
+            "filterText": "printf",
+            "insertText": "printf",
+            "documentation": { "kind": "markdown", "value": "fmt output" },
+        });
+        let lite = parse_completion_item(raw);
+        assert_eq!(lite.label, "printf");
+        assert_eq!(lite.kind, "function");
+        assert_eq!(
+            lite.detail.as_deref(),
+            Some("int printf(const char *, ...)")
+        );
+        assert_eq!(lite.insert.as_deref(), Some("printf"));
+        assert_eq!(lite.doc.as_deref(), Some("fmt output"));
+        // 内部字段无对应键（struct 字段未定义）—— 静态保证。
+    }
+
+    /// insert 缺时用 label 兜底。
+    #[test]
+    fn parse_item_insert_falls_back_to_label() {
+        let raw = serde_json::json!({ "label": "foo" });
+        let lite = parse_completion_item(raw);
+        assert_eq!(lite.insert.as_deref(), Some("foo"));
+    }
+
+    /// kind map：Function → "function"；Unknown → "other"。
+    #[test]
+    fn kind_map_lowercases_lsp_enum_names() {
+        assert_eq!(map_completion_kind(3), "function");
+        assert_eq!(map_completion_kind(2), "method");
+        assert_eq!(map_completion_kind(6), "variable");
+        assert_eq!(map_completion_kind(14), "keyword");
+        assert_eq!(map_completion_kind(99), "other");
+    }
+
+    /// doc 截断：> 200 char 截断 + "…"；≤ 200 char 原文。
+    #[test]
+    fn truncate_doc_caps_at_two_hundred_chars() {
+        let short = "a".repeat(100);
+        assert_eq!(truncate_doc(short.clone()), short);
+        let long = "a".repeat(500);
+        let out = truncate_doc(long);
+        assert!(
+            out.chars().count() <= DOC_MAX_CHARS + 1,
+            "got {} chars",
+            out.chars().count()
+        );
+        assert!(out.ends_with('…'), "expected trailing ellipsis: {out}");
+    }
+
+    /// documentation: String / MarkupContent 都能展平。
+    #[test]
+    fn extract_doc_string_handles_both_shapes() {
+        let s = serde_json::json!("plain text");
+        assert_eq!(extract_doc_string(&s).as_deref(), Some("plain text"));
+        let m = serde_json::json!({ "kind": "markdown", "value": "**bold**" });
+        assert_eq!(extract_doc_string(&m).as_deref(), Some("**bold**"));
+        let none = serde_json::json!(null);
+        assert_eq!(extract_doc_string(&none), None);
     }
 }

@@ -343,6 +343,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "reqwest",
  "serde",
  "serde_json",
  "supervisor",

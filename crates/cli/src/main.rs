@@ -169,6 +169,48 @@ enum Cmd {
         start_line: u32,
         end_line: u32,
     },
+    /// 安全删除符号：无引用才删；有引用拒删并列出引用位置。
+    SafeDeleteSymbol { file: String, symbol: String },
+    /// 在 line（1-based）前插入内容，原行下移；line = 总行数+1 即追加。
+    InsertAtLine {
+        file: String,
+        line: u32,
+        text: String,
+        /// 可选：上次 read-file 返回的全文 hash，不符拒写。
+        #[arg(long)]
+        expected_hash: Option<String>,
+    },
+    /// 用新内容替换 [start_line, end_line]（1-based 含端）。
+    ReplaceLines {
+        file: String,
+        start_line: u32,
+        end_line: u32,
+        text: String,
+        /// 可选：上次 read-file 返回的全文 hash，不符拒写。
+        #[arg(long)]
+        expected_hash: Option<String>,
+    },
+    /// 删除 [start_line, end_line]（1-based 含端）。
+    DeleteLines {
+        file: String,
+        start_line: u32,
+        end_line: u32,
+        /// 可选：上次 read-file 返回的全文 hash，不符拒写。
+        #[arg(long)]
+        expected_hash: Option<String>,
+    },
+    /// 代码补全（textDocument/completion）—— AI-friendly 字段裁剪 + 自动推断 trigger。
+    Completion {
+        file: String,
+        line: u32,
+        col: u32,
+        /// 上限（0 = 不限，默认 5）。
+        #[arg(long, default_value_t = 5)]
+        limit: u32,
+        /// 显式 trigger char（如 "." / "::"）；省略时按 file 后缀自动推断。
+        #[arg(long)]
+        trigger: Option<String>,
+    },
     /// daemon 状态（uptime / pid / loaded LS）。
     Status,
     /// 停掉 daemon（draining + 删 lock）。
@@ -259,6 +301,30 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             .tool_refs(&root, file, *line, *col, cli.lang.as_deref())
             .await
             .and_then(|vec| print_json(&json!(vec))),
+        Some(Cmd::Completion {
+            file,
+            line,
+            col,
+            limit,
+            trigger,
+        }) => {
+            let trigger = trigger
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| infer_trigger_char(file));
+            sup.tool_completion(
+                &root,
+                file,
+                *line,
+                *col,
+                *limit as usize,
+                trigger.as_deref(),
+                cli.lang.as_deref(),
+            )
+            .await
+            .and_then(|resp| print_json(&json!(resp)))
+        }
         other => {
             let _ = other;
             eprintln!("this subcommand is daemon-mode only in M1");
@@ -488,10 +554,75 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
             "delete-text-in-symbol",
             json!({"file": file, "symbol": symbol, "start_line": start_line, "end_line": end_line}),
         ),
-        | Some(Cmd::Status)
-        | Some(Cmd::StopAll)
-        | Some(Cmd::Shell)
-        | None => {
+        Some(Cmd::SafeDeleteSymbol { file, symbol }) => (
+            "safe-delete-symbol",
+            json!({"file": file, "symbol": symbol}),
+        ),
+        Some(Cmd::InsertAtLine {
+            file,
+            line,
+            text,
+            expected_hash,
+        }) => (
+            "insert-at-line",
+            json!({"file": file, "line": line, "content": text, "expected_hash": expected_hash}),
+        ),
+        Some(Cmd::ReplaceLines {
+            file,
+            start_line,
+            end_line,
+            text,
+            expected_hash,
+        }) => (
+            "replace-lines",
+            json!({
+                "file": file,
+                "start_line": start_line,
+                "end_line": end_line,
+                "content": text,
+                "expected_hash": expected_hash,
+            }),
+        ),
+        Some(Cmd::DeleteLines {
+            file,
+            start_line,
+            end_line,
+            expected_hash,
+        }) => (
+            "delete-lines",
+            json!({
+                "file": file,
+                "start_line": start_line,
+                "end_line": end_line,
+                "expected_hash": expected_hash,
+            }),
+        ),
+        Some(Cmd::Completion {
+            file,
+            line,
+            col,
+            limit,
+            trigger,
+        }) => {
+            // trigger=None 时按 file 后缀自动推断（C++=., Rust=::, TS/JS/Py=.）；
+            // 显式传 "" 也视为 None（agent 端不需要感知 7 种扩展名）。
+            let trigger = trigger
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| infer_trigger_char(file));
+            (
+                "completion",
+                json!({
+                    "file": file,
+                    "line": line,
+                    "col": col,
+                    "limit": limit,
+                    "trigger": trigger,
+                }),
+            )
+        }
+        Some(Cmd::Status) | Some(Cmd::StopAll) | Some(Cmd::Shell) | None => {
             unreachable!("handled earlier")
         }
     };
@@ -532,7 +663,9 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
             let code = err
                 .get("code")
                 .and_then(|c| serde_json::from_value::<daemon::dto::WireErrorCode>(c.clone()).ok());
-            std::process::exit(i32::from(code.map_or(1u8, daemon::dto::wire_error_code_to_exit)));
+            std::process::exit(i32::from(
+                code.map_or(1u8, daemon::dto::wire_error_code_to_exit),
+            ));
         }
     }
 }
@@ -744,8 +877,11 @@ async fn dispatch_shell_cmd(
         | "replace-text-in-symbol"
         | "insert-text-after-symbol"
         | "insert-text-before-symbol"
-        | "delete-text-in-symbol" => cmd,
-
+        | "delete-text-in-symbol"
+        | "safe-delete-symbol"
+        | "insert-at-line"
+        | "replace-lines"
+        | "delete-lines" => cmd,
         other => return Err(format!("unknown cmd: {other}")),
     };
     let body = json!({
@@ -793,6 +929,21 @@ fn resolve_project_root(raw: Option<PathBuf>) -> PathBuf {
     let p = raw.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     dunce::canonicalize(&p).unwrap_or(p)
 }
+
+/// 按 file 后缀推断 LSP `textDocument/completion` 的 triggerCharacter。
+/// 仅当 agent 显式不传 trigger 时启用（C++ / Rust / TS / JS / Py 共 5 系）。
+/// ponytail: 这是文件后缀到 trigger 字符的固定映射表，新加 lang 时补一行即可，
+///          不必上配置。
+fn infer_trigger_char(file: &str) -> Option<String> {
+    let ext = file.rsplit('.').next()?.to_ascii_lowercase();
+    let ch: &'static str = match ext.as_str() {
+        "cpp" | "c" | "cc" | "cxx" | "h" | "hpp" | "hxx" => ".",
+        "rs" => "::",
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" => ".",
+        _ => return None,
+    };
+    Some(ch.to_owned())
+}
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -808,4 +959,3 @@ fn json_escape(s: &str) -> String {
     }
     out
 }
-
