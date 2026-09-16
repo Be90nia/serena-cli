@@ -35,7 +35,7 @@ async fn diagnostics_returns_error_on_bad_code() {
 
     let sup = Supervisor::direct().await.expect("supervisor");
     let diag = sup
-        .tool_diagnostics(&dir, "bad.cpp", None)
+        .tool_diagnostics(&dir, "bad.cpp", None, None)
         .await
         .expect("diagnostics");
 
@@ -70,7 +70,7 @@ async fn diagnostics_returns_empty_on_clean_code() {
 
     let sup = Supervisor::direct().await.expect("supervisor");
     let diag = sup
-        .tool_diagnostics(&dir, "ok.cpp", None)
+        .tool_diagnostics(&dir, "ok.cpp", None, None)
         .await
         .expect("diagnostics");
 
@@ -82,6 +82,114 @@ async fn diagnostics_returns_empty_on_clean_code() {
     assert!(
         items.is_empty(),
         "expected 0 diagnostics on clean code, got: {diag}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_wait_gen_zero_returns_immediately() {
+    if !has_clangd() {
+        println!("skipped: clangd not in PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("serena-diag-wgen0-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ok.cpp"), "int main() { return 0; }\n").unwrap();
+
+    let sup = Supervisor::direct().await.expect("supervisor");
+    // wait_gen=0 → 立即返回：响应形态合法（{ items: [...] }），不 panic、不超时。
+    let diag = sup
+        .tool_diagnostics(&dir, "ok.cpp", None, Some(0))
+        .await
+        .expect("diagnostics");
+    assert!(
+        diag.get("items").and_then(|i| i.as_array()).is_some(),
+        "expected items array, got: {diag}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_wait_gen_at_current_returns_immediately_with_items() {
+    if !has_clangd() {
+        println!("skipped: clangd not in PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("serena-diag-wgencur-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // 类型错误 → clangd 必推送非空 items，generation 必然 > 0。
+    std::fs::write(dir.join("bad.cpp"), "const char* s = 12345;\n").unwrap();
+
+    let sup = Supervisor::direct().await.expect("supervisor");
+    // 先以默认路径触发 publish，建立 generation + items 缓存。
+    let _ = sup
+        .tool_diagnostics(&dir, "bad.cpp", None, None)
+        .await
+        .expect("seed diagnostics");
+    let cur = sup.diag_generation();
+    assert!(cur > 0, "expected generation > 0 after seed, got {cur}");
+
+    // wait_gen = 当前 generation → 立即通过。
+    let start = std::time::Instant::now();
+    let diag = sup
+        .tool_diagnostics(&dir, "bad.cpp", None, Some(cur))
+        .await
+        .expect("wait-gen-at-current");
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(500),
+        "wait_gen=cur should return fast, took {:?}",
+        start.elapsed()
+    );
+    let items = diag
+        .get("items")
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !items.is_empty(),
+        "expected items from cache, got: {diag}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_wait_gen_huge_times_out_with_empty_items() {
+    if !has_clangd() {
+        println!("skipped: clangd not in PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("serena-diag-wgentoo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ok.cpp"), "int main() { return 0; }\n").unwrap();
+
+    let sup = Supervisor::direct().await.expect("supervisor");
+    // wait_gen = u64::MAX → 不可能到达 → 必超时（5s 上限），返 {items:[]} 不 panic。
+    let start = std::time::Instant::now();
+    let diag = sup
+        .tool_diagnostics(&dir, "ok.cpp", None, Some(u64::MAX))
+        .await
+        .expect("diagnostics");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed <= std::time::Duration::from_millis(6_500),
+        "wait_gen=huge should hit 5s timeout, took {:?}",
+        elapsed
+    );
+    let items = diag
+        .get("items")
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        items.is_empty(),
+        "expected empty items on timeout (clean file), got: {diag}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

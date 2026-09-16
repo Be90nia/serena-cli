@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -119,6 +120,9 @@ pub struct Supervisor {
     direct_mode: bool,
     /// publishDiagnostics 通知缓存：key = (root, uri)，value = items 数组。
     diag_cache: DiagCache,
+    /// diagnostics generation：每次 publishDiagnostics 通知 ++（含空 items 的"无错"推送）。
+    /// 客户端可请求 `wait_gen >= N` 等新一代诊断，避免盲轮询 5s。
+    diag_generation: Arc<AtomicU64>,
 }
 /// 实例键：canonicalize、去尾分隔符并大小写折叠的 root + language。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -216,6 +220,7 @@ impl Supervisor {
             last_used: Mutex::new(HashMap::new()),
             direct_mode: true,
             diag_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            diag_generation: std::sync::Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -371,9 +376,10 @@ impl Supervisor {
         adapter.initialize_patches(&mut params);
 
         let session = Session::start(Some(child), params).await?;
-        // 注册 publishDiagnostics handler → 写 diag_cache。
+        // 注册 publishDiagnostics handler → 写 diag_cache + 累 generation。
         let cache_root = key.root.clone();
         let cache = std::sync::Arc::clone(&self.diag_cache);
+        let generation = std::sync::Arc::clone(&self.diag_generation);
         session
             .client()
             .on_notification("textDocument/publishDiagnostics", move |msg| {
@@ -394,6 +400,9 @@ impl Supervisor {
                 else {
                     return;
                 };
+                // 每次 publishDiagnostics 都 ++ generation（含空 items 的"无错"推送），
+                // 客户端 wait_gen >= N 才能精确等新一代，而非盲等 5s。
+                generation.fetch_add(1, Ordering::Relaxed);
                 if !items.is_empty() {
                     cache
                         .lock()
@@ -421,11 +430,17 @@ impl Supervisor {
     /// `textDocument/diagnostic` 诊断：依赖 LS `publishDiagnostics` 推送缓存。
     /// clangd 对 pull 式 `textDocument/diagnostic` 返 -32601，故走通知缓存 +
     /// 轮询等待（打开文件即推，100ms × 50 次 = 5s 上限），返 `{ items: [...] }`。
+    ///
+    /// `wait_gen`：
+    /// - `None`：盲轮询 5s（同现状，向后兼容）。
+    /// - `Some(0)`：立即返回当前 generation 的诊断（不等）。
+    /// - `Some(N>0)`：等 generation >= N，仍受 5s 上限；超时返 `{ items: [] }`。
     pub async fn tool_diagnostics(
         &self,
         root: &Path,
         file: &str,
         lang_override: Option<&str>,
+        wait_gen: Option<u64>,
     ) -> ToolResult<serde_json::Value> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let path = root.join(file);
@@ -437,20 +452,33 @@ impl Supervisor {
             .to_string();
         let session = self.session_for(root, lang.as_str()).await?;
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
-        // 连续 2 次 items 长度相同即认稳；上限 50 × 100ms = 5s。
-        // 等 cache 命中 + 再 200ms 确认（防止清空推送被误判为"无错"）。
-        // 上限 50 × 100ms = 5s；空 cache（无错）也只等 5s 返空数组。
         let key = Self::key(root, lang.as_str());
-        for i in 0..50 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if i >= 4 {
-                let present = self
-                    .diag_cache
-                    .lock()
-                    .unwrap()
-                    .contains_key(&(key.root.clone(), uri.clone()));
-                if present {
-                    break;
+        match wait_gen {
+            None => {
+                // 默认盲轮询：等 cache 命中或上限 50 × 100ms = 5s。
+                // 空 cache（无错）也只等 5s 返空数组（向后兼容）。
+                for i in 0..50 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if i >= 4 {
+                        let present = self
+                            .diag_cache
+                            .lock()
+                            .unwrap()
+                            .contains_key(&(key.root.clone(), uri.clone()));
+                        if present {
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(target) => {
+                // generation 等待：每 100ms 探一次，5s 上限。Some(0) 等价"立即返回"。
+                for _ in 0..50 {
+                    let cur = self.diag_generation.load(Ordering::Relaxed);
+                    if cur >= target {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
@@ -462,6 +490,11 @@ impl Supervisor {
             .cloned()
             .unwrap_or_default();
         Ok(json!({ "items": items }))
+    }
+
+    /// 当前 diagnostics generation 快照（用于客户端记录基准值 + 下次 wait_gen 等待）。
+    pub fn diag_generation(&self) -> u64 {
+        self.diag_generation.load(Ordering::Relaxed)
     }
 
     pub async fn tool_hover(
@@ -2158,7 +2191,8 @@ impl SupervisorTrait for Supervisor {
             }
             "diagnostics" => {
                 let file = required_file(&args)?;
-                serde_json::to_value(self.tool_diagnostics(root, &file, lang).await?)
+                let wait_gen = args.get("wait_gen").and_then(|v| v.as_u64());
+                serde_json::to_value(self.tool_diagnostics(root, &file, lang, wait_gen).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
             "def" => {

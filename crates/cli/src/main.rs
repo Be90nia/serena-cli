@@ -66,8 +66,12 @@ enum Cmd {
     Refs { file: String, line: u32, col: u32 },
     /// 鼠标位置符号的 type / doc（textDocument/hover）。
     Hover { file: String, line: u32, col: u32 },
-    /// 当前文件错误/警告（textDocument/diagnostic）。
-    Diagnostics { file: String },
+    Diagnostics {
+        file: String,
+        /// 等 diagnostics generation >= N（替代盲轮询 5s）；0=立即返回当前；仍受 5s 上限。
+        #[arg(long, value_name = "GEN")]
+        wait_gen: Option<u64>,
+    },
     /// 全 workspace 跨文件符号查找（workspace/symbol）。
     FindSymbol {
         /// 子串或正则（取决于 LSP server 行为，clangd 默认子串）。
@@ -458,7 +462,9 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
         Some(Cmd::Hover { file, line, col }) => {
             ("hover", json!({"file": file, "line": line, "col": col}))
         }
-        Some(Cmd::Diagnostics { file }) => ("diagnostics", json!({"file": file})),
+        Some(Cmd::Diagnostics { file, wait_gen }) => {
+            ("diagnostics", json!({"file": file, "wait_gen": wait_gen}))
+        }
         Some(Cmd::FindSymbol { query, limit }) => {
             ("find-symbol", json!({"query": query, "limit": limit}))
         }
