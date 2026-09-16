@@ -4,8 +4,8 @@
 //!
 //! ## trait `LanguageServerAdapter`（ARCHITECTURE §4.1 定稿）
 //!
-//! 7 个方法：id / languages / launch_info(async) / initialize_patches /
-//! on_server_ready / request_hooks / supports_implementation。
+//! 8 个方法：id / languages / launch_info(async) / initialize_patches /
+//! set_project_root / on_server_ready / request_hooks / supports_implementation。
 //! `launch_info` 改 async 是 ARCH 相对 DESIGN §4 草稿的修订（A2）—— 慢 IO 探测
 //! 不再强迫调用方起 `spawn_blocking`。
 //!
@@ -103,10 +103,35 @@ impl RequestHooks {
     }
 }
 
+/// root 下候选探针文件（首个存在者胜出）：`.gitignore`/`README.md` 几乎所有仓库都有，
+/// 其余是各语言工程标记兜底。
+const PROBE_CANDIDATES: &[&str] = &[
+    ".gitignore",
+    "README.md",
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+];
+
+/// root 下选就绪探针 URI：优先真实存在的小文件 —— 虚拟 URI 不会触发 LS 的项目
+/// lazy-load，首个真实工具请求就得独自承担全量索引（cold-start hang 根因，见
+/// local/cold-start-hang-diagnosis.md）。root 未设置 / 无候选文件时退 `fallback`
+/// 虚拟 URI（向后兼容旧行为）。
+pub(crate) fn probe_uri_for_root(root: &Path, fallback: &str) -> String {
+    for name in PROBE_CANDIDATES {
+        let candidate = root.join(name);
+        if candidate.is_file() {
+            return lsp_core::docsync::path_to_uri_str(&candidate);
+        }
+    }
+    fallback.to_string()
+}
+
 /// 适配器 trait 签名（ARCHITECTURE §4.1 完整定稿）。
 ///
-/// 七个方法 —— 任何 `T0`（配置驱动）或 `T2`（手写）实现都覆盖。`on_server_ready` /
-/// `supports_implementation` 给默认实现，让 T0 模板零代码可用。
+/// 八个方法 —— 任何 `T0`（配置驱动）或 `T2`（手写）实现都覆盖。`set_project_root` /
+/// `on_server_ready` / `supports_implementation` 给默认实现，让 T0 模板零代码可用。
 #[async_trait]
 pub trait LanguageServerAdapter: Send + Sync {
     /// 稳定标识（"clangd" / "rust-analyzer" / ...），对应 `servers.toml` 的 key 与
@@ -135,6 +160,10 @@ pub trait LanguageServerAdapter: Send + Sync {
     async fn on_server_ready(&self, _session: &lsp_core::session::Session) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// 记录当前项目 root，供 `on_server_ready` 选真实文件探针（触发 LS 项目索引）。
+    /// 默认空实现：无文件探针需求的 adapter（如 jdtls 的 language/status 路径）不必覆盖。
+    fn set_project_root(&self, _root: &Path) {}
 
     /// 请求改写钩子（quirk 用：改 params、注入额外通知）。默认无操作。
     fn request_hooks(&self) -> RequestHooks {
@@ -215,3 +244,63 @@ where
 pub(crate) fn exists(p: &Path) -> bool {
     p.exists()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyAdapter;
+
+    #[async_trait]
+    impl LanguageServerAdapter for DummyAdapter {
+        fn id(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn languages(&self) -> &'static [LanguageId] {
+            &[]
+        }
+
+        async fn launch_info(
+            &self,
+            _ctx: &ProjectCtx,
+        ) -> anyhow::Result<ls_runtime::process::LaunchInfo> {
+            unimplemented!("probe tests 不启动 LS")
+        }
+
+        // set_project_root / on_server_ready / 其余方法走默认实现。
+    }
+
+    #[test]
+    fn probe_uri_prefers_real_file_under_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "").unwrap();
+        let uri = probe_uri_for_root(dir.path(), "file:///__fallback__");
+        assert!(uri.starts_with("file:///"), "必须是 file URI: {uri}");
+        assert!(uri.ends_with(".gitignore"), "应指向真实文件: {uri}");
+    }
+
+    #[test]
+    fn probe_uri_falls_back_when_no_candidate_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            probe_uri_for_root(dir.path(), "file:///__fallback__"),
+            "file:///__fallback__"
+        );
+    }
+
+    #[test]
+    fn probe_uri_picks_first_existing_candidate_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        let uri = probe_uri_for_root(dir.path(), "file:///__fallback__");
+        assert!(uri.ends_with("README.md"), "按候选序取首个存在者: {uri}");
+    }
+
+    #[test]
+    fn default_set_project_root_is_noop() {
+        // 默认空实现可调用 —— 现有/未来不覆盖 set_project_root 的 adapter 不破坏。
+        DummyAdapter.set_project_root(Path::new("D:/anywhere"));
+    }
+}
+

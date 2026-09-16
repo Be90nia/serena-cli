@@ -417,9 +417,10 @@ impl Supervisor {
                 }
             });
         // ↖ mirror: ls.py@43ae021 on_server_started — 把"等待 LS 索引就绪"
-        // 推到 session_for 内，避免用户可见的首请求 = 索引懒加载
-        // （cold-start 120s 根因：supervisor 路径跳过就绪探针，详见
-        // local/cold-start-hang-diagnosis.md）。
+        // 推到 session_for 内，避免用户可见的首请求 = 索引懒加载。探针必须用
+        // root 下真实文件（虚拟 URI 不触发项目索引 —— cold-start hang 根因，
+        // 详见 local/cold-start-hang-diagnosis.md），故先告知 adapter 项目 root。
+        adapter.set_project_root(&key.root);
         if let Err(e) =
             tokio::time::timeout(Duration::from_secs(30), adapter.on_server_ready(&session)).await
         {

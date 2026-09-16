@@ -24,7 +24,8 @@
 //! - 不实现 UE project detection、compile_commands.json 探测 —— 全 M3。
 //! - 不实现 clangd `--query-driver` / `--clang-tidy` 等参数。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -39,6 +40,13 @@ use crate::{
 
 /// `on_server_ready` 等就绪上限（30s）—— clangd 真实项目多在 5s 内返回首次 documentSymbol。
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// root 未设置 / 无候选文件时的退路：旧版虚拟探针 URI（不触发项目索引，仅保底）。
+const PROBE_FALLBACK: &str = "file:///__clangd_ready_probe__";
+
+/// 当前会话项目 root。adapter 是零字段单例（`Copy`）存不了实例状态 —— 会话级数据
+/// 放静态槽，由 supervisor::session_for 在 `on_server_ready` 前经 `set_project_root` 写入。
+static PROBE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// 适配器本体：零字段，单例即可（`&'static str` 返回 `Send + Sync`）。
 #[derive(Debug, Default, Clone, Copy)]
@@ -111,22 +119,23 @@ impl LanguageServerAdapter for ClangdAdapter {
         }
     }
 
+    fn set_project_root(&self, root: &Path) {
+        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+    }
+
     async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
-        // 基础就绪：发起一次 documentSymbol；clangd 在该项目首次请求触发 index lazy load，
-        // 超时 30s 即视为基础就绪放行 —— 完整索引就绪事件由 M3 接入 $/progress。
+        // 基础就绪：用 root 下真实文件发一次 documentSymbol —— 虚拟 URI 不触发 clangd
+        // 的 index lazy load，首个真实工具请求就得独自承担全量索引（cold-start hang
+        // 根因，见 local/cold-start-hang-diagnosis.md）。完整索引就绪事件由 M3 接入
+        // $/progress。失败也返回 Ok 让 supervisor 放行。
         use serde_json::json;
-        // 用一个明显不会触发真实文件读的空参数；如失败也不重试（M0 容忍）。
         let probe = session
             .request::<serde_json::Value>(
                 "textDocument/documentSymbol",
-                json!({
-                    "textDocument": { "uri": "file:///__clangd_ready_probe__" }
-                }),
+                json!({ "textDocument": { "uri": self.probe_uri() } }),
                 READY_PROBE_TIMEOUT,
             )
             .await;
-        // 失败也返回 Ok —— 即便 clangd 没准备好我们也不再阻塞 supervisor；
-        // 后续真实请求由 Session 就绪门保证就位。
         let _ = probe;
         Ok(())
     }
@@ -139,6 +148,18 @@ impl LanguageServerAdapter for ClangdAdapter {
     fn supports_implementation(&self) -> bool {
         // clangd 支持 `textDocument/implementation`（goto implementation）。
         true
+    }
+}
+
+impl ClangdAdapter {
+    /// `on_server_ready` 将发出的探针 URI：root 下真实小文件的 file URI；root 未设置
+    /// 或无候选文件时退虚拟 URI。
+    fn probe_uri(&self) -> String {
+        let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
+        match root {
+            Some(root) => crate::probe_uri_for_root(&root, PROBE_FALLBACK),
+            None => PROBE_FALLBACK.to_string(),
+        }
     }
 }
 
@@ -171,3 +192,26 @@ pub(crate) fn clangd_client_capabilities() -> ClientCapabilities {
         ..Default::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 探针选 root 下真实文件（触发项目索引）；无候选文件退虚拟 URI（向后兼容）。
+    #[test]
+    fn probe_uri_real_file_then_fallback() {
+        let adapter = ClangdAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "").unwrap();
+        adapter.set_project_root(dir.path());
+        let uri = adapter.probe_uri();
+        assert!(uri.starts_with("file:///"), "必须是 file URI: {uri}");
+        assert!(uri.ends_with(".gitignore"), "应指向真实文件: {uri}");
+
+        let empty = tempfile::tempdir().unwrap();
+        adapter.set_project_root(empty.path());
+        assert_eq!(adapter.probe_uri(), PROBE_FALLBACK);
+    }
+}
+
