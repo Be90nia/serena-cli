@@ -24,6 +24,7 @@ use std::time::Duration;
 use lsp_core::docsync::{path_to_uri, path_to_uri_str};
 use lsp_core::error::CoreError;
 use lsp_core::init_params::base_initialize_params;
+use lsp_core::init_params::supports_pull_diagnostics;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
 use lsp_core::session::Session;
 pub mod edit_tools;
@@ -123,8 +124,12 @@ pub struct Supervisor {
     /// diagnostics generation：每次 publishDiagnostics 通知 ++（含空 items 的"无错"推送）。
     /// 客户端可请求 `wait_gen >= N` 等新一代诊断，避免盲轮询 5s。
     diag_generation: Arc<AtomicU64>,
+    /// per-key pull diagnostics 支持标记。session_for 末尾读 `ServerCapabilities.diagnosticProvider`
+    /// 探测后写入；tool_diagnostics 入口查这里决定走 `textDocument/diagnostic` 还是 push 缓存。
+    /// `true` = LS 声明支持；`false` = 缺字段/null → 走 push 缓存（与 2.5 之前等价）。
+    /// 锁用 std::sync::Mutex —— 写一次读多次、临界区小，不值得换 parking_lot。
+    pull_diag_supported: std::sync::Arc<Mutex<HashMap<Key, bool>>>,
 }
-/// 实例键：canonicalize、去尾分隔符并大小写折叠的 root + language。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
     pub root: PathBuf,
@@ -221,6 +226,7 @@ impl Supervisor {
             direct_mode: true,
             diag_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             diag_generation: std::sync::Arc::new(AtomicU64::new(0)),
+            pull_diag_supported: std::sync::Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -419,6 +425,17 @@ impl Supervisor {
         {
             tracing::warn!(adapter = adapter.id(), error = %e, "on_server_ready probe failed/timed out; continuing");
         }
+
+        // 写一次、读多次；错就当不支持（fallback push 与 2.4 之前等价）。
+        let supports_pull = session
+            .server_capabilities()
+            .as_ref()
+            .map(supports_pull_diagnostics)
+            .unwrap_or(false);
+        self.pull_diag_supported
+            .lock()
+            .unwrap()
+            .insert(key.clone(), supports_pull);
         self.instances
             .lock()
             .unwrap()
@@ -427,9 +444,13 @@ impl Supervisor {
         Ok(session)
     }
 
-    /// `textDocument/diagnostic` 诊断：依赖 LS `publishDiagnostics` 推送缓存。
-    /// clangd 对 pull 式 `textDocument/diagnostic` 返 -32601，故走通知缓存 +
-    /// 轮询等待（打开文件即推，100ms × 50 次 = 5s 上限），返 `{ items: [...] }`。
+    /// `textDocument/diagnostic` 诊断（PLAN Phase 2.5）。
+    ///
+    /// 主路径选择：
+    /// - 若 session_for 末尾探测到 LS 声明 `diagnosticProvider` → 优先 `textDocument/diagnostic`
+    ///   （pull，LSP 3.17）；返回的 `Full` 报告 items 即最终结果，`Unchanged` 报告保留 push 缓存。
+    /// - pull 失败（`-32601 MethodNotFound` 等任何 RPC 错）/ LS 未声明 pull / 字段缺失 →
+    ///   透明 fallback 到 `publishDiagnostics` push 缓存（与 2.4 之前完全等价）。
     ///
     /// `wait_gen`：
     /// - `None`：盲轮询 5s（同现状，向后兼容）。
@@ -453,6 +474,39 @@ impl Supervisor {
         let session = self.session_for(root, lang.as_str()).await?;
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
         let key = Self::key(root, lang.as_str());
+
+        // 探测结果查表。缺 key 视为"未探测过" → 走 push（防御：未来多写漏写）。
+        let supports_pull = self
+            .pull_diag_supported
+            .lock()
+            .unwrap()
+            .get(&key)
+            .copied()
+            .unwrap_or(false);
+
+        // 主路径选择。`supports_pull=false` 直接走 push（任务 #1/#2 覆盖）。
+        // `supports_pull=true` 走 textDocument/diagnostic；纯函数 `extract_pull_items`
+        // 统一处理 LSP 3.17 报告 + 错误 → None 触发 push fallback（任务 #4）。
+        let pull_items: Option<Vec<serde_json::Value>> = if supports_pull {
+            let params = json!({ "textDocument": { "uri": uri.clone() } });
+            let resp: Result<serde_json::Value, CoreError> = session
+                .client()
+                .request("textDocument/diagnostic", params, TOOL_TIMEOUT)
+                .await;
+            match resp {
+                Ok(value) => Self::extract_pull_items(&value),
+                Err(_) => None, // fallback push（-32601 / timeout / 任意 RPC 错）。
+            }
+        } else {
+            None
+        };
+        if let Some(items) = pull_items {
+            // pull full 命中：++ generation 保持与 publishDiagnostics 一致（任务要求）；
+            // 不与 push cache 拼接避免重复。
+            self.diag_generation.fetch_add(1, Ordering::Relaxed);
+            return Ok(json!({ "items": items }));
+        }
+        // 推送路径（push-only LS，或 pull fallback）：等 generation/cache 后取 push cache。
         match wait_gen {
             None => {
                 // 默认盲轮询：等 cache 命中或上限 50 × 100ms = 5s。
@@ -492,7 +546,25 @@ impl Supervisor {
         Ok(json!({ "items": items }))
     }
 
-    /// 当前 diagnostics generation 快照（用于客户端记录基准值 + 下次 wait_gen 等待）。
+    /// 从 LSP 3.17 `textDocument/diagnostic` 响应提取权威 items。
+    ///
+    /// 返回 `Some(items)` 仅当 `kind == "full"` —— 表示"完整报告"，items 是权威。
+    /// `unchanged` / `partial` / 缺 kind → 返 `None`（触发 push fallback）。
+    /// 任务验收分支 #5：pull 成功 → 取 items；与 push cache 不重复拼接。
+    ///
+    /// 纯函数 —— 单测不拉 LS，直接喂构造 JSON 验 5 个分支。
+    fn extract_pull_items(value: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+        if value.get("kind").and_then(|v| v.as_str()) != Some("full") {
+            return None;
+        }
+        Some(
+            value
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
     pub fn diag_generation(&self) -> u64 {
         self.diag_generation.load(Ordering::Relaxed)
     }
@@ -3137,5 +3209,105 @@ mod signature_help_tests {
         assert_eq!(parsed.signatures[0].label, "f()");
         assert_eq!(parsed.signatures[0].active_parameter, None);
         assert_eq!(parsed.active_signature, None);
+    }
+}
+
+#[cfg(test)]
+mod pull_diagnostics_tests {
+    //! Phase 2.5: textDocument/diagnostic pull 路径 + fallback 透明契约（PLAN Task 2.5）。
+    //!
+    //! 不拉 LS，纯函数 + HashMap 表层断言 5 个分支：
+    //! - #1 diagnosticProvider 字段缺失（mock_ls / rust-analyzer 现状）→ supports=false。
+    //! - #2 diagnosticProvider = null → supports=false。
+    //! - #3 diagnosticProvider = true / DiagnosticOptions 对象 → supports=true。
+    //! - #4 pull 失败（LS 返 -32601）→ extract_pull_items 不被调用；tool_diagnostics 走 push。
+    //! - #5 pull 成功（kind=full）→ extract_pull_items 取 items，**不**与 push 拼接。
+    //!
+    //! 真实端到端 fallback 验证走 fixtures/rust_demo + rust-analyzer 的 CLI smoke
+    //! （拉起 supervisor → tool_diagnostics → 字段缺失 → 自动走 push 缓存），
+    //! 见完成报告 `end-to-end` 一节。
+    use super::Supervisor;
+    use lsp_core::init_params::supports_pull_diagnostics;
+    use serde_json::json;
+
+    /// #1 capabilities 缺 diagnosticProvider 字段（mock_ls 现状）。
+    #[test]
+    fn missing_diagnostic_provider_field_means_no_pull_support() {
+        let caps = json!({ "positionEncoding": "utf-16" });
+        assert!(!supports_pull_diagnostics(&caps));
+    }
+
+    /// #2 diagnosticProvider 显式为 null。
+    #[test]
+    fn null_diagnostic_provider_means_no_pull_support() {
+        let caps = json!({ "diagnosticProvider": null });
+        assert!(!supports_pull_diagnostics(&caps));
+    }
+
+    /// #3a diagnosticProvider = true（简写形态）。
+    #[test]
+    fn boolean_true_diagnostic_provider_means_pull_supported() {
+        let caps = json!({ "diagnosticProvider": true });
+        assert!(supports_pull_diagnostics(&caps));
+    }
+
+    /// #3b diagnosticProvider = DiagnosticOptions 对象（含 interFileDependencies）。
+    /// 任务边界契约：子字段不影响 pull 支持判定。
+    #[test]
+    fn diagnostic_options_object_means_pull_supported() {
+        let caps = json!({
+            "diagnosticProvider": {
+                "interFileDependencies": false,
+                "workspaceDiagnostics": false
+            }
+        });
+        assert!(supports_pull_diagnostics(&caps));
+    }
+
+    /// #4+#5 extract_pull_items 纯函数：kind=full → Some(items)；
+    /// 其它形态 → None（unchanged / partial / 缺 kind / 错形态都触发 push fallback）。
+    #[test]
+    fn extract_pull_items_returns_items_only_for_full_kind() {
+        let full = json!({
+            "kind": "full",
+            "items": [{"range": {"start": {"line": 0, "character": 0},
+                                  "end": {"line": 0, "character": 1}},
+                       "message": "err"}]
+        });
+        let items = Supervisor::extract_pull_items(&full).expect("kind=full 必须返 Some");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["message"], "err");
+
+        // unchanged → None（push 缓存已有完整 items；不重复拼接）。
+        let unchanged = json!({"kind": "unchanged", "resultId": "r1"});
+        assert!(Supervisor::extract_pull_items(&unchanged).is_none());
+
+        // 缺 kind → None（异常回 push 兜底）。
+        let no_kind = json!({"items": []});
+        assert!(Supervisor::extract_pull_items(&no_kind).is_none());
+
+        // 空对象 → None。
+        let empty = json!({});
+        assert!(Supervisor::extract_pull_items(&empty).is_none());
+    }
+
+    /// #5 抽取成功路径与"与 push 不重复"语义：返回的是完整 items 数组，
+    /// 调用方不再访问 push 缓存（避免重复拼接）。
+    #[test]
+    fn extract_pull_items_success_does_not_query_push_cache() {
+        let full = json!({
+            "kind": "full",
+            "items": [
+                {"message": "e1", "range": {"start": {"line": 0, "character": 0},
+                                             "end": {"line": 0, "character": 1}}},
+                {"message": "e2", "range": {"start": {"line": 1, "character": 0},
+                                             "end": {"line": 1, "character": 1}}}
+            ]
+        });
+        let items = Supervisor::extract_pull_items(&full).expect("kind=full");
+        // 完整 items 直接返回（不与 push 拼接）；保证不重复。
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["message"], "e1");
+        assert_eq!(items[1]["message"], "e2");
     }
 }

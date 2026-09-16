@@ -115,6 +115,16 @@ pub struct Session {
     /// docsync 缓冲池：`ensure_open` / `FileGuard::drop` 用（PLAN Task 7，§3.4 锁表）。
     pub(crate) buffers:
         Mutex<std::collections::HashMap<lsp_types::Uri, crate::docsync::FileBuffer>>,
+    /// initialize 响应的 `capabilities` 字段原值。握手成功后由 `Session::start` 写入；
+    /// supervisor 在 session_for 末尾用 `init_params::supports_pull_diagnostics`
+    /// 读 `diagnosticProvider` 决定走 pull/push。失败握手不会写入。
+    ///
+    /// ponytail: 存 `serde_json::Value` 而非 typed `lsp_types::ServerCapabilities` —
+    /// lsp-types 把 `diagnosticProvider` 编成 untagged enum (`Options` / `RegistrationOptions`),
+    /// 实际 LS 还可能返简化 `true` literal，typed 反序列化会炸；后续探测只关心字段是否
+    /// 非 null，不需要类型结构。
+    pub(crate) server_capabilities:
+        std::sync::Arc<Mutex<Option<serde_json::Value>>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -183,16 +193,29 @@ impl Session {
             pumps: Mutex::new(Some(pumps)),
             stdout_eof,
             buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
+            server_capabilities: std::sync::Arc::new(Mutex::new(None)),
         });
 
         // 握手：发 initialize → 等响应（最多 HANDSHAKE_TIMEOUT）→ 发 initialized 通知。
+        // 拿到 initialize 响应的 `capabilities` 子对象存入 Session（PLAN Phase 2.5，
+        // supervisor 在 session_for 末尾读 `diagnosticProvider` 决定 pull/push）。
         match Self::handshake(&session, params).await {
-            Ok(()) => {
+            Ok(Some(caps)) => {
                 {
                     let mut state = session.state.lock().unwrap();
                     *state = SessionState::Ready;
                 }
+                *session.server_capabilities.lock().unwrap() = Some(caps);
                 // 就绪门放行：所有等门的 request() 唤醒。
+                session.initialized_notify.notify_waiters();
+                Ok(session)
+            }
+            Ok(None) => {
+                // initialize 响应缺 capabilities 字段 —— LSP 不允许但兜底。
+                {
+                    let mut state = session.state.lock().unwrap();
+                    *state = SessionState::Ready;
+                }
                 session.initialized_notify.notify_waiters();
                 Ok(session)
             }
@@ -210,13 +233,17 @@ impl Session {
     }
 
     /// 握手协议：发送 `initialize`，等到响应，发 `initialized` 通知。失败 → CoreError。
-    async fn handshake(session: &Arc<Self>, params: InitializeParams) -> Result<()> {
+    /// 成功返回 `Option<Value>`：LS 响应的 `capabilities` 子对象；缺则返 None。
+    async fn handshake(
+        session: &Arc<Self>,
+        params: InitializeParams,
+    ) -> Result<Option<Value>> {
         let params_json = serde_json::to_value(params).map_err(|e| CoreError::Rpc {
             code: -1,
             message: format!("initialize params serialize: {e}"),
         })?;
 
-        let _resp: Value = time::timeout(
+        let resp: Value = time::timeout(
             HANDSHAKE_TIMEOUT,
             session
                 .client
@@ -227,6 +254,9 @@ impl Session {
             method: "initialize".into(),
             secs: HANDSHAKE_TIMEOUT.as_secs(),
         })??;
+        // LSP 3.17 §initialize：响应是 InitializeResult { capabilities, serverInfo? }。
+        // 提取 capabilities 子对象；缺则视为空能力（探测时一律 false）。
+        let caps = resp.get("capabilities").cloned();
 
         // 通知 `initialized` —— LSP 协议要求；mock_ls 不消费此通知（注释 Task 6 要求），
         // 但真实服务器需要它才会从 Initializing 切到 Ready。
@@ -239,7 +269,7 @@ impl Session {
                 )))
             })?;
 
-        Ok(())
+        Ok(caps)
     }
 
     /// 当前状态快照。
@@ -251,7 +281,6 @@ impl Session {
     pub fn client(&self) -> &Client {
         &self.client
     }
-
     /// docsync 缓冲池引用（PLAN Task 7）。仅 `crate::docsync` 使用 —— 该 crate 通过
     /// `pub(crate)` 字段直访更经济；这里留一个最小访问器便于未来「关闭文件」等工具调用。
     #[allow(dead_code)]
@@ -261,6 +290,13 @@ impl Session {
     {
         &self.buffers
     }
+
+    /// initialize 响应的 `capabilities` 子对象克隆。握手成功后才有值；之前返 None。
+    /// 仅 supervisor 用 — 在 `session_for` 末尾探测 pull diagnostics 等支持能力。
+    pub fn server_capabilities(&self) -> Option<serde_json::Value> {
+        self.server_capabilities.lock().unwrap().clone()
+    }
+
 
     /// LSP 请求转发。Ready 前到达则等就绪门，门开且 state == Ready 后才放行；
     /// 若 state 已 Failed 则立即回 `CoreError`（门开但语义失败）。

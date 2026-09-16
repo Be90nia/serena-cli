@@ -100,6 +100,65 @@ pub fn with_base(mut user: InitializeParams) -> InitializeParams {
     user
 }
 
+/// LSP 3.17 `ServerCapabilities.diagnosticProvider` 探测（PLAN Phase 2.5 / upstream
+/// ls.py@43ae021 `_supports_pull_diagnostics`）。
+///
+/// 判定规则（与上游一致 — 不解析 `DiagnosticOptions` 子字段）：
+/// - 字段缺失 → `false`（不声明 pull 能力）。
+/// - 字段为 `null` → `false`。
+/// - 字段为 `true` / `DiagnosticOptions` 对象 / `DiagnosticRegistrationOptions` 对象 →
+///   `true`（一律走 textDocument/diagnostic；服务端真不支持会让 request 返 -32601，
+///   supervisor 层捕获后自动 fallback push 缓存）。
+///
+/// `relatedByDocument` / `interFileDependencies` / `workspaceDiagnostics` 等子字段
+/// 不影响"是否尝试 pull"的判定 —— 单文件 textDocument/diagnostic 在所有子字段缺失时
+/// 仍可工作，错误仅在 LS 端做语义过滤；调用方的 fallback 才是统一的兜底闸门。
+pub fn supports_pull_diagnostics(capabilities: &serde_json::Value) -> bool {
+    capabilities
+        .get("diagnosticProvider")
+        .is_some_and(|v| !v.is_null())
+}
+
+#[cfg(test)]
+mod diag_probe_tests {
+    //! 单元覆盖 4 个 LSP 3.17 diagnosticProvider 形态：
+    //! - 字段缺失（mock_ls / rust-analyzer 现状） → false
+    //! - 字段存在但为 null → false
+    //! - 字段为 `true`（简写形态） → true
+    //! - 字段为 `DiagnosticOptions` 对象 → true
+    use super::supports_pull_diagnostics;
+    use serde_json::json;
+
+    #[test]
+    fn missing_diagnostic_provider_field_returns_false() {
+        let caps = json!({ "positionEncoding": "utf-16" });
+        assert!(!supports_pull_diagnostics(&caps));
+    }
+
+    #[test]
+    fn null_diagnostic_provider_returns_false() {
+        let caps = json!({ "diagnosticProvider": null });
+        assert!(!supports_pull_diagnostics(&caps));
+    }
+
+    #[test]
+    fn boolean_true_diagnostic_provider_returns_true() {
+        let caps = json!({ "diagnosticProvider": true });
+        assert!(supports_pull_diagnostics(&caps));
+    }
+
+    #[test]
+    fn diagnostic_options_object_returns_true() {
+        let caps = json!({
+            "diagnosticProvider": {
+                "interFileDependencies": false,
+                "workspaceDiagnostics": false
+            }
+        });
+        assert!(supports_pull_diagnostics(&caps));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

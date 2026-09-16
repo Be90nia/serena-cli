@@ -37,8 +37,12 @@ struct Config {
     send_server_requests: bool,
     /// 文档事件跟踪日志路径（Task 7）。设了就把 didOpen/didChange/didClose 追加写入。
     track_file_events: Option<std::path::PathBuf>,
+    /// 开启后 capabilities 加 `diagnosticProvider: { ... }`，
+    /// `textDocument/diagnostic` 返 LSP 3.17 Full 报告（Phase 2.5 测试用）。
+    diagnostic_provider: bool,
+    /// 开启后 `textDocument/diagnostic` 返 -32601 MethodNotFound（fallback 路径测试用）。
+    diagnostic_unsupported: bool,
 }
-
 /// 各方法已回 ContentModified 次数（仅 `contentmodified_methods` 内的方法计入）。
 static CM_COUNT: LazyLock<std::sync::Mutex<HashMap<String, AtomicU32>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -62,6 +66,12 @@ fn load_config() -> Config {
         track_file_events: std::env::var("MOCK_LS_TRACK_FILE_EVENTS")
             .ok()
             .map(std::path::PathBuf::from),
+        diagnostic_provider: std::env::var("MOCK_LS_DIAGNOSTIC_PROVIDER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        diagnostic_unsupported: std::env::var("MOCK_LS_DIAGNOSTIC_UNSUPPORTED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
     }
 }
 
@@ -173,8 +183,7 @@ async fn main() {
                     },
                 ))
             } else {
-                make_reply(&msg).map(|mut r| {
-                    // string-id 模式
+                make_reply(&msg, &config).map(|mut r| {
                     if let Some(method) = msg.method.as_deref()
                         && config.string_id_methods.contains(method)
                         && let Some(id) = r.id.take()
@@ -220,29 +229,69 @@ async fn main() {
     }
 }
 
-fn make_reply(msg: &JsonRpc) -> Option<JsonRpc> {
+
+fn capabilities(config: &Config) -> Value {
+    let mut caps = json!({
+        "positionEncoding": "utf-16",
+        "textDocumentSync": 1,
+        "documentSymbolProvider": true
+    });
+    if config.diagnostic_provider {
+        // LSP 3.17 §DiagnosticOptions：interFileDependencies + workspaceDiagnostics 必填 bool。
+        caps["diagnosticProvider"] = json!({
+            "interFileDependencies": false,
+            "workspaceDiagnostics": false
+        });
+    }
+    json!({
+        "capabilities": caps,
+        "serverInfo": { "name": "mock_ls", "version": "0.1.0" }
+    })
+}
+
+fn diagnostic_report() -> Value {
+    json!({
+        "kind": "full",
+        "items": [{
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 1 }
+            },
+            "severity": 1,
+            "code": "E0001",
+            "source": "mock_ls",
+            "message": "mock diagnostic"
+        }]
+    })
+}
+
+fn make_reply(msg: &JsonRpc, config: &Config) -> Option<JsonRpc> {
     match (msg.method.as_deref(), &msg.id) {
-        (Some("initialize"), Some(id)) => Some(JsonRpc::response_ok(id.clone(), capabilities())),
+        (Some("initialize"), Some(id)) => {
+            Some(JsonRpc::response_ok(id.clone(), capabilities(config)))
+        }
         (Some("textDocument/documentSymbol"), Some(id)) => {
             Some(JsonRpc::response_ok(id.clone(), document_symbols()))
+        }
+        (Some("textDocument/diagnostic"), Some(id)) => {
+            if config.diagnostic_unsupported {
+                Some(JsonRpc::response_err(
+                    id.clone(),
+                    RpcError {
+                        code: -32601,
+                        message: "Method not found".into(),
+                        data: None,
+                    },
+                ))
+            } else {
+                Some(JsonRpc::response_ok(id.clone(), diagnostic_report()))
+            }
         }
         (Some("shutdown"), Some(id)) => Some(JsonRpc::response_ok(id.clone(), Value::Null)),
         (Some(_), Some(id)) => Some(JsonRpc::response_ok(id.clone(), Value::Null)),
         _ => None,
     }
 }
-
-fn capabilities() -> Value {
-    json!({
-        "capabilities": {
-            "positionEncoding": "utf-16",
-            "textDocumentSync": 1,
-            "documentSymbolProvider": true
-        },
-        "serverInfo": { "name": "mock_ls", "version": "0.1.0" }
-    })
-}
-
 fn document_symbols() -> Value {
     let symbol = |name: &str, line: i64| {
         json!({
