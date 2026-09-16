@@ -175,12 +175,18 @@ async fn delete_text_in_symbol_rejects_start_gt_end() {
     }
     let (root, _file) = scratch("delflip");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "demo.cpp", None).await.expect("overview");
+    let _ = sup
+        .tool_overview(&root, "demo.cpp", None)
+        .await
+        .expect("overview");
     let err = sup
         .tool_edit_delete_text(&root, "demo.cpp", "main", 5, 3, None)
         .await
         .expect_err("start_line > end_line 应 error");
-    assert!(matches!(err, supervisor::ToolError::BadArgs { .. }), "got: {err:?}");
+    assert!(
+        matches!(err, supervisor::ToolError::BadArgs { .. }),
+        "got: {err:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -192,12 +198,18 @@ async fn edit_tools_reject_unknown_symbol() {
     }
     let (root, _file) = scratch("nosym");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "demo.cpp", None).await.expect("overview");
+    let _ = sup
+        .tool_overview(&root, "demo.cpp", None)
+        .await
+        .expect("overview");
     let err = sup
         .tool_edit_replace_text(&root, "demo.cpp", "nonexistent_symbol", "x", "y", None)
         .await
         .expect_err("未知 symbol 应 error");
-    assert!(matches!(err, supervisor::ToolError::BadArgs { .. }), "got: {err:?}");
+    assert!(
+        matches!(err, supervisor::ToolError::BadArgs { .. }),
+        "got: {err:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -209,7 +221,10 @@ async fn concurrent_writes_serialize_in_order() {
     }
     let (root, file) = scratch("concurrent");
     let sup = std::sync::Arc::new(Supervisor::direct().await.expect("supervisor"));
-    let _ = sup.tool_overview(&root, "demo.cpp", None).await.expect("overview");
+    let _ = sup
+        .tool_overview(&root, "demo.cpp", None)
+        .await
+        .expect("overview");
     let sup2 = std::sync::Arc::clone(&sup);
     let root2 = root.clone();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -235,10 +250,7 @@ async fn concurrent_writes_serialize_in_order() {
     let content = std::fs::read_to_string(&file).unwrap();
     let has_t2 = content.contains("// t2");
     let has_t1 = content.contains("// t1");
-    assert!(
-        has_t2 || has_t1,
-        "至少一个修改应生效: {content}"
-    );
+    assert!(has_t2 || has_t1, "至少一个修改应生效: {content}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -250,7 +262,10 @@ async fn write_then_read_consistency() {
     }
     let (root, file) = scratch("rr");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "demo.cpp", None).await.expect("overview");
+    let _ = sup
+        .tool_overview(&root, "demo.cpp", None)
+        .await
+        .expect("overview");
     sup.tool_edit_replace_text(
         &root,
         "demo.cpp",

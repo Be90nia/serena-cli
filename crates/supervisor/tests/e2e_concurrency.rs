@@ -89,16 +89,25 @@ async fn three_concurrent_reads_and_one_write_serialize() {
     // 3 reader + 1 writer。
     let sup_r1 = sup.clone();
     let root_r1 = root.clone();
-    let r1 =
-        tokio::spawn(async move { sup_r1.tool_symbol_body(&root_r1, "impl.cpp", "add", None).await });
+    let r1 = tokio::spawn(async move {
+        sup_r1
+            .tool_symbol_body(&root_r1, "impl.cpp", "add", None)
+            .await
+    });
     let sup_r2 = sup.clone();
     let root_r2 = root.clone();
-    let r2 =
-        tokio::spawn(async move { sup_r2.tool_symbol_body(&root_r2, "impl.cpp", "add", None).await });
+    let r2 = tokio::spawn(async move {
+        sup_r2
+            .tool_symbol_body(&root_r2, "impl.cpp", "add", None)
+            .await
+    });
     let sup_r3 = sup.clone();
     let root_r3 = root.clone();
-    let r3 =
-        tokio::spawn(async move { sup_r3.tool_symbol_body(&root_r3, "impl.cpp", "add", None).await });
+    let r3 = tokio::spawn(async move {
+        sup_r3
+            .tool_symbol_body(&root_r3, "impl.cpp", "add", None)
+            .await
+    });
 
     let sup_w = sup.clone();
     let root_w = root.clone();

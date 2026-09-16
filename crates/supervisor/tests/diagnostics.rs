@@ -34,18 +34,25 @@ async fn diagnostics_returns_error_on_bad_code() {
     std::fs::write(dir.join("bad.cpp"), "const char* s = 12345;\n").unwrap();
 
     let sup = Supervisor::direct().await.expect("supervisor");
-    let diag = sup.tool_diagnostics(&dir, "bad.cpp", None).await.expect("diagnostics");
+    let diag = sup
+        .tool_diagnostics(&dir, "bad.cpp", None)
+        .await
+        .expect("diagnostics");
 
-    let items = diag.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+    let items = diag
+        .get("items")
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default();
     assert!(
         !items.is_empty(),
         "expected at least 1 diagnostic, got: {diag}"
     );
-    let msg = items[0].get("message").and_then(|m| m.as_str()).unwrap_or("");
-    assert!(
-        !msg.is_empty(),
-        "expected non-empty message, got: {msg}"
-    );
+    let msg = items[0]
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    assert!(!msg.is_empty(), "expected non-empty message, got: {msg}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -62,9 +69,16 @@ async fn diagnostics_returns_empty_on_clean_code() {
     std::fs::write(dir.join("ok.cpp"), "int main() { return 0; }\n").unwrap();
 
     let sup = Supervisor::direct().await.expect("supervisor");
-    let diag = sup.tool_diagnostics(&dir, "ok.cpp", None).await.expect("diagnostics");
+    let diag = sup
+        .tool_diagnostics(&dir, "ok.cpp", None)
+        .await
+        .expect("diagnostics");
 
-    let items = diag.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+    let items = diag
+        .get("items")
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default();
     assert!(
         items.is_empty(),
         "expected 0 diagnostics on clean code, got: {diag}"

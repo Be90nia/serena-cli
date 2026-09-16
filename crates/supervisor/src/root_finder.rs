@@ -125,7 +125,13 @@ mod tests {
         } else {
             dunce::canonicalize(&tmp).unwrap()
         };
-        assert_eq!(found, expected, "home={} tmp={}", home.display(), tmp.display());
+        assert_eq!(
+            found,
+            expected,
+            "home={} tmp={}",
+            home.display(),
+            tmp.display()
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

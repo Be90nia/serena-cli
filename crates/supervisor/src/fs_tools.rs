@@ -35,6 +35,8 @@ pub struct ReadReport {
     pub start_line: u32,
     /// 客户端请求的 end_line（1-based，含）。
     pub end_line: u32,
+    /// 全文 content-hash（sha256 前 16 位）—— 行级三件套 `expected_hash` 对账用。
+    pub hash: String,
 }
 
 /// `list_dir` 单条结果。
@@ -95,6 +97,7 @@ pub async fn read_file(
         total_lines: total,
         start_line: s,
         end_line: e,
+        hash: crate::content_hash(&text),
     })
 }
 

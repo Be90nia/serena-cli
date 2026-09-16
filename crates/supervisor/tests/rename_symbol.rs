@@ -107,7 +107,10 @@ async fn rename_foo_to_bar_across_files() {
 async fn empty_new_name_returns_bad_args() {
     let root = scratch("empty");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "foo.h", None).await.expect("overview");
+    let _ = sup
+        .tool_overview(&root, "foo.h", None)
+        .await
+        .expect("overview");
 
     let err = sup
         .tool_rename_symbol(&root, "foo.h", 0, 4, "", None)
@@ -125,7 +128,10 @@ async fn empty_new_name_returns_bad_args() {
 async fn whitespace_new_name_returns_bad_args() {
     let root = scratch("ws");
     let sup = Supervisor::direct().await.expect("supervisor");
-    let _ = sup.tool_overview(&root, "foo.h", None).await.expect("overview");
+    let _ = sup
+        .tool_overview(&root, "foo.h", None)
+        .await
+        .expect("overview");
 
     let err = sup
         .tool_rename_symbol(&root, "foo.h", 0, 4, "bad name", None)

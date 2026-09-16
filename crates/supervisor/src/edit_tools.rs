@@ -27,6 +27,9 @@ use crate::write_gate;
 pub enum EditError {
     #[error("bad args: {detail}")]
     BadArgs { detail: String },
+    /// 盘上 hash 与 expected_hash 不符（C3 防线 ①）—— 拒写，需重读文件。
+    #[error("write conflict on {path}: {reason}")]
+    WriteConflict { path: String, reason: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("core: {0}")]
@@ -305,8 +308,265 @@ pub async fn delete_text_in_symbol(
     commit_change(session, file, root, &new_content).await
 }
 
+// ============ 行级三件套（全文行级，非符号体内；1-based 含端）============
+// ↖ mirror: file_tools.py@43ae021 InsertAtLineTool / ReplaceLinesTool / DeleteLinesTool
+// （上游 0-based → 本项目 1-based 含端，与 delete-text-in-symbol 一致；Δ expected_hash 对账）。
+
+/// 每行起始 byte 偏移表：`starts[0]=0`，末尾追加 EOF 锚点 `text.len()`。
+/// `"a\nb\n"` → `[0,2,4]`（total=2）；`"a\nb"` → `[0,2,3]`（total=2）；`""` → `[0]`（total=0）。
+fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    if *starts.last().unwrap_or(&0) != text.len() {
+        starts.push(text.len());
+    }
+    starts
+}
+
+fn line_bounds_error(start: u32, end: u32, total: usize) -> EditError {
+    EditError::BadArgs {
+        detail: format!("line range {start}..{end} out of bounds (1..={total})"),
+    }
+}
+
+/// 在 `line`（1-based）前插入 content（规范化补尾 `\n`），原有行整体下移；
+/// `line == total+1` 即追加到文件尾。
+pub(crate) fn apply_insert_at_line(text: &str, line: u32, content: &str) -> EditResult<String> {
+    let starts = line_starts(text);
+    let total = starts.len() - 1;
+    if line == 0 || line as usize > total + 1 {
+        return Err(line_bounds_error(line, line, total + 1));
+    }
+    let pos = starts[(line - 1) as usize];
+    let mut content = content.to_string();
+    if !content.ends_with('\n') {
+        content.push('\n'); // ↖ mirror: file_tools.py@43ae021 InsertAtLineTool.apply 内容规范化
+    }
+    Ok(format!("{}{}{}", &text[..pos], content, &text[pos..]))
+}
+
+/// 删除 `[start, end]` 行（1-based 含端）。
+pub(crate) fn apply_delete_lines(text: &str, start: u32, end: u32) -> EditResult<String> {
+    let starts = line_starts(text);
+    let total = starts.len() - 1;
+    if start == 0 || end < start || end as usize > total {
+        return Err(line_bounds_error(start, end, total));
+    }
+    let from = starts[(start - 1) as usize];
+    let to = starts[end as usize]; // EOF 锚点：删到末行时自然收尾
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..from]);
+    out.push_str(&text[to..]);
+    Ok(out)
+}
+
+/// 用 content 整体替换 `[start, end]` 行（规范化补尾 `\n`）。
+pub(crate) fn apply_replace_lines(
+    text: &str,
+    start: u32,
+    end: u32,
+    content: &str,
+) -> EditResult<String> {
+    let starts = line_starts(text);
+    let total = starts.len() - 1;
+    if start == 0 || end < start || end as usize > total {
+        return Err(line_bounds_error(start, end, total));
+    }
+    let from = starts[(start - 1) as usize];
+    let to = starts[end as usize];
+    let mut content = content.to_string();
+    if !content.ends_with('\n') {
+        content.push('\n'); // ↖ mirror: file_tools.py@43ae021 ReplaceLinesTool.apply
+    }
+    Ok(format!("{}{}{}", &text[..from], content, &text[to..]))
+}
+
+/// hash 对账（C3 防线 ①）：expected 与盘上全文 hash 不符 → 拒写 WRITE_CONFLICT。
+pub(crate) fn verify_hash(expected: Option<&str>, actual: &str, path: &Path) -> EditResult<()> {
+    let Some(want) = expected else {
+        return Ok(());
+    };
+    let got = crate::content_hash(actual);
+    if got != want {
+        return Err(EditError::WriteConflict {
+            path: path.display().to_string(),
+            reason: format!(
+                "content hash mismatch: disk={got} expected={want}; re-read the file first"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// 行级写事务公共链路（与 replace-body 一致）：写门 → ensure_open → 读盘 →
+/// hash 对账 → 行变换 → atomic_write + didChange 全量。
+async fn line_edit<F>(
+    session: &Arc<Session>,
+    root: &Path,
+    file: &Path,
+    expected_hash: Option<&str>,
+    transform: F,
+) -> EditResult<()>
+where
+    F: FnOnce(&str) -> EditResult<String>,
+{
+    let _gate = write_gate::acquire().await;
+    let _guard = session.ensure_open(file).await?;
+    let content = tokio::fs::read_to_string(file).await?;
+    verify_hash(expected_hash, &content, file)?;
+    let new_content = transform(&content)?;
+    commit_change(session, file, root, &new_content).await
+}
+
+/// `insert-at-line`：在 `line`（1-based）前插入，原行下移；`line == total+1` 追加 EOF。
+pub async fn insert_at_line(
+    session: &Arc<Session>,
+    root: &Path,
+    file: &Path,
+    line: u32,
+    content: &str,
+    expected_hash: Option<&str>,
+) -> EditResult<()> {
+    line_edit(session, root, file, expected_hash, |t| {
+        apply_insert_at_line(t, line, content)
+    })
+    .await
+}
+
+/// `replace-lines`：用 content 替换 `[start_line, end_line]`（1-based 含端）。
+pub async fn replace_lines(
+    session: &Arc<Session>,
+    root: &Path,
+    file: &Path,
+    start_line: u32,
+    end_line: u32,
+    content: &str,
+    expected_hash: Option<&str>,
+) -> EditResult<()> {
+    line_edit(session, root, file, expected_hash, |t| {
+        apply_replace_lines(t, start_line, end_line, content)
+    })
+    .await
+}
+
+/// `delete-lines`：删除 `[start_line, end_line]`（1-based 含端）。
+pub async fn delete_lines(
+    session: &Arc<Session>,
+    root: &Path,
+    file: &Path,
+    start_line: u32,
+    end_line: u32,
+    expected_hash: Option<&str>,
+) -> EditResult<()> {
+    line_edit(session, root, file, expected_hash, |t| {
+        apply_delete_lines(t, start_line, end_line)
+    })
+    .await
+}
+
 // 抑制未使用 Position 警告（备扩展）。
 #[allow(dead_code)]
 fn _force_use_position(_p: Position) -> PathBuf {
     PathBuf::new()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_starts_anchors() {
+        assert_eq!(line_starts("a\nb\n"), vec![0, 2, 4]);
+        assert_eq!(line_starts("a\nb"), vec![0, 2, 3]);
+        assert_eq!(line_starts(""), vec![0]);
+    }
+
+    #[test]
+    fn insert_pushes_lines_down_and_appends() {
+        // 首行前插入。
+        assert_eq!(
+            apply_insert_at_line("int a = 1;\nint b = 2;\n", 1, "// hdr\n").unwrap(),
+            "// hdr\nint a = 1;\nint b = 2;\n"
+        );
+        // 中间插入 + content 缺尾换行自动补。
+        assert_eq!(
+            apply_insert_at_line("int a = 1;\nint b = 2;\n", 2, "int c = 3;").unwrap(),
+            "int a = 1;\nint c = 3;\nint b = 2;\n"
+        );
+        // total+1 = 追加 EOF。
+        assert_eq!(
+            apply_insert_at_line("int a = 1;\n", 2, "int b = 2;\n").unwrap(),
+            "int a = 1;\nint b = 2;\n"
+        );
+    }
+
+    #[test]
+    fn insert_out_of_bounds_rejected() {
+        let err = apply_insert_at_line("a\nb\n", 4, "x\n").unwrap_err();
+        assert!(err.to_string().contains("out of bounds"), "{err}");
+        assert!(apply_insert_at_line("a\n", 0, "x\n").is_err());
+    }
+
+    #[test]
+    fn delete_removes_inclusive_range() {
+        assert_eq!(apply_delete_lines("1\n2\n3\n", 2, 2).unwrap(), "1\n3\n");
+        assert_eq!(apply_delete_lines("1\n2\n3\n", 1, 3).unwrap(), "");
+        // 末行无尾换行也能删干净。
+        assert_eq!(apply_delete_lines("1\n2", 2, 2).unwrap(), "1\n");
+    }
+
+    #[test]
+    fn delete_out_of_bounds_rejected() {
+        assert!(
+            apply_delete_lines("1\n2\n", 2, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("out of bounds")
+        );
+        assert!(
+            apply_delete_lines("1\n2\n", 2, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("out of bounds")
+        );
+        assert!(
+            apply_delete_lines("1\n2\n", 0, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("out of bounds")
+        );
+    }
+
+    #[test]
+    fn replace_swaps_range() {
+        assert_eq!(
+            apply_replace_lines("1\n2\n3\n", 2, 2, "two").unwrap(),
+            "1\ntwo\n3\n"
+        );
+        assert_eq!(
+            apply_replace_lines("1\n2\n3\n", 1, 3, "x\ny\n").unwrap(),
+            "x\ny\n"
+        );
+    }
+
+    #[test]
+    fn replace_out_of_bounds_rejected() {
+        assert!(apply_replace_lines("1\n", 1, 2, "x\n").is_err());
+    }
+
+    #[test]
+    fn hash_mismatch_rejects_write() {
+        let path = Path::new("demo.cpp");
+        verify_hash(None, "anything", path).unwrap(); // 不传 hash = 跳过对账
+        let good = crate::content_hash("int a = 1;\n");
+        verify_hash(Some(&good), "int a = 1;\n", path).unwrap();
+        let err = verify_hash(Some(&good), "int a = 2;\n", path).unwrap_err();
+        assert!(
+            matches!(err, EditError::WriteConflict { .. }),
+            "hash 失配必须拒写，实际: {err}"
+        );
+    }
 }

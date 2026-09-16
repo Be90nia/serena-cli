@@ -204,28 +204,26 @@ async fn concurrent_replace_serializes_via_gate() {
     let sup1 = sup.clone();
     let root1 = root.clone();
     let t1 = tokio::spawn(async move {
-        sup1
-            .tool_replace_body(
-                &root1,
-                "impl.cpp",
-                "add",
-                "int add(int a, int b) {\n    return a + b + 100;\n}\n",
-                None,
-            )
-            .await
+        sup1.tool_replace_body(
+            &root1,
+            "impl.cpp",
+            "add",
+            "int add(int a, int b) {\n    return a + b + 100;\n}\n",
+            None,
+        )
+        .await
     });
     let sup2 = sup.clone();
     let root2 = root.clone();
     let t2 = tokio::spawn(async move {
-        sup2
-            .tool_replace_body(
-                &root2,
-                "impl.cpp",
-                "add",
-                "int add(int a, int b) {\n    return a + b + 200;\n}\n",
-                None,
-            )
-            .await
+        sup2.tool_replace_body(
+            &root2,
+            "impl.cpp",
+            "add",
+            "int add(int a, int b) {\n    return a + b + 200;\n}\n",
+            None,
+        )
+        .await
     });
     let (r1, r2) = tokio::join!(t1, t2);
     let _ = r1.expect("task1 join");

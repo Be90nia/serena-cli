@@ -72,7 +72,10 @@ async fn virtual_method_finds_all_implementations() {
     let sup = Supervisor::direct().await.expect("supervisor");
 
     // 触发索引。
-    let _ = sup.tool_overview(&root, "shape.h", None).await.expect("overview");
+    let _ = sup
+        .tool_overview(&root, "shape.h", None)
+        .await
+        .expect("overview");
 
     // 在 `area` 第一次出现处（virtual 声明那行）请求 implementation。
     // shape.h 里 `virtual double area() const = 0;` 大约在第 3 行 char 12。
