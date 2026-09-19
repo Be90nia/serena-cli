@@ -48,12 +48,14 @@ impl LanguageServerAdapter for RustAnalyzerAdapter {
     }
 
     async fn launch_info(&self, ctx: &ProjectCtx) -> anyhow::Result<LaunchInfo> {
-        let exe = which_no_unc("rust-analyzer").ok_or_else(|| {
-            not_installed_error(
-                "rust-analyzer",
-                "install rust-analyzer (https://rust-analyzer.github.io) and ensure `rust-analyzer` is on PATH",
-            )
-        })?;
+        let exe = Self::locate_rust_analyzer()
+            .await
+            .ok_or_else(|| {
+                not_installed_error(
+                    "rust-analyzer",
+                    "install rust-analyzer (`rustup component add rust-analyzer` or https://rust-analyzer.github.io) and ensure it is on PATH",
+                )
+            })?;
         Ok(LaunchInfo {
             cmd: vec![exe.into_os_string()],
             cwd: ctx.project_root.clone(),
@@ -109,6 +111,89 @@ impl RustAnalyzerAdapter {
             None => PROBE_FALLBACK.to_string(),
         }
     }
+
+    /// ↖ mirror: rust_analyzer.py@43ae021 `_ensure_rust_analyzer_installed`
+    /// 查找链：`rustup which`（版本匹配 toolchain，上游首选）→ PATH（--version 功能
+    /// 校验，防 rustup proxy 断链）→ `~/.cargo/bin` 兜底。
+    /// Δ 上游：不做 `rustup component add` 自动装（网络 + 写操作，CLI 侧副作用大，
+    /// 失败路径报 not_installed 带指引即可）。
+    async fn locate_rust_analyzer() -> Option<PathBuf> {
+        // 1. rustup which：优先 —— 保证与项目 toolchain 版本一致
+        if let Some(rustup) = which_no_unc("rustup") {
+            let out = tokio::process::Command::new(rustup)
+                .args(["which", "rust-analyzer"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .creation_flags_safe()
+                .output()
+                .await;
+            if let Ok(out) = out
+                && out.status.success()
+            {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                if !s.is_empty() {
+                    let p = PathBuf::from(s);
+                    if p.is_file() {
+                        return Some(dunce::canonicalize(&p).unwrap_or(p));
+                    }
+                }
+            }
+        }
+        // 2. PATH —— rustup 生态下 PATH 里的可能是 rustup proxy，组件没装时是坏的；
+        //    用 --version 校验功能（2s 超时护栏，慢机器不拖启动）。
+        if let Some(p) = which_no_unc("rust-analyzer")
+            && Self::binary_functional(&p).await
+        {
+            return Some(p);
+        }
+        // 3. ~/.cargo/bin 兜底（cargo install / rustup 标准位置）
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            for name in ["rust-analyzer.exe", "rust-analyzer"] {
+                let p = PathBuf::from(&home).join(".cargo/bin").join(name);
+                if p.is_file() && Self::binary_functional(&p).await {
+                    return Some(dunce::canonicalize(&p).unwrap_or(p));
+                }
+            }
+        }
+        None
+    }
+
+    /// `--version` 能正常退出即认为功能可用（2s 超时护栏）。
+    async fn binary_functional(path: &Path) -> bool {
+        let fut = tokio::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags_safe()
+            .status();
+        matches!(
+            tokio::time::timeout(Duration::from_secs(2), fut).await,
+            Ok(Ok(status)) if status.success()
+        )
+    }
+}
+
+/// Windows 隐藏子进程窗口（CREATE_NO_WINDOW）；非 Windows 无操作。
+trait CreationFlagsSafe {
+    fn creation_flags_safe(&mut self) -> &mut Self;
+}
+
+#[cfg(windows)]
+impl CreationFlagsSafe for tokio::process::Command {
+    fn creation_flags_safe(&mut self) -> &mut Self {
+        // 与 ls-runtime process.rs 同款语义（CREATE_NO_WINDOW）。tokio Command 在
+        // Windows 有固有 creation_flags 方法，无需 std CommandExt。
+        self.creation_flags(0x0800_0000)
+    }
+}
+
+#[cfg(not(windows))]
+impl CreationFlagsSafe for tokio::process::Command {
+    fn creation_flags_safe(&mut self) -> &mut Self {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +215,29 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         adapter.set_project_root(empty.path());
         assert_eq!(adapter.probe_uri(), PROBE_FALLBACK);
+    }
+
+    /// 查找链：本机 rust-analyzer 应能定位（rustup which 或 PATH 之一命中）且功能可用。
+    #[tokio::test]
+    async fn locate_finds_functional_rust_analyzer() {
+        if which_no_unc("rustup").is_none() && which_no_unc("rust-analyzer").is_none() {
+            // 无 rust 生态的 CI 跳过（fixture 门，非逻辑断言）。
+            return;
+        }
+        let p = RustAnalyzerAdapter::locate_rust_analyzer()
+            .await
+            .expect("rust 生态存在时应能定位 rust-analyzer");
+        assert!(p.is_file(), "定位结果必须是存在的文件: {p:?}");
+        assert!(
+            RustAnalyzerAdapter::binary_functional(&p).await,
+            "定位结果必须通过 --version 功能校验"
+        );
+    }
+
+    /// binary_functional 对垃圾路径必须返回 false（2s 内失败，不误报可用）。
+    #[tokio::test]
+    async fn binary_functional_rejects_garbage_path() {
+        let bogus = std::env::temp_dir().join("__definitely_not_rust_analyzer__.exe");
+        assert!(!RustAnalyzerAdapter::binary_functional(&bogus).await);
     }
 }
