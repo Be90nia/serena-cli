@@ -1,3 +1,5 @@
 /target
 node_modules/
 .codebase-memory/
+fixtures/rust_demo/target/
+fixtures/rust_demo/Cargo.lock
