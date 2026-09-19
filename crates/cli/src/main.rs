@@ -60,6 +60,13 @@ struct Cli {
 enum Cmd {
     /// 列出文件顶层符号。
     Overview { file: String },
+    /// 聚合目录下源码文件符号（跨文件符号树；依赖 LS，逐文件可复用缓存）。
+    SymbolTree {
+        dir: String,
+        /// 保险丝：最多扫描文件数（超出截断并标 truncated）。
+        #[arg(long, value_name = "N", default_value_t = 200)]
+        max_files: usize,
+    },
     /// 跳转到符号定义（textDocument/definition）。
     Def { file: String, line: u32, col: u32 },
     /// 列出引用（textDocument/references）。line/col 0-based。
@@ -305,6 +312,10 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             .tool_overview(&root, file, cli.lang.as_deref())
             .await
             .and_then(|hits| print_json(&json!(hits))),
+        Some(Cmd::SymbolTree { dir, max_files }) => sup
+            .tool_symbol_tree(&root, dir, cli.lang.as_deref(), *max_files)
+            .await
+            .and_then(|tree| print_json(&tree)),
         Some(Cmd::Def { file, line, col }) => sup
             .tool_def(&root, file, *line, *col, cli.lang.as_deref())
             .await
@@ -453,6 +464,10 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
     // 工具名与 args 组装。
     let (tool, args): (&str, serde_json::Value) = match &cli.cmd {
         Some(Cmd::Overview { file }) => ("overview", json!({"file": file})),
+        Some(Cmd::SymbolTree { dir, max_files }) => (
+            "symbol-tree",
+            json!({"dir": dir, "max_files": max_files}),
+        ),
         Some(Cmd::Def { file, line, col }) => {
             ("def", json!({"file": file, "line": line, "col": col}))
         }
@@ -897,6 +912,7 @@ async fn dispatch_shell_cmd(
     // LSP 工具：透传到 /tools/{name}。
     let tool = match cmd {
         "overview"
+        | "symbol-tree"
         | "hover"
         | "diagnostics"
         | "def"

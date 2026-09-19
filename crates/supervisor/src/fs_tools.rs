@@ -54,7 +54,7 @@ pub fn should_ignore(name: &str) -> bool {
 
 /// 构造带内置 ignore 过滤的 walker；depth 0（扫描根自身）不过滤，
 /// 以便显式列 `dist/` 等仍可行。
-fn filtered_walker(root: &Path) -> ignore::WalkBuilder {
+pub(crate) fn filtered_walker(root: &Path) -> ignore::WalkBuilder {
     let mut walker = ignore::WalkBuilder::new(root);
     walker
         .standard_filters(true)

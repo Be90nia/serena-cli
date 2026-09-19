@@ -691,7 +691,82 @@ impl Supervisor {
         self.symbol_cache_put(cache_key, out.clone()); // cache_miss → 写入
         Ok(out)
     }
-    /// `textDocument/documentSymbol` → 在树中按 (line, col) 反查最深包含符号 → `Vec<SymbolHit>`。
+
+    /// 跨文件符号树（PLAN Phase 2.5 / 7.2）：聚合 `dir` 下源码文件的 documentSymbol。
+    ///
+    /// 逐文件走 `tool_overview` —— 天然复用 3.1 缓存（同文件二次 symbol-tree/overview
+    /// 免 LS 往返）；目录扫描走 3.3 `filtered_walker`（venv/node_modules/target 等内置
+    /// ignore + gitignore）。`max_files` 保险丝（默认 200）：超限截断并标 `truncated`。
+    pub async fn tool_symbol_tree(
+        &self,
+        root: &Path,
+        dir: &str,
+        lang: Option<&str>,
+        max_files: usize,
+    ) -> ToolResult<serde_json::Value> {
+        if dir.is_empty() {
+            return Err(ToolError::BadArgs {
+                detail: "missing 'dir'".into(),
+            });
+        }
+        let canon_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let canon_dir = dunce::canonicalize(canon_root.join(dir)).map_err(|e| ToolError::BadArgs {
+            detail: format!("dir not found: {dir} ({e})"),
+        })?;
+        if !canon_dir.starts_with(&canon_root) {
+            return Err(ToolError::BadArgs {
+                detail: format!("dir escapes root: {dir}"),
+            });
+        }
+
+        // 收集源码文件：只收能解析语言的扩展名；max_files 保险丝。
+        let mut files: Vec<String> = Vec::new();
+        let mut truncated = false;
+        for entry in crate::fs_tools::filtered_walker(&canon_dir).build() {
+            let Ok(entry) = entry else { continue };
+            let is_file = entry.file_type().as_ref().is_some_and(|t| t.is_file());
+            if !is_file {
+                continue;
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(&canon_root)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            // 按扩展名探测（None）：lang override 只作用于请求语言，不当文件筛选 ——
+            // 否则 Some("rust") 会把 .md 等非源码也收进来。
+            if resolve_lang_for_file(&rel, None).is_ok() {
+                if files.len() >= max_files {
+                    truncated = true;
+                    break;
+                }
+                files.push(rel);
+            }
+        }
+
+        // 逐文件聚合（顺序即可：daemon 内 LS 请求本就串行；单文件失败不炸整树）。
+        let mut entries = Vec::with_capacity(files.len());
+        let mut errors = Vec::new();
+        for file in &files {
+            match self.tool_overview(root, file, lang).await {
+                Ok(symbols) if !symbols.is_empty() => {
+                    entries.push(serde_json::json!({ "file": file, "symbols": symbols }));
+                }
+                Ok(_) => {} // 无符号文件（空/纯注释）不占条目
+                Err(e) => errors.push(serde_json::json!({ "file": file, "error": e.to_string() })),
+            }
+        }
+        serde_json::to_value(serde_json::json!({
+            "dir": dir,
+            "files_scanned": files.len(),
+            "truncated": truncated,
+            "entries": entries,
+            "errors": errors,
+        }))
+        .map_err(|e| ToolError::Serialize(e.into()))
+    }
+
     ///
     /// Phase 2.1（local/solidlsp-development-plan.md §2.1）：位置已知，从 grep/搜索结果直接
     /// 跳进符号工作流，无需按名字再扫一遍。无命中时返空数组（区别于 `tool_def` 的 BadArgs——
@@ -2332,6 +2407,17 @@ impl SupervisorTrait for Supervisor {
                 serde_json::to_value(self.tool_overview(root, &file, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
+            "symbol-tree" => {
+                let dir = args.get("dir").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::BadArgs {
+                        detail: "missing 'dir'".into(),
+                    }
+                })?;
+                let max_files = args.get("max_files").and_then(|v| v.as_u64()).unwrap_or(200)
+                    as usize;
+                serde_json::to_value(self.tool_symbol_tree(root, dir, lang, max_files).await?)
+                    .map_err(|e| ToolError::Serialize(e.into()))
+            }
             "find-symbol" => {
                 let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
                     ToolError::BadArgs {
@@ -3570,5 +3656,64 @@ mod symbol_cache_tests {
             matches!(err, ToolError::BadArgs { .. }),
             "unexpected: {err:?}"
         );
+    }
+
+    /// symbol-tree：预置缓存全链路聚合（不拉 LS）；node_modules 被 3.3 过滤；
+    /// dir 逃逸 root 报 BadArgs。
+    #[tokio::test]
+    async fn symbol_tree_aggregates_from_cache_and_skips_ignored_dirs() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(dir.path().join("note.md"), "# doc\n").unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("dep.rs"), "fn dep() {}\n").unwrap();
+        let root = dir.path();
+
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs"), vec![hit("sym_a")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "b.rs"), vec![hit("sym_b")]);
+
+        let tree = sup
+            .tool_symbol_tree(root, ".", Some("rust"), 200)
+            .await
+            .unwrap();
+        assert_eq!(tree["files_scanned"], 2, "node_modules/note.md 必须被过滤: {tree}");
+        assert_eq!(tree["truncated"], false);
+        let entries = tree["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "两文件各有符号条目: {tree}");
+
+        // dir 逃逸 root。
+        let err = sup
+            .tool_symbol_tree(root, "../elsewhere", Some("rust"), 200)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::BadArgs { .. }), "unexpected: {err:?}");
+    }
+
+    /// symbol-tree：max_files 保险丝 —— 超限截断并标 truncated。
+    #[tokio::test]
+    async fn symbol_tree_respects_max_files_fuse() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("f{i}.rs")), "fn x() {}\n").unwrap();
+        }
+        let root = dir.path();
+        for i in 0..5 {
+            sup.symbol_cache_put(
+                doc_symbol_cache_key(root, &format!("f{i}.rs")),
+                vec![hit("x")],
+            );
+        }
+
+        let tree = sup
+            .tool_symbol_tree(root, ".", Some("rust"), 3)
+            .await
+            .unwrap();
+        assert_eq!(tree["files_scanned"], 3, "max_files=3 截断: {tree}");
+        assert_eq!(tree["truncated"], true);
+        assert_eq!(tree["entries"].as_array().unwrap().len(), 3);
     }
 }
