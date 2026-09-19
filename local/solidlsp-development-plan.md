@@ -111,6 +111,11 @@ Phase 0.5 ──→ Phase 4.6；Phase 4.1-4.5/4.7 各自独立
 | fbe21d5 | Phase 3.2 per-LS 就绪等待 | 2 单测 + rename 162ms 成功 + replace-body 位置正确 |
 | 4b7ebf4 | Phase 3.1 文档符号缓存 | 6 单测 + 二次 overview 0.88-0.93ms (shell 模式) / 19-21ms (CLI spawn 模式) |
 | de6cfa3 | Phase 3.3 ignore spec | 3 单测 + 真实 CLI smoke（node_modules/.venv/target 全部过滤） |
+| acd508e | docs: gap matrix + plan 定稿 | 文档 |
+| 3a8ae48 | Step 1 rust_demo 加 Cargo.toml | workspace mode 生效；无竞争冷启动 89s→5.07s（17×）；热 274ms |
+| 62cc336 | Step 2 Phase 4.3 TS 适配器深度 | tsconfig 旁探针 + 关 ATA；5 单测；e2e 冷 ~5s 热 65-108ms |
+| f364715 | Step 3 Phase 4.1 rust-analyzer 查找链 | rustup which 优先 + 功能校验 + cargo bin 兜底；+2 单测 |
+| ad65d09 | Step 5 Phase 7.2 symbol-tree | 跨文件符号树闭环（2.5）；+2 单测；e2e 2 文件聚合 0.34s |
 
 **累计验证基线**：
 - cargo test --workspace: 49 个 test target 全绿（含 30+ 新单测）
@@ -123,14 +128,17 @@ Phase 0.5 ──→ Phase 4.6；Phase 4.1-4.5/4.7 各自独立
 
 | 局限 | 影响 | 建议 |
 |---|---|---|
-| fixture/rust_demo 无 Cargo.toml → rust-analyzer 走单文件 mode → 探针触发不了 workspace 索引 | cold-start 89s（基线 88s，**修复对 fixture 无效**） | 给 fixture 加 Cargo.toml（可测 7ms 量级） |
-| ls-runtime/deps.rs URL 矩阵 sha256 占位假值 | download 流程未实装，**功能不影响** | MVP 流程实装时填真 hash |
+| ~~fixture/rust_demo 无 Cargo.toml~~ | **已解决**（3a8ae48）：workspace mode 生效，无 VS Code 竞争时冷启动 89s→5.07s | — |
+| 同机 VS Code rust-analyzer 重索引主 workspace 时 CPU 竞争 | fixture 冷启动可达 300s+（环境噪声非代码问题）；PM 冷测数字须在无竞争窗口取 | 冷测前 taskkill 用户 rust-analyzer 或接受宽区间 |
+| ls-runtime/deps.rs URL 矩阵 sha256 占位假值 | download 流程未实装，**功能不影响**；**Step 4 刻意跳过**——为无人消费的流程填真值是 YAGNI（版本升级即过期） | download 流程实装时按消费方需求填真 hash（clangd 4 平台 + rust-analyzer release SHA256SUMS） |
 | 7 语言适配器 5 个本机未装 | smoke 仅 2/7（rust + typescript） | CI 装 LS 后跑全景 smoke |
-| 子代理报告 hot-daemon 假数据 vs PM cold-start 真数据 | 多次 false PASS（如 0.2 报 75ms 实测 89s） | 子代理报告必须 cold state 验证；PM 端到端验作为唯一权威 |
+| ~~子代理 hot-daemon 假数据~~ | **教训已吸收**：PM 端到端为唯一权威 | 另见 powershell 测量伪影条目 |
+| powershell `Select-Object -First N` 测量伪影 | -First 提前断管道 → CLI EPIPE 卡写 → powershell 等 EOF 双等死锁，表现同"挂死"；曾误判为 daemon bug（排障 1h） | **CLI e2e 一律 bash 完整重定向测量**；CLI 对 EPIPE 的处理（卡而非退）可后续优化 |
+| typescript-language-server 7.x 不兼容 | npm typescript@7 native 线无 tsserver.js → LS 报 -32603 | fixture 已 pin ts 5.9.3；适配器 README 提示用户降级 |
 
 ## 7. SolidLSP 整体评估
 
-- **wrapper 面（vs 上游 39 tool）**：核心 13/13 已实现 + 5 个 Phase 2 新增 wrapper = **18/18 高 ROI 上游 tool 全覆盖**
-- **适配器（vs 上游 73 LS）**：7/73 落地（rust + typescript 本机可用；其他 5 适配器代码就绪但本机无 LS）
+- **wrapper 面（vs 上游 39 tool）**：核心 13/13 已实现 + 5 个 Phase 2 新增 wrapper + symbol-tree = **19/19 高 ROI 上游 tool 全覆盖**
+- **适配器（vs 上游 73 LS）**：7/73 落地（rust + typescript 本机可用；其他 5 适配器代码就绪但本机无 LS）；rust/TS 两个主力适配器已从 T0 浅壳升级（rustup 查找链 / tsconfig 探针 + ATA off）
 - **核心 LSP method**：hover / definition / implementation / references / workspace/symbol / completion / signatureHelp / publishDiagnostics / textDocument/diagnostic (pull) / prepareRename / rename / documentSymbol **全覆盖**
-- **性能**：hot daemon 重复查询 < 30ms；cold daemon fixture 89s（rust-analyzer 单文件模式固有限制）
+- **性能**：hot daemon 重复查询 65-108ms（CLI spawn）/ <1ms（缓存直读）；cold（rust fixture workspace mode）~5s（无竞争时）

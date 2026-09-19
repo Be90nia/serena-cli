@@ -11,7 +11,7 @@
 | 上游 SolidLanguageServer 方法 | 底层 LSP method | 本项目状态 | 备注 |
 |---|---|---|---|
 | `request_document_symbols` | documentSymbol | ✅ | overview / find-symbol / symbol-body 全走它；3.1 加 (root,file,mtime) 缓存 |
-| `request_full_symbol_tree`（跨文件全树） | documentSymbol ×N | ❌ | M2 有 find-symbol（workspace/symbol）；全项目符号树缺 |
+| `request_full_symbol_tree`（跨文件全树） | documentSymbol ×N | ✅ | **Phase 7.2** `symbol-tree <dir>`（commit ad65d09）：filtered_walker + 复用 3.1 缓存 + max_files 保险丝 |
 | `request_dir_overview` / `request_document_overview` | documentSymbol 过滤 | ◐ | overview 只做单文件全量平铺；dir 级聚合缺 |
 | `request_hover` | hover | ✅ | `hover` |
 | `request_definition` | definition | ✅ | `def` |
@@ -49,10 +49,10 @@
 | C/C++ (clangd) | 20KB | 173 行 | documentSymbol(真实文件) ≤30s | compile_commands.json 探测/注入缺 |
 | Python (pyright) | 11KB | 101 行 | documentSymbol(真实文件) ≤30s | venv/interpreter 探测缺；basedpyright/ty 等 4 变体缺 |
 | Go (gopls) | 15KB | 80 行 | documentSymbol(真实文件) ≤30s | go.mod 多模块、GOFLAGS 缺 |
-| TS (typescript-ls) | 28KB | 111 行 | documentSymbol(真实文件) ≤30s | tsconfig/jsconfig 探测、npm shim（已有 3 层 fix 模板）、monorepo workspace 缺 |
+| TS (typescript-ls) | 28KB | 111→**170 行** | tsconfig 旁 .ts 优先（**4.3**，62cc336） | ATA 已关 ✅；monorepo workspace 缺；ts 7.x 不兼容（fixture pin 5.9.3） |
 | C# (csharp-ls) | 34KB | 84 行 | documentSymbol(真实文件) ≤60s | 上游已换 roslyn LS（NuGet 下载）；我们仍是 csharp-ls 旧线 |
 | Java (jdtls) | 77KB | 104 行 | language/status ✅（特判已有） | jdtls 下载/解包/JVM 参数/heap 缺——用户须自装并配 PATH |
-| Rust (rust-analyzer) | 38KB | 87 行 | documentSymbol(真实文件) ≤30s | rustup 探测、cargo target 目录排除、flycheck 等待缺 |
+| Rust (rust-analyzer) | 38KB | 87→**200 行** | documentSymbol(真实文件) ≤30s | **4.1** rustup which 优先 + --version 功能校验 + cargo bin 兜底（f364715）✅；Δ 不自动 component add；flycheck quiescent 就绪用 3.2 探针等效替代 |
 
 依赖自动下载基建：`ls-runtime/deps.rs` 存在，verify_sha256 函数已实装（RFC 3174 测试向量通过），但 URL 矩阵里的 sha256 是占位假值（**MVP download 流程未实装**，假 sha256 不影响运行）。
 
@@ -74,13 +74,14 @@
 | P1 | ToolError::Launch 兜底误映射 | 错误分类 | **已修**（现 grep 仅 2 处且都用于 spawn 失败，非 retryable 误映射） |
 | P2 | sha256 URL 矩阵占位假值 | ls-runtime/deps.rs | **接受现状**（MVP download 流程未实装） |
 
-## 4. 总账（phase 0/2/3 后）
+## 4. 总账（phase 0/2/3 + 深化轮后，2026-09-19）
 
-- ✅ **本次完成**：completion 接线（Phase 1.1）、5 wrapper tools（Phase 2.1-2.5）、0.2 cold-start 探针真实文件、3.1 文档符号缓存、3.2 per-LS 就绪等待、3.3 ignore spec——**共 8 个 commit**
-- ✅ **上游 wrapper 面价值高的缺口**：**全部补完**（completion / signatureHelp / containing/defining symbol / 文档符号缓存 / 诊断 generation / 诊断 pull / per-LS 就绪等待）
-- ⚠️ **适配器缺口**：66 个未落地；既有 7 个全为 T0 浅壳（**接受**——用户语言驱动）
-- ⚠️ **infra 缺口**：sha256 URL 矩阵占位假值（**接受**——MVP 无 download 流程）、additional workspace、全局 timeout
-- ⚠️ **性能未达预期**：cold-start fixture（无 Cargo.toml）仍 89s（rust-analyzer 单文件 mode 限制）；workspace 99s（架构对 fixture 无效）
+- ✅ **根基加固（10 commit）**：completion 接线、5 wrapper tools、cold-start 探针真实文件、文档符号缓存、per-LS 就绪等待、ignore spec
+- ✅ **深化轮（4 commit，2026-09-19）**：rust_demo Cargo.toml workspace mode（冷启动 89s→5s）、TS 适配器 tsconfig 探针+ATA、rust-analyzer 三级查找链、symbol-tree 跨文件符号树
+- ✅ **上游 wrapper 面价值高的缺口**：**全部补完**（completion / signatureHelp / containing/defining symbol / 文档符号缓存 / 诊断 generation / 诊断 pull / per-LS 就绪等待 / 跨文件符号树）
+- ⚠️ **适配器缺口**：66 个未落地；既有 7 个中 rust/TS 已升级（T0.5），其余 5 个仍 T0 浅壳（**接受**——用户语言驱动）
+- ⚠️ **infra 缺口**：sha256 URL 矩阵占位假值（**接受**——download 流程未实装，Step 4 YAGNI 跳过）、additional workspace、全局 timeout
+- ⚠️ **测量纪律**：CLI e2e 一律 bash 完整重定向；powershell `-First N` 断管道会产生"挂死"伪影（详见 plan Phase 6）
 
 ## 5. 后续路线建议
 
