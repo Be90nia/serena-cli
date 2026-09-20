@@ -63,6 +63,8 @@ pub struct ChildHandle {
     pub stderr: tokio::process::ChildStderr,
     /// Windows Job Object（KILL_ON_JOB_CLOSE）。持有即保活；drop/kill 关句柄即灭树。
     pub job: Option<win32job::Job>,
+    /// 直接子进程 pid（测试断言进程回收用；spawn 后理论上不为 None）。
+    pub pid: Option<u32>,
 }
 
 impl ChildHandle {
@@ -103,6 +105,16 @@ impl Child {
         let mut child = cmd.spawn().map_err(spawn_err(cmd_display.clone()))?;
 
         // Job Object：先登记进程句柄再交出 stdio（句柄此刻必然有效）。
+        //
+        // ↖ mirror: oraios/serena PR #1918（subprocess_util.py `_get_process_descendants`
+        //   + `_wait_for_processes`：psutil 快照子孙 → 逐个 wait → 超时 kill 兜底）。
+        //   Windows 侧等价实现走内核 Job Object，覆盖面严格更广：
+        //   ① 本 job 未设 BREAKAWAY_OK/SILENT_BREAKAWAY_OK，故 LS 自行 spawn 的子孙
+        //     （jdtls 的 java、ts-server 的 node 等）创建时自动并入同一 job —— 无需快照，
+        //     快照窗口期后新生的进程同样被覆盖（快照式 reap 的盲区）；
+        //   ② drop/kill 关闭 job 句柄 → KILL_ON_JOB_CLOSE 由内核终止全树（含 LS 已
+        //     退出但其子孙仍存活的场景 —— 上游 PR #1918 要修的正是这个泄漏）；
+        //   ③ 宿主崩溃时句柄随进程关闭，同机制兜底，无孤儿。
         #[cfg(windows)]
         let job = {
             let job_err = |cmd: String| {
@@ -133,6 +145,7 @@ impl Child {
             stdout: child.stdout.take().expect("stdout piped above"),
             stderr: child.stderr.take().expect("stderr piped above"),
             job,
+            pid: child.id(),
         })
     }
 }

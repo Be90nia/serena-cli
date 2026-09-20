@@ -271,6 +271,14 @@ impl Session {
                 Ok(session)
             }
             Err(e) => {
+                // ↖ mirror: ls.py@dc59a893 — start 中途失败必须回收已 spawn 的 LS 子进程，
+                // 不留孤儿（上游在 start() 异常分支显式 stop）。本项目不能只依赖
+                // session drop 兜底：$/progress handler 闭包与 session 构成 Arc 环
+                // （session → client → handlers → session），失败态 session 不会自然
+                // drop → Job 句柄不关 → KILL_ON_JOB_CLOSE 不触发。显式丢 Job 灭树。
+                if let Some(pumps) = session.pumps.lock().unwrap().as_mut() {
+                    pumps.kill();
+                }
                 let cause = format!("{e:?}");
                 {
                     let mut state = session.state.lock().unwrap();

@@ -91,15 +91,16 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
     }
 
     fn initialize_patches(&self, base: &mut InitializeParams) {
-        // ↖ mirror: typescript_language_server.py@43ae021 `_create_base_initialize_params`
+        // ↖ mirror: typescript_language_server.py@28e866b5 `_create_base_initialize_params`
         // 关闭 ATA（Automatic Type Acquisition）：开启时 tsserver 索引期间后台从 npm
         // 拉 @types/*，拖慢启动、引入网络依赖，离线/受限机器可挂死。与上游一致只依赖
-        // 项目已装类型。
+        // 项目已装类型。Δ 上游 #1990：flag 必须在 initializationOptions 顶层——
+        // typescript-language-server 新版不再读 preferences 包裹层。
         let opts = base.initialization_options.get_or_insert_with(serde_json::Value::default);
         if !opts.is_object() {
             *opts = serde_json::json!({});
         }
-        opts["preferences"]["disableAutomaticTypingAcquisition"] = serde_json::Value::Bool(true);
+        opts["disableAutomaticTypingAcquisition"] = serde_json::Value::Bool(true);
     }
 
     fn set_project_root(&self, root: &Path) {
@@ -272,6 +273,8 @@ mod tests {
     }
 
     /// ↖ mirror: `_create_base_initialize_params` —— 注入关闭 ATA。
+    /// Δ 上游 #1990（28e866b5）：flag 必须在 initializationOptions 顶层，
+    /// TLS 新版不读 preferences 包裹层。
     #[test]
     fn initialize_patches_disables_automatic_type_acquisition() {
         let adapter = TypescriptLanguageServerAdapter;
@@ -280,14 +283,14 @@ mod tests {
         adapter.initialize_patches(&mut params);
         let opts = params.initialization_options.clone().expect("应注入 initializationOptions");
         assert_eq!(
-            opts["preferences"]["disableAutomaticTypingAcquisition"],
+            opts["disableAutomaticTypingAcquisition"],
             serde_json::Value::Bool(true),
             "ATA 应被关闭: {opts}"
         );
         // 幂等：二次 patch 不炸不翻转
         adapter.initialize_patches(&mut params);
         assert_eq!(
-            params.initialization_options.unwrap()["preferences"]["disableAutomaticTypingAcquisition"],
+            params.initialization_options.unwrap()["disableAutomaticTypingAcquisition"],
             serde_json::Value::Bool(true)
         );
     }

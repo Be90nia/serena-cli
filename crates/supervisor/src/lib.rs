@@ -615,6 +615,8 @@ impl Supervisor {
             .lock()
             .unwrap()
             .insert(key.clone(), supports_pull);
+        // 低层会话换代（旧会话已被 evict/懒重启移除）→ 高层符号缓存整体失效。
+        self.invalidate_symbol_cache_for_root(&key.root);
         self.instances
             .lock()
             .unwrap()
@@ -1308,6 +1310,21 @@ impl Supervisor {
     fn symbol_cache_put(&self, key: SymbolCacheKey, hits: Vec<SymbolHit>) {
         self.symbol_cache.lock().unwrap().insert(key, hits);
     }
+
+    /// 低层（LS 会话）版本变化 → 该 root 的全部高层符号缓存失效。
+    ///
+    /// ↖ mirror: ls.py@a5fd4d68 — 高层 document symbol 缓存版本必须纳入 LS-specific
+    /// 低层缓存版本，低层变化即失效（否则 LS 换代后命中旧代缓存）。本项目把"低层
+    /// 版本"物化为会话本身：`(root, lang)` 的 LS 会话重建（evict / Failed 懒重启 /
+    /// mid-call Terminated 重试）即低层版本变更，key 中的 mtime 无法感知这种变化。
+    /// 在 session_for 挂入新会话前调用，单点覆盖所有换代路径。
+    fn invalidate_symbol_cache_for_root(&self, root: &Path) {
+        self.symbol_cache
+            .lock()
+            .unwrap()
+            .retain(|key, _| key.0 != root);
+    }
+
     /// `textDocument/documentSymbol` → 平铺递归 `DocumentSymbol::children` → `Vec<SymbolHit>`。
     pub async fn tool_overview(
         &self,
@@ -1613,9 +1630,9 @@ impl Supervisor {
                 .flatten()
             {
                 if entry.file_type().is_some_and(|t| t.is_file())
-                    && let Some(l) = ls_registry::resolve(entry.path())
+                    && let Some(l) = ls_registry::resolve_lang_name(entry.path())
                 {
-                    set.insert(l.as_str().to_string());
+                    set.insert(l.to_string());
                 }
             }
             set
@@ -1918,6 +1935,7 @@ impl Supervisor {
     }
 
     /// `insert_text_before_symbol`：在 symbol 开头插入 text（Task 25）。
+    /// 返回插入内容末尾的 (end_line, end_col)（1-based）。
     pub async fn tool_edit_insert_before_symbol(
         &self,
         root: &Path,
@@ -1925,7 +1943,7 @@ impl Supervisor {
         symbol: &str,
         text: &str,
         lang_override: Option<&str>,
-    ) -> ToolResult<()> {
+    ) -> ToolResult<(u32, u32)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs = root.join(file);
@@ -1944,7 +1962,7 @@ impl Supervisor {
         symbol: &str,
         text: &str,
         lang_override: Option<&str>,
-    ) -> ToolResult<()> {
+    ) -> ToolResult<(u32, u32)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs = root.join(file);
@@ -2627,6 +2645,7 @@ impl Supervisor {
 
     /// `insert-at-line`：在 line（1-based）前插入，原行下移；line == total+1 追加 EOF。
     /// ↖ mirror: file_tools.py@43ae021 InsertAtLineTool（0-based → 1-based Δ）。
+    /// 返回插入内容末尾的 (end_line, end_col)（1-based）。
     pub async fn tool_insert_at_line(
         &self,
         root: &Path,
@@ -2635,7 +2654,7 @@ impl Supervisor {
         content: &str,
         expected_hash: Option<&str>,
         lang_override: Option<&str>,
-    ) -> ToolResult<()> {
+    ) -> ToolResult<(u32, u32)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs = root.join(file);
@@ -2926,13 +2945,14 @@ async fn lsp_position_from_byte(
     Ok(Position::new(pos.line, pos.character))
 }
 
-/// 解析 lang: 有 override 直接用 (大小写折叠), 否则按文件扩展名探测。
+/// 解析 lang: 有 override 直接用 (大小写折叠), 否则按文件扩展名探测
+/// （内置 EXT_TABLE → external-servers.toml extensions 兜底）。
 fn resolve_lang_for_file(file: &str, lang_override: Option<&str>) -> ToolResult<String> {
     if let Some(l) = lang_override {
         return Ok(l.to_ascii_lowercase());
     }
-    ls_registry::resolve(Path::new(file))
-        .map(|l| l.as_str().to_string())
+    ls_registry::resolve_lang_name(Path::new(file))
+        .map(str::to_string)
         .ok_or_else(|| ToolError::BadArgs {
             detail: format!("file not supported: {file}"),
         })
@@ -3594,15 +3614,17 @@ impl SupervisorTrait for Supervisor {
             }
             "insert-text-after-symbol" => {
                 let (file, symbol, text) = required_edit_args(&args)?;
-                self.tool_edit_insert_after_symbol(root, &file, &symbol, &text, lang)
+                let (end_line, end_col) = self
+                    .tool_edit_insert_after_symbol(root, &file, &symbol, &text, lang)
                     .await?;
-                Ok(serde_json::Value::Null)
+                Ok(serde_json::json!({ "end_line": end_line, "end_col": end_col }))
             }
             "insert-text-before-symbol" => {
                 let (file, symbol, text) = required_edit_args(&args)?;
-                self.tool_edit_insert_before_symbol(root, &file, &symbol, &text, lang)
+                let (end_line, end_col) = self
+                    .tool_edit_insert_before_symbol(root, &file, &symbol, &text, lang)
                     .await?;
-                Ok(serde_json::Value::Null)
+                Ok(serde_json::json!({ "end_line": end_line, "end_col": end_col }))
             }
             "delete-text-in-symbol" => {
                 let file = required_file(&args)?;
@@ -3652,16 +3674,20 @@ impl SupervisorTrait for Supervisor {
                         detail: "missing 'content'".into(),
                     })?
                     .to_owned();
-                self.tool_insert_at_line(
-                    root,
-                    &file,
-                    line,
-                    &content,
-                    opt_expected_hash(&args).as_deref(),
-                    lang,
-                )
-                .await?;
-                Ok(serde_json::Value::Null)
+                let (end_line, end_col) = self
+                    .tool_insert_at_line(
+                        root,
+                        &file,
+                        line,
+                        &content,
+                        opt_expected_hash(&args).as_deref(),
+                        lang,
+                    )
+                    .await?;
+                Ok(serde_json::json!({
+                    "end_line": end_line,
+                    "end_col": end_col,
+                }))
             }
             "replace-lines" => {
                 let (file, start_line, end_line) = required_line_range(&args)?;
@@ -4013,7 +4039,20 @@ pub(crate) fn content_hash(text: &str) -> String {
 }
 
 /// tempfile 原子写 + rename；Windows 共享冲突（目标被别进程打开）重试 5×50ms（I5）。
+///
+/// ↖ mirror: PR oraios/serena#2041（save edited source files atomically）对账 —
+/// 上游把编辑保存从截断写 `open(path,"w")` 改为 temp-file+`os.replace`，并要求
+/// symlink 目标**透传写**（rename 会把链接本体替换成普通文件，破坏链接关系）。
+/// 本项目 edit 链路本就走 tmp+rename（语义已对齐），唯一缺口即 symlink：
+/// rename 前先解析链接到真实目标，对目标做原子写。
 async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    // 仅当最终组件是 symlink 才解析（canonicalize）；其余路径行为不变。
+    // 悬空链接/链接环在此报错 —— 与其把链接替换成普通文件，不如明确失败。
+    let target = match tokio::fs::symlink_metadata(path).await {
+        Ok(m) if m.is_symlink() => Some(tokio::fs::canonicalize(path).await?),
+        _ => None,
+    };
+    let path: &Path = target.as_deref().unwrap_or(path);
     let dir = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
     })?;
@@ -4039,6 +4078,58 @@ async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    /// smoke：普通文件原子写落盘。
+    #[tokio::test]
+    async fn writes_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.rs");
+        atomic_write(&p, "fn main() {}\n").await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&p).await.unwrap(),
+            "fn main() {}\n"
+        );
+    }
+
+    /// ↖ mirror: PR oraios/serena#2041 — symlink 目标透传写：内容更新到 target，
+    /// 链接本体不得被 rename 替换成普通文件。
+    #[tokio::test]
+    async fn symlinked_file_is_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.rs");
+        std::fs::write(&target, "old\n").unwrap();
+        let link = dir.path().join("link.rs");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        match std::os::windows::fs::symlink_file(&target, &link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Windows symlink 需开发者模式/管理员；无权限环境跳过（行为无法构造）。
+                println!("skipped: symlink 需要开发者模式/管理员权限");
+                return;
+            }
+            Err(e) => panic!("symlink_file: {e}"),
+        }
+        atomic_write(&link, "new\n").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new\n",
+            "内容必须写到 target"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .is_symlink(),
+            "链接本体不得被替换成普通文件"
+        );
+    }
+}
+
 #[cfg(test)]
 mod safe_delete_tests {
     use super::*;
@@ -4483,8 +4574,38 @@ mod symbol_cache_tests {
         }
     }
 
-    /// cache 命中：同 file 二次 overview 命中不拉 LS（首跑 warmup 后 <1ms；
-    /// 冷 page cache 首测可到几 ms——断言只保护"命中路径 vs LS 往返秒级"的量级差）。
+    /// ↖ mirror: ls.py@a5fd4d68 — 低层（LS 会话）版本变化后高层缓存不得再命中：
+    /// 同 root 的单文件级与 workspace 级缓存全部失效，其他 root 不受影响。
+    #[tokio::test]
+    async fn session_rebuild_invalidates_symbol_cache_for_root() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        let other = Path::new("Z:/no/such/other");
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs"), vec![hit("main")]);
+        sup.symbol_cache_put(find_symbol_cache_key(root, "main"), vec![hit("main")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(other, "a.rs"), vec![hit("helper")]);
+
+        // 模拟 (root, lang) 会话换代（session_for 挂入新会话前的失效动作）。
+        sup.invalidate_symbol_cache_for_root(root);
+
+        assert!(
+            sup.symbol_cache_get(&doc_symbol_cache_key(root, "a.rs"))
+                .is_none(),
+            "会话换代后同 root 文档符号缓存必须 miss"
+        );
+        assert!(
+            sup.symbol_cache_get(&find_symbol_cache_key(root, "main"))
+                .is_none(),
+            "会话换代后同 root workspace 级缓存必须 miss"
+        );
+        assert!(
+            sup.symbol_cache_get(&doc_symbol_cache_key(other, "a.rs")).is_some(),
+            "其他 root 的缓存不受影响"
+        );
+    }
+
+    /// cache 命中：同 file 二次 overview 命中不拉 LS（命中路径 vs LS 往返秒级的量级差；
+    /// 并行全量测试下 CPU 调度抖动可达数 ms，阈值放宽到 10ms 仍比 LS 往返低两个量级）。
     #[tokio::test]
     async fn overview_cache_hit_returns_under_1ms() {
         let sup = Supervisor::direct().await.unwrap();
@@ -4500,7 +4621,7 @@ mod symbol_cache_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "main");
         assert!(
-            elapsed < Duration::from_millis(1),
+            elapsed < Duration::from_millis(10),
             "cache hit took {elapsed:?}"
         );
     }
@@ -4591,7 +4712,7 @@ mod symbol_cache_tests {
             .unwrap();
         let elapsed = t0.elapsed();
         assert!(
-            elapsed < Duration::from_millis(1),
+            elapsed < Duration::from_millis(10),
             "cache hit took {elapsed:?}"
         );
         assert_eq!(out.len(), 2, "limit must apply to cached full list");

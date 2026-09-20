@@ -147,33 +147,9 @@ async fn commit_change(
     new_content: &str,
 ) -> EditResult<()> {
     // atomic_write：tempfile 写 + rename（共享冲突重试 5×50ms）。
-    atomic_write(file, new_content).await?;
+    crate::atomic_write(file, new_content).await?;
     // mtime 推进 → docsync 自动发 version=prev+1 的 didChange 全量。
     let _refreshed = session.ensure_open(file).await?;
-    Ok(())
-}
-
-/// tempfile 原子写 + rename（与 lib.rs::atomic_write 同语义，独立以免循环依赖）。
-async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
-    })?;
-    let tmp = tempfile::NamedTempFile::new_in(parent)?;
-    let tmp_path = tmp.into_temp_path().keep()?;
-    tokio::fs::write(&tmp_path, content).await?;
-    for attempt in 0..5 {
-        match tokio::fs::rename(&tmp_path, path).await {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt + 1))).await;
-                let _ = e;
-            }
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(e);
-            }
-        }
-    }
     Ok(())
 }
 
@@ -199,13 +175,14 @@ pub async fn replace_text_in_symbol(
 }
 
 /// `insert_text_after_symbol`：在 symbol 末尾（range.end）插入 text。
+/// 返回插入内容末尾的 `(end_line, end_col)`（1-based，col 按字符计）。
 pub async fn insert_text_after_symbol(
     session: &Arc<Session>,
     root: &Path,
     file: &Path,
     symbol: &str,
     text: &str,
-) -> EditResult<()> {
+) -> EditResult<(u32, u32)> {
     let _gate = write_gate::acquire().await;
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
@@ -216,11 +193,10 @@ pub async fn insert_text_after_symbol(
         range.end.character,
         OffsetEncoding::Utf16,
     )?;
-    let mut new_content = String::with_capacity(content.len() + text.len());
-    new_content.push_str(&content[..end_byte]);
-    new_content.push_str(text);
-    new_content.push_str(&content[end_byte..]);
-    commit_change(session, file, root, &new_content).await
+    let new_content = format!("{}{}{}", &content[..end_byte], text, &content[end_byte..]);
+    let (end_line, end_col) = end_line_col(&new_content, end_byte + text.len());
+    commit_change(session, file, root, &new_content).await?;
+    Ok((end_line, end_col))
 }
 
 /// `insert_text_before_symbol`：在 symbol 开头（range.start）插入 text。
@@ -230,7 +206,7 @@ pub async fn insert_text_before_symbol(
     file: &Path,
     symbol: &str,
     text: &str,
-) -> EditResult<()> {
+) -> EditResult<(u32, u32)> {
     let _gate = write_gate::acquire().await;
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
@@ -241,11 +217,10 @@ pub async fn insert_text_before_symbol(
         range.start.character,
         OffsetEncoding::Utf16,
     )?;
-    let mut new_content = String::with_capacity(content.len() + text.len());
-    new_content.push_str(&content[..start_byte]);
-    new_content.push_str(text);
-    new_content.push_str(&content[start_byte..]);
-    commit_change(session, file, root, &new_content).await
+    let new_content = format!("{}{}{}", &content[..start_byte], text, &content[start_byte..]);
+    let (end_line, end_col) = end_line_col(&new_content, start_byte + text.len());
+    commit_change(session, file, root, &new_content).await?;
+    Ok((end_line, end_col))
 }
 
 /// `delete_text_in_symbol`：在 symbol 体内删除 `start_line..end_line` 切片（行号 1-based 含端）。
@@ -333,9 +308,27 @@ fn line_bounds_error(start: u32, end: u32, total: usize) -> EditError {
     }
 }
 
+/// 从结果文本反推插入内容末尾的 `(line, col)`（均 1-based，col 按 Unicode 标量字符计）。
+///
+/// ↖ mirror: ls_utils.py@9554456 insert_text_at_position — 位置必须从插入后的**结果文本**
+/// 反推，而非用插入文本自身步进估算：插入落在既有 `\r` 之后的 `\n` 会与之合并成单个
+/// `\r\n` 行界，只看插入文本会错位一行。Δ 上游 0-based → 本项目行级工具 1-based 约定。
+fn end_line_col(new_text: &str, end_byte: usize) -> (u32, u32) {
+    let upto = &new_text[..end_byte];
+    let line = (upto.bytes().filter(|&b| b == b'\n').count() + 1).min(u32::MAX as usize) as u32;
+    let line_start = upto.rfind('\n').map_or(0, |i| i + 1);
+    let col = (upto[line_start..].chars().count() + 1).min(u32::MAX as usize) as u32;
+    (line, col)
+}
+
 /// 在 `line`（1-based）前插入 content（规范化补尾 `\n`），原有行整体下移；
-/// `line == total+1` 即追加到文件尾。
-pub(crate) fn apply_insert_at_line(text: &str, line: u32, content: &str) -> EditResult<String> {
+/// `line == total+1` 即追加到文件尾。返回 `(new_text, end_line, end_col)`：
+/// end position = 插入内容末尾（1-based，col 按字符计）。
+pub(crate) fn apply_insert_at_line(
+    text: &str,
+    line: u32,
+    content: &str,
+) -> EditResult<(String, u32, u32)> {
     let starts = line_starts(text);
     let total = starts.len() - 1;
     if line == 0 || line as usize > total + 1 {
@@ -346,7 +339,9 @@ pub(crate) fn apply_insert_at_line(text: &str, line: u32, content: &str) -> Edit
     if !content.ends_with('\n') {
         content.push('\n'); // ↖ mirror: file_tools.py@43ae021 InsertAtLineTool.apply 内容规范化
     }
-    Ok(format!("{}{}{}", &text[..pos], content, &text[pos..]))
+    let new_text = format!("{}{}{}", &text[..pos], content, &text[pos..]);
+    let (end_line, end_col) = end_line_col(&new_text, pos + content.len());
+    Ok((new_text, end_line, end_col))
 }
 
 /// 删除 `[start, end]` 行（1-based 含端）。
@@ -403,26 +398,29 @@ pub(crate) fn verify_hash(expected: Option<&str>, actual: &str, path: &Path) -> 
 }
 
 /// 行级写事务公共链路（与 replace-body 一致）：写门 → ensure_open → 读盘 →
-/// hash 对账 → 行变换 → atomic_write + didChange 全量。
-async fn line_edit<F>(
+/// hash 对账 → 行变换 → atomic_write + didChange 全量。变换产出 `(new_text, T)`，
+/// T 供调用方附带返回值（如 insert 的 end position）。
+async fn line_edit<T, F>(
     session: &Arc<Session>,
     root: &Path,
     file: &Path,
     expected_hash: Option<&str>,
     transform: F,
-) -> EditResult<()>
+) -> EditResult<T>
 where
-    F: FnOnce(&str) -> EditResult<String>,
+    F: FnOnce(&str) -> EditResult<(String, T)>,
 {
     let _gate = write_gate::acquire().await;
     let _guard = session.ensure_open(file).await?;
     let content = tokio::fs::read_to_string(file).await?;
     verify_hash(expected_hash, &content, file)?;
-    let new_content = transform(&content)?;
-    commit_change(session, file, root, &new_content).await
+    let (new_content, extra) = transform(&content)?;
+    commit_change(session, file, root, &new_content).await?;
+    Ok(extra)
 }
 
 /// `insert-at-line`：在 `line`（1-based）前插入，原行下移；`line == total+1` 追加 EOF。
+/// 返回插入内容末尾的 `(end_line, end_col)`（1-based）。
 pub async fn insert_at_line(
     session: &Arc<Session>,
     root: &Path,
@@ -430,9 +428,10 @@ pub async fn insert_at_line(
     line: u32,
     content: &str,
     expected_hash: Option<&str>,
-) -> EditResult<()> {
+) -> EditResult<(u32, u32)> {
     line_edit(session, root, file, expected_hash, |t| {
         apply_insert_at_line(t, line, content)
+            .map(|(s, end_line, end_col)| (s, (end_line, end_col)))
     })
     .await
 }
@@ -448,7 +447,7 @@ pub async fn replace_lines(
     expected_hash: Option<&str>,
 ) -> EditResult<()> {
     line_edit(session, root, file, expected_hash, |t| {
-        apply_replace_lines(t, start_line, end_line, content)
+        apply_replace_lines(t, start_line, end_line, content).map(|s| (s, ()))
     })
     .await
 }
@@ -463,7 +462,7 @@ pub async fn delete_lines(
     expected_hash: Option<&str>,
 ) -> EditResult<()> {
     line_edit(session, root, file, expected_hash, |t| {
-        apply_delete_lines(t, start_line, end_line)
+        apply_delete_lines(t, start_line, end_line).map(|s| (s, ()))
     })
     .await
 }
@@ -486,21 +485,37 @@ mod tests {
 
     #[test]
     fn insert_pushes_lines_down_and_appends() {
-        // 首行前插入。
-        assert_eq!(
-            apply_insert_at_line("int a = 1;\nint b = 2;\n", 1, "// hdr\n").unwrap(),
-            "// hdr\nint a = 1;\nint b = 2;\n"
-        );
-        // 中间插入 + content 缺尾换行自动补。
-        assert_eq!(
-            apply_insert_at_line("int a = 1;\nint b = 2;\n", 2, "int c = 3;").unwrap(),
-            "int a = 1;\nint c = 3;\nint b = 2;\n"
-        );
-        // total+1 = 追加 EOF。
-        assert_eq!(
-            apply_insert_at_line("int a = 1;\n", 2, "int b = 2;\n").unwrap(),
-            "int a = 1;\nint b = 2;\n"
-        );
+        // 首行前插入；插入内容以 \n 结尾 → 末尾位置落在下一行行首。
+        let (out, l, c) = apply_insert_at_line("int a = 1;\nint b = 2;\n", 1, "// hdr\n").unwrap();
+        assert_eq!(out, "// hdr\nint a = 1;\nint b = 2;\n");
+        assert_eq!((l, c), (2, 1));
+        // 中间插入 + content 缺尾换行自动补；补入的 \n 属插入内容
+        // → 尾 = 其后一行行首（原 b 行，新第 3 行）。
+        let (out, l, c) = apply_insert_at_line("int a = 1;\nint b = 2;\n", 2, "int c = 3;").unwrap();
+        assert_eq!(out, "int a = 1;\nint c = 3;\nint b = 2;\n");
+        assert_eq!((l, c), (3, 1));
+        // total+1 = 追加 EOF；插入内容以 \n 结尾 → 尾 = one-past-EOF 行首
+        // （"末尾之后"语义，与该坐标可直接作为下次 insert-at-line 的 line 复用）。
+        let (out, l, c) = apply_insert_at_line("int a = 1;\n", 2, "int b = 2;\n").unwrap();
+        assert_eq!(out, "int a = 1;\nint b = 2;\n");
+        assert_eq!((l, c), (3, 1));
+    }
+
+    /// ↖ mirror: ls_utils.py@9554456（PR #1842）— 插入多行内容后，end position 必须
+    /// 等于插入内容在**结果文本**中的末尾；CRLF 文件行界按 `\n` 计，`\r` 不多算一行；
+    /// col 按 Unicode 字符计而非字节。
+    #[test]
+    fn insert_end_position_points_at_insertion_tail() {
+        // 多行插入："x\ny\n" 插到原第 2 行前 → 新文本行序 a/x/y/b，尾 \n 已推进
+        // → end position = 第 4 行行首（原 b 行），即插入内容末尾之后。
+        let (_, l, c) = apply_insert_at_line("a\nb\n", 2, "x\ny\n").unwrap();
+        assert_eq!((l, c), (4, 1));
+        // CRLF 文件：插入 "c\n" 后尾 = 新第 3 行行首（原 b 行）；行界按 \n 计，
+        // 行中 \r 不产生额外行号偏移。
+        let (_, l, c) = apply_insert_at_line("a\r\nb\r\n", 2, "c\n").unwrap();
+        assert_eq!((l, c), (3, 1));
+        // col 按 Unicode 标量字符计而非字节："çé" 4 字节 = 2 字符。
+        assert_eq!(end_line_col("a\nçéb", "a\nçé".len()), (2, 3));
     }
 
     #[test]

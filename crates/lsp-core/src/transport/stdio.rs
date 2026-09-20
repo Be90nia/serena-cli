@@ -66,6 +66,7 @@ pub fn pump(
         stdout,
         stderr,
         job,
+        pid: _,
     } = child;
 
     let reply_tx_for_dispatch = reply_tx.clone();
@@ -197,6 +198,7 @@ pub fn record_pump(
         stdout,
         stderr,
         job,
+        pid: _,
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
     let rec_w = recorder.clone();

@@ -7,6 +7,7 @@ mod common;
 use ls_adapters::LanguageId;
 use ls_adapters::LanguageServerAdapter;
 use ls_adapters::typescript::TypescriptLanguageServerAdapter;
+use lsp_types::InitializeParams;
 
 #[test]
 fn metadata() {
@@ -72,4 +73,24 @@ async fn launch_errors_when_missing() {
         "typescript-language-server",
     )
     .await;
+}
+
+/// ↖ mirror: oraios/serena@28e866b5（PR #1990）— disableAutomaticTypingAcquisition 必须在
+/// initializationOptions 顶层；旧版放在 preferences 包裹层里 TLS 读不到，ATA 照常联网拉类型。
+#[test]
+fn initialize_patches_disables_ata_at_top_level() {
+    let mut params = InitializeParams::default();
+    TypescriptLanguageServerAdapter.initialize_patches(&mut params);
+    let opts = params
+        .initialization_options
+        .expect("initialize_patches 应写入 initialization_options");
+    assert_eq!(
+        opts.get("disableAutomaticTypingAcquisition"),
+        Some(&serde_json::Value::Bool(true)),
+        "ATA 关闭 flag 必须在 initializationOptions 顶层, opts={opts}"
+    );
+    assert!(
+        opts.get("preferences").is_none(),
+        "不得再用 preferences 包裹层（上游 #1990 修正的正是这个错位）, opts={opts}"
+    );
 }

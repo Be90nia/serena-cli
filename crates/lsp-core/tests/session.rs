@@ -144,6 +144,51 @@ async fn session_start_failure_returns_core_error() {
     );
 }
 
+/// ↖ mirror: ls.py@dc59a893 — start 中途失败不得遗留已 spawn 的 LS 子进程。
+/// 上游在 start() 异常分支显式 stop()；本项目等价机制 = Session::start 失败返回
+/// Err → Session（含 Pumps 持有的 Job 句柄）随 Arc 归零 drop → KILL_ON_JOB_CLOSE
+/// 内核灭树。本测试证明：握手超时返回 Err 后，仍存活的长跑子进程被立即回收，
+/// 而非继续跑满自身寿命。
+#[tokio::test]
+async fn session_start_failure_reaps_child() {
+    let info = LaunchInfo {
+        cmd: vec![
+            OsString::from("ping"),
+            OsString::from("-n"),
+            OsString::from("30"),
+            OsString::from("127.0.0.1"),
+        ],
+        cwd: std::env::temp_dir(),
+        env: vec![],
+        transport: TransportKind::Stdio,
+    };
+    let child = Child::spawn(info).unwrap();
+    let pid = child.pid.expect("spawn 成功后 pid 应可用");
+    assert!(pid_running(pid), "spawn 后子进程应存活, pid={pid}");
+
+    // ping 不回任何 LSP 帧 → 10s 握手超时 → start 返回 Err。
+    let res = Session::start(Some(child), dummy_init_params()).await;
+    assert!(res.is_err(), "无响应 LS 的 Session::start 必须失败");
+
+    // 失败后子进程必须被回收（job 随 pumps drop 关闭），不能跑满 30s。
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while pid_running(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "start 失败后子进程仍残留（pid={pid}）：失败路径未回收已 spawn 的 LS"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn pid_running(pid: u32) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .expect("tasklist 可用（Windows 验收环境）");
+    String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+}
+
 /// 单元测试：状态枚举的 Debug/PartialEq 形态稳定。
 #[test]
 fn session_state_debug_is_stable() {
