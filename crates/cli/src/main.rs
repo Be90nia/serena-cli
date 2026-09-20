@@ -51,6 +51,16 @@ struct Cli {
     #[arg(long, global = true, value_name = "LANG")]
     lang: Option<String>,
 
+    /// 全局工具请求超时（毫秒）。Phase 4 基建 Task 22b。优先级最高：CLI > servers.toml
+    /// `[defaults].timeout_ms` > 30s 默认。`--index-timeout` 单独覆盖 workspace/symbol
+    /// 等长操作（默认 120s）。
+    #[arg(long, global = true, value_name = "MS")]
+    request_timeout: Option<u32>,
+
+    /// 索引型工具（workspace/symbol、workspace/diagnostic 等）超时（毫秒）。默认 120s。
+    #[arg(long, global = true, value_name = "MS")]
+    index_timeout: Option<u32>,
+
     /// 子命令；`--daemon` 模式下可省略。
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -230,6 +240,82 @@ enum Cmd {
 
     /// 函数调用位置的参数签名提示（textDocument/signatureHelp）。无调用位置返 null。
     SignatureHelp { file: String, line: u32, col: u32 },
+    /// 列出可用 codeAction（textDocument/codeAction）。可选 `--kind` 过滤（如 quickfix / refactor）。
+    CodeAction {
+        file: String,
+        line: u32,
+        col: u32,
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// 整文件格式化（textDocument/formatting）。返 edits[]；非编辑端用 `jq` 应用。
+    Format {
+        file: String,
+        #[arg(long)]
+        tab_size: Option<u32>,
+        #[arg(long)]
+        insert_spaces: Option<bool>,
+    },
+    /// range 内格式化（textDocument/rangeFormatting）。返 edits[]。
+    FormatRange {
+        file: String,
+        start_line: u32,
+        start_col: u32,
+        end_line: u32,
+        end_col: u32,
+        #[arg(long)]
+        tab_size: Option<u32>,
+        #[arg(long)]
+        insert_spaces: Option<bool>,
+    },
+    /// 行范围内类型提示（textDocument/inlayHint）。
+    InlayHint {
+        file: String,
+        start_line: u32,
+        end_line: u32,
+    },
+    /// 光标位置的同符号高亮（textDocument/documentHighlight）。
+    DocumentHighlight {
+        file: String,
+        line: u32,
+        col: u32,
+    },
+    /// 折叠区（textDocument/foldingRange）。
+    FoldingRange { file: String },
+    /// 语义 token（textDocument/semanticTokens/full）。
+    SemanticTokens { file: String },
+    /// 代码透镜（textDocument/codeLens）。
+    CodeLens { file: String },
+    /// 文档链接（textDocument/documentLink）。
+    DocumentLink { file: String },
+    /// 调用层级：prepare / incoming / outgoing 三件套（callHierarchy/*）。
+    CallHierarchy {
+        /// "prepare" 用 file/line/col；"incoming"/"outgoing" 用 --item。
+        op: String,
+        file: Option<String>,
+        line: Option<u32>,
+        col: Option<u32>,
+        /// prepare 返的 CallHierarchyItem JSON（incoming/outgoing 必填）。
+        #[arg(long)]
+        item: Option<String>,
+    },
+    /// 类型层级：prepare / supertypes / subtypes 三件套（typeHierarchy/*）。
+    TypeHierarchy {
+        op: String,
+        file: Option<String>,
+        line: Option<u32>,
+        col: Option<u32>,
+        #[arg(long)]
+        item: Option<String>,
+    },
+    /// 全局符号标识（textDocument/moniker）。
+    Moniker {
+        file: String,
+        line: u32,
+        col: u32,
+    },
+    /// workspace 级 pull diagnostics（workspace/diagnostic）。
+    WorkspaceDiagnostic,
     /// daemon 状态（uptime / pid / loaded LS）。
     Status,
     /// 停掉 daemon（draining + 删 lock）。
@@ -358,6 +444,98 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             .await
             .and_then(|resp| print_json(&json!(resp)))
         }
+        // ==== Phase 1 · 上游 wrapper 缺口（13 个 --direct 路径）====
+        Some(Cmd::CodeAction { file, line, col, kind }) => sup
+            .tool_code_action(
+                &root,
+                file,
+                *line,
+                *col,
+                kind.as_deref(),
+                cli.lang.as_deref(),
+            )
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::Format { file, tab_size, insert_spaces }) => sup
+            .tool_format(&root, file, *tab_size, *insert_spaces, cli.lang.as_deref())
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::FormatRange {
+            file,
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            tab_size,
+            insert_spaces,
+        }) => sup
+            .tool_format_range(
+                &root,
+                file,
+                *start_line,
+                *start_col,
+                *end_line,
+                *end_col,
+                *tab_size,
+                *insert_spaces,
+                cli.lang.as_deref(),
+            )
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::InlayHint { file, start_line, end_line }) => sup
+            .tool_inlay_hint(&root, file, *start_line, *end_line, cli.lang.as_deref())
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::DocumentHighlight { file, line, col }) => sup
+            .tool_document_highlight(&root, file, *line, *col, cli.lang.as_deref())
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::FoldingRange { file }) => sup
+            .tool_folding_range(&root, file, cli.lang.as_deref())
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::SemanticTokens { file }) => sup
+            .tool_semantic_tokens(&root, file, cli.lang.as_deref())
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::CodeLens { file }) => sup
+            .tool_code_lens(&root, file, cli.lang.as_deref())
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::DocumentLink { file }) => sup
+            .tool_document_link(&root, file, cli.lang.as_deref())
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::CallHierarchy { op, file, line, col, item }) => handle_call_hierarchy(
+            &sup,
+            &root,
+            op,
+            file.as_deref(),
+            *line,
+            *col,
+            item.as_deref(),
+            cli.lang.as_deref(),
+        )
+        .await,
+        Some(Cmd::TypeHierarchy { op, file, line, col, item }) => handle_type_hierarchy(
+            &sup,
+            &root,
+            op,
+            file.as_deref(),
+            *line,
+            *col,
+            item.as_deref(),
+            cli.lang.as_deref(),
+        )
+        .await,
+        Some(Cmd::Moniker { file, line, col }) => sup
+            .tool_moniker(&root, file, *line, *col, cli.lang.as_deref())
+            .await
+            .and_then(|v| print_json(&json!(v))),
+        Some(Cmd::WorkspaceDiagnostic) => sup
+            .tool_workspace_diagnostic(&root, cli.lang.as_deref())
+            .await
+            .and_then(|v| print_json(&json!(v))),
         other => {
             let _ = other;
             eprintln!("this subcommand is daemon-mode only in M1");
@@ -381,6 +559,124 @@ fn tool_error_exit(e: &ToolError) -> u8 {
         ToolError::Protocol { .. } => 1,
         ToolError::Serialize(_) => 3,
         ToolError::Core(_) | ToolError::Launch(_) => 3,
+    }
+}
+
+/// Phase 1 · call-hierarchy 三件套的 --direct 调度（op=prepare|incoming|outgoing）。
+///
+/// prepare 必填 file/line/col；incoming/outgoing 必填 --item（CallHierarchyItem JSON）。
+#[allow(clippy::too_many_arguments)]
+async fn handle_call_hierarchy(
+    sup: &Supervisor,
+    root: &Path,
+    op: &str,
+    file: Option<&str>,
+    line: Option<u32>,
+    col: Option<u32>,
+    item: Option<&str>,
+    lang: Option<&str>,
+) -> Result<(), ToolError> {
+    match op {
+        "prepare" => {
+            let f = file.ok_or_else(|| ToolError::BadArgs {
+                detail: "prepare requires <file> <line> <col>".into(),
+            })?;
+            let l = line.ok_or_else(|| ToolError::BadArgs {
+                detail: "prepare requires <line>".into(),
+            })?;
+            let c = col.ok_or_else(|| ToolError::BadArgs {
+                detail: "prepare requires <col>".into(),
+            })?;
+            let items = sup.tool_call_hierarchy_prepare(root, f, l, c, lang).await?;
+            print_json(&json!(items))
+        }
+        "incoming" => {
+            let item_str = item.ok_or_else(|| ToolError::BadArgs {
+                detail: "incoming requires --item".into(),
+            })?;
+            let item_val: serde_json::Value =
+                serde_json::from_str(item_str).map_err(|e| ToolError::BadArgs {
+                    detail: format!("bad --item JSON: {e}"),
+                })?;
+            let v = sup
+                .tool_call_hierarchy_incoming(root, item_val, lang)
+                .await?;
+            print_json(&json!(v))
+        }
+        "outgoing" => {
+            let item_str = item.ok_or_else(|| ToolError::BadArgs {
+                detail: "outgoing requires --item".into(),
+            })?;
+            let item_val: serde_json::Value =
+                serde_json::from_str(item_str).map_err(|e| ToolError::BadArgs {
+                    detail: format!("bad --item JSON: {e}"),
+                })?;
+            let v = sup
+                .tool_call_hierarchy_outgoing(root, item_val, lang)
+                .await?;
+            print_json(&json!(v))
+        }
+        other => Err(ToolError::BadArgs {
+            detail: format!("unknown call-hierarchy op: {other}"),
+        }),
+    }
+}
+
+/// Phase 1 · type-hierarchy 三件套的 --direct 调度（op=prepare|supertypes|subtypes）。
+#[allow(clippy::too_many_arguments)]
+async fn handle_type_hierarchy(
+    sup: &Supervisor,
+    root: &Path,
+    op: &str,
+    file: Option<&str>,
+    line: Option<u32>,
+    col: Option<u32>,
+    item: Option<&str>,
+    lang: Option<&str>,
+) -> Result<(), ToolError> {
+    match op {
+        "prepare" => {
+            let f = file.ok_or_else(|| ToolError::BadArgs {
+                detail: "prepare requires <file> <line> <col>".into(),
+            })?;
+            let l = line.ok_or_else(|| ToolError::BadArgs {
+                detail: "prepare requires <line>".into(),
+            })?;
+            let c = col.ok_or_else(|| ToolError::BadArgs {
+                detail: "prepare requires <col>".into(),
+            })?;
+            let items = sup.tool_type_hierarchy_prepare(root, f, l, c, lang).await?;
+            print_json(&json!(items))
+        }
+        "supertypes" => {
+            let item_str = item.ok_or_else(|| ToolError::BadArgs {
+                detail: "supertypes requires --item".into(),
+            })?;
+            let item_val: serde_json::Value =
+                serde_json::from_str(item_str).map_err(|e| ToolError::BadArgs {
+                    detail: format!("bad --item JSON: {e}"),
+                })?;
+            let v = sup
+                .tool_type_hierarchy_supertypes(root, item_val, lang)
+                .await?;
+            print_json(&json!(v))
+        }
+        "subtypes" => {
+            let item_str = item.ok_or_else(|| ToolError::BadArgs {
+                detail: "subtypes requires --item".into(),
+            })?;
+            let item_val: serde_json::Value =
+                serde_json::from_str(item_str).map_err(|e| ToolError::BadArgs {
+                    detail: format!("bad --item JSON: {e}"),
+                })?;
+            let v = sup
+                .tool_type_hierarchy_subtypes(root, item_val, lang)
+                .await?;
+            print_json(&json!(v))
+        }
+        other => Err(ToolError::BadArgs {
+            detail: format!("unknown type-hierarchy op: {other}"),
+        }),
     }
 }
 
@@ -687,6 +983,95 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
                 "col": col,
             }),
         ),
+        // ==== Phase 1 · 上游 wrapper 缺口（13 个）====
+        Some(Cmd::CodeAction { file, line, col, kind }) => (
+            "code-action",
+            json!({"file": file, "line": line, "col": col, "kind": kind}),
+        ),
+        Some(Cmd::Format { file, tab_size, insert_spaces }) => (
+            "format",
+            json!({
+                "file": file,
+                "tab_size": tab_size,
+                "insert_spaces": insert_spaces,
+            }),
+        ),
+        Some(Cmd::FormatRange {
+            file,
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            tab_size,
+            insert_spaces,
+        }) => (
+            "format-range",
+            json!({
+                "file": file,
+                "start_line": start_line,
+                "start_col": start_col,
+                "end_line": end_line,
+                "end_col": end_col,
+                "tab_size": tab_size,
+                "insert_spaces": insert_spaces,
+            }),
+        ),
+        Some(Cmd::InlayHint {
+            file,
+            start_line,
+            end_line,
+        }) => (
+            "inlay-hint",
+            json!({
+                "file": file,
+                "start_line": start_line,
+                "end_line": end_line,
+            }),
+        ),
+        Some(Cmd::DocumentHighlight { file, line, col }) => (
+            "document-highlight",
+            json!({"file": file, "line": line, "col": col}),
+        ),
+        Some(Cmd::FoldingRange { file }) => ("folding-range", json!({"file": file})),
+        Some(Cmd::SemanticTokens { file }) => {
+            ("semantic-tokens", json!({"file": file}))
+        }
+        Some(Cmd::CodeLens { file }) => ("code-lens", json!({"file": file})),
+        Some(Cmd::DocumentLink { file }) => {
+            ("document-link", json!({"file": file}))
+        }
+        Some(Cmd::CallHierarchy { op, file, line, col, item }) => {
+            let mut args = json!({"op": op});
+            if let (Some(f), Some(l), Some(c)) = (file, line, col) {
+                args["file"] = json!(f);
+                args["line"] = json!(l);
+                args["col"] = json!(c);
+            }
+            if let Some(it) = item {
+                // 解析 agent 传入的 JSON item 字符串；解析失败留原串（supervisor 端会拒）。
+                args["item"] = serde_json::from_str(it)
+                    .unwrap_or_else(|_| serde_json::Value::String(it.clone()));
+            }
+            ("call-hierarchy", args)
+        }
+        Some(Cmd::TypeHierarchy { op, file, line, col, item }) => {
+            let mut args = json!({"op": op});
+            if let (Some(f), Some(l), Some(c)) = (file, line, col) {
+                args["file"] = json!(f);
+                args["line"] = json!(l);
+                args["col"] = json!(c);
+            }
+            if let Some(it) = item {
+                args["item"] = serde_json::from_str(it)
+                    .unwrap_or_else(|_| serde_json::Value::String(it.clone()));
+            }
+            ("type-hierarchy", args)
+        }
+        Some(Cmd::Moniker { file, line, col }) => (
+            "moniker",
+            json!({"file": file, "line": line, "col": col}),
+        ),
+        Some(Cmd::WorkspaceDiagnostic) => ("workspace-diagnostic", json!({})),
         Some(Cmd::Status)
         | Some(Cmd::StopAll)
         | Some(Cmd::Install { .. })
@@ -696,6 +1081,9 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
         }
     };
     let project_root = resolve_project_root(cli.project.clone());
+    // Phase 4 基建 Task 22b：CLI flag → args 私有字段 → supervisor 三层合并。
+    let mut args = args;
+    inject_timeout_args(&mut args, cli.request_timeout, cli.index_timeout);
     let body = json!({
         "project_root": project_root.to_string_lossy(),
         "args": args,
@@ -966,6 +1354,19 @@ async fn dispatch_shell_cmd(
         | "find-symbol"
         | "find-implementations"
         | "rename-symbol"
+        | "code-action"
+        | "format"
+        | "format-range"
+        | "inlay-hint"
+        | "document-highlight"
+        | "folding-range"
+        | "semantic-tokens"
+        | "code-lens"
+        | "document-link"
+        | "call-hierarchy"
+        | "type-hierarchy"
+        | "moniker"
+        | "workspace-diagnostic"
         | "read-file"
         | "list-dir"
         | "find-file"
@@ -1055,4 +1456,20 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Phase 4 基建 Task 22b：把 CLI flag `--request-timeout` / `--index-timeout` 注入
+/// `args._timeout_ms` / `args._index_timeout_ms` 私有字段（supervisor
+/// `execute_tool` 入口 `sanitize_timeout_args` 会清掉）。`args` 必须是 object
+/// 形态；其他形态（少见，子命令可能返 null/array）静默跳过。
+fn inject_timeout_args(args: &mut serde_json::Value, req_ms: Option<u32>, idx_ms: Option<u32>) {
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+    if let Some(ms) = req_ms {
+        obj.insert("_timeout_ms".into(), serde_json::json!(ms));
+    }
+    if let Some(ms) = idx_ms {
+        obj.insert("_index_timeout_ms".into(), serde_json::json!(ms));
+    }
 }

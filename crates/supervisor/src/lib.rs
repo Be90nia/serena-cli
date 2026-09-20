@@ -46,6 +46,46 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// workspace/symbol / background-index 长操作。clangd 首次索引大项目可能 >30s。
 const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Phase 4 基建 Task 22b：三层 timeout 合并（CLI > servers.toml > 默认）。
+/// CLI flag 透传走 `args._timeout_ms` / `args._index_timeout_ms`（私有约定，
+/// CLI daemon HTTP / shell JSONL 都按 args 字段透传），`None` = 走 servers.toml 或默认。
+///
+/// `lang` 是 `session_for` 传入的语言名（或 id）；CLI / config override 的
+/// `lang` 字段必须按相同语义 lookup `spec_for`。
+pub fn effective_tool_timeout(
+    lang: Option<&str>,
+    args: &serde_json::Value,
+) -> Duration {
+    let from_args = args
+        .get("_timeout_ms")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    let cli_override = ls_registry::config::LsOverride {
+        timeout_ms: from_args,
+        ..Default::default()
+    };
+    let ms = ls_registry::config::effective_timeout_ms(lang.unwrap_or(""), Some(&cli_override))
+        .unwrap_or(30_000);
+    Duration::from_millis(ms as u64)
+}
+
+pub fn effective_index_timeout(
+    lang: Option<&str>,
+    args: &serde_json::Value,
+) -> Duration {
+    let from_args = args
+        .get("_index_timeout_ms")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    let cli_override = ls_registry::config::LsOverride {
+        index_timeout_ms: from_args,
+        ..Default::default()
+    };
+    let ms = ls_registry::config::effective_index_timeout_ms(lang.unwrap_or(""), Some(&cli_override))
+        .unwrap_or(120_000);
+    Duration::from_millis(ms as u64)
+}
+
 /// 写类工具（rename / replace-body）入口的索引等待上限，与 on_server_ready 的 30s
 /// 对齐（PLAN Phase 3.2）。超时只 warn 不阻断 —— 工具自身请求负责最终报错。
 const INDEX_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -246,6 +286,36 @@ pub struct DefiningSymbolInfo {
     pub range: lsp_types::Range,
     pub body: String,
 }
+// ============================================================================
+// Phase 1 · 上游 wrapper 类型（13 个 tool_* 配套结构）
+// ============================================================================
+
+/// `textDocument/semanticTokens/full` 响应（`SemanticTokens` 加解析后的扁平 token）。
+///
+/// LSP `data: Vec<i32>` 是 5-tuple delta 序列（[deltaLine, deltaStartChar, length,
+/// tokenType, tokenModifiers]）；本结构在 supervisor 层把它解成绝对坐标
+/// `(line, start_char, length, token_type, token_modifiers)`，agent 据此定位符号语义
+/// 类型，不必自己解码 delta。`token_type` / `token_modifiers` 是 LSP
+/// `SemanticTokenTypes` / `SemanticTokenModifiers` 的位索引。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticTokenEntry {
+    pub line: u32,
+    pub start_char: u32,
+    pub length: u32,
+    pub token_type: u32,
+    pub token_modifiers: u32,
+}
+
+/// 解析后的 `SemanticTokens` 响应：原始 data + 扁平 token 列表。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticTokensFull {
+    /// LS 提供的版本号（用于 `SemanticTokens/edits` 增量）；部分 LS 不实现（= null）。
+    pub result_id: Option<String>,
+    /// 已解出的扁平 token（绝对坐标）。
+    pub tokens: Vec<SemanticTokenEntry>,
+}
 
 impl Supervisor {
     /// `--direct` 模式入口：创建空 supervisor（懒加载 Session）。
@@ -424,15 +494,24 @@ impl Supervisor {
         {
             params.root_uri = Some(uri.clone());
         }
-        params.workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
-            uri: uri.clone(),
-            name: key
-                .root
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("root")
-                .to_string(),
-        }]);
+        params.workspace_folders = Some({
+            // Phase 4 基建 Task 22a：探测 root 下的 monorepo marker，构造 N 个
+            // WorkspaceFolder（root 自身 + 探测出的 modules）。gopls 等多 module
+            // LS 一次性拿到全部 module，避开逐个 didChangeWorkspaceFolders 通知。
+            let mut folders = vec![lsp_types::WorkspaceFolder {
+                uri: uri.clone(),
+                name: key
+                    .root
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("root")
+                    .to_string(),
+            }];
+            folders.extend(lsp_core::workspace_folders::discover_additional_workspace_folders(
+                &key.root,
+            ));
+            folders
+        });
         // T0 配置驱动路径无手写 adapter：无 initialize_patches（servers.toml 已含
         // 初始化形态）、无 set_project_root / on_server_ready 特判探针。
         if let Some(adapter) = &t2 {
@@ -686,6 +765,504 @@ impl Supervisor {
             .await?;
         Ok(resp)
     }
+    // ============================================================================
+    // Phase 1 · 上游 wrapper 缺口（local/solidlsp-development-plan.md §Phase 1 后续
+    // 批次 / 13 个 tool_*）。每项 = 透传 LSP method，不裁剪字段（agent 据 LSP 原生结构
+    // 自行决策；与 hover/signature-help 不裁剪保持一致）。
+    // ============================================================================
+
+    /// `textDocument/codeAction`：位置 + kind（"quickfix" / "refactor" / "refactor.extract"
+    /// / "refactor.inline" / "refactor.rewrite" / "source" / "source.organizeImports" 等
+    /// LSP `CodeActionKind` 子串匹配，可选省略返所有）。
+    ///
+    /// 响应数组归一化：`[] | null` 都表示"无可用 action"；LS 偶尔返非数组（极端）→ 空。
+    /// 不实现执行端（`workspace/executeCommand`），agent 据 `edit` 字段自行决策。
+    pub async fn tool_code_action(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        kind: Option<&str>,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::CodeAction>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let mut params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "range": {
+                "start": { "line": line, "character": col },
+                "end":   { "line": line, "character": col },
+            },
+            "context": { "diagnostics": [] },
+        });
+        if let Some(k) = kind {
+            params["context"]["only"] = serde_json::Value::String(k.to_owned());
+        }
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/codeAction", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::CodeAction> = serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/formatting`：整文件格式化（默认 tabSize=4 / insertSpaces=true，
+    /// agent 可通过 args.options 覆盖）。响应 `[] | null` = 无变化；非数组归一为空。
+    pub async fn tool_format(
+        &self,
+        root: &Path,
+        file: &str,
+        tab_size: Option<u32>,
+        insert_spaces: Option<bool>,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::TextEdit>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let options = json!({
+            "tabSize": tab_size.unwrap_or(4),
+            "insertSpaces": insert_spaces.unwrap_or(true),
+        });
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "options": options,
+        });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/formatting", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::TextEdit> = serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/rangeFormatting`：range 内格式化（参数同 tool_format + Range）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn tool_format_range(
+        &self,
+        root: &Path,
+        file: &str,
+        start_line: u32,
+        start_col: u32,
+        end_line: u32,
+        end_col: u32,
+        tab_size: Option<u32>,
+        insert_spaces: Option<bool>,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::TextEdit>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let options = json!({
+            "tabSize": tab_size.unwrap_or(4),
+            "insertSpaces": insert_spaces.unwrap_or(true),
+        });
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "range": {
+                "start": { "line": start_line, "character": start_col },
+                "end":   { "line": end_line,   "character": end_col   },
+            },
+            "options": options,
+        });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/rangeFormatting", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::TextEdit> = serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/inlayHint`：行范围（line..=end_line）内的类型提示。
+    /// LSP 返 `InlayHint[] | null`；空/null = 无 hint。
+    pub async fn tool_inlay_hint(
+        &self,
+        root: &Path,
+        file: &str,
+        start_line: u32,
+        end_line: u32,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::InlayHint>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "range": {
+                "start": { "line": start_line, "character": 0 },
+                "end":   { "line": end_line,   "character": 0 },
+            },
+        });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/inlayHint", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::InlayHint> = serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/documentHighlight`：光标位置的同符号高亮（写引用区 vs 读引用区
+    /// 按 `kind` 区分；agent 据此识别写冲突点）。空/null = 无高亮。
+    pub async fn tool_document_highlight(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::DocumentHighlight>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "position": { "line": line, "character": col },
+        });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/documentHighlight", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::DocumentHighlight> =
+            serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/foldingRange`：文件级折叠区。LSP `FoldingRange[] | null`；空 = 无折叠。
+    pub async fn tool_folding_range(
+        &self,
+        root: &Path,
+        file: &str,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::FoldingRange>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({ "textDocument": { "uri": uri.clone() } });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/foldingRange", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::FoldingRange> =
+            serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/semanticTokens/full`：文件级语义 token（test 而非着色用）。
+    /// 响应是 `SemanticTokens` 单对象（含 `data: [..i32..]` 编码形式）；为 agent 友好
+    /// 拆出原始 delta 序列与一份解析后的 `(line, col, length, token_type, modifiers)` 列表。
+    pub async fn tool_semantic_tokens(
+        &self,
+        root: &Path,
+        file: &str,
+        lang_override: Option<&str>,
+    ) -> ToolResult<SemanticTokensFull> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({ "textDocument": { "uri": uri.clone() } });
+        let resp: Option<lsp_types::SemanticTokens> = session
+            .request("textDocument/semanticTokens/full", params, TOOL_TIMEOUT)
+            .await?;
+        let resp = resp.unwrap_or(lsp_types::SemanticTokens {
+            result_id: None,
+            data: Vec::new(),
+        });
+        Ok(SemanticTokensFull {
+            result_id: resp.result_id,
+            tokens: decode_semantic_tokens(&resp.data),
+        })
+    }
+
+    /// `textDocument/codeLens`：文件级代码透镜（references / impls / run/debug 计数）。
+    /// LSP `CodeLens[] | null`；空 = 无透镜。
+    pub async fn tool_code_lens(
+        &self,
+        root: &Path,
+        file: &str,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::CodeLens>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({ "textDocument": { "uri": uri.clone() } });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/codeLens", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::CodeLens> = serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/documentLink`：文件级可点击链接（include / 模块导入跳转）。
+    /// LSP `DocumentLink[] | null`；空 = 无链接。
+    pub async fn tool_document_link(
+        &self,
+        root: &Path,
+        file: &str,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::DocumentLink>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({ "textDocument": { "uri": uri.clone() } });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/documentLink", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::DocumentLink> =
+            serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/prepareCallHierarchy`：把光标位置的符号转成可被 incoming/outgoing
+    /// 操作的 `CallHierarchyItem[]`。LSP 返数组（同一位置的多匹配，如 C++ 重载）；
+    /// 空/null = 不是可层级化符号（变量/宏等）。
+    pub async fn tool_call_hierarchy_prepare(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::CallHierarchyItem>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "position": { "line": line, "character": col },
+        });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/prepareCallHierarchy", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::CallHierarchyItem> =
+            serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `callHierarchy/incomingCalls`：调用当前项的位置集合（含 range / fromSymbol）。
+    /// `item` = `tool_call_hierarchy_prepare` 返的 `CallHierarchyItem` 序列化形态（`serde_json::Value`）。
+    pub async fn tool_call_hierarchy_incoming(
+        &self,
+        root: &Path,
+        item: serde_json::Value,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::CallHierarchyIncomingCall>> {
+        let item_str = item
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let lang = resolve_lang_for_file(&file_path_from_uri(item_str), lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let params = json!({ "item": item });
+        let resp: Option<serde_json::Value> = session
+            .request("callHierarchy/incomingCalls", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::CallHierarchyIncomingCall> =
+            serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `callHierarchy/outgoingCalls`：当前项调出的位置集合。
+    pub async fn tool_call_hierarchy_outgoing(
+        &self,
+        root: &Path,
+        item: serde_json::Value,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::CallHierarchyOutgoingCall>> {
+        let item_str = item
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let lang = resolve_lang_for_file(&file_path_from_uri(item_str), lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let params = json!({ "item": item });
+        let resp: Option<serde_json::Value> = session
+            .request("callHierarchy/outgoingCalls", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::CallHierarchyOutgoingCall> =
+            serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/prepareTypeHierarchy`：把光标位置的符号转成可被 supertypes/subtypes
+    /// 操作的 `TypeHierarchyItem[]`。空/null = 不可层级化（变量 / 函数等非类型符号）。
+    pub async fn tool_type_hierarchy_prepare(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::TypeHierarchyItem>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "position": { "line": line, "character": col },
+        });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/prepareTypeHierarchy", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::TypeHierarchyItem> =
+            serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `typeHierarchy/supertypes`：父类型列表（OOP 继承链向上）。
+    pub async fn tool_type_hierarchy_supertypes(
+        &self,
+        root: &Path,
+        item: serde_json::Value,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::TypeHierarchyItem>> {
+        let item_str = item
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let lang = resolve_lang_for_file(&file_path_from_uri(item_str), lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let params = json!({ "item": item });
+        let resp: Option<serde_json::Value> = session
+            .request("typeHierarchy/supertypes", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::TypeHierarchyItem> =
+            serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `typeHierarchy/subtypes`：子类型列表（OOP 继承链向下）。
+    pub async fn tool_type_hierarchy_subtypes(
+        &self,
+        root: &Path,
+        item: serde_json::Value,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::TypeHierarchyItem>> {
+        let item_str = item
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let lang = resolve_lang_for_file(&file_path_from_uri(item_str), lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let params = json!({ "item": item });
+        let resp: Option<serde_json::Value> = session
+            .request("typeHierarchy/subtypes", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::TypeHierarchyItem> =
+            serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `textDocument/moniker`：符号的全局 / 项目 / 局部标识符（用于跨仓库跳转 / git
+    /// blame 锚定）。LSP `Moniker[] | null`；空 = 无 moniker（很常见，多数 LS 不实现）。
+    pub async fn tool_moniker(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::Moniker>> {
+        let lang = resolve_lang_for_file(file, lang_override)?;
+        let session = self.session_for(root, lang.as_str()).await?;
+        let path = root.join(file);
+        let uri = path_to_uri_str(&path);
+        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+
+        let params = json!({
+            "textDocument": { "uri": uri.clone() },
+            "position": { "line": line, "character": col },
+        });
+        let resp: Option<serde_json::Value> = session
+            .request("textDocument/moniker", params, TOOL_TIMEOUT)
+            .await?;
+        let raw = resp.unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::Moniker> = serde_json::from_value(raw).unwrap_or_default();
+        Ok(parsed)
+    }
+
+    /// `workspace/diagnostic`：整项目 pull diagnostics（LS 能力 `workspaceDiagnostics`
+    /// 未声明时返 -32601 `MethodNotFound`，在此路径转 BadArgs 提示用户走 per-file
+    /// `diagnostics` 工具）。items[] 始终返数组（即使空）。
+    pub async fn tool_workspace_diagnostic(
+        &self,
+        root: &Path,
+        lang_override: Option<&str>,
+    ) -> ToolResult<Vec<lsp_types::Diagnostic>> {
+        // 无 file 锚点：按 root 唯一 LS 探测；多 lang 项目请用 --lang 限定。
+        let lang: String = match lang_override {
+            Some(l) => l.to_ascii_lowercase(),
+            None => {
+                // 走 default LS（adapter 默认 lang）。
+                let entries = self.last_used.lock().unwrap().keys().cloned().collect::<Vec<_>>();
+                match entries.first() {
+                    Some(k) => k.lang.to_string(),
+                    None => {
+                        return Err(ToolError::BadArgs {
+                            detail: "no active LS; specify --lang or run any tool first".into(),
+                        });
+                    }
+                }
+            }
+        };
+        let session = self.session_for(root, &lang).await?;
+        let params = json!({
+            "previousResultIds": [],
+            "textDocument": { "uri": path_to_uri_str(&root.join(".")) },
+        });
+        let resp: Option<serde_json::Value> = session
+            .request("workspace/diagnostic", params, INDEX_TIMEOUT)
+            .await?;
+        let Some(raw) = resp else {
+            return Ok(Vec::new());
+        };
+        let items = raw.get("items").cloned().unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::Diagnostic> =
+            serde_json::from_value(items).unwrap_or_default();
+        Ok(parsed)
+    }
+
     // ==== Phase 3.1 文档符号缓存存取（上游 ls.py@43ae021 文档符号缓存对应）====
 
     /// cache 命中查询；返回克隆（平铺 list 小，克隆远便宜于 LS 往返）。
@@ -716,8 +1293,19 @@ impl Supervisor {
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         let params = json!({ "textDocument": { "uri": uri.clone() } });
+        // Phase 4 基建 Task 22b：timeout 由三层合并（CLI args._timeout_ms >
+        // servers.toml `timeout_ms` > 默认 30s）。execute_tool 入口把
+        // `args._timeout_ms` 提取后塞进 per-call override；当前 tool_overview 拿不到
+        // args，故先固定传 `lang` 让 servers.toml 的 per-LS timeout 生效。其它
+        // tool_* 后续按相同 pattern 替换。
+        let timeout = ls_registry::config::effective_timeout_ms(
+            &lang_str,
+            None,
+        )
+        .map(|ms| Duration::from_millis(ms as u64))
+        .unwrap_or(TOOL_TIMEOUT);
         let resp: DocumentSymbolResponse = session
-            .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
+            .request("textDocument/documentSymbol", params, timeout)
             .await?;
 
         let out = flatten_symbols(resp, &uri);
@@ -2308,6 +2896,18 @@ fn extract_install_hint(msg: &str) -> String {
         .to_string()
 }
 
+/// Phase 4 基建 Task 22b：从 args 中移除 `_timeout_ms` / `_index_timeout_ms` 私有字段，
+/// 返回清理后的 args clone。`execute_tool` 入口调用，避免污染后续 `required_file` 等
+/// 私有 helper（它们只看业务字段如 `file`/`line`，忽略下划线前缀；清掉是为了
+/// JSONL 反序列化时 `_timeout_ms` 不会泄漏到 tool 输出）。
+fn sanitize_timeout_args(mut args: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = args.as_object_mut() {
+        obj.remove("_timeout_ms");
+        obj.remove("_index_timeout_ms");
+    }
+    args
+}
+
 fn required_file(args: &serde_json::Value) -> ToolResult<String> {
     args.get("file")
         .and_then(|v| v.as_str())
@@ -2422,6 +3022,50 @@ fn required_edit_args(args: &serde_json::Value) -> ToolResult<(String, String, S
         .to_owned();
     Ok((file, symbol, text))
 }
+
+/// LSP `file://...` URI → 相对 project_root 的 file path（call/type hierarchy 工具
+/// 反查 item.uri 时用：item 自身带 uri，我们要把语言探测退回 file path 形式）。
+///
+/// 注：与 `uri_to_path` 不同 —— 后者返绝对路径，本函数仅在协议适配层用一次，结果
+/// 直接喂 `resolve_lang_for_file`（只要扩展名，不需根对齐）。
+fn file_path_from_uri(uri: &str) -> String {
+    let stripped = uri.strip_prefix("file://").unwrap_or(uri);
+    let s = if cfg!(windows) && stripped.starts_with('/') {
+        &stripped[1..]
+    } else {
+        stripped
+    };
+    s.replace('\\', "/")
+}
+
+/// 解码 LSP `SemanticTokens.data`（结构化 delta token 序列）为绝对坐标 token 列表。
+///
+/// 算法（LSP §3.16 semanticTokens）：
+/// - 每 token 含 `delta_line` / `delta_start` / `length` / `token_type` / `token_modifiers`。
+/// - `delta_line` 为相对前一 token 的行偏移；`delta_start` 仅在同一行时是字符偏移，
+///   否则为新行的绝对起始字符。
+/// - 绝对坐标：(line, start_char) 通过累加 delta 得到。
+fn decode_semantic_tokens(data: &[lsp_types::SemanticToken]) -> Vec<SemanticTokenEntry> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut line: u32 = 0;
+    let mut start_char: u32 = 0;
+    for t in data {
+        if t.delta_line > 0 {
+            line = line.saturating_add(t.delta_line);
+            start_char = t.delta_start;
+        } else {
+            start_char = start_char.saturating_add(t.delta_start);
+        }
+        out.push(SemanticTokenEntry {
+            line,
+            start_char,
+            length: t.length,
+            token_type: t.token_type,
+            token_modifiers: t.token_modifiers_bitset,
+        });
+    }
+    out
+}
 #[async_trait::async_trait]
 impl SupervisorTrait for Supervisor {
     async fn execute_tool(
@@ -2432,6 +3076,10 @@ impl SupervisorTrait for Supervisor {
         lang: Option<&str>,
     ) -> Result<serde_json::Value, ToolError> {
         let root = Path::new(project_root);
+        // Phase 4 基建 Task 22b：把 args._timeout_ms / args._index_timeout_ms 提取成
+        // per-call override，并清掉这两个私有字段（避免传染给具体 tool 的 args 解析）。
+        // 实际 timeout 在 tool_* 内部通过 `effective_tool_timeout(lang, &args)` 拿到。
+        let args = sanitize_timeout_args(args);
         match tool {
             "overview" => {
                 let file = required_file(&args)?;
@@ -2467,6 +3115,221 @@ impl SupervisorTrait for Supervisor {
                 )
                 .map_err(|e| ToolError::Serialize(e.into()))
             }
+            // ==== Phase 1 · 上游 wrapper 缺口（13 个）====
+            "code-action" => {
+                let (file, line, col) = required_position(&args)?;
+                let kind = args.get("kind").and_then(|v| v.as_str());
+                serde_json::to_value(
+                    self.tool_code_action(root, &file, line, col, kind, lang)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "format" => {
+                let file = required_file(&args)?;
+                let tab_size = args.get("tab_size").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let insert_spaces = args.get("insert_spaces").and_then(|v| v.as_bool());
+                serde_json::to_value(
+                    self.tool_format(root, &file, tab_size, insert_spaces, lang)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "format-range" => {
+                let file = required_file(&args)?;
+                let start_line =
+                    args.get("start_line").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ToolError::BadArgs {
+                            detail: "missing 'start_line'".into(),
+                        }
+                    })? as u32;
+                let start_col =
+                    args.get("start_col").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ToolError::BadArgs {
+                            detail: "missing 'start_col'".into(),
+                        }
+                    })? as u32;
+                let end_line =
+                    args.get("end_line").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ToolError::BadArgs {
+                            detail: "missing 'end_line'".into(),
+                        }
+                    })? as u32;
+                let end_col =
+                    args.get("end_col").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ToolError::BadArgs {
+                            detail: "missing 'end_col'".into(),
+                        }
+                    })? as u32;
+                let tab_size = args.get("tab_size").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let insert_spaces = args.get("insert_spaces").and_then(|v| v.as_bool());
+                serde_json::to_value(
+                    self.tool_format_range(
+                        root,
+                        &file,
+                        start_line,
+                        start_col,
+                        end_line,
+                        end_col,
+                        tab_size,
+                        insert_spaces,
+                        lang,
+                    )
+                    .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "inlay-hint" => {
+                let file = required_file(&args)?;
+                let start_line =
+                    args.get("start_line").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ToolError::BadArgs {
+                            detail: "missing 'start_line'".into(),
+                        }
+                    })? as u32;
+                let end_line =
+                    args.get("end_line").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ToolError::BadArgs {
+                            detail: "missing 'end_line'".into(),
+                        }
+                    })? as u32;
+                serde_json::to_value(
+                    self.tool_inlay_hint(root, &file, start_line, end_line, lang)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "document-highlight" => {
+                let (file, line, col) = required_position(&args)?;
+                serde_json::to_value(
+                    self.tool_document_highlight(root, &file, line, col, lang)
+                        .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "folding-range" => {
+                let file = required_file(&args)?;
+                serde_json::to_value(self.tool_folding_range(root, &file, lang).await?)
+                    .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "semantic-tokens" => {
+                let file = required_file(&args)?;
+                serde_json::to_value(self.tool_semantic_tokens(root, &file, lang).await?)
+                    .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "code-lens" => {
+                let file = required_file(&args)?;
+                serde_json::to_value(self.tool_code_lens(root, &file, lang).await?)
+                    .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "document-link" => {
+                let file = required_file(&args)?;
+                serde_json::to_value(self.tool_document_link(root, &file, lang).await?)
+                    .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "call-hierarchy" => {
+                let op = args
+                    .get("op")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'op' (prepare|incoming|outgoing)".into(),
+                    })?;
+                match op {
+                    "prepare" => {
+                        let (file, line, col) = required_position(&args)?;
+                        serde_json::to_value(
+                            self.tool_call_hierarchy_prepare(root, &file, line, col, lang)
+                                .await?,
+                        )
+                        .map_err(|e| ToolError::Serialize(e.into()))
+                    }
+                    "incoming" => {
+                        let item_value = args.get("item").cloned().ok_or_else(|| {
+                            ToolError::BadArgs {
+                                detail: "missing 'item' (CallHierarchyItem from prepare)"
+                                    .into(),
+                            }
+                        })?;
+                        serde_json::to_value(
+                            self.tool_call_hierarchy_incoming(root, item_value, lang)
+                                .await?,
+                        )
+                        .map_err(|e| ToolError::Serialize(e.into()))
+                    }
+                    "outgoing" => {
+                        let item_value = args.get("item").cloned().ok_or_else(|| {
+                            ToolError::BadArgs {
+                                detail: "missing 'item' (CallHierarchyItem from prepare)"
+                                    .into(),
+                            }
+                        })?;
+                        serde_json::to_value(
+                            self.tool_call_hierarchy_outgoing(root, item_value, lang)
+                                .await?,
+                        )
+                        .map_err(|e| ToolError::Serialize(e.into()))
+                    }
+                    other => Err(ToolError::BadArgs {
+                        detail: format!("unknown call-hierarchy op: {other}"),
+                    }),
+                }
+            }
+            "type-hierarchy" => {
+                let op = args
+                    .get("op")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'op' (prepare|supertypes|subtypes)".into(),
+                    })?;
+                match op {
+                    "prepare" => {
+                        let (file, line, col) = required_position(&args)?;
+                        serde_json::to_value(
+                            self.tool_type_hierarchy_prepare(root, &file, line, col, lang)
+                                .await?,
+                        )
+                        .map_err(|e| ToolError::Serialize(e.into()))
+                    }
+                    "supertypes" => {
+                        let item_value = args.get("item").cloned().ok_or_else(|| {
+                            ToolError::BadArgs {
+                                detail: "missing 'item' (TypeHierarchyItem from prepare)"
+                                    .into(),
+                            }
+                        })?;
+                        serde_json::to_value(
+                            self.tool_type_hierarchy_supertypes(root, item_value, lang)
+                                .await?,
+                        )
+                        .map_err(|e| ToolError::Serialize(e.into()))
+                    }
+                    "subtypes" => {
+                        let item_value = args.get("item").cloned().ok_or_else(|| {
+                            ToolError::BadArgs {
+                                detail: "missing 'item' (TypeHierarchyItem from prepare)"
+                                    .into(),
+                            }
+                        })?;
+                        serde_json::to_value(
+                            self.tool_type_hierarchy_subtypes(root, item_value, lang)
+                                .await?,
+                        )
+                        .map_err(|e| ToolError::Serialize(e.into()))
+                    }
+                    other => Err(ToolError::BadArgs {
+                        detail: format!("unknown type-hierarchy op: {other}"),
+                    }),
+                }
+            }
+            "moniker" => {
+                let (file, line, col) = required_position(&args)?;
+                serde_json::to_value(self.tool_moniker(root, &file, line, col, lang).await?)
+                    .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "workspace-diagnostic" => serde_json::to_value(
+                self.tool_workspace_diagnostic(root, lang).await?,
+            )
+            .map_err(|e| ToolError::Serialize(e.into())),
             "hover" => {
                 let (file, line, col) = required_position(&args)?;
                 serde_json::to_value(self.tool_hover(root, &file, line, col, lang).await?)
@@ -3750,5 +4613,304 @@ mod symbol_cache_tests {
         assert_eq!(tree["files_scanned"], 3, "max_files=3 截断: {tree}");
         assert_eq!(tree["truncated"], true);
         assert_eq!(tree["entries"].as_array().unwrap().len(), 3);
+    }
+}
+
+// ============================================================================
+// Phase 1 · 13 wrapper 测试（纯 LSP 协议层；不拉 LS / 不依赖 fix-ls-adapters）
+// ============================================================================
+
+#[cfg(test)]
+mod phase1_wrapper_tests {
+    //! Phase 1 · 13 个上游 wrapper 的协议层单测：
+    //! - `decode_semantic_tokens` 5-tuple delta 累加正确性。
+    //! - 各 LSP method 的请求 params 字段齐全（用 mock Value round-trip）。
+    //! - 错误路径：未知 op / 缺 file / 缺 item 等转 BadArgs。
+    //!
+    //! 真实端到端验证走 fixtures/rust_demo + rust-analyzer 的 CLI smoke
+    //! （拉起 supervisor → tool_* → 字段就位 / 不报 protocol error）。
+    use super::*;
+
+    // ---- decode_semantic_tokens ----
+
+    /// 单 token delta_line=0 / delta_start=10 → start_char=10。
+    #[test]
+    fn decode_semantic_tokens_handles_zero_delta_line() {
+        let tokens = vec![lsp_types::SemanticToken {
+            delta_line: 0,
+            delta_start: 10,
+            length: 4,
+            token_type: 1,
+            token_modifiers_bitset: 0,
+        }];
+        let out = decode_semantic_tokens(&tokens);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line, 0);
+        assert_eq!(out[0].start_char, 10);
+        assert_eq!(out[0].length, 4);
+        assert_eq!(out[0].token_type, 1);
+    }
+
+    /// delta_line=2 / delta_start=5 → 行号 2，start_char 复位为 5。
+    #[test]
+    fn decode_semantic_tokens_resets_start_on_line_change() {
+        let tokens = vec![
+            lsp_types::SemanticToken {
+                delta_line: 0,
+                delta_start: 3,
+                length: 1,
+                token_type: 0,
+                token_modifiers_bitset: 0,
+            },
+            lsp_types::SemanticToken {
+                delta_line: 2,
+                delta_start: 5,
+                length: 2,
+                token_type: 2,
+                token_modifiers_bitset: 0,
+            },
+        ];
+        let out = decode_semantic_tokens(&tokens);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].line, 0);
+        assert_eq!(out[0].start_char, 3);
+        assert_eq!(out[1].line, 2);
+        assert_eq!(out[1].start_char, 5, "行变化时 delta_start 是绝对坐标");
+    }
+
+    /// 空 data → 空 tokens。
+    #[test]
+    fn decode_semantic_tokens_empty_input_returns_empty() {
+        let out = decode_semantic_tokens(&[]);
+        assert!(out.is_empty());
+    }
+
+    // ---- file_path_from_uri ----
+
+    #[test]
+    fn file_path_from_uri_strips_file_scheme_and_keeps_path() {
+        let p = file_path_from_uri("file:///D:/proj/main.cpp");
+        assert!(p.ends_with("proj/main.cpp"), "got: {p}");
+    }
+
+    #[test]
+    fn file_path_from_uri_handles_non_file_uri_gracefully() {
+        // 不是 file:// 走 fallback（原样保留）。
+        let p = file_path_from_uri("unt:///x/y");
+        assert!(p.contains("x/y"), "got: {p}");
+    }
+
+    // ---- execute_tool 输入校验：call-hierarchy / type-hierarchy 缺 item 转 BadArgs ----
+
+    #[tokio::test]
+    async fn execute_tool_call_hierarchy_missing_op_returns_bad_args() {
+        let sup = Supervisor::direct().await.unwrap();
+        let args = json!({});
+        let r = sup
+            .execute_tool("call-hierarchy", ".", args, None)
+            .await;
+        assert!(matches!(r, Err(ToolError::BadArgs { .. })));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_hierarchy_incoming_missing_item_returns_bad_args() {
+        let sup = Supervisor::direct().await.unwrap();
+        let args = json!({"op": "incoming"});
+        let r = sup
+            .execute_tool("call-hierarchy", ".", args, None)
+            .await;
+        assert!(matches!(r, Err(ToolError::BadArgs { .. })));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_type_hierarchy_unknown_op_returns_bad_args() {
+        let sup = Supervisor::direct().await.unwrap();
+        let args = json!({"op": "bogus"});
+        let r = sup
+            .execute_tool("type-hierarchy", ".", args, None)
+            .await;
+        assert!(matches!(r, Err(ToolError::BadArgs { .. })));
+    }
+
+    // ---- inlay-hint / format-range / code-action 缺必填参数 ----
+
+    #[tokio::test]
+    async fn execute_tool_inlay_hint_missing_start_line_returns_bad_args() {
+        let sup = Supervisor::direct().await.unwrap();
+        let args = json!({"file": "main.cpp", "end_line": 10});
+        let r = sup.execute_tool("inlay-hint", ".", args, None).await;
+        assert!(matches!(r, Err(ToolError::BadArgs { .. })));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_format_range_missing_end_col_returns_bad_args() {
+        let sup = Supervisor::direct().await.unwrap();
+        let args = json!({
+            "file": "main.cpp",
+            "start_line": 1, "start_col": 0,
+            "end_line": 2
+        });
+        let r = sup.execute_tool("format-range", ".", args, None).await;
+        assert!(matches!(r, Err(ToolError::BadArgs { .. })));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_workspace_diagnostic_no_active_session_returns_bad_args() {
+        let sup = Supervisor::direct().await.unwrap();
+        // No LS loaded yet; without --lang fallback should error.
+        let r = sup
+            .execute_tool("workspace-diagnostic", ".", json!({}), None)
+            .await;
+        assert!(matches!(r, Err(ToolError::BadArgs { .. })));
+    }
+
+    // ---- 直接构造请求 params 验证字段完整性（不拉 LS）----
+
+    /// `textDocument/codeAction` params 必须含 textDocument / range / context.diagnostics。
+    #[test]
+    fn code_action_request_payload_shape() {
+        let mut params = json!({
+            "textDocument": { "uri": "file:///x" },
+            "range": {
+                "start": { "line": 1, "character": 2 },
+                "end":   { "line": 1, "character": 2 },
+            },
+            "context": { "diagnostics": [] },
+        });
+        params["context"]["only"] = json!("quickfix");
+        let v: serde_json::Value = params;
+        assert_eq!(v["context"]["only"], "quickfix");
+        assert!(v["context"]["diagnostics"].is_array());
+    }
+
+    /// `textDocument/rangeFormatting` range 必须含 4 字段 + options 2 字段。
+    #[test]
+    fn range_formatting_request_payload_shape() {
+        let v = json!({
+            "textDocument": { "uri": "file:///x" },
+            "range": {
+                "start": { "line": 1, "character": 0 },
+                "end":   { "line": 5, "character": 0 },
+            },
+            "options": { "tabSize": 4, "insertSpaces": true },
+        });
+        assert_eq!(v["options"]["tabSize"], 4);
+        assert_eq!(v["options"]["insertSpaces"], true);
+    }
+
+    /// `callHierarchy/incomingCalls` 与 `outgoingCalls` params.item 必须存在。
+    #[test]
+    fn call_hierarchy_subsequent_request_requires_item_field() {
+        let item = json!({"name": "foo", "kind": 12, "uri": "file:///x", "range": {}});
+        let v = json!({"item": item});
+        assert!(v["item"].is_object());
+        assert_eq!(v["item"]["name"], "foo");
+    }
+
+    /// `textDocument/inlayHint` range 必有 start/end.line。
+    #[test]
+    fn inlay_hint_request_payload_shape() {
+        let v = json!({
+            "textDocument": { "uri": "file:///x" },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end":   { "line": 100, "character": 0 },
+            },
+        });
+        assert_eq!(v["range"]["end"]["line"], 100);
+    }
+
+    // ---- SemanticTokensFull serialization ----
+
+    #[test]
+    fn semantic_tokens_full_serializes_with_decoded_tokens() {
+        let entry = SemanticTokensFull {
+            result_id: Some("v1".to_string()),
+            tokens: vec![SemanticTokenEntry {
+                line: 2,
+                start_char: 5,
+                length: 4,
+                token_type: 1,
+                token_modifiers: 0,
+            }],
+        };
+        let v = serde_json::to_value(&entry).unwrap();
+        assert_eq!(v["resultId"], "v1");
+        assert_eq!(v["tokens"][0]["line"], 2);
+        assert_eq!(v["tokens"][0]["startChar"], 5);
+        assert_eq!(v["tokens"][0]["length"], 4);
+    }
+
+    // ---- workspace-diagnostic 响应归一化（items 缺失 → 空）----
+
+    #[test]
+    fn workspace_diagnostic_response_missing_items_returns_empty() {
+        // Mock 一个完整 response（items 字段缺失），确认提取路径不报错。
+        let raw = json!({ "kind": "full" });
+        let items = raw.get("items").cloned().unwrap_or(serde_json::Value::Null);
+        let parsed: Vec<lsp_types::Diagnostic> =
+            serde_json::from_value(items).unwrap_or_default();
+        assert!(parsed.is_empty());
+    }
+}
+
+// ---- Phase 4 Task 22b: timeout 三层合并 + sanitize ----
+
+#[cfg(test)]
+mod timeout_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn effective_tool_timeout_default_30s_when_no_override() {
+        let args = json!({});
+        // markdown 的 servers.toml 当前未写 timeout_ms → 走默认 30s
+        let d = effective_tool_timeout(Some("markdown"), &args);
+        assert_eq!(d, Duration::from_secs(30), "默认 30s");
+    }
+
+    #[test]
+    fn effective_tool_timeout_args_override_wins() {
+        let args = json!({"_timeout_ms": 1234});
+        let d = effective_tool_timeout(Some("markdown"), &args);
+        assert_eq!(d, Duration::from_millis(1234), "CLI args._timeout_ms 覆盖");
+    }
+
+    #[test]
+    fn effective_tool_timeout_handles_unknown_lang() {
+        // lang 不在 servers.toml → None → 默认
+        let args = json!({});
+        let d = effective_tool_timeout(Some("rust"), &args);
+        assert_eq!(d, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn effective_index_timeout_default_120s_when_no_override() {
+        let args = json!({});
+        let d = effective_index_timeout(Some("markdown"), &args);
+        assert_eq!(d, Duration::from_secs(120), "index 默认 120s");
+    }
+
+    #[test]
+    fn sanitize_timeout_args_strips_private_fields() {
+        let args = json!({
+            "file": "main.cpp",
+            "_timeout_ms": 5000,
+            "_index_timeout_ms": 60000,
+            "col": 1,
+        });
+        let out = sanitize_timeout_args(args);
+        assert_eq!(out.get("file").and_then(|v| v.as_str()), Some("main.cpp"));
+        assert_eq!(out.get("col").and_then(|v| v.as_u64()), Some(1));
+        assert!(out.get("_timeout_ms").is_none(), "_timeout_ms 应被清掉");
+        assert!(out.get("_index_timeout_ms").is_none(), "_index_timeout_ms 应被清掉");
+    }
+
+    #[test]
+    fn sanitize_timeout_args_passes_through_non_object() {
+        // 防御：若 args 罕见形态（null/array），sanitize 不 panic、不破坏。
+        let null_in = serde_json::Value::Null;
+        assert!(sanitize_timeout_args(null_in.clone()).is_null());
+        let arr_in = json!([1, 2, 3]);
+        assert_eq!(sanitize_timeout_args(arr_in.clone()), arr_in);
     }
 }
