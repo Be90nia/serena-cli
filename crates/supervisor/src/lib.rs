@@ -1337,7 +1337,12 @@ impl Supervisor {
     }
 
     /// cache_miss 后写入。LS 错误路径不经过这里（失败不进 cache）。
+    /// 空结果不写：语义未就绪窗口的空响应（RA/gopls 加载期）会被永久缓存，
+    /// 导致就绪后仍 miss 假象；空是合法语义结果，宁可重查不可错缓存。
     fn symbol_cache_put(&self, key: SymbolCacheKey, hits: Vec<SymbolHit>) {
+        if hits.is_empty() {
+            return;
+        }
         self.symbol_cache.lock().unwrap().insert(key, hits);
     }
 
