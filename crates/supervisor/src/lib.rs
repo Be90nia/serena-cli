@@ -417,6 +417,39 @@ impl Supervisor {
         n
     }
 
+    /// Self-heal 包装：调 `session_for` + 闭包；若闭包因 LS 终结返 `Core(Terminated)`，
+    /// 驱逐该 (root, lang) 的旧 session（避免下次再拿到死 session）并重试一次。
+    ///
+    /// 重试上限 1 次 —— 再次 Terminated 透传原错误给 agent，避免无限重试掩盖真实故障。
+    /// 写门内工具（replace-body / insert-*）的 LS 死亡根因是单写门后多次 write 的
+    /// didChange version 非单调 → rust-analyzer 关 channel（详 edit_tools::commit_change 注）。
+    /// 修复 write 链路后此 self-heal 兜底偶发冷启动失败 / 索引风暴把 RA 拉死的场景。
+    ///
+    /// ponytail: 重试仅 1 次 —— 再 fail 慢 1 次冷启动（rust-analyzer 89s）远超 TOOL_TIMEOUT，
+    /// agent 自己比 supervisor 更适合决定「等 vs 报错」。
+    pub(crate) async fn with_session_retry<F, Fut, T>(
+        sup: &Supervisor,
+        root: &Path,
+        lang: &str,
+        mut f: F,
+    ) -> ToolResult<T>
+    where
+        F: FnMut(Arc<Session>) -> Fut,
+        Fut: Future<Output = ToolResult<T>>,
+    {
+        let session = sup.session_for(root, lang).await?;
+        match f(session.clone()).await {
+            Err(ToolError::Core(CoreError::Terminated { .. })) => {
+                let key = Supervisor::key(root, lang);
+                tracing::warn!(?key, "session terminated mid-call; evicting and retrying once");
+                let _ = sup.evict(&key).await;
+                let session2 = sup.session_for(root, lang).await?;
+                f(session2).await
+            }
+            other => other,
+        }
+    }
+
     /// 拿到/创建 (root, lang) 对应的 Session，同 key 只允许一次冷启动。
     async fn session_for(&self, root: &Path, lang: &str) -> ToolResult<Arc<Session>> {
         let key = Self::key(root, lang);
@@ -1992,6 +2025,10 @@ impl Supervisor {
     /// 3. 新 body 替换 range → tempfile 原子写 + rename（Windows 共享冲突重试 5×50ms）
     /// 4. 读回 diff 校验 —— 不符 → 从写前副本回滚 + WRITE_CONFLICT
     /// 5. didChange 全量同步 → LS 与盘一致
+    ///
+    /// Self-heal：闭包内 session.request / ensure_open 任何一步收到
+    /// `Core(Terminated)`（RA 因前置写入 didChange 错序 / 索引风暴把 LS 拉死），
+    /// `with_session_retry` 驱逐旧 session + 重试一次。再 fail 透传原错误给 agent。
     pub async fn tool_replace_body(
         &self,
         root: &Path,
@@ -2001,20 +2038,53 @@ impl Supervisor {
         lang_override: Option<&str>,
     ) -> ToolResult<()> {
         let lang = resolve_lang_for_file(file, lang_override)?;
-        let session = self.session_for(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri_str = path_to_uri_str(&path);
+        let symbol = symbol.to_string();
+        let new_body = new_body.to_string();
+        let lang_owned = lang.clone();
+        Self::with_session_retry(self, root, lang.as_str(), move |session| {
+            let path = path.clone();
+            let uri_str = uri_str.clone();
+            let symbol = symbol.clone();
+            let new_body = new_body.clone();
+            let lang_str = lang_owned.clone();
+            async move {
+                Self::tool_replace_body_inner(
+                    session,
+                    root,
+                    &path,
+                    &uri_str,
+                    &symbol,
+                    &new_body,
+                    lang_str.as_str(),
+                )
+                .await
+            }
+        })
+        .await
+    }
 
+    /// tool_replace_body 的实际实现 ——
+    /// 拆出来便于 `with_session_retry` 在闭包里重放整条链路（含写门重取）。
+    #[allow(unused_variables)]
+    async fn tool_replace_body_inner(
+        session: Arc<Session>,
+        root: &Path,
+        path: &Path,
+        uri_str: &str,
+        symbol: &str,
+        new_body: &str,
+        lang: &str,
+    ) -> ToolResult<()> {
         // 0) 索引等待（PLAN Phase 3.2）：cold-start 下 LS 未索引时 documentSymbol 会
         //    给过期/错位 range —— replace-body 错位的根因。先 didOpen + documentSymbol
         //    探针等就绪再进写门；探针超时只 warn 不阻断（回退契约同 on_server_ready）。
-        let _probe_open = session.ensure_open(&path).await.map_err(ToolError::Core)?;
-        // T0 配置驱动语言无手写 adapter：wait_for_index trait 默认实现等价于通用
-        // documentSymbol 探针，此处无 adapter 就跳过特判等待（不报错）。
-        if let Some(adapter) = ls_registry::adapter_for(lang.as_str())
+        let _probe_open = session.ensure_open(path).await.map_err(ToolError::Core)?;
+        if let Some(adapter) = ls_registry::adapter_for(lang)
             && let Err(e) = tokio::time::timeout(
                 INDEX_WAIT_TIMEOUT,
-                adapter.wait_for_index(&session, &path, INDEX_WAIT_TIMEOUT),
+                adapter.wait_for_index(&session, path, INDEX_WAIT_TIMEOUT),
             )
             .await
         {
@@ -2029,26 +2099,22 @@ impl Supervisor {
         let _gate = write_gate::acquire().await;
 
         // 1) 锁内解析符号 range（杜绝客户端 range 过期）。
-        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
-        let params = json!({ "textDocument": { "uri": uri_str.clone() } });
+        let _guard = session.ensure_open(path).await.map_err(ToolError::Core)?;
+        let params = json!({ "textDocument": { "uri": uri_str } });
         let resp: DocumentSymbolResponse = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
         let range = find_symbol_range(&resp, symbol).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("symbol `{symbol}` not found in {file}"),
+            detail: format!("symbol `{symbol}` not found in {}", path.display()),
         })?;
 
         // 2) 读盘 + content-hash 对账（C3 防线 ①）。
-        let old_text = tokio::fs::read_to_string(&path)
+        let old_text = tokio::fs::read_to_string(path)
             .await
             .map_err(|e| ToolError::BadArgs {
                 detail: format!("read {}: {e}", path.display()),
             })?;
         let old_hash = content_hash(&old_text);
-
-        // didOpen/didChange 后 LS 侧的版本号；从 1 递增即可（mock 与 clangd 都不校验具体值）。
-        static VERSION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
-        let version = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // 3) 新文本 = 老文本替换 range；tempfile 原子写 + rename。
         let start = LspPos {
@@ -2059,12 +2125,10 @@ impl Supervisor {
             line: range.end.line,
             character: range.end.character,
         };
-        let start_byte =
-            lsp_core::offsets::position_to_byte(&old_text, start, OffsetEncoding::Utf16).map_err(
-                |e| ToolError::BadArgs {
-                    detail: format!("start position: {e}"),
-                },
-            )?;
+        let start_byte = lsp_core::offsets::position_to_byte(&old_text, start, OffsetEncoding::Utf16)
+            .map_err(|e| ToolError::BadArgs {
+            detail: format!("start position: {e}"),
+        })?;
         let end_byte = lsp_core::offsets::position_to_byte(&old_text, end, OffsetEncoding::Utf16)
             .map_err(|e| ToolError::BadArgs {
             detail: format!("end position: {e}"),
@@ -2076,7 +2140,7 @@ impl Supervisor {
             &old_text[end_byte..]
         );
 
-        atomic_write(&path, &new_text)
+        atomic_write(path, &new_text)
             .await
             .map_err(|e| ToolError::WriteConflict {
                 path: path.display().to_string(),
@@ -2091,22 +2155,20 @@ impl Supervisor {
             })?;
         if readback != new_text {
             // 回滚：老内容写回。
-            let _ = atomic_write(&path, &old_text).await;
+            let _ = atomic_write(path, &old_text).await;
             return Err(ToolError::WriteConflict {
                 path: path.display().to_string(),
                 reason: "readback mismatch; rolled back".into(),
             });
         }
 
-        // 5) didChange 全量同步到 LS。
-        let change_params = json!({
-            "textDocument": { "uri": uri_str, "version": version },
-            "contentChanges": [ { "text": new_text } ],
-        });
-        session
-            .notify("textDocument/didChange", change_params)
-            .await
-            .map_err(ToolError::Core)?;
+        // 5) didChange 全量同步 → LS 与盘一致。
+        // 走 `ensure_open` 的 mtime-检测路径：它用 Session 内部的 content_version
+        // 单调递增（与 didOpen 起始号连续），不再用本工具自维护的 VERSION 计数器，
+        // 避免与 edit_tools 的 didChange 序列撞车（rust-analyzer 一见乱序即
+        // 关闭 channel → 后续所有工具 LS_TERMINATED）。
+        drop(_guard);
+        let _refreshed = session.ensure_open(path).await.map_err(ToolError::Core)?;
 
         // 防御：old_hash 在此仅供将来做"多客户端并发"检测（M2 扩展）。
         let _ = old_hash;
@@ -2431,15 +2493,10 @@ impl Supervisor {
                     reason: format!("atomic write failed: {e}"),
                 })?;
 
-            // 全量 didChange 让 LS 跟上。
-            let change_params = json!({
-                "textDocument": { "uri": uri },
-                "contentChanges": [{ "text": new_content }],
-            });
-            session
-                .notify("textDocument/didChange", change_params)
-                .await
-                .map_err(ToolError::Core)?;
+            // 全量 didChange 让 LS 跟上 —— 走 ensure_open 的 mtime-检测路径，
+            // 与 tool_replace_body / edit_tools 共享同一 content_version 单调递增
+            // （rust-analyzer 拒收非单调 version → channel 关）。
+            let _refreshed = session.ensure_open(&abs).await.map_err(ToolError::Core)?;
 
             report.files_modified += 1;
             report.edits_applied += edits.len();
@@ -2555,16 +2612,10 @@ impl Supervisor {
                 reason: "readback mismatch; rolled back".into(),
             });
         }
-        static SD_VERSION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
-        let version = SD_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let change_params = json!({
-            "textDocument": { "uri": uri_str, "version": version },
-            "contentChanges": [ { "text": new_text } ],
-        });
-        session
-            .notify("textDocument/didChange", change_params)
-            .await
-            .map_err(ToolError::Core)?;
+        // 走 `ensure_open` 的 mtime-检测路径，与 tool_replace_body / edit_tools 共享
+        // 同一 content_version 单调递增（rust-analyzer 拒收非单调 version → channel 关）。
+        drop(_guard);
+        let _refreshed = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         Ok(SafeDeleteReport {
             deleted: true,

@@ -207,3 +207,173 @@ async fn nested_guards_emit_did_open_once() {
 
     session.shutdown().await;
 }
+
+/// P1 修复 #4：连续多次 mtime 推进 → version 必须单调递增（v1, v2, v3, ...）。
+/// 修复前：edit_tools 各自维护 `version` 计数器，跨工具调用序列非单调，
+/// rust-analyzer 拒收 → 关 channel → 后续所有 LS_TERMINATED。
+/// 修复后：统一走 `ensure_open` 的 `content_version` 内部递增。
+#[tokio::test]
+async fn repeated_mtime_changes_yield_monotonic_versions() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file = tmp.path().join("d.cpp");
+    tokio::fs::write(&file, b"v1\n")
+        .await
+        .expect("write v1");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    let _g1 = session.ensure_open(&file).await.expect("first open");
+    for i in 2..=4u64 {
+        time::sleep(Duration::from_millis(60)).await;
+        tokio::fs::write(&file, format!("v{i}\n").as_bytes())
+            .await
+            .expect("rewrite");
+        time::sleep(Duration::from_millis(60)).await;
+        let _g = session
+            .ensure_open(&file)
+            .await
+            .expect("subsequent ensure_open");
+    }
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    let changes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didChange"))
+        .collect();
+    assert_eq!(opens.len(), 1, "4 次 ensure_open 仅首次 didOpen；events={events:?}");
+    assert_eq!(changes.len(), 3, "后 3 次 mtime 变化 → 3 次 didChange；events={events:?}");
+    let versions: Vec<i64> = std::iter::once(opens[0].get("version").and_then(Value::as_i64).unwrap())
+        .chain(changes.iter().map(|e| e.get("version").and_then(Value::as_i64).unwrap()))
+        .collect();
+    assert_eq!(versions, vec![1, 2, 3, 4], "version 必须严格单调递增");
+
+    session.shutdown().await;
+}
+
+/// P1 修复 #5：单写门跨工具（edit_tools::commit_change → tool_replace_body）场景下，
+/// 一次 ensure_open 拿到的 guard 在被替换为下一个 ensure_open 之前释放，
+/// 等价于「FileGuard drop → ref_count 归零 → 后续 ensure_open 重新 didOpen」，
+/// 不会因 ref_count 残留导致 version 撞车。
+#[tokio::test]
+async fn guard_drop_then_reopen_restarts_version_at_one() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file = tmp.path().join("e.cpp");
+    tokio::fs::write(&file, b"v1\n").await.expect("write v1");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    // 周期 1：guard 持有 → drop → ref_count=0 → buffer 清空。
+    let g1 = session.ensure_open(&file).await.expect("open #1");
+    drop(g1);
+    time::sleep(Duration::from_millis(60)).await;
+
+    // 周期 2：buffer 已移除 → 重新走 didOpen（version 重置为 1，非承接上轮 version）。
+    let _g2 = session.ensure_open(&file).await.expect("reopen");
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    let closes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didClose"))
+        .collect();
+    assert_eq!(
+        opens.len(),
+        2,
+        "guard drop 后再 ensure_open 应再发一次 didOpen；events={events:?}"
+    );
+    assert_eq!(opens[1].get("version").and_then(Value::as_i64), Some(1));
+    assert!(
+        !closes.is_empty(),
+        "drop 应触发 didClose；events={events:?}"
+    );
+
+    session.shutdown().await;
+}
+
+/// P1 修复 #6：单 session 跨文件并行 ensure_open —— 不同 file URI 各自维护 version，
+/// 互不串扰（与 P1 修复前"全文件共用静态 VERSION 计数器"的关键区别）。
+#[tokio::test]
+async fn different_files_keep_independent_versions() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file_a = tmp.path().join("a.cpp");
+    let file_b = tmp.path().join("b.cpp");
+    tokio::fs::write(&file_a, b"a1\n").await.expect("write a1");
+    tokio::fs::write(&file_b, b"b1\n").await.expect("write b1");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    let _ga1 = session.ensure_open(&file_a).await.expect("a open");
+    let _gb1 = session.ensure_open(&file_b).await.expect("b open");
+
+    time::sleep(Duration::from_millis(60)).await;
+    tokio::fs::write(&file_a, b"a2\n").await.expect("rewrite a2");
+    tokio::fs::write(&file_b, b"b2\n").await.expect("rewrite b2");
+    time::sleep(Duration::from_millis(60)).await;
+
+    let _ga2 = session.ensure_open(&file_a).await.expect("a reopen");
+    let _gb2 = session.ensure_open(&file_b).await.expect("b reopen");
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events = read_track_events(&track_log).await;
+    let uri_a = file_uri(&file_a);
+    let uri_b = file_uri(&file_b);
+    let a_opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| {
+            e.get("event").and_then(Value::as_str) == Some("didOpen")
+                && e.get("uri").and_then(Value::as_str) == Some(uri_a.as_str())
+        })
+        .collect();
+    let b_opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| {
+            e.get("event").and_then(Value::as_str) == Some("didOpen")
+                && e.get("uri").and_then(Value::as_str) == Some(uri_b.as_str())
+        })
+        .collect();
+    let a_changes: Vec<&Value> = events
+        .iter()
+        .filter(|e| {
+            e.get("event").and_then(Value::as_str) == Some("didChange")
+                && e.get("uri").and_then(Value::as_str) == Some(uri_a.as_str())
+        })
+        .collect();
+    let b_changes: Vec<&Value> = events
+        .iter()
+        .filter(|e| {
+            e.get("event").and_then(Value::as_str) == Some("didChange")
+                && e.get("uri").and_then(Value::as_str) == Some(uri_b.as_str())
+        })
+        .collect();
+    assert_eq!(a_opens.len(), 1, "a 仅首次 didOpen；events={events:?}");
+    assert_eq!(b_opens.len(), 1, "b 仅首次 didOpen；events={events:?}");
+    assert_eq!(a_changes.len(), 1, "a mtime 变化 1 次 → 1 次 didChange；events={events:?}");
+    assert_eq!(b_changes.len(), 1, "b mtime 变化 1 次 → 1 次 didChange；events={events:?}");
+    assert_eq!(a_opens[0].get("version").and_then(Value::as_i64), Some(1));
+    assert_eq!(b_opens[0].get("version").and_then(Value::as_i64), Some(1));
+    assert_eq!(a_changes[0].get("version").and_then(Value::as_i64), Some(2));
+    assert_eq!(b_changes[0].get("version").and_then(Value::as_i64), Some(2));
+
+    session.shutdown().await;
+}

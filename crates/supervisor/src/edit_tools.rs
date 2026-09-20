@@ -133,7 +133,12 @@ fn pos_to_byte(text: &str, line: u32, col: u32, enc: OffsetEncoding) -> EditResu
     })
 }
 
-/// 修改文件 + atomic_write + didChange 全量同步 + 缓存失效（与 replace-body 一致）。
+/// 修改文件 + atomic_write + didChange 全量同步（与 replace-body 一致）。
+///
+/// didChange 走 `session.ensure_open` —— 它按 mtime 检测是否需重发，
+/// 并用内部递增的 `content_version`（与 didOpen 起始版本号连续）。
+/// root cause：单写门后多个 write 工具各自维护 version 计数器，
+/// ls 收到的不是单调递增序列 → 拒响应 / EOF channel。
 async fn commit_change(
     session: &Arc<Session>,
     file: &Path,
@@ -143,13 +148,8 @@ async fn commit_change(
 ) -> EditResult<()> {
     // atomic_write：tempfile 写 + rename（共享冲突重试 5×50ms）。
     atomic_write(file, new_content).await?;
-    // 全量 didChange。
-    let uri = path_to_uri_str(file);
-    let params = json!({
-        "textDocument": { "uri": uri },
-        "contentChanges": [{ "text": new_content }],
-    });
-    session.notify("textDocument/didChange", params).await?;
+    // mtime 推进 → docsync 自动发 version=prev+1 的 didChange 全量。
+    let _refreshed = session.ensure_open(file).await?;
     Ok(())
 }
 
