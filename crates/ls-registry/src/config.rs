@@ -32,6 +32,11 @@ pub struct LsOverride {
     pub base_cmd: Option<Vec<String>>,
     /// `--ls-args`：追加参数。
     pub args: Option<Vec<String>>,
+    /// `--request-timeout <ms>`：工具请求 timeout override。CLI 优先于 servers.toml
+    /// `timeout_ms` 字段。Phase 4 基建 Task 22b。
+    pub timeout_ms: Option<u32>,
+    /// `--index-timeout <ms>`：index 类（workspace/symbol）长操作 timeout override。
+    pub index_timeout_ms: Option<u32>,
 }
 
 /// §4 用户全局 config.toml 路径（Windows %APPDATA%\serena；Unix ~/.config/serena）。
@@ -53,6 +58,8 @@ pub fn user_override(lang: &str) -> Option<LsOverride> {
         path: ls.get("ls_path").and_then(|v| v.as_str()).map(PathBuf::from),
         base_cmd: str_list(ls.get("ls_base_cmd")),
         args: str_list(ls.get("ls_args")),
+        timeout_ms: ls.get("timeout_ms").and_then(toml_to_u32),
+        index_timeout_ms: ls.get("index_timeout_ms").and_then(toml_to_u32),
     })
 }
 
@@ -61,6 +68,38 @@ fn str_list(v: Option<&toml::Value>) -> Option<Vec<String>> {
         .iter()
         .map(|s| s.as_str().map(String::from))
         .collect()
+}
+
+fn toml_to_u32(v: &toml::Value) -> Option<u32> {
+    v.as_integer().and_then(|n| u32::try_from(n).ok()).or_else(|| {
+        // toml 字符串字面量也接受（与 ls_path 同语义）
+        v.as_str().and_then(|s| s.parse::<u32>().ok())
+    })
+}
+
+/// Task 22b：tool 调用的 effective timeout（毫秒）。
+///
+/// 优先级：CLI flag `LsOverride.timeout_ms` > servers.toml `ServerSpec.timeout_ms`
+/// > supervisor 默认 30000ms（30s）。`None` 表示走 supervisor 默认。
+///
+/// 配套 `effective_index_timeout_ms` 给 index 类（workspace/symbol / 大项目索引），
+/// 默认 120s。
+pub fn effective_timeout_ms(lang: &str, cli_override: Option<&LsOverride>) -> Option<u32> {
+    if let Some(c) = cli_override
+        && let Some(ms) = c.timeout_ms
+    {
+        return Some(ms);
+    }
+    spec_for(lang).and_then(|(_, spec)| spec.timeout_ms)
+}
+
+pub fn effective_index_timeout_ms(lang: &str, cli_override: Option<&LsOverride>) -> Option<u32> {
+    if let Some(c) = cli_override
+        && let Some(ms) = c.index_timeout_ms
+    {
+        return Some(ms);
+    }
+    spec_for(lang).and_then(|(_, spec)| spec.index_timeout_ms)
 }
 
 /// 按 id 或语言名查找（`languages` 数组含 lang，或 id 精确匹配——`cli install
@@ -160,6 +199,11 @@ pub fn to_install_spec(
                     version: npm.version.clone(),
                     bin_rel: npm.bin_rel.clone(),
                     npm_args: npm.npm_args.clone(),
+                    secondary: npm
+                        .secondary_packages
+                        .iter()
+                        .map(|s| ls_runtime::install_pkg::npm_pkg_ref(&s.package, s.version.as_deref()))
+                        .collect(),
                 },
                 exec: spec.exec.clone(),
             })
@@ -175,6 +219,50 @@ pub fn to_install_spec(
                     version: uvx.version.clone(),
                     entrypoint: uvx.entrypoint.clone(),
                     args: uvx.args.clone(),
+                },
+                exec: spec.exec.clone(),
+            })
+        }
+        "dotnet" => {
+            let d = spec.dotnet.as_ref().ok_or_else(|| {
+                format!("[{id}]: install=dotnet but no dotnet table (InvalidSpec)")
+            })?;
+            Ok(InstallSpec {
+                id: id.to_string(),
+                kind: InstallKind::Dotnet {
+                    tool: d.tool.clone(),
+                    version: d.version.clone(),
+                    args: d.args.clone(),
+                },
+                exec: spec.exec.clone(),
+            })
+        }
+        "gem" => {
+            let g = spec.gem.as_ref().ok_or_else(|| {
+                format!("[{id}]: install=gem but no gem table (InvalidSpec)")
+            })?;
+            Ok(InstallSpec {
+                id: id.to_string(),
+                kind: InstallKind::Gem {
+                    gem: g.gem.clone(),
+                    version: g.version.clone(),
+                    bin_rel: g.bin_rel.clone(),
+                    args: g.args.clone(),
+                },
+                exec: spec.exec.clone(),
+            })
+        }
+        "source" => {
+            let s = spec.source.as_ref().ok_or_else(|| {
+                format!("[{id}]: install=source but no source table (InvalidSpec)")
+            })?;
+            Ok(InstallSpec {
+                id: id.to_string(),
+                kind: InstallKind::Source {
+                    repo: s.repo.clone(),
+                    pin: s.pin.clone(),
+                    build_cmd: s.build_cmd.clone(),
+                    bin_rel: s.bin_rel.clone(),
                 },
                 exec: spec.exec.clone(),
             })
@@ -206,6 +294,42 @@ pub fn effective_override(lang: &str, cli: Option<&LsOverride>) -> Option<LsOver
         return Some(c.clone());
     }
     user_override(lang)
+}
+
+/// 包管理器类安装 + 拉起组装的共享尾部（uvx/dotnet/gem/source 四分支同构）：
+/// spec → InstallSpec → installer → outcome 归一为 (exe, args) 或语义错误串。
+fn launch_via_pkg_installer(
+    spec: &crate::spec::ServerSpec,
+    id: &str,
+    auto_install: bool,
+    allow_unsigned_sha: bool,
+    install: impl FnOnce(
+        &InstallCtx,
+        &InstallSpec,
+    ) -> Result<InstallOutcome, ls_runtime::process::RuntimeError>,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let install_spec = to_install_spec(spec, id, Os::current(), ls_runtime::deps::Arch::current())?;
+    let ictx = InstallCtx {
+        os: Os::current(),
+        arch: ls_runtime::deps::Arch::current(),
+        auto_install,
+        allow_unsigned_sha,
+        cache_root: dirs_cache_root(),
+    };
+    match install(&ictx, &install_spec) {
+        Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process { exe, args })) => {
+            Ok((exe, args))
+        }
+        Ok(InstallOutcome::Ready(ls_runtime::install::Launch::External { host, port })) => {
+            Err(format!("external LS not supported by CLI launch: {host}:{port}"))
+        }
+        Ok(InstallOutcome::UnsignedRefused { hint, .. }) => Err(hint),
+        Ok(InstallOutcome::NotInstalled { hint, install_cmd }) => match install_cmd {
+            Some(cmd) => Err(format!("{hint}; install with: {cmd}")),
+            None => Err(hint),
+        },
+        Err(e) => Err(format!("{e}")),
+    }
 }
 
 /// A 类安装 + 拉起组装（路径 B opt-in；`auto_install=false` 永不触网，design §0）。
@@ -283,22 +407,24 @@ pub fn ensure_launch(
         }
         Some(crate::spec::KindRef::Uvx(_)) => {
             // 无安装步骤：uvx 直接拉起（uv 自管缓存）；最终 cmd 由启动器返回。
-            let install_spec =
-                to_install_spec(spec, id, Os::current(), ls_runtime::deps::Arch::current())?;
-            let ictx = InstallCtx {
-                os: Os::current(),
-                arch: ls_runtime::deps::Arch::current(),
-                auto_install,
-                allow_unsigned_sha,
-                cache_root: dirs_cache_root(),
-            };
-            match UvxInstaller.install(&ictx, &install_spec) {
-                Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process { exe, args })) => {
-                    Ok((exe, args))
-                }
-                Ok(InstallOutcome::NotInstalled { hint, .. }) => Err(hint),
-                other => Err(format!("uvx launch unexpected outcome: {other:?}")),
-            }
+            launch_via_pkg_installer(spec, id, auto_install, allow_unsigned_sha, |c, s| {
+                UvxInstaller.install(c, s)
+            })
+        }
+        Some(crate::spec::KindRef::Dotnet(_)) => {
+            launch_via_pkg_installer(spec, id, auto_install, allow_unsigned_sha, |c, s| {
+                ls_runtime::install_extra::DotnetInstaller.install(c, s)
+            })
+        }
+        Some(crate::spec::KindRef::Gem(_)) => {
+            launch_via_pkg_installer(spec, id, auto_install, allow_unsigned_sha, |c, s| {
+                ls_runtime::install_extra::GemInstaller.install(c, s)
+            })
+        }
+        Some(crate::spec::KindRef::Source(_)) => {
+            launch_via_pkg_installer(spec, id, auto_install, allow_unsigned_sha, |c, s| {
+                ls_runtime::install_extra::SourceInstaller.install(c, s)
+            })
         }
         Some(crate::spec::KindRef::Download(dl)) => {
             let os = Os::current();
@@ -374,6 +500,77 @@ mod tests {
         assert!(spec_for("markdown").is_some(), "languages 维度命中");
         assert!(spec_for("crystal").is_some());
         assert!(spec_for("rust").is_none(), "手写 T2 语言不进表");
+    }
+
+    // ---- Phase 4 Task 22b: timeout resolution ----
+
+    /// 三层合并：CLI > servers.toml > None。CLI 给值 → 优先；不给 → 走 servers.toml；
+    /// 都不给 → None（让 supervisor 走默认 30s）。
+    #[test]
+    fn effective_timeout_prefers_cli_over_server_spec() {
+        let cli = LsOverride {
+            timeout_ms: Some(1234),
+            ..Default::default()
+        };
+        let ms = effective_timeout_ms("markdown", Some(&cli));
+        assert_eq!(ms, Some(1234), "CLI 优先于 servers.toml");
+    }
+
+    #[test]
+    fn effective_timeout_falls_back_to_server_spec() {
+        // 选一个 servers.toml 里 timeout_ms 字段不存在/为 None 的语言；fallback 即 None。
+        let cli = LsOverride::default();
+        let ms = effective_timeout_ms("markdown", Some(&cli));
+        // marksman 当前 toml 未写 timeout_ms → None（supervisor 默认 30s）。
+        assert_eq!(ms, None);
+    }
+
+    #[test]
+    fn effective_timeout_none_when_no_spec_or_override() {
+        // 手写 T2（rust）— 无 spec_for 命中 → None
+        let ms = effective_timeout_ms("rust", None);
+        assert_eq!(ms, None);
+    }
+
+    #[test]
+    fn effective_timeout_index_uses_dedicated_field() {
+        let cli = LsOverride {
+            index_timeout_ms: Some(60_000),
+            ..Default::default()
+        };
+        let ms = effective_index_timeout_ms("markdown", Some(&cli));
+        assert_eq!(ms, Some(60_000));
+    }
+
+    #[test]
+    fn servers_toml_timeout_field_parses() {
+        // 临时 toml 注入 timeout_ms，确认字段 deser 行为正确
+        let toml_str = r#"
+            [servers.demo]
+            languages = ["demo"]
+            install = "path_only"
+            timeout_ms = 7777
+            index_timeout_ms = 99999
+            [servers.demo.path_only]
+            binary_name = "demo"
+            install_hint = "x"
+        "#;
+        let parsed = parse(toml_str).expect("toml 解析 ok");
+        let s = &parsed.servers["demo"];
+        assert_eq!(s.timeout_ms, Some(7777));
+        assert_eq!(s.index_timeout_ms, Some(99999));
+        // 字段缺省时为 None（向后兼容老 toml）
+        let legacy_toml = r#"
+            [servers.legacy]
+            languages = ["legacy"]
+            install = "path_only"
+            [servers.legacy.path_only]
+            binary_name = "legacy"
+            install_hint = "x"
+        "#;
+        let parsed2 = parse(legacy_toml).expect("legacy toml 解析 ok");
+        assert_eq!(parsed2.servers["legacy"].timeout_ms, None);
+        assert_eq!(parsed2.servers["legacy"].index_timeout_ms, None);
     }
 
     #[test]
@@ -480,7 +677,7 @@ args = ["-v"]
         let mapped =
             to_install_spec(npm, "npm_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
         match mapped.kind {
-            InstallKind::Npm { package, version, bin_rel, npm_args } => {
+            InstallKind::Npm { package, version, bin_rel, npm_args, secondary: _ } => {
                 assert_eq!(package, "bash-language-server");
                 assert_eq!(version, None, "toml 未写 version → None（latest）");
                 assert_eq!(bin_rel, "bash-language-server");
@@ -540,5 +737,119 @@ args = ["-v"]
                 eprintln!("SKIP: npm not available on this machine ({msg})");
             }
         }
+    }
+
+    const EXTRA_KINDS_TOML: &str = r#"
+[servers.dn_probe]
+languages = ["fsharp-fake"]
+install = "dotnet"
+
+[servers.dn_probe.dotnet]
+tool = "fsautocomplete"
+version = "0.83.0"
+args = ["--stdio"]
+
+[servers.gm_probe]
+languages = ["ruby-fake"]
+install = "gem"
+
+[servers.gm_probe.gem]
+gem = "solargraph"
+version = "0.51.1"
+bin_rel = "solargraph"
+args = ["stdio"]
+
+[servers.src_probe]
+languages = ["nix-fake"]
+install = "source"
+
+[servers.src_probe.source]
+repo = "https://github.com/nix-community/nixd"
+build_cmd = ["nix", "build"]
+bin_rel = "result/bin/nixd"
+
+[servers.npm_sec_probe]
+languages = ["ts-fake"]
+install = "npm"
+
+[servers.npm_sec_probe.npm]
+package = "typescript-language-server"
+version = "5.1.3"
+bin_rel = "typescript-language-server"
+
+[[servers.npm_sec_probe.npm.secondary_packages]]
+package = "typescript"
+version = "5.9.3"
+
+[[servers.npm_sec_probe.npm.secondary_packages]]
+package = "@vue/language-server"
+"#;
+
+    #[test]
+    fn to_install_spec_maps_dotnet_gem_source_and_secondary() {
+        let parsed = crate::spec::parse(EXTRA_KINDS_TOML).unwrap();
+        let dn = &parsed.servers["dn_probe"];
+        let mapped =
+            to_install_spec(dn, "dn_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        match mapped.kind {
+            InstallKind::Dotnet { tool, version, args } => {
+                assert_eq!(tool, "fsautocomplete");
+                assert_eq!(version.as_deref(), Some("0.83.0"));
+                assert_eq!(args, Some(vec!["--stdio".to_string()]));
+            }
+            other => panic!("expect Dotnet, got {other:?}"),
+        }
+        let gm = &parsed.servers["gm_probe"];
+        let mapped =
+            to_install_spec(gm, "gm_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        match mapped.kind {
+            InstallKind::Gem { gem, version, bin_rel, args } => {
+                assert_eq!(gem, "solargraph");
+                assert_eq!(version.as_deref(), Some("0.51.1"));
+                assert_eq!(bin_rel, "solargraph");
+                assert_eq!(args, Some(vec!["stdio".to_string()]));
+            }
+            other => panic!("expect Gem, got {other:?}"),
+        }
+        let src = &parsed.servers["src_probe"];
+        let mapped =
+            to_install_spec(src, "src_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        match mapped.kind {
+            InstallKind::Source { repo, pin, build_cmd, bin_rel } => {
+                assert_eq!(repo, "https://github.com/nix-community/nixd");
+                assert!(pin.is_none());
+                assert_eq!(build_cmd, vec!["nix", "build"]);
+                assert_eq!(bin_rel, "result/bin/nixd");
+            }
+            other => panic!("expect Source, got {other:?}"),
+        }
+        // npm secondary → pkg@ver 引用（npm_pkg_ref 同形态；无版本 = 裸包名）。
+        let npm = &parsed.servers["npm_sec_probe"];
+        let mapped =
+            to_install_spec(npm, "npm_sec_probe", Os::Windows, ls_runtime::deps::Arch::X86_64)
+                .unwrap();
+        match mapped.kind {
+            InstallKind::Npm { secondary, .. } => {
+                assert_eq!(
+                    secondary,
+                    vec!["typescript@5.9.3".to_string(), "@vue/language-server".to_string()]
+                );
+            }
+            other => panic!("expect Npm, got {other:?}"),
+        }
+    }
+
+    /// ensure_launch 对新 kind 的 NotInstalled 归一路径：真表 gem 条目 + auto_install=false →
+    /// 语义错误串含安装命令（不触网）。其余新 kind 共享同一 helper。
+    #[test]
+    fn ensure_launch_gem_without_auto_install_reports_hint() {
+        assert!(spec_for("solargraph").is_some(), "solargraph 条目应已收录");
+        let err = ensure_launch("solargraph", None, false, false).unwrap_err();
+        assert!(
+            err.contains("gem install --user-install") && err.contains("solargraph"),
+            "err: {err}"
+        );
+        // 同 helper 的 uvx 路径：pyright 未装 uv → hint 带 uv 安装指引（本机有 uv 则 Ready）。
+        let _ = ensure_launch("pyright", None, false, false);
     }
 }

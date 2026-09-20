@@ -163,7 +163,7 @@ fn legacy_entries_survive_batch_addition() {
     ] {
         assert!(servers.contains_key(id), "legacy entry `{id}` was lost");
     }
-    assert_eq!(servers.len(), 38, "14 legacy + 24 new download entries");
+    assert_eq!(servers.len(), 62, "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24");
     let marksman = &servers["marksman"];
     assert_eq!(marksman.install, "download");
     assert_eq!(
@@ -198,5 +198,126 @@ fn language_routes_are_unique_across_table() {
     assert!(
         duplicated.is_empty(),
         "duplicate language route(s) make spec_for() HashMap-order dependent: {duplicated:?}"
+    );
+}
+
+/// Phase 3 B/C/D/E/F 类 24 条（npm 13 + uvx 5 + dotnet 2 + gem 2 + source 2）。
+/// 数据锚 = oraios/serena@43ae0211 适配器源码 DEFAULT_* 原值（spot-check 代表性 pin，
+/// 防数据漂移）；angular 不入表（tri-server 编排，jdtls 先例）。
+#[test]
+fn phase3_pkg_entries_parse_with_upstream_pins() {
+    let servers = parsed_servers();
+    let mut seen: HashSet<&'static str> = HashSet::new();
+
+    // npm 类：必填四件 + 版本 pin spot-check + secondary 展开正确。
+    const NPM_IDS: &[&str] = &[
+        "bash", "ansible", "elm", "intelephense", "json", "solidity", "scss", "svelte", "html",
+        "typescript_ls", "typescript_vts", "vue", "yaml",
+    ];
+    for id in NPM_IDS {
+        seen.insert("npm");
+        let spec = servers
+            .get(*id)
+            .unwrap_or_else(|| panic!("[servers.{id}] missing"));
+        assert_eq!(spec.install, "npm", "{id}");
+        let npm = spec.npm.as_ref().unwrap_or_else(|| panic!("{id}: npm table"));
+        assert!(!npm.package.is_empty(), "{id}");
+        assert!(!npm.bin_rel.is_empty(), "{id}");
+        for sec in &npm.secondary_packages {
+            assert!(!sec.package.is_empty(), "{id}: secondary package");
+        }
+    }
+    // 上游 pin spot-check（DEFAULT_* 原值）。
+    let bash = servers["bash"].npm.as_ref().unwrap();
+    assert_eq!(bash.package, "bash-language-server");
+    assert_eq!(bash.version.as_deref(), Some("5.6.0"));
+    assert_eq!(bash.npm_args, Some(vec!["start".to_string()]));
+    let svelte = servers["svelte"].npm.as_ref().unwrap();
+    assert_eq!(svelte.bin_rel, "svelteserver", "svelte 可执行名 = svelteserver");
+    assert_eq!(svelte.secondary_packages.len(), 3, "typescript+tsls+svelte-plugin");
+    assert_eq!(svelte.secondary_packages[0].version.as_deref(), Some("6.0.3"));
+    let ts = servers["typescript_ls"].npm.as_ref().unwrap();
+    assert_eq!(ts.version.as_deref(), Some("5.1.3"));
+    assert_eq!(ts.secondary_packages[0].package, "typescript");
+    assert_eq!(ts.secondary_packages[0].version.as_deref(), Some("5.9.3"));
+    let vts = servers["typescript_vts"].npm.as_ref().unwrap();
+    assert_eq!(vts.package, "@vtsls/language-server");
+    assert_eq!(vts.bin_rel, "vtsls");
+    let sol = servers["solidity"].npm.as_ref().unwrap();
+    assert_eq!(sol.package, "@nomicfoundation/solidity-language-server");
+    assert_eq!(sol.secondary_packages[0].package, "@foundry-rs/forge");
+
+    // uvx 类：package+entrypoint 必填 + pin spot-check。
+    const UVX_IDS: &[&str] = &["pyright", "basedpyright", "python_ty", "python_pyrefly", "fortls"];
+    for id in UVX_IDS {
+        seen.insert("uvx");
+        let spec = servers.get(*id).unwrap_or_else(|| panic!("[servers.{id}] missing"));
+        assert_eq!(spec.install, "uvx", "{id}");
+        let u = spec.uvx.as_ref().unwrap_or_else(|| panic!("{id}: uvx table"));
+        assert!(!u.package.is_empty() && !u.entrypoint.is_empty(), "{id}");
+    }
+    assert_eq!(servers["pyright"].uvx.as_ref().unwrap().version.as_deref(), Some("1.1.403"));
+    assert_eq!(
+        servers["pyright"].uvx.as_ref().unwrap().entrypoint,
+        "pyright-langserver"
+    );
+    assert_eq!(servers["basedpyright"].uvx.as_ref().unwrap().version.as_deref(), Some("1.39.9"));
+    let ty = servers["python_ty"].uvx.as_ref().unwrap();
+    assert_eq!(ty.package, "ty");
+    assert_eq!(ty.args, Some(vec!["server".to_string()]));
+    let pyrefly = servers["python_pyrefly"].uvx.as_ref().unwrap();
+    assert_eq!(pyrefly.version.as_deref(), Some("1.1.1"));
+    assert_eq!(pyrefly.args, Some(vec!["lsp".to_string()]));
+    assert_eq!(servers["fortls"].uvx.as_ref().unwrap().version.as_deref(), Some("3.2.2"));
+
+    // dotnet 类。
+    for id in ["fsharp", "csharp_ls"] {
+        seen.insert("dotnet");
+        let spec = servers.get(id).unwrap_or_else(|| panic!("[servers.{id}] missing"));
+        assert_eq!(spec.install, "dotnet", "{id}");
+        assert!(spec.dotnet.as_ref().unwrap().tool.len() > 1, "{id}");
+    }
+    let fs = servers["fsharp"].dotnet.as_ref().unwrap();
+    assert_eq!(fs.tool, "fsautocomplete");
+    assert_eq!(fs.version.as_deref(), Some("0.83.0"), "上游 DEFAULT_FSAUTOCOMPLETE_VERSION");
+
+    // gem 类。
+    for id in ["ruby_lsp", "solargraph"] {
+        seen.insert("gem");
+        let spec = servers.get(id).unwrap_or_else(|| panic!("[servers.{id}] missing"));
+        assert_eq!(spec.install, "gem", "{id}");
+        let g = spec.gem.as_ref().unwrap_or_else(|| panic!("{id}: gem table"));
+        assert!(!g.gem.is_empty() && !g.bin_rel.is_empty(), "{id}");
+    }
+    assert_eq!(servers["ruby_lsp"].gem.as_ref().unwrap().version.as_deref(), Some("0.26.8"));
+    assert_eq!(servers["solargraph"].gem.as_ref().unwrap().version.as_deref(), Some("0.51.1"));
+    assert_eq!(servers["solargraph"].gem.as_ref().unwrap().args, Some(vec!["stdio".to_string()]));
+
+    // source 类：repo HTTPS + build_cmd 非空。
+    for id in ["nixd", "crystalline_source"] {
+        seen.insert("source");
+        let spec = servers.get(id).unwrap_or_else(|| panic!("[servers.{id}] missing"));
+        assert_eq!(spec.install, "source", "{id}");
+        let s = spec.source.as_ref().unwrap_or_else(|| panic!("{id}: source table"));
+        assert!(s.repo.starts_with("https://"), "{id}");
+        assert!(!s.build_cmd.is_empty(), "{id}");
+        assert!(!s.bin_rel.is_empty(), "{id}");
+    }
+    let nixd = servers["nixd"].source.as_ref().unwrap();
+    assert_eq!(nixd.build_cmd, vec!["nix", "build"]);
+    assert_eq!(nixd.bin_rel, "result/bin/nixd");
+
+    // 五类齐活。
+    assert_eq!(seen.len(), 5, "B/C/D/E/F 五类都应有条目");
+}
+
+/// angular 的 tri-server 编排形态不入表（上游 angular_language_server.py：ngserver +
+/// 伴随 typescript-language-server + vscode-html companion 三进程）。
+#[test]
+fn angular_tri_server_form_is_not_in_table() {
+    let servers = parsed_servers();
+    assert!(
+        !servers.contains_key("angular"),
+        "angular 双/三进程编排不适配单进程 Launch（eclipse_jdtls 先例），不入本表"
     );
 }

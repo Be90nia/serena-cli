@@ -10,6 +10,19 @@
 //!
 //! 真实校验走 `std::process::Command` 调系统 `certutil` / `sha256sum` /
 //! `shasum -a 256`（ARCH §8 禁第三方依赖，与项目 npm shim 调系统命令风格一致）。
+//!
+//! Task 22d sha256 真值口径（Phase 4 基建）：
+//! - A 类 download 条目 24 条真值已搬到 `crates/ls-registry/servers.toml`，由
+//!   `tests/servers_toml_coverage.rs::new_download_entries_parse_with_complete_fields`
+//!   闸门校验 64-hex 长度 + 字符集 + url/sha 1:1 配对。锚源见 `local/ls-download-matrix.md`。
+//! - rust-analyzer 4 平台已在下面 `rust_analyzer_release_for` 真值填齐（GitHub
+//!   API assets[].digest）。
+//! - clangd 4 平台仍**占位空串**——LLVM 官方 release 资产**无 SHA256SUMS 旁文件**
+//!   （`releases.llvm.org` 不签二级制品），上游 serena
+//!   `downloaded_dependency_hashes.json` 也不含 clangd 条目。设计 §2.9：sha 未知 →
+//!   拒绝 auto-install，仅 `--allow-unsigned-sha` 人类显式越狱——假 hash 必败校验
+//!   更危险（错把 LLVM 资产挂掉就成 P0）。
+//! - 后续 LS 加进来时按 `clangd_release_for` 模板复制，sha 真值表见 ls-download-matrix。
 
 /// 平台标识（与 `std::env::consts::OS` 对齐，但显式枚举便于测试）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -367,5 +380,52 @@ mod tests {
         uniq.sort();
         uniq.dedup();
         assert_eq!(uniq.len(), urls.len(), "每个 platform URL 必须唯一");
+    }
+
+    /// Task 22d：clangd 4 平台 sha256 必须**全部为空**——这是已知的 known-unknown，
+    /// 不是占位假值。设计 §2.9 门：empty → 拒绝 auto-install，仅
+    /// `--allow-unsigned-sha` 越狱。锚源 LLVM 官方 release 资产无 SHA256SUMS 旁
+    /// 文件（`releases.llvm.org` 不签二级制品），上游 serena 内嵌 hash-DB 也不含
+    /// clangd 条目。
+    #[test]
+    fn clangd_known_unknown_sha256_documented() {
+        for (os, arch) in [
+            (Os::Windows, Arch::X86_64),
+            (Os::Linux, Arch::X86_64),
+            (Os::Macos, Arch::X86_64),
+            (Os::Macos, Arch::Aarch64),
+        ] {
+            let r = clangd_release_for(os, arch).expect("4 主流平台必须有条目");
+            assert_eq!(
+                r.sha256, "",
+                "clangd {os:?}/{arch:?} sha256 必须为空（LLVM 官方无 SHA256SUMS 端点，\
+                 §2.9 已知 unknown）。若此断言失败 = 有人填了假值，违反 §2.9。",
+            );
+            assert!(
+                r.url.contains("llvm.org-18.1.5") || r.url.contains("llvm-project"),
+                "clangd URL 锚必须为 llvm-project 18.1.5"
+            );
+        }
+    }
+
+    /// Task 22d：rust-analyzer 4 平台 sha256 必须是 64-hex 真值（GitHub API digest）。
+    /// 若 release 滚动后 digest 变，需重新查询 `gh api .../releases` 并更新。
+    #[test]
+    fn rust_analyzer_sha256_are_64hex_truth_values() {
+        for (os, arch) in [
+            (Os::Windows, Arch::X86_64),
+            (Os::Linux, Arch::X86_64),
+            (Os::Macos, Arch::X86_64),
+            (Os::Macos, Arch::Aarch64),
+        ] {
+            let r = rust_analyzer_release_for(os, arch).expect("4 主流平台必须有条目");
+            assert_eq!(r.sha256.len(), 64, "rust-analyzer 真值 64-hex");
+            assert!(r.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+            // 真值不应是已知假值 000…0（防御 regression 误填零）
+            assert!(
+                !r.sha256.chars().all(|c| c == '0'),
+                "rust-analyzer sha256 不应全 0"
+            );
+        }
     }
 }

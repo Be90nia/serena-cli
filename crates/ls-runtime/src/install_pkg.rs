@@ -22,13 +22,14 @@ impl NpmInstaller {
         ctx: &InstallCtx,
         spec: &InstallSpec,
     ) -> Result<InstallOutcome, RuntimeError> {
-        let (package, version, bin_rel, npm_args) = match &spec.kind {
+        let (package, version, bin_rel, npm_args, secondary) = match &spec.kind {
             InstallKind::Npm {
                 package,
                 version,
                 bin_rel,
                 npm_args,
-            } => (package, version, bin_rel, npm_args),
+                secondary,
+            } => (package, version, bin_rel, npm_args, secondary),
             _ => return Err(wrong_kind(spec)),
         };
         let dir_name = version.clone().unwrap_or_else(|| "latest".to_string());
@@ -59,7 +60,9 @@ impl NpmInstaller {
             cause: format!("npm install: create install dir {}: {e}", install_dir.display()),
         })?;
         let _lock = acquire_install_lock(&install_dir)?;
-        run_npm_install(&npm_pkg_ref(package, version.as_deref()), &install_dir)?;
+        let mut pkg_refs = vec![npm_pkg_ref(package, version.as_deref())];
+        pkg_refs.extend(secondary.iter().cloned());
+        run_npm_install(&pkg_refs, &install_dir)?;
         let exe = npm_bin_path(&install_dir, bin_rel).ok_or_else(|| RuntimeError::Download {
             url: String::new(),
             expected_sha: None,
@@ -109,8 +112,8 @@ impl UvxInstaller {
     }
 }
 
-/// `pkg` / `pkg@ver`（npm install 目标引用，纯函数）。
-fn npm_pkg_ref(package: &str, version: Option<&str>) -> String {
+/// `pkg` / `pkg@ver`（npm install 目标引用，纯函数；ls-registry 映射层同用）。
+pub fn npm_pkg_ref(package: &str, version: Option<&str>) -> String {
     match version {
         Some(v) => format!("{package}@{v}"),
         None => package.to_string(),
@@ -172,27 +175,44 @@ fn find_on_path(name: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBu
     None
 }
 
-/// 同步 `npm install --prefix <dir> <pkg_ref>`。
-/// stdout → null（npm 进度日志无人消费）；stderr 捕获（失败时带出摘要）；
-/// 600s 硬超时（std 无 wait_timeout，`try_wait` 轮询 + kill 兜底防挂死）。
-/// npm 不在 PATH → MissingRuntime；其余失败 → Download 变体（cause 带命令与 stderr 摘要）。
-fn run_npm_install(package_ref: &str, dir: &Path) -> Result<(), RuntimeError> {
+/// 同步 `npm install --prefix <dir> <pkg_refs...>`（secondary 伴随包同一次 install 装齐）。
+fn run_npm_install(package_refs: &[String], dir: &Path) -> Result<(), RuntimeError> {
     let program = if cfg!(windows) { "npm.cmd" } else { "npm" };
-    let cmd_label = format!("{program} install --prefix {} {package_ref}", dir.display());
+    let mut args = vec!["install".to_string(), "--prefix".to_string(), dir.to_string_lossy().to_string()];
+    args.extend(package_refs.iter().cloned());
+    run_pkg_cmd(
+        program,
+        &args,
+        dir,
+        "npm",
+        "install Node.js (https://nodejs.org) and ensure `npm` is on PATH",
+    )
+}
+
+/// 同步外部安装命令执行（npm install / dotnet tool install / gem install / git 共用）。
+/// `cwd` = 命令工作目录（调用方负责先建目录；npm --prefix 与路径参数类命令 cwd 无关，
+/// 源码构建类命令依赖 cwd=clone 根）。stdout → null（进度日志无人消费）；stderr 捕获
+/// （失败时带出摘要）；600s 硬超时（std 无 wait_timeout，`try_wait` 轮询 + kill 兜底防挂死）。
+/// program 不在 PATH → MissingRuntime；其余失败 → Download 变体（cause 带命令与 stderr 摘要）。
+pub(crate) fn run_pkg_cmd(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    missing_what: &str,
+    missing_hint: &str,
+) -> Result<(), RuntimeError> {
+    let cmd_label = format!("{program} {}", args.join(" "));
     let mut child = std::process::Command::new(program)
-        .arg("install")
-        .arg("--prefix")
-        .arg(dir)
-        .arg(package_ref)
+        .args(args)
+        .current_dir(cwd)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 RuntimeError::MissingRuntime {
-                    what: "npm".to_string(),
-                    install_hint: "install Node.js (https://nodejs.org) and ensure `npm` is on PATH"
-                        .to_string(),
+                    what: missing_what.to_string(),
+                    install_hint: missing_hint.to_string(),
                 }
             } else {
                 RuntimeError::Spawn { cmd: cmd_label.clone(), cause: e }
@@ -217,7 +237,7 @@ fn run_npm_install(package_ref: &str, dir: &Path) -> Result<(), RuntimeError> {
                 let detail = if err_buf.trim().is_empty() {
                     format!("exit {status:?}")
                 } else {
-                    // 摘要截断：npm 失败日志可达数十 KB，错误串只需定位线索。
+                    // 摘要截断：安装器失败日志可达数十 KB，错误串只需定位线索。
                     let t = err_buf.trim();
                     if t.len() > 500 {
                         format!("{}…", &t[..500])
@@ -335,6 +355,7 @@ mod tests {
                 version: None,
                 bin_rel: "my-bin".into(),
                 npm_args: Some(vec!["--stdio".into()]),
+                secondary: Vec::new(),
             },
             exec: vec![],
         };

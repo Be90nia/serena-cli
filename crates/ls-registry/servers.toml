@@ -890,3 +890,297 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 #     sha256 aa5fc1fe6004c17cd83086a57a8c8f28bb3f360914872711bfbb83490dc3c19e
 # 运行需 LaTeX 工具链。latest v5.26.0 新增 aarch64-windows 等资产（M/W digest MISSING，
 # 未收）。
+
+# ---- B/C/D/E/F 类批量收录（Phase 3；数据源 oraios/serena@43ae0211 适配器源码实测：
+# npm/uvx 包名+版本+bin+启动参数均为上游 DEFAULT_*/RuntimeDependency 原值）----
+# 语言路由避撞（omnisharp/phpantom 先例）：语言名已被既有条目占用时，languages = 条目 id
+# 自身，会话仍由手写 T2 适配器 / 既有条目接管，本条目服务 `serena-cli install <id>` 与
+# [ls.<id>] 用户配置。angular 不入表：上游为 tri-server 编排（ngserver + typescript-
+# language-server 伴随进程 + vscode-html companion，angular_language_server.py 模块注释），
+# 单进程 Launch 形态不适配（eclipse_jdtls 双下载先例同理）。
+# npm/uvx/dotnet/gem/source 条目不适用 exec/{bin} 模板：最终 cmd 由安装器/启动器返回。
+
+# ---- B 类 npm（13 条；全部要求 Node.js + npm 在 PATH）----
+
+[servers.bash]
+languages = ["bash"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.bash.npm]
+package = "bash-language-server"
+version = "5.6.0"
+bin_rel = "bash-language-server"
+npm_args = ["start"]
+
+[servers.ansible]
+languages = ["ansible"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.ansible.npm]
+package = "@ansible/ansible-language-server"
+version = "1.2.3"
+bin_rel = "ansible-language-server"
+npm_args = ["--stdio"]
+
+[servers.elm]
+languages = ["elm"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.elm.npm]
+package = "@elm-tooling/elm-language-server"
+version = "2.8.0"
+bin_rel = "elm-language-server"
+npm_args = ["--stdio"]
+# 伴随 elm 编译器（上游 DEFAULT_ELM_COMPILER_VERSION；启动 env 注入归会话层）。
+[[servers.elm.npm.secondary_packages]]
+package = "elm"
+version = "0.19.1-6"
+
+[servers.intelephense]
+# php 语言路由归 phpactor 条目，本条仅按 id 显式安装（避撞先例同 phpantom）。
+languages = ["intelephense"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.intelephense.npm]
+package = "intelephense"
+version = "1.14.4"
+bin_rel = "intelephense"
+npm_args = ["--stdio"]
+
+[servers.json]
+languages = ["json"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.json.npm]
+package = "vscode-json-languageserver"
+version = "1.3.4"
+bin_rel = "vscode-json-languageserver"
+npm_args = ["--stdio"]
+
+[servers.solidity]
+languages = ["solidity"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.solidity.npm]
+package = "@nomicfoundation/solidity-language-server"
+version = "0.8.4"
+bin_rel = "nomicfoundation-solidity-language-server"
+npm_args = ["--stdio"]
+# 伴随 forge（上游 DEFAULT_FORGE_VERSION 1.5.1；Solidity LS 校验用，无 env 注入时
+# 降级为无 forge 校验——完整功能需会话层把 node_modules/.bin 加进 PATH）。
+[[servers.solidity.npm.secondary_packages]]
+package = "@foundry-rs/forge"
+version = "1.5.1"
+
+[servers.scss]
+languages = ["scss"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.scss.npm]
+package = "some-sass-language-server"
+version = "2.3.8"
+bin_rel = "some-sass-language-server"
+npm_args = ["--stdio"]
+
+[servers.svelte]
+languages = ["svelte"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.svelte.npm]
+# bin_rel = svelteserver（svelte-language-server 包提供的可执行名）。
+package = "svelte-language-server"
+version = "0.18.0"
+bin_rel = "svelteserver"
+npm_args = ["--stdio"]
+# 三个伴随包（上游 svelte_language_server.py L195-202 默认值；tsdk 路径注入归会话层）。
+[[servers.svelte.npm.secondary_packages]]
+package = "typescript"
+version = "6.0.3"
+[[servers.svelte.npm.secondary_packages]]
+package = "typescript-language-server"
+version = "5.1.3"
+[[servers.svelte.npm.secondary_packages]]
+package = "typescript-svelte-plugin"
+version = "0.3.52"
+
+[servers.html]
+languages = ["html"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.html.npm]
+package = "vscode-langservers-extracted"
+version = "4.10.0"
+bin_rel = "vscode-html-language-server"
+npm_args = ["--stdio"]
+
+[servers.typescript_ls]
+# typescript 语言路由被 deno 条目占用 + 手写 T2 适配器接管会话；本条为 npm 安装形态
+# 后备（避撞先例同 omnisharp）。上游 typescript_language_server.py 双包同装。
+languages = ["typescript_ls"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.typescript_ls.npm]
+package = "typescript-language-server"
+version = "5.1.3"
+bin_rel = "typescript-language-server"
+npm_args = ["--stdio"]
+[[servers.typescript_ls.npm.secondary_packages]]
+package = "typescript"
+version = "5.9.3"
+
+[servers.typescript_vts]
+# @vtsls/language-server；上游 vts_language_server.py 裸启动（vtsls 默认 stdio）。
+languages = ["typescript_vts"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.typescript_vts.npm]
+package = "@vtsls/language-server"
+version = "0.2.9"
+bin_rel = "vtsls"
+
+[servers.vue]
+languages = ["vue"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.vue.npm]
+package = "@vue/language-server"
+version = "3.1.5"
+bin_rel = "vue-language-server"
+npm_args = ["--stdio"]
+# 伴随 typescript + typescript-language-server（上游 vue_language_server.py L543-565）。
+[[servers.vue.npm.secondary_packages]]
+package = "typescript"
+version = "5.9.3"
+[[servers.vue.npm.secondary_packages]]
+package = "typescript-language-server"
+version = "5.1.3"
+
+[servers.yaml]
+languages = ["yaml"]
+install = "npm"
+source_commit = "43ae0211"
+[servers.yaml.npm]
+package = "yaml-language-server"
+version = "1.19.2"
+bin_rel = "yaml-language-server"
+npm_args = ["--stdio"]
+
+# ---- C 类 uvx（5 条；全部要求 uv/uvx 在 PATH，uv 自管 Python 3.13 与缓存）----
+
+[servers.pyright]
+# python 语言路由归 jedi 条目（G 类先收）+ 手写 pyright T2 适配器接管会话；
+# 本条服务 `serena-cli install pyright` 与 [ls.pyright] 配置。
+languages = ["pyright"]
+install = "uvx"
+source_commit = "43ae0211"
+[servers.pyright.uvx]
+package = "pyright"
+version = "1.1.403"
+entrypoint = "pyright-langserver"
+args = ["--stdio"]
+
+[servers.basedpyright]
+languages = ["basedpyright"]
+install = "uvx"
+source_commit = "43ae0211"
+[servers.basedpyright.uvx]
+package = "basedpyright"
+version = "1.39.9"
+entrypoint = "basedpyright-langserver"
+args = ["--stdio"]
+
+[servers.python_ty]
+languages = ["python_ty"]
+install = "uvx"
+source_commit = "43ae0211"
+[servers.python_ty.uvx]
+package = "ty"
+version = "0.0.25"
+entrypoint = "ty"
+args = ["server"]
+
+[servers.python_pyrefly]
+languages = ["python_pyrefly"]
+install = "uvx"
+source_commit = "43ae0211"
+[servers.python_pyrefly.uvx]
+package = "pyrefly"
+version = "1.1.1"
+entrypoint = "pyrefly"
+args = ["lsp"]
+
+[servers.fortls]
+languages = ["fortran"]
+install = "uvx"
+source_commit = "43ae0211"
+[servers.fortls.uvx]
+package = "fortls"
+version = "3.2.2"
+entrypoint = "fortls"
+
+# ---- D 类 dotnet tool（2 条；要求 dotnet SDK 在 PATH）----
+
+[servers.fsharp]
+languages = ["fsharp"]
+install = "dotnet"
+source_commit = "43ae0211"
+[servers.fsharp.dotnet]
+# 上游 fsharp_language_server.py L145：--tool-path 自有目录（非 -g），L188 启动开关组。
+tool = "fsautocomplete"
+version = "0.83.0"
+args = ["--adaptive-lsp-server-enabled", "--project-graph-enabled", "--use-fcs-transparent-compiler"]
+
+[servers.csharp_ls]
+# 本地扩展条目（上游已迁 Roslyn，本地暂留 csharp-ls，见 local/csharp-ls-decision.md）；
+# csharp 语言路由归 csharp（Roslyn）条目。无上游版本 pin → latest。
+languages = ["csharp_ls"]
+install = "dotnet"
+[servers.csharp_ls.dotnet]
+tool = "csharp-ls"
+
+# ---- E 类 gem（2 条；要求 ruby + gem 在 PATH）----
+
+[servers.ruby_lsp]
+languages = ["ruby"]
+install = "gem"
+source_commit = "43ae0211"
+[servers.ruby_lsp.gem]
+# 上游 ruby_lsp.py RUBY_LSP_VERSION；裸启动（上游 ProcessLaunchInfo 无参数）。
+gem = "ruby-lsp"
+version = "0.26.8"
+bin_rel = "ruby-lsp"
+
+[servers.solargraph]
+# ruby 语言路由归 ruby_lsp 条目，本条仅按 id 显式安装（避撞先例同 phpantom）。
+languages = ["solargraph"]
+install = "gem"
+source_commit = "43ae0211"
+[servers.solargraph.gem]
+# 上游 solargraph.py installCommand: gem install solargraph -v 0.51.1；启动 `solargraph stdio`。
+gem = "solargraph"
+version = "0.51.1"
+bin_rel = "solargraph"
+args = ["stdio"]
+
+# ---- F 类 source（2 条；要求构建工具链在 PATH；完整性锚 = pin，无产物级 sha256）----
+
+[servers.nixd]
+# 上游 nixd_ls.py 安装面 = nix-env/nix profile；本表以 flake 源码构建形态收录
+# （clone + nix build 单步）。Windows 无 Nix 支持（上游同）。
+languages = ["nix"]
+install = "source"
+source_commit = "43ae0211"
+[servers.nixd.source]
+repo = "https://github.com/nix-community/nixd"
+build_cmd = ["nix", "build"]
+bin_rel = "result/bin/nixd"
+
+[servers.crystalline_source]
+# crystalline 源码构建形态（任务示例：shards build；crystal 语言路由归 path_only 条目）。
+# 无上游版本 pin → 默认分支；无 source_commit（非 serena 上游安装形态）。
+languages = ["crystalline_source"]
+install = "source"
+[servers.crystalline_source.source]
+repo = "https://github.com/elbywan/crystalline"
+build_cmd = ["shards", "build", "--release"]
+bin_rel = "bin/crystalline"

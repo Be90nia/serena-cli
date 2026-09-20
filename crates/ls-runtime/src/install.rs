@@ -49,14 +49,17 @@ pub enum InstallKind {
         binary_name: String,
         install_hint: String,
     },
-    /// npm 类（§2.3）：`npm install --prefix {cache}/{id}/{version} <pkg>[@<ver>]`，
+    /// npm 类（§2.3）：`npm install --prefix {cache}/{id}/{version} <pkg>[@<ver>] ...`，
     /// 产物 = `node_modules/.bin/<bin_rel>`；`version=None` → latest（不锁版本）。
+    /// `secondary` = 同一次 install 追加的伴随包引用（如 typescript-language-server
+    /// 需要的 `typescript@5.9.3`，已含版本后缀的 `pkg[@ver]` 形态）。
     Npm {
         package: String,
         version: Option<String>,
         bin_rel: String,
         /// 启动时追加在 bin 之后的参数。
         npm_args: Option<Vec<String>>,
+        secondary: Vec<String>,
     },
     /// uvx 类（§2.5）：无安装步骤——`uvx --from <pkg>[==<ver>] <entrypoint> <args>`，
     /// uv 运行时自管缓存；PATH 无 `uvx` → NotInstalled + hint。
@@ -66,6 +69,34 @@ pub enum InstallKind {
         entrypoint: String,
         /// 启动时追加在 entrypoint 之后的参数。
         args: Option<Vec<String>>,
+    },
+    /// dotnet tool 类（§2.5）：`dotnet tool install --tool-path {cache}/{id}/{version}
+    /// <tool> [--version <ver>]`（上游 fsharp 适配器同形态——装进自有资源目录而非 -g 全局，
+    /// 便于按版本隔离与卸载）；产物 = `{dir}/<tool>[.exe]`。PATH 无 `dotnet` → MissingRuntime。
+    Dotnet {
+        tool: String,
+        version: Option<String>,
+        /// 启动时追加在 tool 之后的参数（如 fsautocomplete 的 LSP 开关）。
+        args: Option<Vec<String>>,
+    },
+    /// gem 类（§2.6）：`gem install --user-install --bindir {cache}/{id}/{version}/bin
+    /// <gem> [-v <ver>]`（gem 库体归 RubyGems 用户目录管，可执行物钉进本工具缓存，
+    /// 规避 ~/.gem/ruby/<ruby版本>/bin 的版本相关布局）；产物 = `{bindir}/<bin_rel>[.bat/.cmd]`。
+    Gem {
+        gem: String,
+        version: Option<String>,
+        bin_rel: String,
+        /// 启动时追加在 bin 之后的参数（如 solargraph 的 `stdio`）。
+        args: Option<Vec<String>>,
+    },
+    /// 源码构建类：`git clone --depth 1 <repo> src`（+ 可选 `--branch <pin>`）后
+    /// 在 clone 根执行单步 `build_cmd`，产物 = `src/<bin_rel>`。
+    /// 完整性锚 = pin（tag/branch）；无产物级 sha256（Δ A 类，如实记录）。
+    Source {
+        repo: String,
+        pin: Option<String>,
+        build_cmd: Vec<String>,
+        bin_rel: String,
     },
 }
 
@@ -144,9 +175,11 @@ impl DownloadInstaller {
                     install_cmd: None,
                 });
             }
-            InstallKind::Npm { .. } | InstallKind::Uvx { .. } => {
-                return Err(wrong_kind(spec));
-            }
+            InstallKind::Npm { .. }
+            | InstallKind::Uvx { .. }
+            | InstallKind::Dotnet { .. }
+            | InstallKind::Gem { .. }
+            | InstallKind::Source { .. } => return Err(wrong_kind(spec)),
         };
 
         let install_dir = ctx.cache_root.join(&spec.id).join(version);
