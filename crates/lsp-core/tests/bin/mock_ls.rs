@@ -35,6 +35,9 @@ struct Config {
     contentmodified_methods: HashSet<String>,
     contentmodified_fails: u32,
     send_server_requests: bool,
+    /// Phase 4 Task 22c：初始化后立刻发 `$/progress` 通知（token, kind="end"）。
+    /// e2e 测试用：让 client wait_for_progress 能等到真通知。
+    progress_token: Option<String>,
     /// 文档事件跟踪日志路径（Task 7）。设了就把 didOpen/didChange/didClose 追加写入。
     track_file_events: Option<std::path::PathBuf>,
     /// 开启后 capabilities 加 `diagnosticProvider: { ... }`，
@@ -42,6 +45,9 @@ struct Config {
     diagnostic_provider: bool,
     /// 开启后 `textDocument/diagnostic` 返 -32601 MethodNotFound（fallback 路径测试用）。
     diagnostic_unsupported: bool,
+    /// Phase 4 Task 22a：把收到的 `initialize` params 写到该路径（一行 JSON）。
+    /// supervisor monorepo 接线测试断言 workspaceFolders 数组。
+    log_initialize: Option<std::path::PathBuf>,
 }
 /// 各方法已回 ContentModified 次数（仅 `contentmodified_methods` 内的方法计入）。
 static CM_COUNT: LazyLock<std::sync::Mutex<HashMap<String, AtomicU32>>> =
@@ -63,6 +69,7 @@ fn load_config() -> Config {
         send_server_requests: std::env::var("MOCK_LS_SEND_SERVER_REQUESTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
+        progress_token: std::env::var("MOCK_LS_PROGRESS_TOKEN").ok(),
         track_file_events: std::env::var("MOCK_LS_TRACK_FILE_EVENTS")
             .ok()
             .map(std::path::PathBuf::from),
@@ -72,6 +79,30 @@ fn load_config() -> Config {
         diagnostic_unsupported: std::env::var("MOCK_LS_DIAGNOSTIC_UNSUPPORTED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
+        log_initialize: std::env::var("MOCK_LS_LOG_INITIALIZE")
+            .ok()
+            .map(std::path::PathBuf::from),
+    }
+}
+
+/// 把 initialize params 写到测试日志路径（Task 22a monorepo 接线断言用）。
+/// 写失败 tracing::warn —— 不致命，测试失败可定位为「mock_ls 没收到 initialize」
+/// vs 「supervisor 没构造 workspaceFolders」。
+async fn log_initialize(log_path: &Option<std::path::PathBuf>, msg: &JsonRpc) {
+    let Some(path) = log_path else {
+        return;
+    };
+    let params = msg.params.clone().unwrap_or(Value::Null);
+    let line = match serde_json::to_string(&params) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(?e, "log_initialize serialize failed");
+            return;
+        }
+    };
+    match tokio::fs::write(path, line).await {
+        Ok(()) => {}
+        Err(e) => tracing::warn!(?e, path = ?path.display(), "log_initialize write failed"),
     }
 }
 
@@ -148,6 +179,12 @@ async fn main() {
             // 路径会丢；这里按方法名前缀判断追加写日志。
             track_event(&config.track_file_events, &msg).await;
 
+            // Phase 4 Task 22a：把 initialize params 写到测试日志路径，
+            // 断言 supervisor 端构造的 workspaceFolders 数组形态。
+            if !initialized && msg.method.as_deref() == Some("initialize") {
+                log_initialize(&config.log_initialize, &msg).await;
+            }
+
             // silent 方法不回执
             let is_silent = msg
                 .method
@@ -220,6 +257,23 @@ async fn main() {
 
             if msg.method.as_deref() == Some("initialize") {
                 initialized = true;
+            }
+
+            // Phase 4 Task 22c：发 `$/progress` 通知（kind="end"，模拟 LS 完成）。
+            if let Some(token) = &config.progress_token
+                && msg.method.as_deref() == Some("initialize")
+            {
+                let progress = JsonRpc::notification(
+                    "$/progress",
+                    json!({
+                        "token": token,
+                        "value": { "kind": "end", "message": "mock_ls progress done" },
+                    }),
+                );
+                if stdout.write_all(&encode(&progress)).await.is_err() {
+                    return;
+                }
+                let _ = stdout.flush().await;
             }
 
             if msg.method.as_deref() == Some("exit") {

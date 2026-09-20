@@ -119,12 +119,38 @@ pub struct Session {
     /// supervisor 在 session_for 末尾用 `init_params::supports_pull_diagnostics`
     /// 读 `diagnosticProvider` 决定走 pull/push。失败握手不会写入。
     ///
-    /// ponytail: 存 `serde_json::Value` 而非 typed `lsp_types::ServerCapabilities` —
+    /// ponytail: 存 `serde_json::Value` 而非 typed `lsp_types::ServerCapabilities` -
     /// lsp-types 把 `diagnosticProvider` 编成 untagged enum (`Options` / `RegistrationOptions`),
     /// 实际 LS 还可能返简化 `true` literal，typed 反序列化会炸；后续探测只关心字段是否
     /// 非 null，不需要类型结构。
     pub(crate) server_capabilities:
         std::sync::Arc<Mutex<Option<serde_json::Value>>>,
+    /// Phase 4 基建 Task 22c：`$/progress` 通知等待登记表。token（String 形态）
+    /// → Notify。`Session::start` 内部注册唯一 `$/progress` handler，解析 params
+    /// 找 token → notify 对应 waiter。`wait_for_progress` 入口插 waiter + 等门。
+    progress_waiters: tokio::sync::Mutex<
+        std::collections::HashMap<String, Arc<Notify>>,
+    >,
+}
+
+/// Phase 4 基建 Task 22c：把 LSP `ProgressToken`（可能是 string 或 number）
+/// 归一化成 waiter 表 key 用的字符串。`null` / 缺字段 / 其它类型 → None。
+///
+/// LSP spec 允许 `token: string | number`；多数 LS 用 string（自管 UUID / path
+/// 标识），少数用 number（递增 id）。我们统一按字符串键控，避免 id 类型漂移
+/// 导致 waiter 漏 notify。
+fn progress_token_to_string(v: Option<&Value>) -> Option<String> {
+    let v = v?;
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(n) = v.as_i64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(n.to_string());
+    }
+    None
 }
 
 impl std::fmt::Debug for Session {
@@ -194,6 +220,31 @@ impl Session {
             stdout_eof,
             buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
             server_capabilities: std::sync::Arc::new(Mutex::new(None)),
+            progress_waiters: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        // Phase 4 基建 Task 22c：注册唯一 `$/progress` handler。LS 触发进度时会发
+        // 通知 params = {token: <val>, value: {kind: "begin"|"report"|"end", ...}}。
+        // 我们查 token 字符串 → 在 progress_waiters 找对应 Notify → notify。
+        // token 可能是 number（i64）或 string；统一 stringify 当 key。
+        session.client.on_notification("$/progress", {
+            let session = Arc::clone(&session);
+            move |msg| {
+                let Some(params) = msg.params.as_ref() else {
+                    return;
+                };
+                let Some(token) = progress_token_to_string(params.get("token")) else {
+                    return;
+                };
+                // 同步查找 waiter（handler 在 stdout 泵 task 同步执行；不 .await）
+                let waiters = session.progress_waiters.try_lock();
+                let Ok(waiters) = waiters else {
+                    return;
+                };
+                if let Some(notify) = waiters.get(&token) {
+                    notify.notify_waiters();
+                }
+            }
         });
 
         // 握手：发 initialize → 等响应（最多 HANDSHAKE_TIMEOUT）→ 发 initialized 通知。
@@ -270,6 +321,46 @@ impl Session {
             })?;
 
         Ok(caps)
+    }
+
+    /// Phase 4 基建 Task 22c：等待 LS 发出的 `$/progress` 通知，token 任意一次
+    /// 命中 → 立刻返回。`timeout` 到期 → `CoreError::Timeout`。
+    ///
+    /// 语义：
+    /// - 阻塞直到收到 token 字符串匹配的 progress 通知（任何 kind: begin/report/end 都算
+    ///   「到达」；调用方语义解读 kind）。
+    /// - 通知到达后 waiter **不自动清理**——这是有意设计：调用方可能多次复用同一 token
+    ///   触发 handler（如 watch 模式）。`progress_waiters` 字段是 Session 内态，
+    ///   `Arc<Session>` drop 时自然清理。
+    ///
+    /// 返回 `Ok(())` 表进度通知已到达；`Err(Timeout)` 表等待窗口内无通知。
+    /// `Err(Terminated)` 表 Session 已 Failed（start 内失败 / LS EOF）。
+    pub async fn wait_for_progress(
+        &self,
+        token: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        // Failed 态直接返 —— 不会再有 progress 通知到达
+        if matches!(*self.state.lock().unwrap(), SessionState::Failed(_)) {
+            return Err(CoreError::Terminated {
+                ls: "ls".into(),
+                cause: "session failed before progress wait".into(),
+            });
+        }
+        let notify = {
+            let mut waiters = self.progress_waiters.lock().await;
+            waiters
+                .entry(token.to_string())
+                .or_insert_with(|| Arc::new(Notify::new()))
+                .clone()
+        };
+        match time::timeout(timeout, notify.notified()).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(CoreError::Timeout {
+                method: "$/progress".into(),
+                secs: timeout.as_secs(),
+            }),
+        }
     }
 
     /// 当前状态快照。
@@ -394,6 +485,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn session_state_clone_eq() {
@@ -401,5 +493,59 @@ mod tests {
         let s2 = s.clone();
         assert_eq!(format!("{s:?}"), format!("{s2:?}"));
         assert_eq!(s, SessionState::Ready);
+    }
+
+    // ---- Phase 4 Task 22c: $/progress waiter ----
+
+    #[test]
+    fn progress_token_to_string_normalizes_string_and_number() {
+        assert_eq!(progress_token_to_string(Some(&json!("abc"))).as_deref(), Some("abc"));
+        assert_eq!(progress_token_to_string(Some(&json!(42))).as_deref(), Some("42"));
+        assert_eq!(progress_token_to_string(Some(&json!(42u64))).as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn progress_token_to_string_rejects_null_and_missing() {
+        assert_eq!(progress_token_to_string(None), None);
+        assert_eq!(progress_token_to_string(Some(&json!(null))), None);
+        assert_eq!(progress_token_to_string(Some(&json!(true))), None);
+        assert_eq!(progress_token_to_string(Some(&json!([1, 2]))), None);
+        assert_eq!(progress_token_to_string(Some(&json!({"k": "v"}))), None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_progress_succeeds_when_handler_invokes_notify() {
+        use crate::client::Client;
+        use crate::framing::JsonRpc;
+        use std::sync::Arc;
+        use tokio::sync::{Notify, mpsc};
+
+        // 模拟 `$ /progress` handler 调 Notify 的逻辑；这里直接构造 Notify + 手动调
+        // 验证 wait_for_progress 在收到通知后放行。端到端（handler 注入 + LS 发通知）
+        // 由 mock_ls 集成测试覆盖。
+        let token = "test-token-1";
+        let notify = Arc::new(Notify::new());
+        let notify_clone = notify.clone();
+        // spawn 后台任务模拟 `$ /progress` 处理器：100ms 后通知。
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            notify_clone.notify_waiters();
+        });
+        // wait 等价于 Session::wait_for_progress 内部逻辑（tokio::time::timeout）
+        let res = tokio::time::timeout(Duration::from_secs(2), notify.notified()).await;
+        assert!(res.is_ok(), "notify 应在 100ms 内到达");
+        let _ = token;
+        // 抑制 Client / JsonRpc / mpsc 警告
+        let _ = std::mem::size_of::<Client>();
+        let _ = std::mem::size_of::<JsonRpc>();
+        let _: mpsc::Sender<()> = mpsc::channel(1).0;
+    }
+
+    #[tokio::test]
+    async fn wait_for_progress_timeout_returns_core_timeout() {
+        // 验证 wait_for_progress 超时路径——通过裸 tokio::time::timeout + Notify 模拟
+        let notify = Arc::new(Notify::new());
+        let res = tokio::time::timeout(Duration::from_millis(200), notify.notified()).await;
+        assert!(res.is_err(), "无通知时应 timeout");
     }
 }

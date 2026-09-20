@@ -8,3 +8,4 @@ pub mod recording;
 pub mod session;
 pub mod transport;
 pub mod types;
+pub mod workspace_folders;
