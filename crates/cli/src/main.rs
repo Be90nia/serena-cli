@@ -234,6 +234,9 @@ enum Cmd {
     Status,
     /// 停掉 daemon（draining + 删 lock）。
     StopAll,
+    /// 安装 servers.toml 配置驱动 LS（PATH 探测 → 下载 → sha256 校验 → 落地缓存）。
+    /// 手写 T2 语言（rust/python/...）不在此列——按各 LS 官方方式安装。
+    Install { lang: String },
     /// 长连接 shell（stdin/stdout JSONL）。Task 18。
     Shell,
 }
@@ -270,6 +273,13 @@ async fn main() -> ExitCode {
     match &cli.cmd {
         Some(Cmd::Status) => return cmd_status(&lock_path).await,
         Some(Cmd::StopAll) => return cmd_stop_all(&lock_path).await,
+        // install 内部自建 blocking runtime（下载），必须在阻塞线程跑。
+        Some(Cmd::Install { lang }) => {
+            let lang = lang.clone();
+            return tokio::task::spawn_blocking(move || cmd_install(&lang))
+                .await
+                .unwrap_or(ExitCode::from(3));
+        }
         Some(Cmd::Shell) => {}
         _ => {}
     }
@@ -463,6 +473,7 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
     // 工具名与 args 组装。
     let (tool, args): (&str, serde_json::Value) = match &cli.cmd {
+        // 本地管理命令已在 main 提前 return；到达此处即编程错误。
         Some(Cmd::Overview { file }) => ("overview", json!({"file": file})),
         Some(Cmd::SymbolTree { dir, max_files }) => (
             "symbol-tree",
@@ -676,7 +687,11 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
                 "col": col,
             }),
         ),
-        Some(Cmd::Status) | Some(Cmd::StopAll) | Some(Cmd::Shell) | None => {
+        Some(Cmd::Status)
+        | Some(Cmd::StopAll)
+        | Some(Cmd::Install { .. })
+        | Some(Cmd::Shell)
+        | None => {
             unreachable!("handled earlier")
         }
     };
@@ -720,6 +735,30 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
             std::process::exit(i32::from(
                 code.map_or(1u8, daemon::dto::wire_error_code_to_exit),
             ));
+        }
+    }
+}
+
+/// `install` 子命令（Task 21）：配置驱动 LS 安装（幂等——已装即返回路径）。
+fn cmd_install(lang: &str) -> ExitCode {
+    match ls_registry::config::ensure_launch(lang, None, true, false) {
+        Ok((exe, args)) => {
+            // args = expand_exec 完整 argv（首元素即 exe）。
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "lang": lang,
+                    "exe": exe.display().to_string(),
+                    "cmd": args,
+                }))
+                .unwrap_or_default()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("install failed: {msg}");
+            ExitCode::from(3)
         }
     }
 }

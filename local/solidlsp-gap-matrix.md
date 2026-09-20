@@ -1,8 +1,8 @@
 # SolidLSP 缺口矩阵（本项目 vs 上游 @43ae0211）
 
 > 锚: `oraios/serena@43ae0211`。上游 API 面见 `local/solidlsp-upstream-api.md`；适配器安装机制见 `local/upstream-ls-catalog.md`。
-> 本项目事实基线：lsp-core 通用 `Session::request(method, params, timeout)` 字符串驱动（无类型化 facade）；supervisor 23+ 个 tool 分支；CLI 透传 25 名单。
-> 核对日期：2026-09-16（phase 0/2/3 修复后更新）。
+> 本项目事实基线：lsp-core 通用 `Session::request(method, params, timeout)` 字符串驱动（无类型化 facade）；supervisor 23+ 个 tool 分支；CLI 透传 33 子命令（29 工具 + status/stop-all/shell/install）。
+> 核对日期：2026-09-20（Task 18/19/21 下载安装基建 + 双路径后更新）。
 
 ## 1. 上游 wrapped method × 本项目状态（语言无关——lsp-core 透传，单列）
 
@@ -74,21 +74,27 @@
 | P1 | ToolError::Launch 兜底误映射 | 错误分类 | **已修**（现 grep 仅 2 处且都用于 spawn 失败，非 retryable 误映射） |
 | P2 | sha256 URL 矩阵占位假值 | ls-runtime/deps.rs | **接受现状**（MVP download 流程未实装） |
 
-## 4. 总账（phase 0/2/3 + 深化轮后，2026-09-19）
+## 4. 总账（Task 18/19/21 后，2026-09-20）
 
 - ✅ **根基加固（10 commit）**：completion 接线、5 wrapper tools、cold-start 探针真实文件、文档符号缓存、per-LS 就绪等待、ignore spec
 - ✅ **深化轮（4 commit，2026-09-19）**：rust_demo Cargo.toml workspace mode（冷启动 89s→5s）、TS 适配器 tsconfig 探针+ATA、rust-analyzer 三级查找链、symbol-tree 跨文件符号树
 - ✅ **上游 wrapper 面价值高的缺口**：**全部补完**（completion / signatureHelp / containing/defining symbol / 文档符号缓存 / 诊断 generation / 诊断 pull / per-LS 就绪等待 / 跨文件符号树）
+- ✅ **下载安装基建（Task 18/19/21，2026-09-20）**：install.rs 下载流（三件套：临时包/预检/zip-slip 防护）+ rust-analyzer 4 平台真值矩阵 + servers.toml schema（marksman/crystalline 首批）+ ConfigAdapter（§4 override 优先级 CLI>config>默认）+ CLI `install` 命令 + supervisor session_for 双路径（T2 adapter 优先 → T0 ensure_launch）
+- ✅ **双路径 e2e 实证（2026-09-20）**：`install marksman` 幂等安装（20.5MB 真下载+sha256）→ `--direct overview readme.md` 经 T0 路径拉起 marksman `server` 子命令 → documentSymbol 返回符号（8s 冷启动）
 - ⚠️ **适配器缺口**：66 个未落地；既有 7 个中 rust/TS 已升级（T0.5），其余 5 个仍 T0 浅壳（**接受**——用户语言驱动）
-- ⚠️ **infra 缺口**：sha256 URL 矩阵占位假值（**接受**——download 流程未实装，Step 4 YAGNI 跳过）、additional workspace、全局 timeout
+- ⚠️ **infra 缺口**：additional workspace folders、全局 timeout（**接受**）
 - ⚠️ **测量纪律**：CLI e2e 一律 bash 完整重定向；powershell `-First N` 断管道会产生"挂死"伪影（详见 plan Phase 6）
+
+### 覆盖率核算（PLAN M3 ≥75% 闸）
+
+口径：上游 39 工具，jetbrains_tools 不计 → 可做 ~35。本项目工具面 29/35 ≈ **83% ≥ 75% 达标**（缺口 = Memory×5 / 项目管理类，均为 serena 容器语境功能，CLI 形态刻意不做）。
 
 ## 5. 后续路线建议
 
 按 ROI 排序：
-- ~~P1: 真 download 流程 + sha256 真值替换占位~~ **Task 18 已落地**（commit 0906842，2026-09-20）：install.rs 下载流（§5 三件套）+ rust-analyzer 4 平台真值矩阵；clangd sha 留空（无官方来源 → UnsignedRefused）；adapter 集成与 CLI install 命令归 Task 19/21
-- P1: Task 19 servers.toml schema + ConfigAdapter（ServerSpec→InstallSpec 映射 + override 优先级）
-- P1: Task 21 根发现 + SKIP + install 命令 + 双路径（adapter 查找链尾接 download 在此闭环）
+- ~~P1: 真 download 流程~~ **Task 18/19/21 已闭环**（commits 0906842/28fac4e/Task21，2026-09-20）
+- ~~P1: Task 21 双路径~~ **已落地**（session_for T2→T0 接线 + CLI install + marksman e2e PASS）
+- P2: Task 20 残余——servers.toml 73 LS 批量收录（纯数据工作，机制已验证）
 - P2: 适配器 quirk 深度剩余项（clangd compile_commands / pyright venv / gopls go.work）
 - P2: 7 语言 smoke CI（需 CI 装 LS）
 - P3: additional workspace folders（monorepo 支持）

@@ -12,7 +12,7 @@
 languages = ["markdown"]
 extensions = [".md", ".markdown"]
 install = "download"
-exec = ["{bin}", "lsp"]
+exec = ["{bin}", "server"]
 source_commit = "43ae0211"
 
 [servers.marksman.download]

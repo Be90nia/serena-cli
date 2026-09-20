@@ -370,23 +370,45 @@ impl Supervisor {
             self.instances.lock().unwrap().remove(&key);
         }
 
-        let adapter = ls_registry::adapter_for(lang).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("unknown language: {lang}"),
-        })?;
+        // 双路径（Task 21）：手写 T2 adapter 优先；servers.toml 条目（T0 配置驱动）
+        // 走 config::ensure_launch——PATH 探测 / 安装缓存命中，永不触网（auto_install=false，
+        // design §0 路径 A；显式下载走 CLI `install` 命令）。
         let ctx = ls_adapters::ProjectCtx {
             project_root: key.root.clone(),
         };
-        let launch = adapter.launch_info(&ctx).await.map_err(|e| {
-            let msg = format!("{e:#}");
-            if msg.contains("not found in PATH") {
-                ToolError::NotInstalled {
-                    language: lang.to_string(),
-                    hint: extract_install_hint(&msg),
+        let t2 = ls_registry::adapter_for(lang);
+        let launch = match &t2 {
+            Some(adapter) => adapter.launch_info(&ctx).await.map_err(|e| {
+                let msg = format!("{e:#}");
+                if msg.contains("not found in PATH") {
+                    ToolError::NotInstalled {
+                        language: lang.to_string(),
+                        hint: extract_install_hint(&msg),
+                    }
+                } else {
+                    ToolError::Launch(e)
                 }
-            } else {
-                ToolError::Launch(e)
+            })?,
+            None => {
+                if ls_registry::config::spec_for(lang).is_none() {
+                    return Err(ToolError::BadArgs {
+                        detail: format!("unknown language: {lang}"),
+                    });
+                }
+                let (_, args) = ls_registry::config::ensure_launch(lang, None, false, false)
+                    .map_err(|msg| ToolError::NotInstalled {
+                        language: lang.to_string(),
+                        hint: msg,
+                    })?;
+                // expand_exec 返回完整 argv（exec 模板首元素即 {bin}）。
+                ls_runtime::process::LaunchInfo {
+                    cmd: args.into_iter().map(Into::into).collect(),
+                    cwd: key.root.clone(),
+                    env: Vec::new(),
+                    transport: ls_runtime::process::TransportKind::Stdio,
+                }
             }
-        })?;
+        };
         let child = ls_runtime::process::Child::spawn(launch)
             .map_err(|e| ToolError::Launch(anyhow::anyhow!("runtime spawn error: {e}")))?;
         let mut params = base_initialize_params();
@@ -411,7 +433,11 @@ impl Supervisor {
                 .unwrap_or("root")
                 .to_string(),
         }]);
-        adapter.initialize_patches(&mut params);
+        // T0 配置驱动路径无手写 adapter：无 initialize_patches（servers.toml 已含
+        // 初始化形态）、无 set_project_root / on_server_ready 特判探针。
+        if let Some(adapter) = &t2 {
+            adapter.initialize_patches(&mut params);
+        }
 
         let session = Session::start(Some(child), params).await?;
         // 注册 publishDiagnostics handler → 写 diag_cache + 累 generation。
@@ -452,11 +478,18 @@ impl Supervisor {
         // 推到 session_for 内，避免用户可见的首请求 = 索引懒加载。探针必须用
         // root 下真实文件（虚拟 URI 不触发项目索引 —— cold-start hang 根因，
         // 详见 local/cold-start-hang-diagnosis.md），故先告知 adapter 项目 root。
-        adapter.set_project_root(&key.root);
-        if let Err(e) =
-            tokio::time::timeout(Duration::from_secs(30), adapter.on_server_ready(&session)).await
-        {
-            tracing::warn!(adapter = adapter.id(), error = %e, "on_server_ready probe failed/timed out; continuing");
+        // T0 配置驱动路径无 adapter 特判探针——工具层 wait_for_index（3.2）的
+        // documentSymbol 通用探针仍然生效。
+        if let Some(adapter) = &t2 {
+            adapter.set_project_root(&key.root);
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_secs(30),
+                adapter.on_server_ready(&session),
+            )
+            .await
+            {
+                tracing::warn!(adapter = adapter.id(), error = %e, "on_server_ready probe failed/timed out; continuing");
+            }
         }
 
         // 写一次、读多次；错就当不支持（fallback push 与 2.4 之前等价）。
@@ -1388,14 +1421,14 @@ impl Supervisor {
         //    给过期/错位 range —— replace-body 错位的根因。先 didOpen + documentSymbol
         //    探针等就绪再进写门；探针超时只 warn 不阻断（回退契约同 on_server_ready）。
         let _probe_open = session.ensure_open(&path).await.map_err(ToolError::Core)?;
-        let adapter = ls_registry::adapter_for(lang.as_str()).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("unknown language: {lang}"),
-        })?;
-        if let Err(e) = tokio::time::timeout(
-            INDEX_WAIT_TIMEOUT,
-            adapter.wait_for_index(&session, &path, INDEX_WAIT_TIMEOUT),
-        )
-        .await
+        // T0 配置驱动语言无手写 adapter：wait_for_index trait 默认实现等价于通用
+        // documentSymbol 探针，此处无 adapter 就跳过特判等待（不报错）。
+        if let Some(adapter) = ls_registry::adapter_for(lang.as_str())
+            && let Err(e) = tokio::time::timeout(
+                INDEX_WAIT_TIMEOUT,
+                adapter.wait_for_index(&session, &path, INDEX_WAIT_TIMEOUT),
+            )
+            .await
         {
             tracing::warn!(
                 adapter = adapter.id(),
@@ -1672,15 +1705,13 @@ impl Supervisor {
 
         // 索引等待（PLAN Phase 3.2）：cold-start 下未索引的 LS 会让 prepareRename /
         // rename 打满 TOOL_TIMEOUT —— 30s 超时的根因。探针就绪后才进写门；探针超时
-        // 只 warn 不阻断（回退契约同 on_server_ready）。
-        let adapter = ls_registry::adapter_for(lang.as_str()).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("unknown language: {lang}"),
-        })?;
-        if let Err(e) = tokio::time::timeout(
-            INDEX_WAIT_TIMEOUT,
-            adapter.wait_for_index(&session, &path, INDEX_WAIT_TIMEOUT),
-        )
-        .await
+        // 只 warn 不阻断（回退契约同 on_server_ready）。T0 无 adapter → 跳过特判等待。
+        if let Some(adapter) = ls_registry::adapter_for(lang.as_str())
+            && let Err(e) = tokio::time::timeout(
+                INDEX_WAIT_TIMEOUT,
+                adapter.wait_for_index(&session, &path, INDEX_WAIT_TIMEOUT),
+            )
+            .await
         {
             tracing::warn!(
                 adapter = adapter.id(),
@@ -3537,12 +3568,16 @@ mod symbol_cache_tests {
         }
     }
 
-    /// cache 命中：同 file 二次 overview 命中返 <1ms（命中路径不拉 LS）。
+    /// cache 命中：同 file 二次 overview 命中不拉 LS（首跑 warmup 后 <1ms；
+    /// 冷 page cache 首测可到几 ms——断言只保护"命中路径 vs LS 往返秒级"的量级差）。
     #[tokio::test]
     async fn overview_cache_hit_returns_under_1ms() {
         let sup = Supervisor::direct().await.unwrap();
         let root = Path::new("Z:/no/such/project");
         sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs"), vec![hit("main")]);
+
+        // warmup：预热 LazyLock / 代码路径，排除首次抖动。
+        let _ = sup.tool_overview(root, "a.rs", Some("rust")).await.unwrap();
 
         let t0 = Instant::now();
         let out = sup.tool_overview(root, "a.rs", Some("rust")).await.unwrap();
@@ -3666,7 +3701,7 @@ mod symbol_cache_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
-        std::fs::write(dir.path().join("note.md"), "# doc\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "not source\n").unwrap();
         let nm = dir.path().join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         std::fs::write(nm.join("dep.rs"), "fn dep() {}\n").unwrap();
@@ -3679,7 +3714,7 @@ mod symbol_cache_tests {
             .tool_symbol_tree(root, ".", Some("rust"), 200)
             .await
             .unwrap();
-        assert_eq!(tree["files_scanned"], 2, "node_modules/note.md 必须被过滤: {tree}");
+        assert_eq!(tree["files_scanned"], 2, "node_modules/notes.txt 必须被过滤: {tree}");
         assert_eq!(tree["truncated"], false);
         let entries = tree["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2, "两文件各有符号条目: {tree}");

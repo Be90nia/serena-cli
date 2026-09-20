@@ -36,6 +36,8 @@ const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("cxx", LanguageId::Cpp),
     ("h", LanguageId::Cpp),
     ("hpp", LanguageId::Cpp),
+    // Markdown（T0 配置驱动：servers.toml marksman，Task 21 双路径）
+    ("md", LanguageId::Markdown),
     // Rust
     ("rs", LanguageId::Rust),
     // Python

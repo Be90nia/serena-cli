@@ -62,13 +62,18 @@ fn str_list(v: Option<&toml::Value>) -> Option<Vec<String>> {
         .collect()
 }
 
-/// 语言 → (id, spec)（`languages` 数组含 lang 即命中；手写 T2 语言不在表内 → None，
-/// supervisor 沿用 `adapter_for` 既有硬编码路径）。
-pub fn spec_for(lang: &str) -> Option<(&'static str, &'static ServerSpec)> {
+/// 按 id 或语言名查找（`languages` 数组含 lang，或 id 精确匹配——`cli install
+/// marksman` 用 id，session_for 传语言名，双语义一函数）。手写 T2 语言不在表内。
+pub fn spec_for(lang_or_id: &str) -> Option<(&'static str, &'static ServerSpec)> {
     SERVERS
         .servers
         .iter()
-        .find(|(_, s)| s.languages.iter().any(|l| l.eq_ignore_ascii_case(lang)))
+        .find(|(id, s)| {
+            id.eq_ignore_ascii_case(lang_or_id)
+                || s.languages
+                    .iter()
+                    .any(|l| l.eq_ignore_ascii_case(lang_or_id))
+        })
         .map(|(k, v)| (k.as_str(), v))
 }
 

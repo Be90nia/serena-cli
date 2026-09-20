@@ -17,6 +17,7 @@ daemon = { path = "../daemon" }
 reqwest = { workspace = true }
 serde.workspace = true
 supervisor = { path = "../supervisor" }
+ls-registry = { path = "../ls-registry" }
 tokio.workspace = true
 dunce.workspace = true
 
