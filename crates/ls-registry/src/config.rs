@@ -152,8 +152,11 @@ pub fn to_install_spec(
     }
 }
 
-/// 展开占位符模板：`{bin}` → exe 路径。
+/// 展开占位符模板：`{bin}` → exe 路径；空模板默认 `[{bin}]`（裸启动即 stdio LS）。
 pub fn expand_exec(exec: &[String], bin: &Path) -> Vec<String> {
+    if exec.is_empty() {
+        return vec![bin.to_string_lossy().to_string()];
+    }
     exec.iter()
         .map(|a| {
             if a == "{bin}" {
@@ -335,6 +338,8 @@ mod tests {
     fn expand_exec_substitutes_bin_placeholder() {
         let out = expand_exec(&["{bin}".into(), "lsp".into()], Path::new("D:/x/marksman.exe"));
         assert_eq!(out, vec!["D:/x/marksman.exe", "lsp"]);
+        // 空模板 = 裸启动默认 [{bin}]（G 类 path_only 批量条目形态）。
+        assert_eq!(expand_exec(&[], Path::new("D:/x/zls.exe")), vec!["D:/x/zls.exe"]);
     }
 
     /// A 类全链路（真下载，门控）：spec → InstallSpec → DownloadInstaller → bin 落地。

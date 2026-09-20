@@ -45,3 +45,109 @@ source_commit = "43ae0211"
 [servers.crystalline.path_only]
 binary_name = "crystalline"
 install_hint = "install crystalline (https://github.com/elbywan/crystalline) and ensure it is on PATH"
+
+# ---- G 类 path_only 批量收录（Task 20；上游 18 条中 14 条进表）----
+# 跳过：gopls/rust-analyzer/pyright（手写 T2 已接管）、wolfram/perl/r（启动形态特殊，
+# 需运行时参数调研，按需补）。exec 省略 = 裸启动 `[{bin}]`（stdio LS 默认形态）。
+# 注：跳过的 T2 语言扩展名探测已由 ls-registry EXT_TABLE 接管；本批语言入
+# session_for 需 EXT_TABLE/LanguageId 扩展（按需做），install 命令立即可用。
+
+[servers.ccls]
+languages = ["cpp"]
+install = "path_only"
+source_commit = "43ae0211"
+[servers.ccls.path_only]
+binary_name = "ccls"
+install_hint = "install ccls via system package manager (apt/dnf/pacman/brew/choco) and ensure it is on PATH"
+
+[servers.deno]
+languages = ["deno", "typescript"]
+install = "path_only"
+exec = ["{bin}", "lsp"]
+source_commit = "43ae0211"
+[servers.deno.path_only]
+binary_name = "deno"
+install_hint = "install deno CLI (https://deno.com) and ensure it is on PATH"
+
+[servers.erlang_ls]
+languages = ["erlang"]
+install = "path_only"
+source_commit = "43ae0211"
+[servers.erlang_ls.path_only]
+binary_name = "erlang_ls"
+install_hint = "install erlang_ls (https://github.com/erlang-ls/erlang_ls) and ensure it is on PATH"
+
+[servers.gleam]
+languages = ["gleam"]
+install = "path_only"
+exec = ["{bin}", "lsp"]
+source_commit = "43ae0211"
+[servers.gleam.path_only]
+binary_name = "gleam"
+install_hint = "install gleam (https://gleam.run) and ensure it is on PATH"
+
+[servers.haskell_ls]
+languages = ["haskell"]
+install = "path_only"
+source_commit = "43ae0211"
+[servers.haskell_ls.path_only]
+binary_name = "haskell-language-server-wrapper"
+install_hint = "install haskell-language-server via ghcup/stack/cabal/brew"
+
+[servers.jedi]
+languages = ["python"]
+install = "path_only"
+source_commit = "43ae0211"
+[servers.jedi.path_only]
+binary_name = "jedi-language-server"
+install_hint = "pip install jedi-language-server and ensure it is on PATH"
+
+[servers.lean4]
+languages = ["lean"]
+install = "path_only"
+exec = ["{bin}", "--server"]
+source_commit = "43ae0211"
+[servers.lean4.path_only]
+binary_name = "lean"
+install_hint = "install lean via elan (https://lean-lang.org/lean4/doc/setup.html)"
+
+[servers.ocamllsp]
+languages = ["ocaml"]
+install = "path_only"
+source_commit = "43ae0211"
+[servers.ocamllsp.path_only]
+binary_name = "ocamllsp"
+install_hint = "opam install ocaml-lsp-server"
+
+[servers.qmlls]
+languages = ["qml"]
+install = "path_only"
+source_commit = "43ae0211"
+[servers.qmlls.path_only]
+binary_name = "qmlls"
+install_hint = "install Qt 6 (qmlls ships with Qt) and ensure it is on PATH"
+
+[servers.regal]
+languages = ["rego"]
+install = "path_only"
+exec = ["{bin}", "workspace", "lsp"]
+source_commit = "43ae0211"
+[servers.regal.path_only]
+binary_name = "regal"
+install_hint = "install regal (https://docs.styra.com/regal) and ensure it is on PATH"
+
+[servers.sourcekit_lsp]
+languages = ["swift"]
+install = "path_only"
+source_commit = "43ae0211"
+[servers.sourcekit_lsp.path_only]
+binary_name = "sourcekit-lsp"
+install_hint = "install Xcode / Swift toolchain (sourcekit-lsp ships with it)"
+
+[servers.zls]
+languages = ["zig"]
+install = "path_only"
+source_commit = "43ae0211"
+[servers.zls.path_only]
+binary_name = "zls"
+install_hint = "install zls (https://github.com/zigtools/zls) and zig; ensure both are on PATH"

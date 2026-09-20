@@ -80,6 +80,7 @@
 - ✅ **深化轮（4 commit，2026-09-19）**：rust_demo Cargo.toml workspace mode（冷启动 89s→5s）、TS 适配器 tsconfig 探针+ATA、rust-analyzer 三级查找链、symbol-tree 跨文件符号树
 - ✅ **上游 wrapper 面价值高的缺口**：**全部补完**（completion / signatureHelp / containing/defining symbol / 文档符号缓存 / 诊断 generation / 诊断 pull / per-LS 就绪等待 / 跨文件符号树）
 - ✅ **下载安装基建（Task 18/19/21，2026-09-20）**：install.rs 下载流（三件套：临时包/预检/zip-slip 防护）+ rust-analyzer 4 平台真值矩阵 + servers.toml schema（marksman/crystalline 首批）+ ConfigAdapter（§4 override 优先级 CLI>config>默认）+ CLI `install` 命令 + supervisor session_for 双路径（T2 adapter 优先 → T0 ensure_launch）
+- ✅ **G 类 path_only 批量收录（Task 20，2026-09-20）**：13 条新收录（ccls/deno/erlang_ls/gleam/haskell_ls/jedi/lean4/ocamllsp/qmlls/regal/sourcekit_lsp/zls + 既有 crystalline = 14/18）；exec 省略 = 裸启动默认；跳过 gopls/rust-analyzer/pyright（T2 接管）与 wolfram/perl/r（启动形态特殊按需补）；A 类 27 条不做（URL/sha256 逐条调研非纯数据，按用户语言需求添加）；B/C/D/E 类需 schema 扩展（npm/uvx/dotnet/gem 安装器）
 - ✅ **双路径 e2e 实证（2026-09-20）**：`install marksman` 幂等安装（20.5MB 真下载+sha256）→ `--direct overview readme.md` 经 T0 路径拉起 marksman `server` 子命令 → documentSymbol 返回符号（8s 冷启动）
 - ⚠️ **适配器缺口**：66 个未落地；既有 7 个中 rust/TS 已升级（T0.5），其余 5 个仍 T0 浅壳（**接受**——用户语言驱动）
 - ⚠️ **infra 缺口**：additional workspace folders、全局 timeout（**接受**）

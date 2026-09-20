@@ -20,10 +20,13 @@ pub struct ServersToml {
 #[derive(Debug, Deserialize)]
 pub struct ServerSpec {
     pub languages: Vec<String>,
+    /// 文件扩展名（信息性；文件探测实际归 ls-registry EXT_TABLE，path_only 可省）。
+    #[serde(default)]
     pub extensions: Vec<String>,
     /// download | path_only（npm/uvx/... Task 20 扩）
     pub install: String,
-    /// 含 `{bin}` 占位符的启动模板（如 `["{bin}", "lsp"]`）。
+    /// 含 `{bin}` 占位符的启动模板（如 `["{bin}", "lsp"]`）；省略 = 裸启动 `[{bin}]`。
+    #[serde(default)]
     pub exec: Vec<String>,
     pub download: Option<DownloadSpec>,
     pub path_only: Option<PathOnlySpec>,
@@ -115,9 +118,7 @@ fn validate(id: &str, spec: &ServerSpec) -> Result<(), String> {
     if spec.languages.is_empty() {
         return Err(format!("[servers.{id}]: languages must not be empty"));
     }
-    if spec.exec.is_empty() {
-        return Err(format!("[servers.{id}]: exec must not be empty"));
-    }
+    // exec 可空 = 裸启动默认（expand_exec 空模板 → [{bin}]）。
     Ok(())
 }
 
