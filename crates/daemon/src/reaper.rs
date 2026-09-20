@@ -53,15 +53,16 @@ pub fn note_activity() {
 
 /// 启动 reaper 常驻 task。返回 JoinHandle 供测试/停机取消。
 ///
-/// `lock_path` 用于 shutdown 收尾删除 lock 文件；`None`（如测试）不删。
+/// `lock` = (lock 路径, 自己的 boot_ms 归属戳)，用于 shutdown 收尾的
+/// 归属校验删除；`None`（如测试）不删。
 pub fn spawn_reaper(
     sup: Arc<Supervisor>,
     state: AppState,
     intervals: ReaperIntervals,
-    lock_path: Option<std::path::PathBuf>,
+    lock: Option<(std::path::PathBuf, u128)>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        reaper_loop(sup, state, intervals, lock_path).await;
+        reaper_loop(sup, state, intervals, lock).await;
     })
 }
 
@@ -69,7 +70,7 @@ async fn reaper_loop(
     sup: Arc<Supervisor>,
     state: AppState,
     iv: ReaperIntervals,
-    lock_path: Option<std::path::PathBuf>,
+    lock: Option<(std::path::PathBuf, u128)>,
 ) {
     loop {
         // sleep 与 shutdown 信号 race：/shutdown 触发后可立即跳出，不等满 scan 周期。
@@ -81,7 +82,7 @@ async fn reaper_loop(
 
         // 已在 draining：走收尾并退出 task（进程随后自然退出）。
         if state.draining.load(Ordering::Acquire) {
-            finish_shutdown(&sup, &state, &lock_path).await;
+            finish_shutdown(&sup, &state, &lock).await;
             return;
         }
 
@@ -104,7 +105,7 @@ async fn reaper_loop(
         if now.duration_since(newest) >= iv.global_idle {
             tracing::info!("global idle reached; entering ShutdownDraining");
             state.draining.store(true, Ordering::Release);
-            finish_shutdown(&sup, &state, &lock_path).await;
+            finish_shutdown(&sup, &state, &lock).await;
             return;
         }
 
@@ -140,9 +141,9 @@ async fn reaper_loop(
 async fn finish_shutdown(
     sup: &Arc<Supervisor>,
     state: &AppState,
-    lock_path: &Option<std::path::PathBuf>,
+    lock: &Option<(std::path::PathBuf, u128)>,
 ) {
-    shutdown_cleanup(sup, state, lock_path).await;
+    shutdown_cleanup(sup, state, lock).await;
     // cfg(not(test))：单测里 reaper_loop 走 finish_shutdown 时不强退——
     // 会把整个测试 binary 拽下来。生产 build 始终带这段。
     #[cfg(not(test))]
@@ -156,7 +157,7 @@ async fn finish_shutdown(
 pub(crate) async fn shutdown_cleanup(
     sup: &Arc<Supervisor>,
     state: &AppState,
-    lock_path: &Option<std::path::PathBuf>,
+    lock: &Option<(std::path::PathBuf, u128)>,
 ) {
     // ponytail: in-flight 精确计数需要 http 层埋点；M1 用 draining 拒新 +
     // 固定 1s 排空窗口近似。正确性由 A6 双实例容忍兜底。
@@ -168,11 +169,13 @@ pub(crate) async fn shutdown_cleanup(
     }
 
     // 删 lock + 通知 axum（保险触发，shutdown_post 已 notify_waiters 过一次）。
-    if let Some(p) = lock_path {
-        let _ = lockfile::remove(p);
+    // 归属校验：drain 期间 lock 可能已被 lazy-spawn 的新 daemon 接管——
+    // 无条件删会把新 daemon 的 lock 删掉，制造"活着但无 lock"的孤儿（bd y2y）。
+    if let Some((p, own_boot)) = lock {
+        lockfile::remove_owned(p, std::process::id(), *own_boot);
     }
     state.shutdown_notify.notify_waiters();
-    tracing::info!("daemon shutdown complete; lock removed");
+    tracing::info!("daemon shutdown complete; lock removed (if still owned)");
 }
 
 #[cfg(test)]
@@ -263,8 +266,19 @@ mod tests {
         );
     }
 
-    /// P0 防回归：shutdown_cleanup 必须真删 lock 文件 + 触发 Notify，
-    /// 否则 daemon 会变僵尸（lock 删但进程不退 / 反之亦然）。
+    /// 写一份"当前测试进程自有归属"的 lock（remove_owned 会认账的内容）。
+    fn write_own_lock(lock_path: &std::path::Path, own_boot: u128) {
+        let own = lockfile::LockEntry {
+            pid: std::process::id(),
+            port: 7860,
+            boot_ms: own_boot,
+            token: "own".into(),
+        };
+        lockfile::write_final(lock_path, &own).expect("write own lock");
+    }
+
+    /// P0 防回归：shutdown_cleanup 必须真删（自有归属的）lock 文件 + 触发
+    /// Notify，否则 daemon 会变僵尸（lock 删但进程不退 / 反之亦然）。
     #[tokio::test]
     async fn shutdown_cleanup_removes_lock_and_fires_notify() {
         // 用真 Supervisor::direct() 空实例：loaded_entries() 空 → evict 循环 no-op。
@@ -272,7 +286,8 @@ mod tests {
         let state = test_state();
         let tmp = tempfile::tempdir().expect("tempdir");
         let lock_path = tmp.path().join("daemon.lock");
-        std::fs::write(&lock_path, "stale").expect("write lock");
+        let own_boot = 42u128;
+        write_own_lock(&lock_path, own_boot);
 
         // 后台监听 Notify（一次性广播；先 listen 再 trigger 才会被唤醒）。
         let notify = state.shutdown_notify.clone();
@@ -281,14 +296,36 @@ mod tests {
             true
         });
 
-        shutdown_cleanup(&sup, &state, &Some(lock_path.clone())).await;
+        shutdown_cleanup(&sup, &state, &Some((lock_path.clone(), own_boot))).await;
 
-        assert!(!lock_path.exists(), "shutdown_cleanup 必须删 lock");
+        assert!(!lock_path.exists(), "shutdown_cleanup 必须删自有 lock");
         let res = tokio::time::timeout(Duration::from_secs(2), notified)
             .await
             .expect("notified within 2s")
             .expect("task ok");
         assert!(res, "shutdown_notify 必须被 notify_waiters");
+    }
+
+    /// bd y2y 根因 1 回归：drain 期间 lock 被新 daemon 接管（pid/boot_ms
+    /// 不再是自己）→ shutdown_cleanup 不得删除他人的 lock。
+    #[tokio::test]
+    async fn shutdown_cleanup_spares_taken_over_lock() {
+        let sup = Arc::new(Supervisor::direct().await.unwrap());
+        let state = test_state();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lock_path = tmp.path().join("daemon.lock");
+        // 接管者的 lock（pid/boot_ms 都不是本进程）。
+        let taken = lockfile::LockEntry {
+            pid: std::process::id() + 1,
+            port: 7860,
+            boot_ms: 7,
+            token: "new-owner".into(),
+        };
+        lockfile::write_final(&lock_path, &taken).expect("write taken-over lock");
+
+        shutdown_cleanup(&sup, &state, &Some((lock_path.clone(), 42))).await;
+
+        assert!(lock_path.exists(), "易主 lock 必须保留，不得误删");
     }
 
     /// P0 防回归：shutdown_signal（Notify）在 reaper 还没进入 select! 时
@@ -298,7 +335,8 @@ mod tests {
     async fn drain_before_reaper_selects_still_cleans_lock() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let lock_path = tmp.path().join("daemon.lock");
-        std::fs::write(&lock_path, "stale").expect("write lock");
+        let own_boot = 43u128;
+        write_own_lock(&lock_path, own_boot);
 
         let sup = Arc::new(Supervisor::direct().await.unwrap());
         let state = test_state();
@@ -306,7 +344,12 @@ mod tests {
         state.draining.store(true, Ordering::Release);
         state.shutdown_notify.notify_waiters();
 
-        let handle = spawn_reaper(sup, state.clone(), fast_intervals(), Some(lock_path.clone()));
+        let handle = spawn_reaper(
+            sup,
+            state.clone(),
+            fast_intervals(),
+            Some((lock_path.clone(), own_boot)),
+        );
         // reaper 首个 tick 走 finish_shutdown → cfg(not(test)) 不强退 → return。
         let _ = tokio::time::timeout(Duration::from_secs(5), handle)
             .await

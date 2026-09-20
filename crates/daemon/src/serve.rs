@@ -1,7 +1,7 @@
 //! daemon serve 入口（PLAN Task 16 的 daemon 侧；lock 仲裁 + axum + reaper 装配）。
 //!
-//! 流程：建 lock 父目录 → try_become_daemon → 胜者 bind 端口 → spawn reaper
-//! → axum::serve（阻塞直至 shutdown）。败者不该走到这里（CLI 转发即可）。
+//! 流程：建 lock 父目录 → bind 端口（OS 排他仲裁）→ try_become_daemon → spawn
+//! reaper → axum::serve（阻塞直至 shutdown）。败者不该走到这里（CLI 转发即可）。
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -54,10 +54,20 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     if let Some(parent) = cfg.lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // bind 先于 lock 仲裁：端口的 OS 排他性是第一道仲裁，bind 输家直接退出、
+    // 不触碰 lock——lock 只由 bind 赢家创建/接管。否则"动过 lock 却起不来"
+    // 的进程会删掉真主人的 lock，制造无 lock 孤儿 + 空 token 403（bd y2y）。
+    let addr = SocketAddr::from(([127, 0, 0, 1], cfg.port));
+    let listener = tokio::net::TcpListener::bind(addr).await
+        .map_err(|e| anyhow::anyhow!("bind {addr} failed: {e}; not starting daemon"))?;
     // lock 仲裁：败者直接退出（正常路径 CLI 已探活转发，不会走到这）。
     let outcome = lockfile::try_become_daemon(&cfg.lock_path, cfg.port)?;
-    let (port, token) = match outcome {
-        Outcome::Won { port, token, .. } => (port, token),
+    let (token, own_boot) = match outcome {
+        Outcome::Won {
+            token,
+            boot_ms,
+            ..
+        } => (token, boot_ms),
         Outcome::Lost { addr } => {
             anyhow::bail!("another daemon already at {addr}; not starting a second one")
         }
@@ -74,7 +84,8 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
-    // reaper 常驻：draining → 删 lock → 卸 LS。
+    // reaper 常驻：draining → 删 lock → 卸 LS。lock 归属戳 (path, boot_ms)
+    // 供收尾 remove_owned 校验——防止删掉接管者的 lock。
     // 末尾 await reaper 让 main 自然返回：graceful shutdown 让 axum::serve 退出，
     // reaper 跑完 finish_shutdown 后再返。Windows Job 句柄随进程关闭，
     // LS 进程树陪葬（ARCH §3.2）。
@@ -82,12 +93,10 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         sup,
         state.clone(),
         cfg.intervals,
-        Some(cfg.lock_path.clone()),
+        Some((cfg.lock_path.clone(), own_boot)),
     );
 
     let app = router(state.clone());
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("daemon listening on {addr}");
     // graceful shutdown 桥接：/shutdown POST 在 http::shutdown_post 中调
     // state.shutdown_notify.notify_waiters()，此处 await notified 触发退出。

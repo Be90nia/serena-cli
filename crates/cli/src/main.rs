@@ -717,24 +717,48 @@ async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<(), String> {
     let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
 
     let base = match entry {
-        Some(e) if probe(e.port) => format!("http://127.0.0.1:{}", e.port),
+        Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
+            format!("http://127.0.0.1:{}", e.port)
+        }
         _ => {
-            // 死 lock（或无 lock）：清残留 + lazy-spawn。
-            let _ = daemon::lockfile::remove(lock_path);
+            // 死 lock（或无 lock）：lazy-spawn。不在这里删 lock——daemon 子进程
+            // 的 lock 仲裁会带宽限接管，CLI 无归属凭据先删会误伤启动中/易主 lock。
             let port = spawn_daemon_child()?;
             wait_ready(port, SPAWN_WAIT).await?;
             format!("http://127.0.0.1:{port}")
         }
     };
 
-    let token = daemon::lockfile::read(lock_path)
-        .map_err(|e| format!("read lock: {e}"))?
-        .map(|e| e.token)
-        .unwrap_or_default();
+    let mut token = read_token_with_retry(lock_path).await?;
 
     // 用户未传 --lang 时按 file 后缀/shebang/文件名推断；显式 --lang 优先。
     let effective_lang = cli.lang.clone().or_else(|| autodetect_lang(cli));
-    forward(cli, &base, &token, effective_lang.as_deref()).await
+    forward(cli, &base, &mut token, lock_path, effective_lang.as_deref()).await
+}
+
+/// 读 lock token；lock 瞬时缺失（bind 赢家尚未写回）时短暂重试，
+/// 仍缺失则报错——绝不带空 token 转发（必 403 且掩盖真实状态，bd y2y）。
+async fn read_token_with_retry(lock_path: &Path) -> Result<String, String> {
+    for _ in 0..10 {
+        match daemon::lockfile::read(lock_path) {
+            Ok(Some(e)) => return Ok(e.token),
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(e) => return Err(format!("read lock: {e}")),
+        }
+    }
+    Err("daemon is serving but lock is missing; retry the command".into())
+}
+
+/// 403 自愈：stop-all × lazy-spawn 交叉时 daemon 会换代，缓存 token 随旧
+/// daemon 一起失效——重读 lock 取新 token。token 确实变了返回 `Some(新token)`
+/// （调用方应更新缓存并重发一次），否则 `None`（403 另有原因，如实上报）。
+async fn refresh_token_if_stale(lock_path: &Path, current: &str) -> Option<String> {
+    let fresh = read_token_with_retry(lock_path).await.ok()?;
+    if fresh != current {
+        Some(fresh)
+    } else {
+        None
+    }
 }
 
 /// 从子命令的第一个 file 形参（Pos 0）推断 LanguageId（仅当用户未传 --lang）。
@@ -863,7 +887,13 @@ async fn wait_ready(port: u16, timeout: Duration) -> Result<(), String> {
 }
 
 /// 按子命令转发 HTTP。
-async fn forward(cli: &Cli, base: &str, token: &str, lang: Option<&str>) -> Result<(), String> {
+async fn forward(
+    cli: &Cli,
+    base: &str,
+    token: &mut String,
+    lock_path: &Path,
+    lang: Option<&str>,
+) -> Result<(), String> {
     let client = reqwest::Client::new();
     // 工具名与 args 组装。
     let (tool, args): (&str, serde_json::Value) = match &cli.cmd {
@@ -1189,14 +1219,29 @@ async fn forward(cli: &Cli, base: &str, token: &str, lang: Option<&str>) -> Resu
         "lang": lang,
     });
 
-    let resp = client
-        .post(format!("{base}/tools/{tool}"))
-        .header("X-Serena-Token", token)
+    let url = format!("{base}/tools/{tool}");
+    let mut resp = client
+        .post(&url)
+        .header("X-Serena-Token", &*token)
         .json(&body)
         .timeout(FORWARD_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("forward {tool}: {e}"))?;
+    if resp.status() == reqwest::StatusCode::FORBIDDEN
+        && let Some(fresh) = refresh_token_if_stale(lock_path, token).await
+    {
+        // daemon 换代后缓存 token 过期：已刷新，用新 token 重发一次。
+        *token = fresh;
+        resp = client
+            .post(&url)
+            .header("X-Serena-Token", &*token)
+            .json(&body)
+            .timeout(FORWARD_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("forward {tool}: {e}"))?;
+    }
 
     let status = resp.status();
     let payload: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
@@ -1371,9 +1416,10 @@ async fn cmd_stop_all(lock_path: &Path) -> ExitCode {
             ExitCode::SUCCESS
         }
         other => {
-            // 端口死但 lock 残留：直接清。
-            let _ = daemon::lockfile::remove(lock_path);
-            eprintln!("shutdown probe failed: {other:?}; stale lock removed");
+            // 端口死/请求失败：lock 留给 daemon 仲裁路径接管清理。
+            // CLI 无归属凭据，此处的 daemon 可能正在 draining 收尾或 lock 已易主——
+            // 无条件删会制造孤儿（bd y2y）。
+            eprintln!("shutdown probe failed: {other:?}; lock left for lazy-spawn arbitration");
             ExitCode::from(3)
         }
     }
@@ -1402,7 +1448,7 @@ fn print_json(v: &serde_json::Value) -> Result<(), ToolError> {
 ///   EOF / `exit` 后退出 0。
 async fn cmd_shell(cli: &Cli) -> ExitCode {
     let lock_path = daemon::serve::default_lock_path();
-    let base_token = match ensure_daemon(&lock_path).await {
+    let mut base_token = match ensure_daemon(&lock_path).await {
         Ok(b) => b,
         Err(e) => {
             // shell 启动失败也要在 stdout 留 JSON，便于 agent 解析。
@@ -1449,7 +1495,8 @@ async fn cmd_shell(cli: &Cli) -> ExitCode {
         // 处理单条命令。
         let resp = dispatch_shell_cmd(
             &client,
-            &base_token,
+            &mut base_token,
+            &lock_path,
             &project_root,
             cmd,
             input.get("args").cloned().unwrap_or(json!({})),
@@ -1465,25 +1512,25 @@ async fn cmd_shell(cli: &Cli) -> ExitCode {
 async fn ensure_daemon(lock_path: &Path) -> Result<(String, String), String> {
     let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
     let base = match entry {
-        Some(e) if probe(e.port) => format!("http://127.0.0.1:{}", e.port),
+        Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
+            format!("http://127.0.0.1:{}", e.port)
+        }
         _ => {
-            let _ = daemon::lockfile::remove(lock_path);
+            // 同 forward_or_spawn：不删 lock，交 daemon 子进程仲裁接管。
             let port = spawn_daemon_child()?;
             wait_ready(port, SPAWN_WAIT).await?;
             format!("http://127.0.0.1:{port}")
         }
     };
-    let token = daemon::lockfile::read(lock_path)
-        .map_err(|e| format!("read lock: {e}"))?
-        .map(|e| e.token)
-        .unwrap_or_default();
+    let token = read_token_with_retry(lock_path).await?;
     Ok((base, token))
 }
 
 /// 单条 shell 命令：HTTP 转发到 daemon。
 async fn dispatch_shell_cmd(
     client: &reqwest::Client,
-    base_token: &(String, String),
+    base_token: &mut (String, String),
+    lock_path: &Path,
     project_root: &Path,
     cmd: &str,
     args: serde_json::Value,
@@ -1555,14 +1602,27 @@ async fn dispatch_shell_cmd(
         "project_root": project_root.to_string_lossy(),
         "args": args,
     });
-    let resp = client
-        .post(format!("{}/tools/{tool}", base_token.0))
-        .header("X-Serena-Token", &base_token.1)
-        .json(&body)
-        .timeout(FORWARD_TIMEOUT)
-        .send()
+    let url = format!("{}/tools/{tool}", base_token.0);
+    let send_tool = |token: &String| {
+        client
+            .post(&url)
+            .header("X-Serena-Token", token)
+            .json(&body)
+            .timeout(FORWARD_TIMEOUT)
+            .send()
+    };
+    let mut resp = send_tool(&base_token.1)
         .await
         .map_err(|e| format!("forward {tool}: {e}"))?;
+    if resp.status() == reqwest::StatusCode::FORBIDDEN
+        && let Some(fresh) = refresh_token_if_stale(lock_path, &base_token.1).await
+    {
+        // daemon 换代后旧 token 过期：已刷新，用新 token 重发一次。
+        base_token.1 = fresh;
+        resp = send_tool(&base_token.1)
+            .await
+            .map_err(|e| format!("forward {tool}: {e}"))?;
+    }
     let status = resp.status();
     let payload: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
     if !status.is_success() {

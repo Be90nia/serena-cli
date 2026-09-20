@@ -9,7 +9,7 @@
 //! ponytail: 不引进程探活 API —— lock 内 `boot_ms` + token + TCP 三检已够（A6）。
 //! 端口为可选项；先回填前 spawn 端不知自己端口，按 `127.0.0.1:0` 让 OS 分配后回写。
 
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,11 +39,13 @@ pub enum LockError {
 /// `try_become_daemon` 的结果。
 #[derive(Debug)]
 pub enum Outcome {
-    /// 胜者：lock 已建，需要监听 `port`；token 为本次生成的鉴权令牌（不回读文件）。
+    /// 胜者：lock 已建，需要监听 `port`；token 为本次生成的鉴权令牌（不回读文件）；
+    /// boot_ms 为本次 lock 的归属戳（收尾删 lock 时校验用）。
     Won {
         port: u16,
         file: PathBuf,
         token: String,
+        boot_ms: u128,
     },
     /// 败者：现成 daemon 已在 `addr` 监听，CLI 转发给它。
     Lost { addr: SocketAddr },
@@ -51,6 +53,9 @@ pub enum Outcome {
 
 /// 探测超时（A6 / DESIGN §3 C1）。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+/// 宽限探活次数与间隔：判 stale 前的最小观察窗（≈0.6s 典型 / ≤2.1s 最坏）。
+const GRACE_PROBES: u32 = 3;
+const GRACE_INTERVAL: Duration = Duration::from_millis(300);
 /// Token 长度（hex 字符数；128-bit → 32 hex chars）。
 const TOKEN_LEN: usize = 32;
 
@@ -123,17 +128,20 @@ fn try_become_daemon_impl(lock_path: &Path, candidate_port: u16) -> Result<Outco
                 port: candidate_port,
                 file: lock_path.to_path_buf(),
                 token,
+                boot_ms,
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // 败者：读现有 lock → TCP 探活。
+            // 败者：读现有 lock → 宽限探活。主人可能正在启动（lock 已建、端口未
+            // bind）或在 draining 收尾（端口已关、进程未退）——单次探活失败就删
+            // lock 会误判 stale，产生孤儿 daemon / token 错配（bd y2y 根因 2）。
             let raw = std::fs::read_to_string(lock_path)?;
             let existing: LockEntry = serde_json::from_str(&raw)?;
             let addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, existing.port).into();
-            if probe_alive(addr) {
+            if is_alive_graceful(existing.port) {
                 Ok(Outcome::Lost { addr })
             } else {
-                // 残留死 lock → 清理重建（自己当胜者）。
+                // 宽限后仍无响应 → 残留死 lock → 清理重建（自己当胜者）。
                 let _ = std::fs::remove_file(lock_path);
                 try_become_daemon_impl(lock_path, candidate_port)
             }
@@ -166,20 +174,48 @@ pub fn read(lock_path: &Path) -> Result<Option<LockEntry>, LockError> {
     Ok(Some(entry))
 }
 
-/// 删 lock 文件（daemon shutdown 路径）。
-pub fn remove(lock_path: &Path) -> Result<(), LockError> {
-    if lock_path.exists() {
-        std::fs::remove_file(lock_path)?;
+/// 归属校验删除 lock：`pid` + `boot_ms` 都匹配当前 lock 内容才删；
+/// lock 已易主（新 daemon 接管）或不存在时跳过，返回 `false`。
+///
+/// daemon shutdown 收尾必须走这里——无条件删除会把接管者的 lock 一起删掉，
+/// 让新 daemon 变成"活着但没有 lock"的孤儿（bd y2y 根因 1）。
+pub fn remove_owned(lock_path: &Path, pid: u32, boot_ms: u128) -> bool {
+    let Ok(Some(entry)) = read(lock_path) else {
+        return false;
+    };
+    if entry.pid != pid || entry.boot_ms != boot_ms {
+        tracing::info!(
+            lock_pid = entry.pid,
+            own_pid = pid,
+            "lock ownership mismatch; skip remove (lock was taken over)"
+        );
+        return false;
     }
-    Ok(())
+    match std::fs::remove_file(lock_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!("remove owned lock failed: {e}");
+            false
+        }
+    }
 }
 
-/// 检查 `addr` 是否可达（500ms 超时）。CLI 探活用。
-pub fn is_alive(addr: impl ToSocketAddrs) -> bool {
-    match addr.to_socket_addrs() {
-        Ok(mut it) => it.next().is_some_and(probe_alive),
-        Err(_) => false,
+/// 宽限探活：连探 3 次（间隔 `GRACE_INTERVAL`）任一成功即活。
+///
+/// 覆盖两个窗口：daemon 启动中（lock 已建、bind 未完成）与 draining 收尾
+/// （listener 已关、进程未退）。全部失败才允许判 stale。
+pub fn is_alive_graceful(port: u16) -> bool {
+    let addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    for i in 0..GRACE_PROBES {
+        if probe_alive(addr) {
+            return true;
+        }
+        if i + 1 < GRACE_PROBES {
+            std::thread::sleep(GRACE_INTERVAL);
+        }
     }
+    false
 }
 
 #[cfg(test)]
@@ -263,11 +299,59 @@ mod tests {
     }
 
     #[test]
-    fn remove_clears_lock() {
+    fn remove_owned_respects_ownership() {
         let (_dir, path) = fresh_lock();
-        try_become_daemon(&path, 7860).expect("win");
+        let out = try_become_daemon(&path, 7860).expect("win");
+        let Outcome::Won { boot_ms, .. } = out else {
+            panic!("first create must win")
+        };
         assert!(path.is_file());
-        remove(&path).expect("remove");
+
+        // lock 已易主（他人 pid/boot_ms）→ 不删，返回 false。
+        let other = LockEntry {
+            pid: 999,
+            port: 7860,
+            boot_ms: 1,
+            token: "other".into(),
+        };
+        write_final(&path, &other).expect("write other's lock");
+        assert!(
+            !remove_owned(&path, std::process::id(), boot_ms),
+            "他人 lock 不得删除"
+        );
+        assert!(path.is_file(), "易主 lock 必须保留");
+
+        // 归属匹配 → 删，返回 true。
+        assert!(remove_owned(&path, 999, 1), "归属匹配应删除");
         assert!(!path.exists());
+
+        // lock 不存在 → false，不报错。
+        assert!(!remove_owned(&path, 999, 1));
+    }
+
+    /// bd y2y 根因 2 回归：主人正在启动（lock 已建、端口未 bind）时，
+    /// 败者必须等宽限探活判活，不得删 lock 抢锁。
+    #[test]
+    fn grace_waits_for_slow_owner() {
+        let (_dir, path) = fresh_lock();
+        let slow = LockEntry {
+            pid: 2,
+            port: 7867,
+            boot_ms: 2,
+            token: "slow".into(),
+        };
+        write_final(&path, &slow).expect("write slow-owner lock");
+        // 700ms 后主人才 bind（> 单次 probe 500ms，< 宽限窗 ~1.4s）。
+        let binder = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(700));
+            std::net::TcpListener::bind(("127.0.0.1", 7867)).expect("bind 7867")
+        });
+        let out = try_become_daemon(&path, 7860).expect("arbitrate");
+        assert!(
+            matches!(out, Outcome::Lost { .. }),
+            "启动中的主人应判活 Lost，不得抢锁；got {out:?}"
+        );
+        assert!(path.is_file(), "宽限判活路径不得删主人的 lock");
+        drop(binder.join().expect("binder thread"));
     }
 }

@@ -149,7 +149,10 @@ sequenceDiagram
 **分支 B 竞态与残留处理**（Δ 全部为自有设计，落地于 `daemon/lockfile.rs`）：
 
 - lock file 位置：`%LOCALAPPDATA%/serena/daemon.lock`（内容 JSON：`{pid, port, boot_ms, token}`；token 为 daemon 随机 128-bit hex，CLI 从 lock 读取后每个请求带 `X-Serena-Token` 头，daemon 校验——本机任意进程都能连 127.0.0.1，无 token 则任何本地程序可调 `replace-body` 改写文件）。
-- 探测判定 = lock 存在 ∧ TCP 连通（connect 超时 500ms）；超时/拒绝即视为死 daemon（崩溃残留），删除 lock 重建。不引入进程探活 API —— lock 内 `boot_ms` + token + TCP 三检已够。
+- 探测判定 = lock 存在 ∧ 宽限 TCP 探活（连探 3 次 × 300ms 间隔，单次 connect 超时 500ms）——覆盖「daemon 启动中（lock 已建、bind 未完成）」与「draining 收尾（listener 已关、进程未退）」两个窗口，全部失败才判 stale 接管。不引入进程探活 API —— lock 内 `boot_ms` + token + TCP 三检已够。
+- 删除归属校验：daemon 收尾删 lock 必须走 `remove_owned`（pid + boot_ms 匹配才删）——drain 期间 lock 可能已被新 daemon 接管，无条件删除会制造「活着但无 lock」的孤儿。CLI 侧不删 lock（无归属凭据），stale 清理统一由 daemon 仲裁路径接管。
+- daemon 启动顺序 = bind 先于 lock 仲裁：端口的 OS 排他性是第一道仲裁，bind 输家直接退出、不触碰 lock；lock 只由 bind 赢家创建/接管。杜绝「动过 lock 却起不来」的进程留下错误归属。
+- CLI 403 自愈：daemon 换代后 CLI 缓存 token 过期（旧 token 打新 daemon）→ CLI 收到 403 重读 lock 刷新 token 重发一次，换代窗口内的瞬时 403 自愈，不产生持久 403。
 - 两个 CLI 同时冷启动：`create_new` 原子建 lock 只有一方成功（赢者 spawn daemon 并在 bind 成功后回填端口），败者轮询——正常路径不会双 daemon。唯一双实例路径：活 daemon 满载未 accept，探测窗口内被误判死 → 新 daemon bind 7860+1 并覆盖 lock，旧实例失去 lock 归属，15min 空闲自杀收敛（A6），无正确性影响。`ponytail: 竞态窗口容忍双 daemon 短暂并存，靠 idle 自杀收敛，不建分布式锁`
 - `--direct` 开发模式：CLI 不经 HTTP，进程内直接构造 Supervisor 执行工具（M0 冒烟与单测路径，也覆盖 §5 状态机的直接驱动）。
 

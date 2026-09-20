@@ -2,6 +2,12 @@
 
 All notable changes to `serena-rust` are recorded here, ordered by phase. Anchored to upstream `oraios/serena@43ae0211`. Commit hashes reflect `feature/solidlsp-phase0-1` at the time of this writing; run `git log --oneline | head -80` for the canonical list.
 
+## Unreleased
+
+| commit | summary | key metric |
+|---|---|---|
+| (uncommitted) | daemon orphan race fix (bd y2y): lock ownership-checked removal (`remove_owned` pid+boot_ms), stale-grace probing (3×300ms) before takeover, bind-before-lock arbitration, CLI 403 token self-heal (`refresh_token_if_stale`) | stop-all × lazy-spawn cross: 403 = 0 (was 400/400 calls), orphan daemons = 0, lock↔listener consistency held across daemon generations |
+
 ## Phase 0 · Stability foundations (P0)
 
 | commit | summary | key metric |
