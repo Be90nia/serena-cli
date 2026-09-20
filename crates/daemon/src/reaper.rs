@@ -130,8 +130,30 @@ async fn reaper_loop(
     }
 }
 
-/// ShutdownDraining 收尾：等排空窗口 → 逐 LS shutdown → 删 lock。
+/// ShutdownDraining 收尾：等排空窗口 → 逐 LS shutdown → 删 lock → 强退进程。
+///
+/// 末尾 `std::process::exit(0)` 是必需的：Windows 下 `cli --daemon` 走
+/// `CREATE_NEW_PROCESS_GROUP` + stdin/stdout→NULL 启动，tokio runtime 的
+/// background threads / signal handlers 持有引用，runtime drop 后进程仍可能
+/// 残留；`process::exit` 直接终止并跳过 drop，等同 systemd / svchost 的
+/// SIGTERM-then-SIGKILL 语义（ARCH §3.2）。
 async fn finish_shutdown(
+    sup: &Arc<Supervisor>,
+    state: &AppState,
+    lock_path: &Option<std::path::PathBuf>,
+) {
+    shutdown_cleanup(sup, state, lock_path).await;
+    // cfg(not(test))：单测里 reaper_loop 走 finish_shutdown 时不强退——
+    // 会把整个测试 binary 拽下来。生产 build 始终带这段。
+    #[cfg(not(test))]
+    std::process::exit(0);
+}
+
+/// ShutdownDraining 可单测的核心清理：sleep 排空 → evict LS → 删 lock → notify。
+///
+/// 从 `finish_shutdown` 抽出，让测试能断言"删 lock / notify 都做了"而不触发
+/// `process::exit`（强退会拽走测试 binary）。
+pub(crate) async fn shutdown_cleanup(
     sup: &Arc<Supervisor>,
     state: &AppState,
     lock_path: &Option<std::path::PathBuf>,
@@ -145,11 +167,11 @@ async fn finish_shutdown(
         let _ = tokio::time::timeout(Duration::from_secs(5), sup.evict(&key)).await;
     }
 
-    // 删 lock。
+    // 删 lock + 通知 axum（保险触发，shutdown_post 已 notify_waiters 过一次）。
     if let Some(p) = lock_path {
         let _ = lockfile::remove(p);
     }
-    let _ = state;
+    state.shutdown_notify.notify_waiters();
     tracing::info!("daemon shutdown complete; lock removed");
 }
 
@@ -239,5 +261,57 @@ mod tests {
             started.elapsed() < Duration::from_secs(4),
             "draining 后 reaper 应尽快退出"
         );
+    }
+
+    /// P0 防回归：shutdown_cleanup 必须真删 lock 文件 + 触发 Notify，
+    /// 否则 daemon 会变僵尸（lock 删但进程不退 / 反之亦然）。
+    #[tokio::test]
+    async fn shutdown_cleanup_removes_lock_and_fires_notify() {
+        // 用真 Supervisor::direct() 空实例：loaded_entries() 空 → evict 循环 no-op。
+        let sup = Arc::new(Supervisor::direct().await.unwrap());
+        let state = test_state();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lock_path = tmp.path().join("daemon.lock");
+        std::fs::write(&lock_path, "stale").expect("write lock");
+
+        // 后台监听 Notify（一次性广播；先 listen 再 trigger 才会被唤醒）。
+        let notify = state.shutdown_notify.clone();
+        let notified = tokio::spawn(async move {
+            notify.notified().await;
+            true
+        });
+
+        shutdown_cleanup(&sup, &state, &Some(lock_path.clone())).await;
+
+        assert!(!lock_path.exists(), "shutdown_cleanup 必须删 lock");
+        let res = tokio::time::timeout(Duration::from_secs(2), notified)
+            .await
+            .expect("notified within 2s")
+            .expect("task ok");
+        assert!(res, "shutdown_notify 必须被 notify_waiters");
+    }
+
+    /// P0 防回归：shutdown_signal（Notify）在 reaper 还没进入 select! 时
+    /// 先 fire 也不能丢——reaper 下次进 select! 时 draining=true 兜底。
+    /// 本测试断言：draining flag 在 reaper 首个 tick 后被读到并触发清理。
+    #[tokio::test]
+    async fn drain_before_reaper_selects_still_cleans_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lock_path = tmp.path().join("daemon.lock");
+        std::fs::write(&lock_path, "stale").expect("write lock");
+
+        let sup = Arc::new(Supervisor::direct().await.unwrap());
+        let state = test_state();
+        // 模拟 cli stop-all 抢先于 reaper 首次 tick：先置 draining + notify。
+        state.draining.store(true, Ordering::Release);
+        state.shutdown_notify.notify_waiters();
+
+        let handle = spawn_reaper(sup, state.clone(), fast_intervals(), Some(lock_path.clone()));
+        // reaper 首个 tick 走 finish_shutdown → cfg(not(test)) 不强退 → return。
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("reaper exits");
+
+        assert!(!lock_path.exists(), "draining 抢占场景下 lock 也必须被删");
     }
 }
