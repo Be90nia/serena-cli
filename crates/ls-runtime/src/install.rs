@@ -4,6 +4,7 @@
 //! Δ 上游无 sha 门（直接信任 URL）；本设计 §2.9 按 A 类 sha 未知 → 拒绝 auto，
 //!   仅 `--allow-unsigned-sha`（人类显式）越狱。
 //!
+//! npm/uvx 包管理器安装器见 `install_pkg`（§2.3/§2.5）。
 //! 同步签名（设计 §3）：daemon(tokio) 调用方须 `spawn_blocking` 包裹（下载分钟级）。
 //! HTTP 走 `reqwest::blocking`（workspace 统一版本，rustls）。
 
@@ -47,6 +48,24 @@ pub enum InstallKind {
     PathOnly {
         binary_name: String,
         install_hint: String,
+    },
+    /// npm 类（§2.3）：`npm install --prefix {cache}/{id}/{version} <pkg>[@<ver>]`，
+    /// 产物 = `node_modules/.bin/<bin_rel>`；`version=None` → latest（不锁版本）。
+    Npm {
+        package: String,
+        version: Option<String>,
+        bin_rel: String,
+        /// 启动时追加在 bin 之后的参数。
+        npm_args: Option<Vec<String>>,
+    },
+    /// uvx 类（§2.5）：无安装步骤——`uvx --from <pkg>[==<ver>] <entrypoint> <args>`，
+    /// uv 运行时自管缓存；PATH 无 `uvx` → NotInstalled + hint。
+    Uvx {
+        package: String,
+        version: Option<String>,
+        entrypoint: String,
+        /// 启动时追加在 entrypoint 之后的参数。
+        args: Option<Vec<String>>,
     },
 }
 
@@ -124,6 +143,9 @@ impl DownloadInstaller {
                     hint: install_hint.clone(),
                     install_cmd: None,
                 });
+            }
+            InstallKind::Npm { .. } | InstallKind::Uvx { .. } => {
+                return Err(wrong_kind(spec));
             }
         };
 
@@ -215,6 +237,21 @@ impl DownloadInstaller {
             exe,
             args: Vec::new(),
         }))
+    }
+}
+
+/// internal：installer 只认自己的 InstallKind；路由错误 = 调用方 bug。
+/// （Spawn.cause 是 io::Error 只装原生 spawn 失败；非下载错误复用空 url 的
+/// Download 变体，同 acquire_install_lock 先例。）
+pub(crate) fn wrong_kind(spec: &InstallSpec) -> RuntimeError {
+    RuntimeError::Download {
+        url: String::new(),
+        expected_sha: None,
+        actual_sha: None,
+        cause: format!(
+            "internal: wrong installer routed for `{}` (InstallKind mismatch)",
+            spec.id
+        ),
     }
 }
 
@@ -648,4 +685,5 @@ mod tests {
             "二调应走已装短路，实际 {out2:?}"
         );
     }
+
 }

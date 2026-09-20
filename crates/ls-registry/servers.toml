@@ -151,3 +151,31 @@ source_commit = "43ae0211"
 [servers.zls.path_only]
 binary_name = "zls"
 install_hint = "install zls (https://github.com/zigtools/zls) and zig; ensure both are on PATH"
+
+# ---- npm / uvx 类别（机制已落地；真实条目数据由另一任务路由收录，此处仅格式示例）----
+# 两类条目均不适用 exec/{bin} 模板：最终 cmd 由安装器/启动器返回。
+#
+# install = "npm"：安装期 `npm install --prefix {cache_root}/{id}/{version} <pkg>[@<ver>]`
+#   （version 省略 = latest，缓存目录名 `latest`）；
+#   启动 = {cache_root}/{id}/{version}/node_modules/.bin/<bin_rel>（Windows 取 .cmd shim）
+#   + npm_args 追加参数。npm 不在 PATH → MissingRuntime。
+# [servers.<id>]
+# languages = ["..."]
+# install = "npm"
+# [servers.<id>.npm]
+# package = "@scope/some-ls"   # 必填，非空
+# version = "1.2.3"            # 可省
+# bin_rel = "some-ls"          # 必填，node_modules/.bin/ 下相对名
+# npm_args = ["--stdio"]       # 可省；追加在 bin 之后
+#
+# install = "uvx"：无安装步骤，launch = `uvx --from <pkg>[==<ver>] <entrypoint> <args>`
+#   （version 省略 = 不锁版本）；uv 运行时自管缓存。
+#   PATH 无 uvx → NotInstalled + 安装 hint。
+# [servers.<id>]
+# languages = ["..."]
+# install = "uvx"
+# [servers.<id>.uvx]
+# package = "some-ls"          # 必填，非空
+# version = "1.2.3"            # 可省
+# entrypoint = "some-ls"       # 必填，非空
+# args = ["--stdio"]           # 可省；追加在 entrypoint 之后

@@ -13,6 +13,7 @@ use ls_runtime::deps::Os;
 use ls_runtime::install::{
     ArchiveKind, DownloadInstaller, InstallCtx, InstallKind, InstallOutcome, InstallSpec,
 };
+use ls_runtime::install_pkg::{NpmInstaller, UvxInstaller};
 
 use crate::spec::{self, ServerSpec};
 
@@ -148,6 +149,36 @@ pub fn to_install_spec(
                 exec: spec.exec.clone(),
             })
         }
+        "npm" => {
+            let npm = spec.npm.as_ref().ok_or_else(|| {
+                format!("[{id}]: install=npm but no npm table (InvalidSpec)")
+            })?;
+            Ok(InstallSpec {
+                id: id.to_string(),
+                kind: InstallKind::Npm {
+                    package: npm.package.clone(),
+                    version: npm.version.clone(),
+                    bin_rel: npm.bin_rel.clone(),
+                    npm_args: npm.npm_args.clone(),
+                },
+                exec: spec.exec.clone(),
+            })
+        }
+        "uvx" => {
+            let uvx = spec.uvx.as_ref().ok_or_else(|| {
+                format!("[{id}]: install=uvx but no uvx table (InvalidSpec)")
+            })?;
+            Ok(InstallSpec {
+                id: id.to_string(),
+                kind: InstallKind::Uvx {
+                    package: uvx.package.clone(),
+                    version: uvx.version.clone(),
+                    entrypoint: uvx.entrypoint.clone(),
+                    args: uvx.args.clone(),
+                },
+                exec: spec.exec.clone(),
+            })
+        }
         other => Err(format!("[{id}]: unknown install `{other}` (InvalidSpec)")),
     }
 }
@@ -210,6 +241,64 @@ pub fn ensure_launch(
                 "missing runtime `{}` not on PATH: {}",
                 po.binary_name, po.install_hint
             ))
+        }
+        Some(crate::spec::KindRef::Npm(npm)) => {
+            let os = Os::current();
+            let arch = ls_runtime::deps::Arch::current();
+            let install_spec = to_install_spec(spec, id, os, arch)?;
+            let cache_root = dirs_cache_root();
+            // 缓存命中（未触网）：{cache_root}/{id}/{version|latest}/node_modules/.bin/{bin_rel}。
+            // 最终 cmd 由安装机制决定，不走 {bin} 模板。
+            let dir_name = npm.version.clone().unwrap_or_else(|| "latest".to_string());
+            if let Some(exe) =
+                ls_runtime::install_pkg::npm_bin_path(&cache_root.join(id).join(&dir_name), &npm.bin_rel)
+            {
+                return Ok((exe, npm.npm_args.clone().unwrap_or_default()));
+            }
+            if !auto_install {
+                return Err(format!(
+                    "language server `{lang}` not installed; enable --auto-install or run `serena-cli install {id}` (npm package {})",
+                    npm.package
+                ));
+            }
+            let ictx = InstallCtx {
+                os,
+                arch,
+                auto_install,
+                allow_unsigned_sha,
+                cache_root,
+            };
+            match NpmInstaller.install(&ictx, &install_spec) {
+                Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process { exe, args })) => {
+                    Ok((exe, args))
+                }
+                Ok(InstallOutcome::Ready(ls_runtime::install::Launch::External { host, port })) => {
+                    Err(format!("external LS not supported by CLI launch: {host}:{port}"))
+                }
+                Ok(InstallOutcome::UnsignedRefused { hint, .. } | InstallOutcome::NotInstalled { hint, .. }) => {
+                    Err(hint)
+                }
+                Err(e) => Err(format!("{e}")),
+            }
+        }
+        Some(crate::spec::KindRef::Uvx(_)) => {
+            // 无安装步骤：uvx 直接拉起（uv 自管缓存）；最终 cmd 由启动器返回。
+            let install_spec =
+                to_install_spec(spec, id, Os::current(), ls_runtime::deps::Arch::current())?;
+            let ictx = InstallCtx {
+                os: Os::current(),
+                arch: ls_runtime::deps::Arch::current(),
+                auto_install,
+                allow_unsigned_sha,
+                cache_root: dirs_cache_root(),
+            };
+            match UvxInstaller.install(&ictx, &install_spec) {
+                Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process { exe, args })) => {
+                    Ok((exe, args))
+                }
+                Ok(InstallOutcome::NotInstalled { hint, .. }) => Err(hint),
+                other => Err(format!("uvx launch unexpected outcome: {other:?}")),
+            }
         }
         Some(crate::spec::KindRef::Download(dl)) => {
             let os = Os::current();
@@ -362,5 +451,94 @@ mod tests {
         };
         let out = DownloadInstaller.install(&ictx, &install_spec).unwrap();
         assert!(matches!(out, InstallOutcome::Ready(_)), "{out:?}");
+    }
+
+    const NPM_TOML: &str = r#"
+[servers.npm_probe]
+languages = ["js-fake"]
+install = "npm"
+
+[servers.npm_probe.npm]
+package = "bash-language-server"
+bin_rel = "bash-language-server"
+
+[servers.uvx_probe]
+languages = ["py-fake"]
+install = "uvx"
+
+[servers.uvx_probe.uvx]
+package = "fake-ls"
+version = "0.9.0"
+entrypoint = "fake-ls"
+args = ["-v"]
+"#;
+
+    #[test]
+    fn to_install_spec_maps_npm_and_uvx() {
+        let parsed = crate::spec::parse(NPM_TOML).unwrap();
+        let npm = &parsed.servers["npm_probe"];
+        let mapped =
+            to_install_spec(npm, "npm_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        match mapped.kind {
+            InstallKind::Npm { package, version, bin_rel, npm_args } => {
+                assert_eq!(package, "bash-language-server");
+                assert_eq!(version, None, "toml 未写 version → None（latest）");
+                assert_eq!(bin_rel, "bash-language-server");
+                assert_eq!(npm_args, None);
+            }
+            other => panic!("expect Npm, got {other:?}"),
+        }
+        let uvx = &parsed.servers["uvx_probe"];
+        let mapped =
+            to_install_spec(uvx, "uvx_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        match mapped.kind {
+            InstallKind::Uvx { package, version, entrypoint, args } => {
+                assert_eq!(package, "fake-ls");
+                assert_eq!(version.as_deref(), Some("0.9.0"));
+                assert_eq!(entrypoint, "fake-ls");
+                assert_eq!(args, Some(vec!["-v".to_string()]));
+            }
+            other => panic!("expect Uvx, got {other:?}"),
+        }
+    }
+
+    /// npm 类全链路（真 npm install，门控 SERENA_TEST_DOWNLOAD）：内存 spec →
+    /// InstallSpec → NpmInstaller → node_modules/.bin bin 落地断言。
+    /// npm 不在场（CI 无 Node）→ MissingRuntime，不算失败。
+    #[test]
+    fn npm_install_e2e_when_gated() {
+        if std::env::var_os("SERENA_TEST_DOWNLOAD").is_none() {
+            return;
+        }
+        let parsed = crate::spec::parse(NPM_TOML).unwrap();
+        let spec = &parsed.servers["npm_probe"];
+        let install_spec =
+            to_install_spec(spec, "npm_probe", Os::current(), ls_runtime::deps::Arch::current())
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ictx = InstallCtx {
+            os: Os::current(),
+            arch: ls_runtime::deps::Arch::current(),
+            auto_install: true,
+            allow_unsigned_sha: false,
+            cache_root: dir.path().to_path_buf(),
+        };
+        match NpmInstaller.install(&ictx, &install_spec) {
+            Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process { exe, .. })) => {
+                assert!(exe.is_file(), "bin 应落地: {}", exe.display());
+                // 已装短路：二调不再触网，仍 Ready。
+                let out2 = NpmInstaller.install(&ictx, &install_spec).unwrap();
+                assert!(matches!(out2, InstallOutcome::Ready(_)), "{out2:?}");
+            }
+            Ok(other) => panic!("应 Ready，实际 {other:?}"),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("MissingRuntime") || msg.contains("missing runtime `npm`"),
+                    "npm 在场却失败，须排查: {msg}"
+                );
+                eprintln!("SKIP: npm not available on this machine ({msg})");
+            }
+        }
     }
 }
