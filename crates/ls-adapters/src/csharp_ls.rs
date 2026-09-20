@@ -9,6 +9,14 @@
 //! - csharp_ls 启动需 ~3s 加载 Roslyn workspaces。
 //! - 默认 .sln/.csproj 自动发现；不需要 --solution。
 //!
+//! ## 深度（M2 落地）
+//!
+//! - 上游 `oraios/serena@43ae021` 已将 csharp 适配器从 csharp_ls 迁到 Roslyn 官方
+//!   `vscode-csharp`（microsoft/vscode-csharp 的 LSP 端 = Roslyn LSP server）。
+//!   我们**暂留 csharp_ls 不切**——理由见 `local/csharp-ls-decision.md`。
+//! - `prepare_csharp_ls_to_roslyn` stub：占位接口，未来切换 Roslyn LS 时改这一处即可。
+//!   当前不调用，仅 doc + compile 验证 trait shape。
+//!
 //! 已知限制：
 //! - 不实现 omnisharp-roslyn 兼容路径 —— 它单独有 `omnisharp` binary 和协议差异。
 //! - 不注入 .editorconfig 读取 —— 用户 workspace 自管。
@@ -128,4 +136,49 @@ mod tests {
         adapter.set_project_root(empty.path());
         assert_eq!(adapter.probe_uri(), PROBE_FALLBACK);
     }
+
+    /// Roslyn LS 切换 stub：当前返 None（不切），仅验证函数 shape。
+    /// 真实切换将走 microsoft/vscode-csharp 的 LSP 端 = Roslyn LSP server（dotnet
+    /// 工具安装 + 启动约定），见 local/csharp-ls-decision.md §3。
+    #[test]
+    fn prepare_csharp_ls_to_roslyn_stub_returns_none() {
+        let resolved = prepare_csharp_ls_to_roslyn();
+        assert!(
+            resolved.is_none(),
+            "M2 stub 必须返 None（决策暂留 csharp_ls）: got {resolved:?}"
+        );
+    }
+}
+
+/// Roslyn LS 切换 stub（`prepare_csharp_ls_to_roslyn`）。
+///
+/// 当前**不切**：上游 `oraios/serena@43ae021` 的 csharp 适配器已迁到 Roslyn LS
+/// （microsoft/vscode-csharp 的 LSP 端），但本地因下述原因暂留 csharp_ls：
+/// 1. csharp_ls 启动快（~3s vs omnisharp 30s+），冷启动 UX 占优；
+/// 2. Roslyn LS 需 `Microsoft.VisualStudio.Code.Tools.ServiceDefaults` + 项目
+///    restore workflow，setup 复杂（dotnet workload install + 手动 MSBuild
+///    discovery），M2 不到；
+/// 3. 真实用户多用 csharp_ls + .NET SDK 5-8（已稳定 4+ 年）。
+///
+/// 切 Roslyn 时的改动入口（**M3+**）：
+/// - `prepare_csharp_ls_to_roslyn` 返 `Some(RoslynLaunchPlan)`；
+/// - `launch_info` 走 Roslyn 分支（vscode-csharp `RoslynLSPServer` 或等价物）；
+/// - `initialize_patches` 设 `RoslynLSPServerOptions`（workspace settings path）。
+///
+/// 返回 `Option<RoslynLaunchPlan>` 让调用方未来能判别实现与否；
+/// 当前 `None` 即「M2 暂不实现」的契约。
+#[derive(Debug, Clone)]
+pub struct RoslynLaunchPlan {
+    /// Roslyn LS 可执行路径（vscode-csharp 提供的 dotnet tool）。
+    pub exe_path: std::path::PathBuf,
+    /// 启动参数（含 dotnet host 入口）。
+    pub args: Vec<String>,
+    /// Roslyn 特有 init patch（workspace settings path / log level）。
+    pub init_patch_keys: Vec<String>,
+}
+
+#[allow(dead_code)] // M2 stub 不调用（决策暂留 csharp_ls）
+pub(crate) fn prepare_csharp_ls_to_roslyn() -> Option<RoslynLaunchPlan> {
+    // M2 stub：决策暂留 csharp_ls（见 local/csharp-ls-decision.md）。
+    None
 }

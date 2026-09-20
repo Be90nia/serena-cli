@@ -24,12 +24,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lsp_types::InitializeParams;
 
+pub mod basedpyright_server;
 pub mod clangd;
 pub mod csharp_ls;
 pub mod gopls;
 pub mod jdtls;
+pub mod jedi_server;
+pub mod pyre_server;
 pub mod pyright;
 pub mod rust_analyzer;
+pub mod ty_server;
 pub mod typescript;
 
 /// 语言标识：与 `servers.toml` `languages` 字段、claude 端 ProjectCtx.language 一一对应。

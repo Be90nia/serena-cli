@@ -8,6 +8,17 @@
 //!
 //! 启动方式：探测到的可执行直接 stdio。pyright 不需要 project_root 初始化文件（无
 //! tsconfig/Cargo.toml 等价物）；`pyrightconfig.json` 仅影响检查策略不影响 LSP。
+//!
+//! ## 深度（M2 落地）
+//!
+//! - `initialize_patches`：root 下探测 `.venv/bin/python(.exe)` / `venv/...` / `.python-version`，
+//!   命中则 `initializationOptions.python.pythonPath=<path>` —— pyright 用此路径解析 import，
+//!   否则会用系统 python（与 venv 不一致 → 类型错乱）。
+//!
+//! ## 同构壳（T2 placeholder，Task 24 收口）
+//!
+//! `basedpyright_server` / `ty_server` / `pyre_server` / `jedi_server` 是其它 Python
+//! LSP 实现，与 pyright 共享探测链；架构 / M2 探测层保持一致。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -80,8 +91,23 @@ impl LanguageServerAdapter for PyrightAdapter {
         })
     }
 
-    fn initialize_patches(&self, _base: &mut InitializeParams) {
-        // pyright 不需要 client capability quirk。
+    fn initialize_patches(&self, base: &mut InitializeParams) {
+        // M2 深度：探测 venv interpreter；命中 → 注入 `initializationOptions.python.pythonPath`。
+        // pyright 用此路径解析 import 与 .pyi 搜索；缺省走系统 python，venv 项目会错乱。
+        let root = PROBE_ROOT
+            .lock()
+            .expect("PROBE_ROOT poisoned")
+            .clone();
+        let Some(interp) = root.as_deref().and_then(find_python_interpreter) else {
+            return;
+        };
+        let opts = base
+            .initialization_options
+            .get_or_insert_with(serde_json::Value::default);
+        if !opts.is_object() {
+            *opts = serde_json::json!({});
+        }
+        opts["python"]["pythonPath"] = serde_json::Value::String(interp.to_string_lossy().into_owned());
     }
 
     fn set_project_root(&self, root: &Path) {
@@ -125,6 +151,30 @@ impl PyrightAdapter {
     }
 }
 
+/// 在 `root` 下探测 Python venv 解释器路径。命中优先级：
+/// 1. `<root>/.venv/bin/python`(.exe) — uv / pip 标准约定
+/// 2. `<root>/venv/bin/python`(.exe) — Debian / venv 经典命名
+/// 3. `<root>/.python-version` 内容（pyenv 用户，文件首行 = 版本号，不返绝对路径，
+///    仅用于文档/调试留 hint，pyright 启动参数仍走系统 python）
+///
+/// 返回绝对路径（dunce 去 UNC）。未命中返回 None —— 调用方（initialize_patches）
+/// 走「不注入 pythonPath」fallback。
+///
+/// ponytail: 不读 pyenv shims 名（`python3.x` → shim 链）—— shim 解析是 pyenv 域，
+/// 我们只兜到 `.venv/venv` 真实 venv，shimless CI 项目无 venv 时维持默认。
+pub(crate) fn find_python_interpreter(root: &Path) -> Option<PathBuf> {
+    let bin_name = if cfg!(windows) { "python.exe" } else { "python" };
+    let candidates: &[&str] = &[".venv", "venv"];
+    for venv in candidates {
+        let candidate = root.join(venv).join("bin").join(bin_name);
+        if candidate.is_file() {
+            let canonical = dunce::canonicalize(&candidate).unwrap_or(candidate);
+            return Some(canonical);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +194,32 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         adapter.set_project_root(empty.path());
         assert_eq!(adapter.probe_uri(), PROBE_FALLBACK);
+    }
+
+    /// venv 探测：.venv/bin/python(.exe) 命中 → 返该路径。
+    #[test]
+    fn find_python_interpreter_dotvenv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_name = if cfg!(windows) { "python.exe" } else { "python" };
+        let venv_bin = dir.path().join(".venv").join("bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        let py = venv_bin.join(bin_name);
+        std::fs::write(&py, "").unwrap();
+        let found = find_python_interpreter(dir.path()).expect(".venv 应命中");
+        assert!(
+            found.ends_with(format!(".venv/bin/{bin_name}").replace('/', std::path::MAIN_SEPARATOR_STR).as_str()),
+            "返回路径必须以 .venv/bin/python 结尾: {found:?}"
+        );
+    }
+
+    /// venv 探测：无 .venv / venv → None（fallback 路径）。
+    #[test]
+    fn find_python_interpreter_absent_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "").unwrap();
+        assert!(
+            find_python_interpreter(dir.path()).is_none(),
+            "无 venv 必须返 None"
+        );
     }
 }

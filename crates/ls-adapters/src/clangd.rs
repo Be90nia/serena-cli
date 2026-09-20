@@ -18,11 +18,12 @@
 //!   tracing 默认分级即可。clangd 的 `I[..]/E[..]` 特异前缀是 M3 + T2 深度 quirk 时
 //!   再补（ARCH §4.1 ↖ mirror `_determine_log_level`）。
 //!
-//! ## 已知限制（M0 显式标）
+//! ## 深度（M2 落地）
 //!
-//! - 不实现 compile_commands 转换（PLAN Task 8 修订推迟 M3）。
-//! - 不实现 UE project detection、compile_commands.json 探测 —— 全 M3。
-//! - 不实现 clangd `--query-driver` / `--clang-tidy` 等参数。
+//! - `launch_info`：root 上下找 `compile_commands.json`（BFS 限深 5），命中则追加
+//!   `--compile-commands-dir=<dir>`（dir = 含 compile_commands.json 的目录）；未命中
+//!   维持原参数，不报错 —— 纯头文件项目仍可用。
+//! - UE project detection、`--query-driver` / `--clang-tidy` 等其它参数仍不做。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -75,12 +76,19 @@ impl LanguageServerAdapter for ClangdAdapter {
                 "install LLVM clangd (https://clangd.llvm.org/installation) and ensure `clangd` is on PATH",
             )
         })?;
+        let mut cmd: Vec<std::ffi::OsString> = vec![
+            exe.into_os_string(),
+            "--background-index".into(),
+            "--limit-results=500".into(),
+        ];
+        // M2 深度：探测 compile_commands.json。命中 → 追加 --compile-commands-dir=<dir>。
+        if let Some(dir) = find_compile_commands_dir(&ctx.project_root) {
+            let mut arg = std::ffi::OsString::from("--compile-commands-dir=");
+            arg.push(dir.as_os_str());
+            cmd.push(arg);
+        }
         Ok(ls_runtime::process::LaunchInfo {
-            cmd: vec![
-                exe.into_os_string(),
-                "--background-index".into(),
-                "--limit-results=500".into(),
-            ],
+            cmd,
             cwd: ctx.project_root.clone(),
             env: vec![],
             transport: ls_runtime::process::TransportKind::Stdio,
@@ -171,6 +179,39 @@ pub(crate) fn locate_clangd() -> Option<PathBuf> {
     which_no_unc("clangd")
 }
 
+/// 从 `root` 向下 BFS 找 `compile_commands.json`，命中返回所在目录（dir 即
+/// --compile-commands-dir= 的取值）。BFS 限深 5 避免大型 monorepo 扫穿。
+///
+/// ↖ mirror: clangd_language_server.py@43ae021 `find_compile_commands`（向上找版本不同；
+/// clangd 自身默认向上找，但项目根不确定时向下更稳）。
+///
+/// ponytail: 不递归遍历子目录做 symlink 检查 —— 绝大多数构建系统产物目录是常规目录，
+/// 真实 symlink-loop 项目极少；后续真撞上再加。
+pub(crate) fn find_compile_commands_dir(root: &Path) -> Option<PathBuf> {
+    if !root.is_dir() {
+        return None;
+    }
+    const MAX_DEPTH: usize = 5;
+    let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = queue.pop() {
+        let probe = dir.join("compile_commands.json");
+        if probe.is_file() {
+            return Some(dir);
+        }
+        if depth < MAX_DEPTH
+            && let Ok(read) = std::fs::read_dir(&dir)
+        {
+            for entry in read.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    queue.push((p, depth + 1));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 客户端能力声明 helper（供 future tests / supervisor 直读）。
 #[allow(dead_code)]
 pub(crate) fn clangd_client_capabilities() -> ClientCapabilities {
@@ -212,6 +253,33 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         adapter.set_project_root(empty.path());
         assert_eq!(adapter.probe_uri(), PROBE_FALLBACK);
+    }
+
+    /// compile_commands.json 命中：root 直下 build/compile_commands.json → 返 build dir。
+    #[test]
+    fn find_compile_commands_dir_in_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = dir.path().join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("compile_commands.json"), "[]").unwrap();
+        let found = find_compile_commands_dir(dir.path()).expect("命中子目录");
+        assert_eq!(
+            dunce::canonicalize(&found).unwrap_or(found.clone()),
+            dunce::canonicalize(&build).unwrap_or(build.clone()),
+            "返回 dir 应等于 build 目录: got={found:?} expected={build:?}"
+        );
+    }
+
+    /// compile_commands.json 未命中：root + 子目录都无 → None（不报错）。
+    #[test]
+    fn find_compile_commands_dir_absent_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.cpp"), "int main(){}\n").unwrap();
+        assert!(
+            find_compile_commands_dir(dir.path()).is_none(),
+            "无 compile_commands.json 必须返 None"
+        );
     }
 }
 
