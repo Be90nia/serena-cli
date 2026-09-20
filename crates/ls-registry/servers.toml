@@ -179,3 +179,714 @@ install_hint = "install zls (https://github.com/zigtools/zls) and zig; ensure bo
 # version = "1.2.3"            # 可省
 # entrypoint = "some-ls"       # 必填，非空
 # args = ["--stdio"]           # 可省；追加在 entrypoint 之后
+
+# ---- A 类 download 批量收录（Task 20 续；数据源 local/ls-download-matrix.md，25 条清单实收 24）----
+# eclipse_jdtls 不入表：java 由手写 jdtls T2 适配器接管（同 gopls/rust-analyzer 先例）。
+# 全部条目 = 上游 serena DEFAULT_*/INITIAL_* 钉住版本（pin），sha256 = 矩阵 [embed] 真值
+# （GitHub 资产锚 assets[].digest，调研日期 2026-09-20）；source_commit 锚上游 43ae0211。
+#
+# 平台组策略（schema 局限，per-platform 扩展前有效）：DownloadSpec.archive / bin_path
+# 为单值字段，而多数 LS 的包内路径带 [.exe] / 平台段差异。每条只填 archive+bin_path
+# 完全自洽的平台组（多组同大取含 windows-x86_64 的组，marksman 先例同形态），其余平台
+# 的 URL/sha256/包内路径全量保留在条目注释中，schema 扩展后可直接搬运。
+# platform key：windows-x86_64 / windows-aarch64 / linux-x86_64 / linux-aarch64 /
+# macos-x86_64 / macos-aarch64（= config::platform_key 输出全集）。
+
+[servers.ada]
+languages = ["ada"]
+install = "download"
+exec = ["{bin}"]
+source_commit = "43ae0211"
+
+[servers.ada.download]
+version = "2026.2.202604091"
+archive = "tar.gz"
+bin_path = "integration/vscode/ada/x64/win32/ada_language_server.exe"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.ada.download.url_per_platform]
+"windows-x86_64" = "https://github.com/AdaCore/ada_language_server/releases/download/2026.2.202604091/als-2026.2.202604091-win32-x64.tar.gz"
+
+[servers.ada.download.sha256_per_platform]
+"windows-x86_64" = "bca024dc3643b2d91aebbb747398e2e6f183ad8cb2f149e24fe7a38cdb16ed8d"
+# bin_path 每平台路径互异（{x64|arm64}/{win32|linux|darwin}/ada_language_server[.exe]），
+# 单值字段仅容一组；其余平台待 per-platform bin_path 扩展：
+#   linux-x86_64: als-2026.2.202604091-linux-x64.tar.gz
+#     sha256 2eb436a7c0e3740128cceaa15da9ff856fa75ef3fbb3e2e9d3a1bd17e15cb949
+#     bin integration/vscode/ada/x64/linux/ada_language_server
+#   linux-aarch64: als-2026.2.202604091-linux-arm64.tar.gz
+#     sha256 65c57df715df90f7581ecd6a1d1884663376baaf38cedbab80d10060ff91b03d
+#     bin integration/vscode/ada/arm64/linux/ada_language_server
+#   macos-x86_64: als-2026.2.202604091-darwin-x64.tar.gz
+#     sha256 18d3277a25a6e08ce3ee7230c3e5ac20419d573cb8d8c883e7983f387a67d223
+#     bin integration/vscode/ada/x64/darwin/ada_language_server
+#   macos-aarch64: als-2026.2.202604091-darwin-arm64.tar.gz
+#     sha256 1d25ded29b6beafcb34c9d0084d52809d84577356e467bf92e8fef32fc4216c4
+#     bin integration/vscode/ada/arm64/darwin/ada_language_server
+# 注：Wa（win32-arm64）上游无资产。
+
+[servers.al]
+languages = ["al"]
+install = "download"
+exec = ["{bin}"]
+source_commit = "43ae0211"
+
+[servers.al.download]
+version = "18.0.2242655"
+archive = "zip"
+bin_path = "extension/bin/win32/Microsoft.Dynamics.Nav.EditorServices.Host.exe"
+allowed_hosts = ["marketplace.visualstudio.com"]
+
+[servers.al.download.url_per_platform]
+"windows-x86_64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/18.0.2242655/vspackage"
+
+[servers.al.download.sha256_per_platform]
+"windows-x86_64" = "3971995e61a59dc4fcce4a65053072a67991ed624a16635c4f2911f12564b2b9"
+# VSIX 形态：universal zip（多平台合一，Marketplace 无官方 digest），各平台同 URL 同
+# sha256；bin_path 随平台段 win32|linux|darwin 变化（unix 无 .exe 后缀），单值字段仅容
+# windows 组：
+#   linux-x86_64 / linux-aarch64 / macos-x86_64 / macos-aarch64 同上 URL / sha256，
+#   bin extension/bin/{linux|darwin}/Microsoft.Dynamics.Nav.EditorServices.Host
+
+[servers.bsl]
+languages = ["bsl"]
+install = "download"
+exec = ["java", "-jar", "{bin}"]
+source_commit = "43ae0211"
+
+[servers.bsl.download]
+version = "0.29.0"
+archive = "raw"
+bin_path = "bsl-language-server-exec.jar"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.bsl.download.url_per_platform]
+"windows-x86_64" = "https://github.com/1c-syntax/bsl-language-server/releases/download/v0.29.0/bsl-language-server-0.29.0-exec.jar"
+"linux-x86_64" = "https://github.com/1c-syntax/bsl-language-server/releases/download/v0.29.0/bsl-language-server-0.29.0-exec.jar"
+"linux-aarch64" = "https://github.com/1c-syntax/bsl-language-server/releases/download/v0.29.0/bsl-language-server-0.29.0-exec.jar"
+"macos-x86_64" = "https://github.com/1c-syntax/bsl-language-server/releases/download/v0.29.0/bsl-language-server-0.29.0-exec.jar"
+"macos-aarch64" = "https://github.com/1c-syntax/bsl-language-server/releases/download/v0.29.0/bsl-language-server-0.29.0-exec.jar"
+
+[servers.bsl.download.sha256_per_platform]
+"windows-x86_64" = "d6fa9ad638ba51855e260b88ad1f8ce4e602385845a4ee43600d148f779bcf0b"
+"linux-x86_64" = "d6fa9ad638ba51855e260b88ad1f8ce4e602385845a4ee43600d148f779bcf0b"
+"linux-aarch64" = "d6fa9ad638ba51855e260b88ad1f8ce4e602385845a4ee43600d148f779bcf0b"
+"macos-x86_64" = "d6fa9ad638ba51855e260b88ad1f8ce4e602385845a4ee43600d148f779bcf0b"
+"macos-aarch64" = "d6fa9ad638ba51855e260b88ad1f8ce4e602385845a4ee43600d148f779bcf0b"
+# any 平台单一 JAR（需 JVM >= 21）；bin_path = raw 落盘文件名。
+
+[servers.csharp]
+# Roslyn 语言服务器（NuGet nupkg）。注意：csharp 语言的手写 csharp-ls T2 适配器仍在
+# ls-adapters（不在本表）；本条为其下载形态后备，语言路由 spec_for("csharp") 命中本条
+# 后由调用方按手写优先原则分流（Task 21 接线）。
+languages = ["csharp"]
+install = "download"
+exec = ["dotnet", "{bin}", "--logLevel=Information", "--extensionLogDirectory={log_dir}", "--stdio"]
+source_commit = "43ae0211"
+
+[servers.csharp.download]
+version = "5.5.0-2.26078.4"
+archive = "zip"
+bin_path = "tools/net10.0/win-x64/Microsoft.CodeAnalysis.LanguageServer.dll"
+allowed_hosts = ["nuget.org"]
+
+[servers.csharp.download.url_per_platform]
+"windows-x86_64" = "https://www.nuget.org/api/v2/package/roslyn-language-server.win-x64/5.5.0-2.26078.4"
+
+[servers.csharp.download.sha256_per_platform]
+"windows-x86_64" = "7f3d4119e75305399e6faa81a68240b33c48b94ad523a904594abd00db95572a"
+# nupkg（zip）包内路径含平台段 tools/net10.0/{plat}/，单值字段仅容 win-x64 组：
+#   linux-x86_64: roslyn-language-server.linux-x64/5.5.0-2.26078.4
+#     sha256 1aad25de456d637a1eee993ca0d569a1b78d711744ccb36410a3a20250a48aa6
+#     bin tools/net10.0/linux-x64/Microsoft.CodeAnalysis.LanguageServer.dll
+#   linux-aarch64: roslyn-language-server.linux-arm64/5.5.0-2.26078.4
+#     sha256 a7dd49bbc0e25d0e2968ae31ec5f3c774373866db51f3500fcea0ac320e2bbc1
+#     bin tools/net10.0/linux-arm64/Microsoft.CodeAnalysis.LanguageServer.dll
+#   macos-x86_64: roslyn-language-server.osx-x64/5.5.0-2.26078.4
+#     sha256 c8de61a88c65150e12f561a2659f70b59d27a7465865136a1de950d2ef826c6d
+#     bin tools/net10.0/osx-x64/Microsoft.CodeAnalysis.LanguageServer.dll
+#   macos-aarch64: roslyn-language-server.osx-arm64/5.5.0-2.26078.4
+#     sha256 995207c14e01dafa71e84080a7eb1f045a697b0c3bb468077bb3809b69bdf456
+#     bin tools/net10.0/osx-arm64/Microsoft.CodeAnalysis.LanguageServer.dll
+#   windows-aarch64: roslyn-language-server.win-arm64/5.5.0-2.26078.4
+#     sha256 0fe3381c4340a7494a5242c3d0c8be1af6ef0802de8b458f947cebca76fd26bc
+#     bin tools/net10.0/win-arm64/Microsoft.CodeAnalysis.LanguageServer.dll
+# exec：.NET 10+ runtime 必需；{log_dir} = 运行时占位（接线层替换）。
+
+[servers.clojure]
+languages = ["clojure"]
+install = "download"
+exec = ["{bin}"]
+source_commit = "43ae0211"
+
+[servers.clojure.download]
+version = "2026.02.20-16.08.58"
+archive = "zip"
+bin_path = "clojure-lsp"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.clojure.download.url_per_platform]
+"linux-x86_64" = "https://github.com/clojure-lsp/clojure-lsp/releases/download/2026.02.20-16.08.58/clojure-lsp-native-linux-amd64.zip"
+"linux-aarch64" = "https://github.com/clojure-lsp/clojure-lsp/releases/download/2026.02.20-16.08.58/clojure-lsp-native-linux-aarch64.zip"
+"macos-x86_64" = "https://github.com/clojure-lsp/clojure-lsp/releases/download/2026.02.20-16.08.58/clojure-lsp-native-macos-amd64.zip"
+"macos-aarch64" = "https://github.com/clojure-lsp/clojure-lsp/releases/download/2026.02.20-16.08.58/clojure-lsp-native-macos-aarch64.zip"
+
+[servers.clojure.download.sha256_per_platform]
+"linux-x86_64" = "52e8bf4fd4cf171df0a3077c8bb5a3bf598d4c621e94b4876dab943a61267309"
+"linux-aarch64" = "f8f09fa07dd4b6743b5c57270ccf1ee5cdbc5fca09dbca8b6a3b22705b5da4e1"
+"macos-x86_64" = "5507434c27104ab816e096d3336d8191641de8a65b57d76afb585d07167a3cf2"
+"macos-aarch64" = "a14d4db074f665378214e2dc888472e186c228dfa065c777b0534bfda5571669"
+# zip 根二进制 clojure-lsp（unix）/ clojure-lsp.exe（win），win 组待扩展：
+#   windows-x86_64: clojure-lsp-native-windows-amd64.zip
+#     sha256 817b1271288817c954fb9e595278b1f25003827ce31f8785f253dc4ac911041f
+#     bin clojure-lsp.exe
+# 运行需 Clojure CLI 在 PATH。
+
+[servers.cue]
+languages = ["cue"]
+install = "download"
+exec = ["{bin}", "lsp"]
+source_commit = "43ae0211"
+
+[servers.cue.download]
+version = "v0.16.1"
+archive = "tar.gz"
+bin_path = "cue"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.cue.download.url_per_platform]
+"linux-x86_64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_linux_amd64.tar.gz"
+"linux-aarch64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_linux_arm64.tar.gz"
+"macos-x86_64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_darwin_amd64.tar.gz"
+"macos-aarch64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_darwin_arm64.tar.gz"
+
+[servers.cue.download.sha256_per_platform]
+"linux-x86_64" = "5d644c1305a2b86504c8dcd2ec829cf5b4999efc2cf51ee375624e0455f774ae"
+"linux-aarch64" = "3cc715a9e969f87b93c4fa34cfaef5388b93e96efa20b248e8ad6826abd25a83"
+"macos-x86_64" = "97b0d78e4c5ee49ff72145fd6ef4f4bab0bb332d55f29660de3fec2af5ec96a9"
+"macos-aarch64" = "a72b0cddb377c52d1b003bed9a335d893b70cd75a182cd5e3fee8bae30ddb6d6"
+# win 组（zip 根 cue.exe）待扩展：
+#   windows-x86_64: cue_v0.16.1_windows_amd64.zip
+#     sha256 2f24123f458229fcf283db534bd86692ad1074da806defee0f0cc62976c0397c
+#   windows-aarch64: cue_v0.16.1_windows_arm64.zip
+#     sha256 e0c15ce53f73e8609b0e8ce6507298f3474b334ac5eb0c826c9497a811fd0cce
+
+[servers.dart]
+languages = ["dart"]
+install = "download"
+exec = ["{bin}", "language-server", "--client-id", "multilspy.dart", "--client-version", "1.2"]
+source_commit = "43ae0211"
+
+[servers.dart.download]
+version = "3.7.1"
+archive = "zip"
+bin_path = "dart-sdk/bin/dart"
+allowed_hosts = ["storage.googleapis.com"]
+
+[servers.dart.download.url_per_platform]
+"linux-x86_64" = "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-linux-x64-release.zip"
+"macos-x86_64" = "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-macos-x64-release.zip"
+"macos-aarch64" = "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-macos-arm64-release.zip"
+
+[servers.dart.download.sha256_per_platform]
+"linux-x86_64" = "2813959e7d9650334015b927cc533f5beadfbf7fa48248beec471f8942a0ee71"
+"macos-x86_64" = "a2765917b6ae49d1ac119553df9584989f9c441a46e8f18c129ba52489658d2e"
+"macos-aarch64" = "f57c25163092bac818f8ca6250a0d8b2c56344c6a075a1bd7c60da7ac28b32a4"
+# 整 Dart SDK zip（~1GB 级）；bin 组 unix=dart-sdk/bin/dart、win=dart.exe，win 组待扩展：
+#   windows-x86_64: dartsdk-windows-x64-release.zip
+#     sha256 f56c03122e17abe5be1429eee0a975fb8ed511b6731ec90c6475992d3dee4ea5
+#   windows-aarch64: dartsdk-windows-arm64-release.zip
+#     sha256 fada411c6538d0ac24c35d6360767241f1298f64cbc5e88716387d54757a105a
+#   bin dart-sdk/bin/dart.exe
+
+[servers.elixir]
+languages = ["elixir"]
+install = "download"
+exec = ["{bin}", "--stdio"]
+source_commit = "43ae0211"
+
+[servers.elixir.download]
+version = "v0.1.0-rc.6"
+archive = "raw"
+bin_path = "expert.exe"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.elixir.download.url_per_platform]
+"windows-x86_64" = "https://github.com/expert-lsp/expert/releases/download/v0.1.0-rc.6/expert_windows_amd64.exe"
+"linux-x86_64" = "https://github.com/expert-lsp/expert/releases/download/v0.1.0-rc.6/expert_linux_amd64"
+"linux-aarch64" = "https://github.com/expert-lsp/expert/releases/download/v0.1.0-rc.6/expert_linux_arm64"
+"macos-x86_64" = "https://github.com/expert-lsp/expert/releases/download/v0.1.0-rc.6/expert_darwin_amd64"
+"macos-aarch64" = "https://github.com/expert-lsp/expert/releases/download/v0.1.0-rc.6/expert_darwin_arm64"
+
+[servers.elixir.download.sha256_per_platform]
+"windows-x86_64" = "babee77d2653679021600b99c68d984d4463290cb221e0fc0d1093b3afdeb3b0"
+"linux-x86_64" = "643a492ff972246668b0ca356a84c3d0a0f5feeae0ab5dc1b9a126876ed460e4"
+"linux-aarch64" = "d8b830bdaa8991d7ebf255dacbb3674f3ea335c87d0bfba4b7f907ded4a8f014"
+"macos-x86_64" = "964f316f1633090b33aab392b6b85fb778c5fb3c0db862671424458da34b1d4d"
+"macos-aarch64" = "5fb5be151baedd635d99835cf3f9986afc9af6ae7b07bd001a1962f4298e45da"
+# raw 单二进制，bin_path = 落盘名（统一 .exe 名；unix 落盘带 .exe 名不影响执行，marksman
+# 先例同形态）。上游仓库已迁移 elixir-lang/expert → expert-lsp/expert（302 实测）。无 Wa。
+# 运行需 Elixir。
+
+[servers.haxe]
+languages = ["haxe"]
+install = "download"
+exec = ["node", "{bin}"]
+source_commit = "43ae0211"
+
+[servers.haxe.download]
+version = "2.34.2"
+archive = "zip"
+bin_path = "extension/bin/server.js"
+allowed_hosts = ["open-vsx.org"]
+
+[servers.haxe.download.url_per_platform]
+"windows-x86_64" = "https://open-vsx.org/api/nadako/vshaxe/2.34.2/file/nadako.vshaxe-2.34.2.vsix"
+"linux-x86_64" = "https://open-vsx.org/api/nadako/vshaxe/2.34.2/file/nadako.vshaxe-2.34.2.vsix"
+"linux-aarch64" = "https://open-vsx.org/api/nadako/vshaxe/2.34.2/file/nadako.vshaxe-2.34.2.vsix"
+"macos-x86_64" = "https://open-vsx.org/api/nadako/vshaxe/2.34.2/file/nadako.vshaxe-2.34.2.vsix"
+"macos-aarch64" = "https://open-vsx.org/api/nadako/vshaxe/2.34.2/file/nadako.vshaxe-2.34.2.vsix"
+
+[servers.haxe.download.sha256_per_platform]
+"windows-x86_64" = "104d785e3f7b57a7f3debf520d9751f7e7abf3a7e78d203db1a8ff3dc7ca30e2"
+"linux-x86_64" = "104d785e3f7b57a7f3debf520d9751f7e7abf3a7e78d203db1a8ff3dc7ca30e2"
+"linux-aarch64" = "104d785e3f7b57a7f3debf520d9751f7e7abf3a7e78d203db1a8ff3dc7ca30e2"
+"macos-x86_64" = "104d785e3f7b57a7f3debf520d9751f7e7abf3a7e78d203db1a8ff3dc7ca30e2"
+"macos-aarch64" = "104d785e3f7b57a7f3debf520d9751f7e7abf3a7e78d203db1a8ff3dc7ca30e2"
+# VSIX（zip）universal：bin/server.js 为矩阵简写，VSIX 包内实际根为 extension/bin/server.js
+# （上游 haxe_language_server.py 按 "/bin/" 模糊匹配后落 bin/，同 al/matlab 形态）。
+# 运行需 Node + Haxe 编译器（3.4.0+）。
+
+[servers.hlsl]
+languages = ["hlsl"]
+install = "download"
+exec = ["{bin}", "--stdio"]
+source_commit = "43ae0211"
+
+[servers.hlsl.download]
+version = "1.3.1"
+archive = "zip"
+bin_path = "shader-language-server.exe"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.hlsl.download.url_per_platform]
+"windows-x86_64" = "https://github.com/antaalt/shader-sense/releases/download/v1.3.1/shader-language-server-x86_64-pc-windows-msvc.zip"
+"windows-aarch64" = "https://github.com/antaalt/shader-sense/releases/download/v1.3.1/shader-language-server-aarch64-pc-windows-msvc.zip"
+
+[servers.hlsl.download.sha256_per_platform]
+"windows-x86_64" = "49081c5547ddde1b8b3b17295282a80ddacbca1d6f5dcd834e2788c02baba997"
+"windows-aarch64" = "a3b3799affe2cad27652e788376b46fe76e1a6c2ce45946a486dcb26c9091412"
+# linux 组（包内无 .exe 后缀）待扩展：
+#   linux-x86_64: shader-language-server-x86_64-unknown-linux-gnu.zip
+#     sha256 61710df7ca17a2d063b598936c57c56c49fbf837707a1aa886f9b0193a35be3c
+#     bin shader-language-server
+# 注：M/Ma 上游无预编译资产（serena 走 cargo install shader_language_server --locked，
+# 非单二进制下载形态，不入本表）。
+
+[servers.kotlin]
+languages = ["kotlin"]
+install = "download"
+exec = ["{bin}", "--stdio", "--system-path", "{system_path}"]
+source_commit = "43ae0211"
+
+[servers.kotlin.download]
+version = "262.9593.0"
+archive = "zip"
+bin_path = "bin/intellij-server.exe"
+allowed_hosts = ["download-cdn.jetbrains.com"]
+
+[servers.kotlin.download.url_per_platform]
+"windows-x86_64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/262.9593.0/kotlin-server-262.9593.0.win.zip"
+"windows-aarch64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/262.9593.0/kotlin-server-262.9593.0-aarch64.win.zip"
+
+[servers.kotlin.download.sha256_per_platform]
+"windows-x86_64" = "f2daaa476f26d99301b406f76de6d87c437d04dc72f06845154619d8f991c51f"
+"windows-aarch64" = "73a552a6a420158622e5ad8d96b53da8aa8ced3f88a24fded01575927a2fd8e7"
+# 包内路径/压缩形态随平台变化，单值字段仅容 win 组：
+#   macos-x86_64: kotlin-server-262.9593.0.sit（zip 格式）
+#     sha256 17369fda97c85418ac24ab38a9df56b21522a3468dfe193832fe455c13920745
+#     bin bin/intellij-server
+#   macos-aarch64: kotlin-server-262.9593.0-aarch64.sit
+#     sha256 6ba6021a706b21e64cef33f7e2b79f187c0910320722bb2d3ed05ad1115ec43f
+#     bin bin/intellij-server
+#   linux-x86_64: kotlin-server-262.9593.0.tar.gz（包内多一层 kotlin-server-{v}/）
+#     sha256 2d99d8e198fbe4aa8f4481e37799724ce94803b4ea12a60b416040e3fcd7cc5e
+#     bin kotlin-server-262.9593.0/bin/intellij-server
+#   linux-aarch64: kotlin-server-262.9593.0-aarch64.tar.gz
+#     sha256 2317831c6e5607d05b7ebc1da655330125ce0e3d66fbf24517dfce442debc14e
+#     bin kotlin-server-262.9593.0/bin/intellij-server
+# exec：{system_path} = 运行时占位（缓存下 kotlin-lsp-system 目录）；需 env
+# JAVA_TOOL_OPTIONS=-Xmx2G 与 JDK。JetBrains CDN 无版本列表端点（latest MISSING）。
+
+[servers.lua]
+languages = ["lua"]
+install = "download"
+exec = ["{bin}"]
+source_commit = "43ae0211"
+
+[servers.lua.download]
+version = "3.15.0"
+archive = "tar.gz"
+bin_path = "bin/lua-language-server"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.lua.download.url_per_platform]
+"linux-x86_64" = "https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-linux-x64.tar.gz"
+"linux-aarch64" = "https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-linux-arm64.tar.gz"
+"macos-x86_64" = "https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-darwin-x64.tar.gz"
+"macos-aarch64" = "https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-darwin-arm64.tar.gz"
+
+[servers.lua.download.sha256_per_platform]
+"linux-x86_64" = "4877b874c52fb7587707898da9026cc3a6c854d9bbab115ef49ac4e6a1b88007"
+"linux-aarch64" = "7dff8edfed4f34cf6325ff384791287d95f9a8dd9615a5279c7c6af81cf8c45d"
+"macos-x86_64" = "01d28a31e264434e51662814a68f584af068393caecfa158c4df5f7fdc3ca2f7"
+"macos-aarch64" = "050f5f493f65112afc116e31281a9f73918546782d3696485dc052724838f58b"
+# win 组（zip，包内 bin/lua-language-server.exe）待扩展：
+#   windows-x86_64: lua-language-server-3.15.0-win32-x64.zip
+#     sha256 76a10c05e8c947a448f00a61acead4240484cd1e2e8c66d54401c67d99b77535
+
+[servers.luau]
+languages = ["luau"]
+install = "download"
+exec = ["{bin}", "lsp"]
+source_commit = "43ae0211"
+
+[servers.luau.download]
+version = "1.63.0"
+archive = "zip"
+bin_path = "luau-lsp"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.luau.download.url_per_platform]
+"linux-x86_64" = "https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.63.0/luau-lsp-linux-x86_64.zip"
+"linux-aarch64" = "https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.63.0/luau-lsp-linux-arm64.zip"
+"macos-x86_64" = "https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.63.0/luau-lsp-macos.zip"
+"macos-aarch64" = "https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.63.0/luau-lsp-macos.zip"
+
+[servers.luau.download.sha256_per_platform]
+"linux-x86_64" = "e4b633ad9a2c15437f60f9e721263f79aa0da606867d8458f0e159a325bf2db8"
+"linux-aarch64" = "355be010f337a6772df6255c92e1fb28a59d194abe5c570453f4186472244355"
+"macos-x86_64" = "01c1d6dd5fee27295b2968915dabb08c192192c46d9fe9c97bf31a130c96b8cb"
+"macos-aarch64" = "01c1d6dd5fee27295b2968915dabb08c192192c46d9fe9c97bf31a130c96b8cb"
+# macos.zip 为 universal（dual-arch 同资产同 sha256）。win 组待扩展：
+#   windows-x86_64: luau-lsp-win64.zip
+#     sha256 eea596d47dc1c94a61ba1b78e6472bb4445bc3309780751515e6ab0a0abba57d
+#     bin luau-lsp.exe
+# 可选辅助文件（type-definitions / api-docs，https://luau-lsp.pages.dev/）未随装。
+
+[servers.matlab]
+languages = ["matlab"]
+install = "download"
+exec = ["node", "{bin}", "--stdio"]
+source_commit = "43ae0211"
+
+[servers.matlab.download]
+version = "1.3.9"
+archive = "zip"
+bin_path = "extension/server/out/index.js"
+allowed_hosts = ["marketplace.visualstudio.com"]
+
+[servers.matlab.download.url_per_platform]
+"windows-x86_64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/MathWorks/vsextensions/language-matlab/1.3.9/vspackage"
+"linux-x86_64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/MathWorks/vsextensions/language-matlab/1.3.9/vspackage"
+"linux-aarch64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/MathWorks/vsextensions/language-matlab/1.3.9/vspackage"
+"macos-x86_64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/MathWorks/vsextensions/language-matlab/1.3.9/vspackage"
+"macos-aarch64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/MathWorks/vsextensions/language-matlab/1.3.9/vspackage"
+
+[servers.matlab.download.sha256_per_platform]
+"windows-x86_64" = "1da3add2c3a593fa0ebcdf1d15231faee8014de10f549c36915ab9d4f18390f2"
+"linux-x86_64" = "1da3add2c3a593fa0ebcdf1d15231faee8014de10f549c36915ab9d4f18390f2"
+"linux-aarch64" = "1da3add2c3a593fa0ebcdf1d15231faee8014de10f549c36915ab9d4f18390f2"
+"macos-x86_64" = "1da3add2c3a593fa0ebcdf1d15231faee8014de10f549c36915ab9d4f18390f2"
+"macos-aarch64" = "1da3add2c3a593fa0ebcdf1d15231faee8014de10f549c36915ab9d4f18390f2"
+# VSIX（zip）universal：bin 平台无关（Node 脚本），各平台同 URL 同 sha256（Marketplace 无
+# 官方 digest）。运行需 MATLAB R2021b+ 与 Node；env MATLAB_INSTALL_PATH 指向 MATLAB 安装。
+
+[servers.nextflow]
+languages = ["nextflow"]
+install = "download"
+exec = ["java", "-jar", "{bin}"]
+source_commit = "43ae0211"
+
+[servers.nextflow.download]
+version = "26.04.3"
+archive = "raw"
+bin_path = "language-server-all.jar"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.nextflow.download.url_per_platform]
+"windows-x86_64" = "https://github.com/nextflow-io/language-server/releases/download/v26.04.3/language-server-all.jar"
+"linux-x86_64" = "https://github.com/nextflow-io/language-server/releases/download/v26.04.3/language-server-all.jar"
+"linux-aarch64" = "https://github.com/nextflow-io/language-server/releases/download/v26.04.3/language-server-all.jar"
+"macos-x86_64" = "https://github.com/nextflow-io/language-server/releases/download/v26.04.3/language-server-all.jar"
+"macos-aarch64" = "https://github.com/nextflow-io/language-server/releases/download/v26.04.3/language-server-all.jar"
+
+[servers.nextflow.download.sha256_per_platform]
+"windows-x86_64" = "20cfa34f6e202d6b8babd8d786202ce00e0d39b70ccec3290e2ab3fbd02bc016"
+"linux-x86_64" = "20cfa34f6e202d6b8babd8d786202ce00e0d39b70ccec3290e2ab3fbd02bc016"
+"linux-aarch64" = "20cfa34f6e202d6b8babd8d786202ce00e0d39b70ccec3290e2ab3fbd02bc016"
+"macos-x86_64" = "20cfa34f6e202d6b8babd8d786202ce00e0d39b70ccec3290e2ab3fbd02bc016"
+"macos-aarch64" = "20cfa34f6e202d6b8babd8d786202ce00e0d39b70ccec3290e2ab3fbd02bc016"
+# any 平台单一 fat JAR（需 JDK >= 17）；bin_path = raw 落盘文件名。
+
+[servers.omnisharp]
+# 旧线 C# OmniSharp（上游已弃，serena 仅启用 linux-x64/win-x64 net6 变体）。语言路由
+# spec_for("csharp") 归 csharp（Roslyn）条目，本条仅按 id 显式安装（languages 避撞）。
+languages = ["omnisharp"]
+install = "download"
+exec = ["{bin}", "-lsp", "--encoding", "ascii", "-z"]
+source_commit = "43ae0211"
+
+[servers.omnisharp.download]
+version = "1.39.10"
+archive = "zip"
+bin_path = "OmniSharp.exe"
+allowed_hosts = ["roslynomnisharp.blob.core.windows.net"]
+
+[servers.omnisharp.download.url_per_platform]
+"windows-x86_64" = "https://roslynomnisharp.blob.core.windows.net/releases/1.39.10/omnisharp-win-x64-1.39.10-net6.0.zip"
+
+[servers.omnisharp.download.sha256_per_platform]
+"windows-x86_64" = "A73327395E7EF92C1D8E307055463DA412662C03F077ECC743462FD2760BB537"
+# sha256 原文大写（上游 JSON integrity 字段；install.rs 校验前统一 to_ascii_lowercase）。
+# linux-x64 net6 变体待扩展（bin OmniSharp，无 .exe）：
+#   linux-x86_64: omnisharp-linux-x64-1.39.10-net6.0.zip
+#     sha256 0926D3BEA060BF4373356B2FC0A68C10D0DE1B1150100B551BA5932814CE51E2
+# Razor 插件为独立 zip（固定 GUID URL 不可模板化）+ exec 追加
+# `--plugin OmniSharpPlugin/Microsoft.AspNetCore.Razor.OmniSharpPlugin.dll`——单下载
+# schema 不支持双包，exec 暂不含 --plugin（基础 OmniSharp LSP 可用）。需 .NET 6-9 runtime；
+# 完整启动还含 -s <sln> --hostPID <pid> 等运行时参数（接线层追加）。
+
+[servers.pascal]
+languages = ["pascal"]
+install = "download"
+exec = ["{bin}"]
+source_commit = "43ae0211"
+
+[servers.pascal.download]
+version = "v0.2.0"
+archive = "zip"
+bin_path = "pasls"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.pascal.download.url_per_platform]
+"windows-x86_64" = "https://github.com/zen010101/pascal-language-server/releases/download/v0.2.0/pasls-x86_64-win64.zip"
+"macos-x86_64" = "https://github.com/zen010101/pascal-language-server/releases/download/v0.2.0/pasls-x86_64-darwin.zip"
+"macos-aarch64" = "https://github.com/zen010101/pascal-language-server/releases/download/v0.2.0/pasls-aarch64-darwin.zip"
+
+[servers.pascal.download.sha256_per_platform]
+"windows-x86_64" = "1493c31552e6f90a59800b2d44669e01fc4551d3647f3cea5dd105a9f6bc73e5"
+"macos-x86_64" = "0abfcd98f63f77dba74094339a40d4407b69317c1c77b13a26b9b7dbdfd885f1"
+"macos-aarch64" = "d4c2411e406af96ceae12b11e77fdb0c684ca15a68bfd8b4f9c6fe1fbdf515a7"
+# zip 组（M/Ma/W）包内根均为 pasls（win zip 内无 .exe 后缀）。tar.gz 组待扩展：
+#   linux-x86_64: pasls-x86_64-linux.tar.gz
+#     sha256 517259395b0a385a5e848cf48b967645a984be3dd456118bc08771283a822a5b
+#   linux-aarch64: pasls-aarch64-linux.tar.gz
+#     sha256 cb4986941cfdcf9cb74ece6bbb53a443390a908e880108a37f4ccf82b2d6c502
+# 运行 env PP/FPCDIR/LAZARUSDIR/FPCTARGET*；需 FPC。sha 三方一致（embed=API=官方 checksums）。
+
+[servers.phpactor]
+languages = ["php"]
+install = "download"
+exec = ["php", "{bin}", "language-server"]
+source_commit = "43ae0211"
+
+[servers.phpactor.download]
+version = "2025.12.21.1"
+archive = "raw"
+bin_path = "phpactor.phar"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.phpactor.download.url_per_platform]
+"windows-x86_64" = "https://github.com/phpactor/phpactor/releases/download/2025.12.21.1/phpactor.phar"
+"linux-x86_64" = "https://github.com/phpactor/phpactor/releases/download/2025.12.21.1/phpactor.phar"
+"linux-aarch64" = "https://github.com/phpactor/phpactor/releases/download/2025.12.21.1/phpactor.phar"
+"macos-x86_64" = "https://github.com/phpactor/phpactor/releases/download/2025.12.21.1/phpactor.phar"
+"macos-aarch64" = "https://github.com/phpactor/phpactor/releases/download/2025.12.21.1/phpactor.phar"
+
+[servers.phpactor.download.sha256_per_platform]
+"windows-x86_64" = "53bbe9625cd9b5e9b394bc2f595fbad13dbbe6dfc96950c56dea3b5d9a246cc3"
+"linux-x86_64" = "53bbe9625cd9b5e9b394bc2f595fbad13dbbe6dfc96950c56dea3b5d9a246cc3"
+"linux-aarch64" = "53bbe9625cd9b5e9b394bc2f595fbad13dbbe6dfc96950c56dea3b5d9a246cc3"
+"macos-x86_64" = "53bbe9625cd9b5e9b394bc2f595fbad13dbbe6dfc96950c56dea3b5d9a246cc3"
+"macos-aarch64" = "53bbe9625cd9b5e9b394bc2f595fbad13dbbe6dfc96950c56dea3b5d9a246cc3"
+# any 平台单一 PHAR（需 PHP 8.1+）；bin_path = raw 落盘文件名。
+
+[servers.phpantom]
+# Rust 实现的 PHP LS（零运行时依赖）。php 语言路由归 phpactor 条目，本条仅按 id 显式
+# 安装（languages 避撞）。
+languages = ["phpantom"]
+install = "download"
+exec = ["{bin}", "--stdio"]
+source_commit = "43ae0211"
+
+[servers.phpantom.download]
+version = "0.8.0"
+archive = "tar.gz"
+bin_path = "phpantom_lsp"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.phpantom.download.url_per_platform]
+"linux-x86_64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-x86_64-unknown-linux-gnu.tar.gz"
+"linux-aarch64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-aarch64-unknown-linux-gnu.tar.gz"
+"macos-x86_64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-x86_64-apple-darwin.tar.gz"
+"macos-aarch64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-aarch64-apple-darwin.tar.gz"
+
+[servers.phpantom.download.sha256_per_platform]
+"linux-x86_64" = "39615b495e624bbafe8787c3be61acabc123ec5ac23e9b30e00ab7660f50e020"
+"linux-aarch64" = "e87fc96430f1bcc4966f953033a73a4e2ea53b2dbb7dc3e5f71cc8ced9022a57"
+"macos-x86_64" = "e09eef93342cd38c9f9cc6c58064d81b005d06ec6d054e7cdeeec7698dc6c5da"
+"macos-aarch64" = "2cdfd103b5df98d20712eaeea9bd00d2b459e2a588296f1ab8e558fe25fde456"
+# win 组（zip 根 phpantom_lsp.exe）待扩展（唯一全 6 平台资产的上游）：
+#   windows-x86_64: phpantom_lsp-x86_64-pc-windows-msvc.zip
+#     sha256 17e23af816fc7ec695fe716f6209df6b0eafcec2fdafb5d9d72e2b352d5ddf83
+#   windows-aarch64: phpantom_lsp-aarch64-pc-windows-msvc.zip
+#     sha256 352bfd90351c0f35947ea1af458dabe7a4dc4753d0cabaf9711a23a61346a63d
+
+[servers.powershell]
+languages = ["powershell"]
+install = "download"
+exec = ["pwsh", "-NoLogo", "-NoProfile", "-Command", "& '{bin}' -HostName SolidLSP -HostProfileId solidlsp -HostVersion 1.0.0 -BundledModulesPath {bundled_modules_path} -LogPath {log_path} -LogLevel Information -SessionDetailsPath {session_details_path} -Stdio"]
+source_commit = "43ae0211"
+
+[servers.powershell.download]
+version = "4.4.0"
+archive = "zip"
+bin_path = "PowerShellEditorServices/Start-EditorServices.ps1"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.powershell.download.url_per_platform]
+"windows-x86_64" = "https://github.com/PowerShell/PowerShellEditorServices/releases/download/v4.4.0/PowerShellEditorServices.zip"
+"linux-x86_64" = "https://github.com/PowerShell/PowerShellEditorServices/releases/download/v4.4.0/PowerShellEditorServices.zip"
+"linux-aarch64" = "https://github.com/PowerShell/PowerShellEditorServices/releases/download/v4.4.0/PowerShellEditorServices.zip"
+"macos-x86_64" = "https://github.com/PowerShell/PowerShellEditorServices/releases/download/v4.4.0/PowerShellEditorServices.zip"
+"macos-aarch64" = "https://github.com/PowerShell/PowerShellEditorServices/releases/download/v4.4.0/PowerShellEditorServices.zip"
+
+[servers.powershell.download.sha256_per_platform]
+"windows-x86_64" = "690b91092989a0f66e6f43986166aaef69d64b559a9fda51feed882e1103fbcc"
+"linux-x86_64" = "690b91092989a0f66e6f43986166aaef69d64b559a9fda51feed882e1103fbcc"
+"linux-aarch64" = "690b91092989a0f66e6f43986166aaef69d64b559a9fda51feed882e1103fbcc"
+"macos-x86_64" = "690b91092989a0f66e6f43986166aaef69d64b559a9fda51feed882e1103fbcc"
+"macos-aarch64" = "690b91092989a0f66e6f43986166aaef69d64b559a9fda51feed882e1103fbcc"
+# any 平台单一 zip（bin = ps1 脚本，平台无关）。需 pwsh 7+；{bundled_modules_path}/
+# {log_path}/{session_details_path} = 运行时占位（接线层替换），PSScriptAnalyzer 1.25.0
+# 需 Save-Module 预置（未随装）。
+
+[servers.systemverilog]
+languages = ["systemverilog"]
+install = "download"
+exec = ["{bin}"]
+source_commit = "43ae0211"
+
+[servers.systemverilog.download]
+version = "v0.0-4051-g9fdb4057"
+archive = "tar.gz"
+strip_components = 1
+bin_path = "bin/verible-verilog-ls"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.systemverilog.download.url_per_platform]
+"linux-x86_64" = "https://github.com/chipsalliance/verible/releases/download/v0.0-4051-g9fdb4057/verible-v0.0-4051-g9fdb4057-linux-static-x86_64.tar.gz"
+"linux-aarch64" = "https://github.com/chipsalliance/verible/releases/download/v0.0-4051-g9fdb4057/verible-v0.0-4051-g9fdb4057-linux-static-arm64.tar.gz"
+"macos-x86_64" = "https://github.com/chipsalliance/verible/releases/download/v0.0-4051-g9fdb4057/verible-v0.0-4051-g9fdb4057-macOS.tar.gz"
+"macos-aarch64" = "https://github.com/chipsalliance/verible/releases/download/v0.0-4051-g9fdb4057/verible-v0.0-4051-g9fdb4057-macOS.tar.gz"
+
+[servers.systemverilog.download.sha256_per_platform]
+"linux-x86_64" = "f52e5920ef63f70620a6086e09dea8bd778147cd7a9ff827bb7de5d6316b1754"
+"linux-aarch64" = "30dd9c6f6e0f4840d6ba0c9e81ea2774a50b5a1a523a855245f9a9b4beb6b58b"
+"macos-x86_64" = "9ef92e9ad345285dd593763e10ca61c8532fcf47bbb6cf4448f9a9423882d662"
+"macos-aarch64" = "9ef92e9ad345285dd593763e10ca61c8532fcf47bbb6cf4448f9a9423882d662"
+# macOS.tar.gz 为 dual-arch 同资产同 sha256；strip_components=1 剥掉包内 verible-{v}/ 层。
+# win 组（zip，verible-{v}/bin/verible-verilog-ls.exe）待扩展：
+#   windows-x86_64: verible-v0.0-4051-g9fdb4057-win64.zip
+#     sha256 729aa244036da4a4f87bc026d33555456fc7f7be79778d983ebe9c893f4a0ca3
+
+[servers.toml]
+# taplo。unix 资产为 single-gz（非 tar.gz），解压落盘名由安装器固定（pkg 名去 .gz），
+# bin_path 依 install.rs SingleGz 语义填 `download`。
+languages = ["toml"]
+install = "download"
+exec = ["{bin}", "lsp", "stdio"]
+source_commit = "43ae0211"
+
+[servers.toml.download]
+version = "0.10.0"
+archive = "gz"
+bin_path = "download"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.toml.download.url_per_platform]
+"linux-x86_64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz"
+"linux-aarch64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-aarch64.gz"
+"macos-x86_64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-x86_64.gz"
+"macos-aarch64" = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-aarch64.gz"
+
+[servers.toml.download.sha256_per_platform]
+"linux-x86_64" = "8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156"
+"linux-aarch64" = "033681d01eec8376c3fd38fa3703c79316f5e14bb013d859943b60a07bccdcc3"
+"macos-x86_64" = "898122cde3a0b1cd1cbc2d52d3624f23338218c91b5ddb71518236a4c2c10ef2"
+"macos-aarch64" = "713734314c3e71894b9e77513c5349835eefbd52908445a0d73b0c7dc469347d"
+# win 组（zip，包内 taplo.exe）待扩展：
+#   windows-x86_64: taplo-windows-x86_64.zip
+#     sha256 1615eed140039bd58e7089109883b1c434de5d6de8f64a993e6e8c80ca57bdf9
+# 注：上游另有 windows-x86/linux-armv7/linux-riscv64/linux-x86 资产（非标准 4 平台键，
+# 未收）；该 release GitHub API digest 全 null，sha256 真值仅 serena 内嵌 checksums。
+
+[servers.terraform]
+languages = ["terraform"]
+install = "download"
+exec = ["{bin}"]
+source_commit = "43ae0211"
+
+[servers.terraform.download]
+version = "0.36.5"
+archive = "zip"
+bin_path = "terraform-ls"
+allowed_hosts = ["releases.hashicorp.com"]
+
+[servers.terraform.download.url_per_platform]
+"linux-x86_64" = "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_linux_amd64.zip"
+"linux-aarch64" = "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_linux_arm64.zip"
+"macos-x86_64" = "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_darwin_amd64.zip"
+"macos-aarch64" = "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_darwin_arm64.zip"
+
+[servers.terraform.download.sha256_per_platform]
+"linux-x86_64" = "37e645cc54fd03e863157e2a3e773e7a5ff1d6cb3d045e4c20860cac1f550a44"
+"linux-aarch64" = "724f45029f32d02d88b1952c7d1526c59fc8cd5dae49e31b9fed676a83f6cae7"
+"macos-x86_64" = "17c5c480f8eec7e528292565f1c05d5097a41edf7ef8ee2a9f3a18d288a1415a"
+"macos-aarch64" = "fee8743aa71fe2d8b0b9b91283b844cfa57d58457306a62e53a8f38d143cec8c"
+# win 组待扩展（官方另有 windows_arm64，serena 未用）：
+#   windows-x86_64: terraform-ls_0.36.5_windows_amd64.zip
+#     sha256 a9223462cac9e1c0e6ba33043fbf9fb4483609b6970b5681a6306b04366698ec
+#     bin terraform-ls.exe
+# sha256 与官方 SHA256SUMS 实调一致；运行需 terraform CLI 在 PATH。
+
+[servers.latex]
+# texlab。
+languages = ["latex"]
+install = "download"
+exec = ["{bin}"]
+source_commit = "43ae0211"
+
+[servers.latex.download]
+version = "5.25.1"
+archive = "tar.gz"
+bin_path = "texlab"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.latex.download.url_per_platform]
+"linux-x86_64" = "https://github.com/latex-lsp/texlab/releases/download/v5.25.1/texlab-x86_64-linux.tar.gz"
+"linux-aarch64" = "https://github.com/latex-lsp/texlab/releases/download/v5.25.1/texlab-aarch64-linux.tar.gz"
+"macos-x86_64" = "https://github.com/latex-lsp/texlab/releases/download/v5.25.1/texlab-x86_64-macos.tar.gz"
+"macos-aarch64" = "https://github.com/latex-lsp/texlab/releases/download/v5.25.1/texlab-aarch64-macos.tar.gz"
+
+[servers.latex.download.sha256_per_platform]
+"linux-x86_64" = "c8260b2fd2849cbad7d1f54c4ffa0389f34664b049392107bc4f7f9c8ec542ba"
+"linux-aarch64" = "e0d8e0b27b2e6e3526fa5019323bb3fddb1202a0f0049e527672b5ff323cc15e"
+"macos-x86_64" = "11289a231f0cf382857a6a4a2eda1ba9f4f4e950af343b455797e3922d13b1ea"
+"macos-aarch64" = "3755e9d1d4ad0b25135bdacd2fb453a612e88f48133185f96d660fa550398f66"
+# win 组（zip 根 texlab.exe）待扩展：
+#   windows-x86_64: texlab-x86_64-windows.zip
+#     sha256 aa5fc1fe6004c17cd83086a57a8c8f28bb3f360914872711bfbb83490dc3c19e
+# 运行需 LaTeX 工具链。latest v5.26.0 新增 aarch64-windows 等资产（M/W digest MISSING，
+# 未收）。
