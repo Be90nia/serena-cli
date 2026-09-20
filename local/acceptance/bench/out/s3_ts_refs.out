@@ -1,0 +1,28 @@
+[
+  {
+    "range": {
+      "end": {
+        "character": 19,
+        "line": 1
+      },
+      "start": {
+        "character": 16,
+        "line": 1
+      }
+    },
+    "uri": "file:///d%3A/Project/serena-rust/local/acceptance/bench/ts_demo/app.ts"
+  },
+  {
+    "range": {
+      "end": {
+        "character": 17,
+        "line": 9
+      },
+      "start": {
+        "character": 14,
+        "line": 9
+      }
+    },
+    "uri": "file:///d%3A/Project/serena-rust/local/acceptance/bench/ts_demo/app.ts"
+  }
+]

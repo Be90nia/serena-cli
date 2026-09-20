@@ -1,0 +1,7 @@
+{
+  "content": "fn add(a: i32, b: i32) -> i32 { a + b }\n\nfn main() {\n    let s = add(1, 2);\n    println!(\"{s}\");\n}",
+  "end_line": 6,
+  "hash": "70a430bcb0e1da55",
+  "start_line": 1,
+  "total_lines": 6
+}
