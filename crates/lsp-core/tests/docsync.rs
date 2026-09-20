@@ -66,6 +66,70 @@ async fn read_track_events(path: &std::path::Path) -> Vec<Value> {
     }
 }
 
+/// 验收（BD serena-rust-81m 次级缺陷）：set_language_id 注入的真实语言必须进
+/// didOpen——此前硬编码 "cpp"，rust-analyzer 收到错语言文档直接拒收。
+#[tokio::test]
+async fn did_open_carries_injected_language_id() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file = tmp.path().join("lib.rs");
+    tokio::fs::write(&file, b"fn main() {}\n")
+        .await
+        .expect("write fixture");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+    session.set_language_id("Rust");
+
+    let _guard = session.ensure_open(&file).await.expect("ensure_open");
+
+    time::sleep(Duration::from_millis(300)).await;
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    assert_eq!(opens.len(), 1, "应 1 次 didOpen；events={events:?}");
+    assert_eq!(
+        opens[0].get("languageId").and_then(Value::as_str),
+        Some("rust"),
+        "didOpen languageId 必须是注入后的真实语言（小写化）"
+    );
+
+    session.shutdown().await;
+}
+
+/// 未注入时保持旧行为 "cpp"（lsp-core 直连路径的兜底兼容）。
+#[tokio::test]
+async fn did_open_defaults_to_cpp_when_language_not_injected() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file = tmp.path().join("a.cpp");
+    tokio::fs::write(&file, b"int main(){}\n")
+        .await
+        .expect("write fixture");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    let _guard = session.ensure_open(&file).await.expect("ensure_open");
+
+    time::sleep(Duration::from_millis(300)).await;
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    assert_eq!(opens.len(), 1, "应 1 次 didOpen；events={events:?}");
+    assert_eq!(opens[0].get("languageId").and_then(Value::as_str), Some("cpp"));
+
+    session.shutdown().await;
+}
+
 /// 用例 #1：ensure_open 后 mock_ls 收到 didOpen，version=1。
 #[tokio::test]
 async fn ensure_open_emits_did_open_with_full_text() {

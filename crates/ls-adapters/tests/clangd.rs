@@ -14,6 +14,11 @@ use std::path::PathBuf;
 use ls_adapters::clangd::ClangdAdapter;
 use ls_adapters::{LanguageId, LanguageServerAdapter, ProjectCtx};
 
+/// 两个 launch_info 用例都要改进程全局 `PATH` —— 并行跑会互踩（一个把 PATH 设为
+/// 空目录的瞬间另一个读到它伪造的 PATH）。env 是进程全局的：共用一把 tokio Mutex
+/// 串行化（先例：lib.rs 测试的 REPLAY_ENV）。
+static PATH_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn dummy_ctx() -> ProjectCtx {
     ProjectCtx {
         project_root: PathBuf::from("."),
@@ -48,6 +53,7 @@ fn request_hooks_default_is_empty() {
 
 #[tokio::test]
 async fn launch_info_finds_clangd_in_path_when_present() {
+    let _env = PATH_ENV_LOCK.lock().await;
     // 模拟 PATH 内有 clangd：临时建一个目录，把"clangd"伪可执行文件写入并 PATH 前置。
     let dir = tempfile::tempdir().expect("tempdir");
     let bin_name = if cfg!(windows) {
@@ -94,6 +100,7 @@ async fn launch_info_finds_clangd_in_path_when_present() {
 
 #[tokio::test]
 async fn launch_info_returns_not_installed_when_clangd_missing() {
+    let _env = PATH_ENV_LOCK.lock().await;
     // PATH 指向一个保证无 clangd 的空目录。
     let dir = tempfile::tempdir().expect("tempdir");
     let original = std::env::var_os("PATH").unwrap_or_default();

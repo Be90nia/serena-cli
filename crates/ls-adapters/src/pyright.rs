@@ -6,7 +6,7 @@
 //! 是 `pyright-langserver`（pip 包）或 `@pyright/langserver`（npm 包）。我们优先
 //! 探测 `pyright-langserver`（pip 安装即可用），其次 `pyright`（新版直接当 LSP server 启动）。
 //!
-//! 启动方式：探测到的可执行直接 stdio。pyright 不需要 project_root 初始化文件（无
+//! 启动方式：探测到的可执行 + `--stdio`。pyright 不需要 project_root 初始化文件（无
 //! tsconfig/Cargo.toml 等价物）；`pyrightconfig.json` 仅影响检查策略不影响 LSP。
 //!
 //! ## 深度（M2 落地）
@@ -76,13 +76,9 @@ impl LanguageServerAdapter for PyrightAdapter {
                 "install pyright (`pip install pyright` or `npm i -g pyright`) and ensure `pyright-langserver` or `pyright` is on PATH",
             )
         })?;
-        let cmd = if exe.to_string_lossy().contains("pyright-langserver") {
-            // pyright-langserver 自动进入 LSP 模式（无额外 flag）。
-            vec![exe]
-        } else {
-            // pyright（npm/Python 包）走 --stdio 进入 LSP 模式。
-            vec![exe, "--stdio".into()]
-        };
+        // 两种二进制都必须 --stdio 进入 LSP 模式：实测 pyright-langserver 无 flag 时
+        // 立即退出（`Connection input stream is not set`）；servers.toml uvx 条目同参。
+        let cmd = vec![exe, "--stdio".into()];
         Ok(LaunchInfo {
             cmd,
             cwd: ctx.project_root.clone(),
@@ -145,7 +141,7 @@ impl PyrightAdapter {
     fn probe_uri(&self) -> String {
         let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
         match root {
-            Some(root) => crate::probe_uri_for_root(&root, PROBE_FALLBACK),
+            Some(root) => crate::probe_uri_for_root(&root, self.languages(), PROBE_FALLBACK),
             None => PROBE_FALLBACK.to_string(),
         }
     }

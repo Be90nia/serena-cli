@@ -25,3 +25,5 @@ dunce.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# instances.rs 回归断言用（主依赖已有，仅补集成测试可见性）。
+dunce.workspace = true

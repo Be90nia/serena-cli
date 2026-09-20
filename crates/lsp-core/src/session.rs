@@ -131,6 +131,10 @@ pub struct Session {
     progress_waiters: tokio::sync::Mutex<
         std::collections::HashMap<String, Arc<Notify>>,
     >,
+    /// `didOpen` 上送的 `languageId`。supervisor 在 session_for 拿到会话后注入真实
+    /// adapter 语言；默认 `"cpp"` 仅兜底 lsp-core 直连路径——硬编码错语言会让
+    /// rust-analyzer 等严格 LS 拒收文档（语义层挂）。
+    language_id: std::sync::Mutex<Box<str>>,
 }
 
 /// Phase 4 基建 Task 22c：把 LSP `ProgressToken`（可能是 string 或 number）
@@ -221,6 +225,7 @@ impl Session {
             buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
             server_capabilities: std::sync::Arc::new(Mutex::new(None)),
             progress_waiters: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            language_id: std::sync::Mutex::new("cpp".into()),
         });
 
         // Phase 4 基建 Task 22c：注册唯一 `$/progress` handler。LS 触发进度时会发
@@ -374,6 +379,17 @@ impl Session {
     /// 当前状态快照。
     pub fn state(&self) -> SessionState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// 注入 `didOpen` 用的真实语言 id（如 "rust"）。session_for 拿到新会话后、
+    /// 首次 `ensure_open` 前调用；晚于首次 didOpen 注入不生效（旧行为 "cpp"）。
+    pub fn set_language_id(&self, lang: &str) {
+        *self.language_id.lock().unwrap() = lang.to_ascii_lowercase().into();
+    }
+
+    /// 当前 `didOpen` languageId 快照（docsync 发 didOpen 时读）。
+    pub(crate) fn language_id(&self) -> String {
+        self.language_id.lock().unwrap().to_string()
     }
 
     /// 客户端句柄（供 supervisor 内部复用，比如发送 `$/cancelRequest`）。

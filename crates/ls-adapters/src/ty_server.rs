@@ -84,6 +84,7 @@ impl LanguageServerAdapter for TyServerAdapter {
         use serde_json::json;
         let uri = crate::probe_uri_for_root(
             PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").as_deref().unwrap_or(Path::new(".")),
+            self.languages(),
             "file:///__ty_ready_probe__",
         );
         let probe = session

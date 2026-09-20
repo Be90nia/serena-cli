@@ -109,7 +109,7 @@ impl Session {
                     (
                         Action::Send {
                             method: "textDocument/didOpen",
-                            params: make_did_open(&uri, &text, version),
+                            params: make_did_open(&uri, &text, version, &self.language_id()),
                         },
                         version,
                     )
@@ -170,11 +170,11 @@ pub fn path_to_uri(path: &Path) -> Result<Uri> {
     })
 }
 
-fn make_did_open(uri: &Uri, text: &str, version: i64) -> Value {
+fn make_did_open(uri: &Uri, text: &str, version: i64, language_id: &str) -> Value {
     json!({
         "textDocument": {
             "uri": uri.as_str(),
-            "languageId": "cpp",
+            "languageId": language_id,
             "version": version,
             "text": text,
         }

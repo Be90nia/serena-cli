@@ -110,7 +110,7 @@ impl CsharpLsAdapter {
     fn probe_uri(&self) -> String {
         let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
         match root {
-            Some(root) => crate::probe_uri_for_root(&root, PROBE_FALLBACK),
+            Some(root) => crate::probe_uri_for_root(&root, self.languages(), PROBE_FALLBACK),
             None => PROBE_FALLBACK.to_string(),
         }
     }

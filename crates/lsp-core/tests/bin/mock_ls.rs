@@ -132,10 +132,16 @@ async fn track_event(track: &Option<std::path::PathBuf>, msg: &JsonRpc) {
         .pointer("/textDocument/version")
         .cloned()
         .unwrap_or(Value::Null);
+    // languageId 仅 didOpen 携带（didChange/didClose 无此字段 → null）。
+    let language_id = params
+        .pointer("/textDocument/languageId")
+        .cloned()
+        .unwrap_or(Value::Null);
     let line = json!({
         "event": event,
         "uri": uri,
         "version": version,
+        "languageId": language_id,
     })
     .to_string();
     let mut f = match tokio::fs::OpenOptions::new()

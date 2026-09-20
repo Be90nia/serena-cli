@@ -11,10 +11,12 @@
 //! ponytail: 升级到 LSP `callHierarchy`（需服务器能力声明，clangd 不支持）。
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use lsp_core::docsync::path_to_uri_str;
 use lsp_core::session::Session;
+
+use crate::uri_to_path;
 
 use std::sync::Arc;
 
@@ -181,16 +183,6 @@ fn find_container_name(symbols: &[DocumentSymbol], line: u32, col: u32) -> Strin
         }
     }
     best.map(|s| s.name.clone()).unwrap_or_default()
-}
-
-fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    let stripped = uri.strip_prefix("file://")?;
-    let s = if cfg!(windows) && stripped.starts_with('/') {
-        &stripped[1..]
-    } else {
-        stripped
-    };
-    Some(PathBuf::from(s.replace('\\', "/")))
 }
 
 pub async fn find_referencing_symbols(

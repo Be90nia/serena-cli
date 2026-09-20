@@ -144,11 +144,82 @@ const PROBE_CANDIDATES: &[&str] = &[
 /// `wait_for_index` 默认实现探针的重试间隔。
 const RETRY_PAUSE: Duration = Duration::from_millis(250);
 
-/// root 下选就绪探针 URI：优先真实存在的小文件 —— 虚拟 URI 不会触发 LS 的项目
-/// lazy-load，首个真实工具请求就得独自承担全量索引（cold-start hang 根因，见
-/// local/cold-start-hang-diagnosis.md）。root 未设置 / 无候选文件时退 `fallback`
-/// 虚拟 URI（向后兼容旧行为）。
-pub(crate) fn probe_uri_for_root(root: &Path, fallback: &str) -> String {
+/// LanguageId → 探针源文件扩展名（不含点）。探针必须是 adapter 语言的真实源文件：
+/// 对 rust workspace 探 Cargo.toml 会让 rust-analyzer 报 -32603（它只吃 .rs 的
+/// documentSymbol）→ 就绪门 no-op → 未就绪期调用挂满超时。
+fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
+    match lang {
+        LanguageId::Cpp => &["cpp", "cc", "cxx", "c", "hpp", "h"],
+        LanguageId::Rust => &["rs"],
+        LanguageId::Python => &["py"],
+        LanguageId::Go => &["go"],
+        LanguageId::Java => &["java"],
+        LanguageId::CSharp => &["cs"],
+        LanguageId::TypeScript => &["ts", "tsx", "js", "jsx"],
+        // T0 注册语言，无 T2 适配器/LS 就绪门语义；探针走工程标记名单。
+        LanguageId::Markdown => &[],
+    }
+}
+
+/// 源文件探测时的跳过目录（构建产物 / VCS / 依赖树，进去只会浪费扫描时间）。
+const PROBE_SKIP_DIRS: &[&str] = &[
+    "target", "node_modules", "build", "dist", ".git", ".hg", ".svn", "__pycache__", "vendor",
+];
+
+/// root 下找 adapter 语言的首个真实源文件（限深 4 层），触发 LS 的项目 lazy-load。
+/// 找不到 → `None`（调用方回退工程标记名单）。
+fn find_language_source_file(root: &Path, langs: &[LanguageId], depth: u8) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let exts: Vec<&str> = langs
+        .iter()
+        .flat_map(|l| probe_extensions(l).iter().copied())
+        .collect();
+    if exts.is_empty() {
+        return None;
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    // 先文件（同层浅优先），再子目录递归。
+    for path in &entries {
+        if path.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| exts.contains(&e.to_string_lossy().to_ascii_lowercase().as_str()))
+        {
+            return Some(path.clone());
+        }
+    }
+    for path in &entries {
+        if path.is_dir() {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+            if name.as_deref().is_some_and(|n| {
+                PROBE_SKIP_DIRS.contains(&n) || n.starts_with('.')
+            }) {
+                continue;
+            }
+            if let Some(hit) = find_language_source_file(path, langs, depth - 1) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+/// root 下选就绪探针 URI：优先 adapter 语言的真实源文件（虚拟 URI 不会触发 LS 的项目
+/// lazy-load，首个真实工具请求就得独自承担全量索引 —— cold-start hang 根因，见
+/// local/cold-start-hang-diagnosis.md；且语言不符的探针会被 LS 拒收，rust-analyzer
+/// 对 Cargo.toml 报 -32603）。无语言源文件再退工程标记名单，root 未设置 / 名单全空
+/// 退 `fallback` 虚拟 URI（向后兼容旧行为）。
+pub(crate) fn probe_uri_for_root(root: &Path, langs: &[LanguageId], fallback: &str) -> String {
+    if let Some(source) = find_language_source_file(root, langs, 4) {
+        return lsp_core::docsync::path_to_uri_str(&source);
+    }
     for name in PROBE_CANDIDATES {
         let candidate = root.join(name);
         if candidate.is_file() {
@@ -347,19 +418,48 @@ mod tests {
     }
 
     #[test]
-    fn probe_uri_prefers_real_file_under_root() {
+    fn probe_uri_prefers_language_source_over_marker_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // rust workspace：.gitignore 与 Cargo.toml 都在，但探针必须选 .rs ——
+        // rust-analyzer 对非源文件 documentSymbol 报 -32603（BD serena-rust-s3q）。
+        std::fs::write(dir.path().join(".gitignore"), "").unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src").join("lib.rs"), "fn main() {}\n").unwrap();
+        let uri = probe_uri_for_root(dir.path(), &[LanguageId::Rust], "file:///__fallback__");
+        assert!(uri.ends_with("lib.rs"), "探针必须是语言源文件: {uri}");
+    }
+
+    #[test]
+    fn probe_uri_falls_back_to_markers_without_language_source() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
-        let uri = probe_uri_for_root(dir.path(), "file:///__fallback__");
+        let uri = probe_uri_for_root(dir.path(), &[LanguageId::Rust], "file:///__fallback__");
         assert!(uri.starts_with("file:///"), "必须是 file URI: {uri}");
-        assert!(uri.ends_with(".gitignore"), "应指向真实文件: {uri}");
+        assert!(uri.ends_with(".gitignore"), "无语言源文件应退工程标记: {uri}");
     }
 
     #[test]
     fn probe_uri_falls_back_when_no_candidate_exists() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            probe_uri_for_root(dir.path(), "file:///__fallback__"),
+            probe_uri_for_root(dir.path(), &[], "file:///__fallback__"),
+            "file:///__fallback__"
+        );
+    }
+
+    #[test]
+    fn probe_uri_skips_build_and_hidden_dirs_when_scanning() {
+        let dir = tempfile::tempdir().unwrap();
+        // target/ 里的 .rs 不是用户源码 —— 不得被探针选中。
+        std::fs::create_dir_all(dir.path().join("target").join("debug")).unwrap();
+        std::fs::write(
+            dir.path().join("target").join("debug").join("junk.rs"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            probe_uri_for_root(dir.path(), &[LanguageId::Rust], "file:///__fallback__"),
             "file:///__fallback__"
         );
     }
@@ -368,7 +468,8 @@ mod tests {
     fn probe_uri_picks_first_existing_candidate_in_order() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("README.md"), "").unwrap();
-        let uri = probe_uri_for_root(dir.path(), "file:///__fallback__");
+        // 空 langs → 语言扫描跳过 → 纯名单路径（README.md 胜出）。
+        let uri = probe_uri_for_root(dir.path(), &[], "file:///__fallback__");
         assert!(uri.ends_with("README.md"), "按候选序取首个存在者: {uri}");
     }
 

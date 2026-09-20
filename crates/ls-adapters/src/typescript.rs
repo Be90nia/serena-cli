@@ -143,7 +143,7 @@ impl TypescriptLanguageServerAdapter {
                 if let Some(uri) = self.tsconfig_adjacent_probe(&root) {
                     return uri;
                 }
-                crate::probe_uri_for_root(&root, PROBE_FALLBACK)
+                crate::probe_uri_for_root(&root, self.languages(), PROBE_FALLBACK)
             }
             None => PROBE_FALLBACK.to_string(),
         }
@@ -230,7 +230,8 @@ mod tests {
         assert!(uri.ends_with("main.ts"), "应优先 tsconfig 旁的 main.ts: {uri}");
     }
 
-    /// 无 tsconfig 退通用探针（.gitignore 兜底），行为向后兼容。
+    /// 无 tsconfig：退通用探针 → 语言源文件扫描优先选中 main.ts（对 tsserver
+    /// 比工程标记更能触发项目加载），.gitignore 仅在无语言源文件时兜底。
     #[test]
     fn probe_uri_falls_back_without_tsconfig() {
         let adapter = TypescriptLanguageServerAdapter;
@@ -239,7 +240,7 @@ mod tests {
         std::fs::write(dir.path().join("main.ts"), "export const x = 1;").unwrap();
         adapter.set_project_root(dir.path());
         let uri = adapter.probe_uri();
-        assert!(uri.ends_with(".gitignore"), "无 tsconfig 应回退通用探针: {uri}");
+        assert!(uri.ends_with("main.ts"), "无 tsconfig 应回退语言源文件探针: {uri}");
     }
 
     /// node_modules 里的 tsconfig 不参与（上游 is_ignored_dirname 增补集）。
@@ -257,7 +258,9 @@ mod tests {
         assert!(uri.ends_with(".gitignore"), "node_modules 应被跳过: {uri}");
     }
 
-    /// .d.ts 与嵌套子目录 tsconfig 的组合：子目录 tsconfig 旁 .d.ts 不算数，继续找。
+    /// .d.ts 与嵌套子目录 tsconfig 的组合：tsconfig-adjacent 不认 .d.ts；但通用
+    /// 语言扫描仍可选它 —— .d.ts 是 root 下真实 TS 文件且紧邻 tsconfig，对
+    /// tsserver 触发项目加载同样有效。
     #[test]
     fn probe_uri_ignores_d_ts() {
         let adapter = TypescriptLanguageServerAdapter;
@@ -269,7 +272,10 @@ mod tests {
         std::fs::write(sub.join("legacy.d.ts"), "declare const z: number;").unwrap();
         adapter.set_project_root(dir.path());
         let uri = adapter.probe_uri();
-        assert!(uri.ends_with(".gitignore"), "目录只有 .d.ts 时不算命中: {uri}");
+        assert!(
+            uri.ends_with("legacy.d.ts"),
+            "tsconfig-adjacent 不认 .d.ts 后应由语言扫描兜住: {uri}"
+        );
     }
 
     /// ↖ mirror: `_create_base_initialize_params` —— 注入关闭 ATA。

@@ -82,6 +82,38 @@ pub fn empty_path() -> (tempfile::TempDir, std::ffi::OsString) {
     (dir, original)
 }
 
+/// PATH 前置 `dir` 后调 `launch_info`，返回原始结果（PATH 已还原）。
+/// 断言细节（cmd[0] 指向、--stdio 之类）由调用方按差异点自行断言。
+pub async fn launch_info_with_dir_on_path<A: LanguageServerAdapter>(
+    adapter: A,
+    dir: &std::path::Path,
+) -> anyhow::Result<ls_runtime::process::LaunchInfo> {
+    let dir_path = dir.to_path_buf();
+    let info_holder: std::sync::Arc<
+        std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let info_holder_c = info_holder.clone();
+    with_path_lock(move || {
+        let info_holder_c = info_holder_c.clone();
+        let dir_path = dir_path.clone();
+        async move {
+            let original = std::env::var_os("PATH").unwrap_or_default();
+            let mut new_path = dir_path.as_os_str().to_os_string();
+            if !original.is_empty() {
+                new_path.push(if cfg!(windows) { ";" } else { ":" });
+                new_path.push(original.clone());
+            }
+            // SAFETY: 持 PATH_LOCK。
+            unsafe { std::env::set_var("PATH", &new_path) };
+            let info = adapter.launch_info(&dummy_ctx()).await;
+            *info_holder_c.lock().unwrap() = Some(info);
+            unsafe { std::env::set_var("PATH", original) };
+        }
+    })
+    .await;
+    info_holder.lock().unwrap().take().unwrap()
+}
+
 /// 通用断言：`launch_info` 在 PATH 含 fake binary 时返回 ok 且 cmd[0] 指向 fake。
 pub async fn assert_launch_finds_binary<A: LanguageServerAdapter>(adapter: A, bin_name: &str) {
     let (dir, _bin) = fake_binary_dir(bin_name);

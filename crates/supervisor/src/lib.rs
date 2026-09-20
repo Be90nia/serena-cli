@@ -202,10 +202,34 @@ pub struct Supervisor {
     /// key 变 → 自然 miss 重调 LS（旧 entry 残留无害）。std Mutex：临界区仅 HashMap 读写。
     symbol_cache: std::sync::Arc<Mutex<HashMap<SymbolCacheKey, Vec<SymbolHit>>>>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// 实例池身份键。`root` 保存 canonical **真实大小写**——rust-analyzer 按 URI 精确
+/// 字符串匹配挂载文件，小写化 root 会让 didOpen/def 的原始大小写 URI 脱挂所有
+/// crate（语法层活、语义层恒 null，BD serena-rust-81m）。身份比较/哈希仍按 root
+/// 的小写形式归一，`HashMap` 调用点对大小写变体透明。
+#[derive(Debug, Clone)]
 pub struct Key {
     pub root: PathBuf,
     pub lang: Box<str>,
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        self.lang == other.lang && key_root_identity(&self.root) == key_root_identity(&other.root)
+    }
+}
+
+impl Eq for Key {}
+
+impl std::hash::Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        key_root_identity(&self.root).hash(state);
+        self.lang.hash(state);
+    }
+}
+
+/// root 的身份形式：小写字符串（Windows 大小写不敏感 FS 的路径归一）。
+fn key_root_identity(root: &Path) -> String {
+    root.to_string_lossy().to_lowercase()
 }
 
 /// 对外暴露给工具调用方的"位置"结构（直接复用 lsp-types `Location`，
@@ -349,7 +373,9 @@ impl Supervisor {
             canonical.pop();
         }
         Key {
-            root: PathBuf::from(canonical.to_string_lossy().to_lowercase()),
+            // 真实大小写保真：LS 的 rootUri / cwd / 探针 URI 都从这里走，
+            // 小写形式只用于身份归一（PartialEq/Hash），绝不外泄。
+            root: canonical,
             lang: Box::from(lang.to_ascii_lowercase()),
         }
     }
@@ -553,6 +579,10 @@ impl Supervisor {
         }
 
         let session = Session::start(Some(child), params).await?;
+        // didOpen 的 languageId 用 adapter 真实语言（默认 "cpp" 对 rust-analyzer
+        // 等严格 LS 是错语言 → 文档拒收）。session_for 是唯一 spawn 点，此处注入
+        // 覆盖全部会话路径。
+        session.set_language_id(lang);
         // 注册 publishDiagnostics handler → 写 diag_cache + 累 generation。
         let cache_root = key.root.clone();
         let cache = std::sync::Arc::clone(&self.diag_cache);
@@ -1497,24 +1527,16 @@ impl Supervisor {
             return Ok(None);
         };
 
-        // 2) Location.uri → 相对 root 的 file 路径。
+        // 2) Location.uri → 相对 root 的 file 路径。走 uri_to_path 统一 percent-decode
+        //    （tsserver 回 `d%3A/...`，不解码会误判 outside workspace root）。
         let def_uri = def_loc.uri.to_string();
-        let abs_path = def_uri
-            .strip_prefix("file://")
-            .or_else(|| def_uri.strip_prefix("file:///"))
-            .unwrap_or(&def_uri);
-        // Windows 下 LSP uri 是 `file:///d:/...`（三斜杠 + 小写盘符）；还原绝对路径。
-        let abs = if cfg!(windows) && abs_path.starts_with('/') {
-            PathBuf::from(&abs_path[1..].replace('/', "\\"))
-        } else {
-            PathBuf::from(abs_path.replace('\\', "/"))
-        };
+        let abs = uri_to_path(&def_uri).ok_or_else(|| ToolError::BadArgs {
+            detail: format!("definition uri is not a file:// URI: {def_uri}"),
+        })?;
         let def_file = abs
             .strip_prefix(root)
             .map_err(|_| ToolError::BadArgs {
-                detail: format!(
-                    "definition at {abs_path} is outside workspace root {root:?}"
-                ),
+                detail: format!("definition at {def_uri} is outside workspace root {root:?}"),
             })?
             .to_string_lossy()
             .replace('\\', "/");
@@ -2347,9 +2369,10 @@ impl Supervisor {
     /// 设计要点：
     /// - **写门全程持锁**：rename 涉及多文件，跨文件不能并行；与 replace-body 共用全局写门。
     /// - **复用 LSP WorkspaceEdit**：LS 决定 edit 范围（textDocument/rename），
-    ///   我们把 `changes: {uri: [TextEdit]}` 应用到盘上 + 全量 didChange。
+    ///   我们把 WorkspaceEdit 的 edits 应用到盘上 + 全量 didChange。
     /// - **位置倒序 apply**：每文件 edits 按 `range.end` 倒序处理，避免偏移漂移。
-    /// - **不支持 `documentChanges`**：clangd 默认走 `changes` map，简化 MVP。
+    /// - **两种 WorkspaceEdit 形态都收**：`documentChanges` 优先，回退 `changes` map
+    ///   （clangd 默认后者，gopls 只产前者）。
     #[allow(clippy::too_many_arguments)]
     pub async fn tool_rename_symbol(
         &self,
@@ -2425,31 +2448,11 @@ impl Supervisor {
             reason: "rename returned null".into(),
         })?;
 
-        // 3) 拆 `changes` map → 按文件分组 + 倒序排序。
-        let changes = resp
-            .get("changes")
-            .and_then(|v| v.as_object()).ok_or_else(|| ToolError::Protocol { tool: "rename_symbol".into(), reason: "rename response has no `changes` map (M2 only supports changes, not documentChanges)".into() })?;
-
-        type EditSpec = (u64, lsp_types::Range, String); // (sort_key, range, new_text)
-        let mut by_uri: Vec<(String, Vec<EditSpec>)> = Vec::new();
-        for (uri, edits) in changes {
-            let file_edits: Vec<(u64, lsp_types::Range, String)> = edits
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| {
-                            let range: lsp_types::Range =
-                                serde_json::from_value(e.get("range")?.clone()).ok()?;
-                            let new_text = e.get("newText")?.as_str()?.to_string();
-                            // 排序 key：end 的 linear index（粗略）。
-                            let key = (range.end.line as u64) << 32 | range.end.character as u64;
-                            Some((key, range, new_text))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            by_uri.push((uri.clone(), file_edits));
-        }
+        // 3) 拆 WorkspaceEdit → 按文件分组（documentChanges 优先，回退 changes map）。
+        let by_uri = parse_workspace_edit(&resp).ok_or_else(|| ToolError::Protocol {
+            tool: "rename_symbol".into(),
+            reason: "rename response has neither `changes` map nor `documentChanges`".into(),
+        })?;
 
         // 4) 对每个文件应用 edits。
         let mut report = RenameReport::default();
@@ -2606,6 +2609,34 @@ impl Supervisor {
             });
         }
 
+        // 3.5) 拦截门：语义层 0 引用 ≠ 真无引用 —— 语义层可能整体不可用（如
+        // rust-analyzer root 大小写脱挂时 references 恒空，BD serena-rust-81m）。
+        // 文本交叉验证：workspace 内符号名仍有 ≥1 处可疑出现（排除定义行 +
+        // 注释/字符串粗滤）→ 拒删，提示语义层可能不可用。RPC_ERROR 不可重试。
+        let search = self
+            .tool_search_for_pattern(
+                root,
+                &regex::escape(symbol),
+                None,
+                TEXT_GATE_MAX_HITS,
+                true,
+            )
+            .await?;
+        let n = textual_occurrences_outside_def(
+            &search.hits,
+            file,
+            selection.start.line + 1,
+            symbol,
+        );
+        if n > 0 {
+            return Err(ToolError::Protocol {
+                tool: "safe-delete-symbol".to_string(),
+                reason: format!(
+                    "symbol has {n} textual occurrence(s) outside definition but 0 semantic refs; semantic layer may be unavailable"
+                ),
+            });
+        }
+
         // 4) 无引用 → 删除：整行语义（见 delete_symbol_text）+ C3 链路。
         let old_text = tokio::fs::read_to_string(&path)
             .await
@@ -2736,8 +2767,13 @@ pub struct RenameReport {
     pub files: Vec<String>,
 }
 
-/// 把 `file://...` URL 转回 PathBuf。
-fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+/// 把 `file://...` URL 转回 PathBuf（percent-decode + Windows 盘符大写归一）。
+///
+/// LS 返回的 URI 可能带 percent-encoding（tsserver 实测 `file:///d%3A/...`），
+/// 不解码会导致路径比对失败——rename 静默 0 编辑、defining-symbol 误判 outside
+/// workspace root。Windows 盘符统一大写：`Path` 前缀比较按字节区分大小写，小写
+/// `d:` 与 dunce canonicalize 出的 `D:` root 不匹配。
+pub(crate) fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
     let stripped = uri.strip_prefix("file://")?;
     // Windows: `file:///C:/foo` → `C:/foo`
     let s = if cfg!(windows) && stripped.starts_with('/') {
@@ -2745,7 +2781,78 @@ fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
     } else {
         stripped
     };
+    let mut s = percent_decode(s);
+    if cfg!(windows) && s.len() >= 2 && s.as_bytes()[1] == b':' {
+        s[..1].make_ascii_uppercase();
+    }
     Some(std::path::PathBuf::from(s.replace('\\', "/")))
+}
+
+/// percent-decode `%XX` 序列（非法 / 截断序列原样保留）。
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// rename 单文件编辑：(排序 key（end 线性 index，粗略）, range, new_text)。
+type EditSpec = (u64, lsp_types::Range, String);
+
+/// 拆单文件 edits 数组；缺 range/newText 的条目跳过（AnnotatedTextEdit 等富形态
+/// 字段是超集，读子集即可）。
+fn parse_edits(v: &serde_json::Value) -> Vec<EditSpec> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let range: lsp_types::Range =
+                        serde_json::from_value(e.get("range")?.clone()).ok()?;
+                    let new_text = e.get("newText")?.as_str()?.to_string();
+                    // 排序 key：end 的 linear index（粗略）。
+                    let key = (range.end.line as u64) << 32 | range.end.character as u64;
+                    Some((key, range, new_text))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 拆 WorkspaceEdit → (uri, edits) 列表。`documentChanges`（LSP 3.13+ 数组形）优先，
+/// 回退 `changes` map —— gopls 只产前者，clangd 默认后者。两者皆缺 → None。
+/// `kind:"create"/"rename"/"delete"` 等非文本条目跳过。
+fn parse_workspace_edit(resp: &serde_json::Value) -> Option<Vec<(String, Vec<EditSpec>)>> {
+    if let Some(docs) = resp.get("documentChanges").and_then(|v| v.as_array()) {
+        Some(
+            docs.iter()
+                .filter_map(|td| {
+                    let uri = td.get("textDocument")?.get("uri")?.as_str()?.to_string();
+                    Some((uri, parse_edits(td.get("edits")?)))
+                })
+                .collect(),
+        )
+    } else {
+        let changes = resp.get("changes")?.as_object()?;
+        Some(
+            changes
+                .iter()
+                .map(|(uri, edits)| (uri.clone(), parse_edits(edits)))
+                .collect(),
+        )
+    }
 }
 
 /// safe-delete 结果报告。
@@ -3107,7 +3214,7 @@ fn file_path_from_uri(uri: &str) -> String {
     } else {
         stripped
     };
-    s.replace('\\', "/")
+    percent_decode(s).replace('\\', "/")
 }
 
 /// 解码 LSP `SemanticTokens.data`（结构化 delta token 序列）为绝对坐标 token 列表。
@@ -3877,6 +3984,68 @@ fn find_symbol_node(
     }
 }
 
+/// safe-delete 文本拦截门的扫描上限。hits 截断（truncated）意味着可疑出现只多不少，
+/// 不影响拒删判定方向。
+const TEXT_GATE_MAX_HITS: usize = 200;
+
+/// safe-delete 文本交叉验证：统计 `hits` 中"可疑引用"数。
+/// - 排除定义行（def_file 的 def_line_1based 行）；
+/// - 注释行粗滤：trim 后以 `//` `/*` `*` `#` 开头（`#` 兼 python 注释/C 预处理；
+///   代价是 rust `#[attr]` 行被跳过——粗滤即此，宁可少拒不可误拒）；
+/// - 字符串粗滤：剥掉 `"..."` / `'...'` 字面量后不再含符号名 → 视为字符串出现跳过。
+fn textual_occurrences_outside_def(
+    hits: &[SearchHit],
+    def_file: &str,
+    def_line_1based: u32,
+    symbol: &str,
+) -> usize {
+    let def_file_norm = def_file.replace('\\', "/").to_ascii_lowercase();
+    hits.iter()
+        .filter(|h| {
+            let hf = h.file.replace('\\', "/").to_ascii_lowercase();
+            !(hf == def_file_norm && h.line == def_line_1based)
+        })
+        .filter(|h| {
+            let t = h.text.trim_start();
+            !(t.starts_with("//")
+                || t.starts_with("/*")
+                || t.starts_with('*')
+                || t.starts_with('#'))
+        })
+        .filter(|h| strip_string_literals(&h.text).contains(symbol))
+        .count()
+}
+
+/// 单行字符串字面量粗剥：`"..."` / `'...'`（含 `\"` 转义）内字符丢弃，其余保留。
+/// ponytail: 行级 naive 引号状态机，多行字符串/原始字符串（r#"..."#）会漏剥——
+/// 粗滤用途足够，漏剥方向是多算可疑 → 误拒可回查，不吞删除。
+fn strip_string_literals(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in line.chars() {
+        match quote {
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                } else {
+                    out.push(c);
+                }
+            }
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 文档截断上限（设计 §3：documentation 默认 200 字符）。
 const DOC_MAX_CHARS: usize = 200;
 
@@ -4159,6 +4328,48 @@ mod safe_delete_tests {
         let text = "int a;\nint orphan() { return 1; }";
         let out = delete_symbol_text(text, range(1, 0, 1, 26)).unwrap();
         assert_eq!(out, "int a;\n");
+    }
+
+    fn hit_line(file: &str, line: u32, text: &str) -> SearchHit {
+        SearchHit {
+            file: file.to_string(),
+            line,
+            col: 1,
+            text: text.to_string(),
+            match_start: 0,
+            match_end: 3,
+        }
+    }
+
+    /// refs 空 + 文本有引用（排除定义行/注释/字符串后仍有出现）→ 拦截门计数 > 0 → 拒。
+    #[test]
+    fn text_gate_counts_occurrences_outside_definition() {
+        let hits = vec![
+            hit_line("src/lib.rs", 7, "fn add(a: i32, b: i32) -> i32 { a + b }"), // 定义行
+            hit_line("src/lib.rs", 9, "    let s = add(1, 2);"),                  // 真引用
+            hit_line("src/main.rs", 3, "// add is unused"),                       // 注释
+            hit_line("src/main.rs", 4, "    println!(\"add called\");"),          // 字符串
+            hit_line("src/main.rs", 5, "    assert_eq!(add(2, 3), 5);"),          // 真引用
+        ];
+        assert_eq!(textual_occurrences_outside_def(&hits, "src/lib.rs", 7, "add"), 2);
+    }
+
+    /// refs 空 + 文本无可疑出现（定义行本身 + 注释/字符串）→ 放行删除。
+    #[test]
+    fn text_gate_passes_when_nothing_outside_definition() {
+        let hits = vec![
+            hit_line("src/lib.rs", 7, "fn orphan() {}"),
+            hit_line("src/lib.rs", 8, "// orphan kept for docs"),
+            hit_line("src/lib.rs", 9, "    let s = \"orphan\";"),
+        ];
+        assert_eq!(textual_occurrences_outside_def(&hits, "src/lib.rs", 7, "orphan"), 0);
+    }
+
+    /// 定义文件路径分隔符/大小写差异不重开定义行豁免（Windows 调用方传 `\` 形态）。
+    #[test]
+    fn text_gate_normalizes_definition_path() {
+        let hits = vec![hit_line("src/lib.rs", 7, "fn add() {}")];
+        assert_eq!(textual_occurrences_outside_def(&hits, "src\\lib.rs", 7, "add"), 0);
     }
 }
 
@@ -4871,6 +5082,93 @@ mod phase1_wrapper_tests {
         // 不是 file:// 走 fallback（原样保留）。
         let p = file_path_from_uri("unt:///x/y");
         assert!(p.contains("x/y"), "got: {p}");
+    }
+
+    // ---- uri percent-decode（LS 返回 URI 统一解码，缺口 #5 回归）----
+
+    #[test]
+    fn uri_to_path_decodes_percent_escapes() {
+        let p = uri_to_path("file:///d%3A/proj/foo%20bar/a.rs").expect("file uri");
+        let s = p.to_string_lossy().replace('\\', "/");
+        assert!(!s.contains('%'), "percent 序列必须解码: {s}");
+        assert!(s.ends_with("foo bar/a.rs"), "got: {s}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_path_uppercases_windows_drive_letter() {
+        // 小写盘符 `d%3A` 解码后必须归一为 `D:`，否则与 canonical root 前缀比对失败。
+        let p = uri_to_path("file:///d%3A/proj/a.rs").expect("file uri");
+        assert!(
+            p.to_string_lossy().starts_with("D:"),
+            "盘符必须大写: {p:?}"
+        );
+    }
+
+    #[test]
+    fn percent_decode_keeps_invalid_sequences() {
+        assert_eq!(percent_decode("a%3Ab"), "a:b");
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("100% off"), "100% off"); // 非法 hex 原样保留
+        assert_eq!(percent_decode("trailing%2"), "trailing%2"); // 截断序列原样保留
+    }
+
+    // ---- parse_workspace_edit（rename 两种 WorkspaceEdit 形态，gopls 兼容回归）----
+
+    #[test]
+    fn parse_workspace_edit_changes_map() {
+        let resp = json!({
+            "changes": {
+                "file:///a.ts": [
+                    {"range": {"start": {"line": 0, "character": 5}, "end": {"line": 0, "character": 8}}, "newText": "b"},
+                    {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 1}}, "newText": "c"}
+                ]
+            }
+        });
+        let by_uri = parse_workspace_edit(&resp).expect("changes map 必须解析");
+        assert_eq!(by_uri.len(), 1);
+        assert_eq!(by_uri[0].0, "file:///a.ts");
+        assert_eq!(by_uri[0].1.len(), 2);
+    }
+
+    #[test]
+    fn parse_workspace_edit_document_changes_array() {
+        // gopls 形态：只有 documentChanges 数组，无 changes map。
+        let resp = json!({
+            "documentChanges": [
+                {"textDocument": {"uri": "file:///a.go"}, "edits": [
+                    {"range": {"start": {"line": 4, "character": 4}, "end": {"line": 4, "character": 7}}, "newText": "sum"}
+                ]}
+            ]
+        });
+        let by_uri = parse_workspace_edit(&resp).expect("documentChanges 必须解析");
+        assert_eq!(by_uri.len(), 1);
+        assert_eq!(by_uri[0].0, "file:///a.go");
+        assert_eq!(by_uri[0].1.len(), 1);
+        assert_eq!(by_uri[0].1[0].1.start.line, 4);
+    }
+
+    #[test]
+    fn parse_workspace_edit_prefers_document_changes_and_skips_non_text_ops() {
+        // 两形态并存时 documentChanges 优先；kind:create 等非文本条目跳过。
+        let resp = json!({
+            "changes": {"file:///fallback.ts": []},
+            "documentChanges": [
+                {"kind": "create", "uri": "file:///new.go"},
+                {"textDocument": {"uri": "file:///a.go"}, "edits": [
+                    {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 3}}, "newText": "x"}
+                ]}
+            ]
+        });
+        let by_uri = parse_workspace_edit(&resp).expect("documentChanges 优先");
+        assert_eq!(by_uri.len(), 1, "create 条目跳过，只留文本编辑文件");
+        assert_eq!(by_uri[0].0, "file:///a.go");
+    }
+
+    #[test]
+    fn parse_workspace_edit_neither_form_returns_none() {
+        assert!(parse_workspace_edit(&json!({})).is_none());
+        assert!(parse_workspace_edit(&json!({"changes": "not-an-object"})).is_none());
     }
 
     // ---- execute_tool 输入校验：call-hierarchy / type-hierarchy 缺 item 转 BadArgs ----

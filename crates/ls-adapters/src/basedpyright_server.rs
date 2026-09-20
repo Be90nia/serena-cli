@@ -57,11 +57,8 @@ impl LanguageServerAdapter for BasedpyrightServerAdapter {
                 "install basedpyright (`pip install basedpyright` or `uv tool install basedpyright`) and ensure `basedpyright-langserver` is on PATH",
             )
         })?;
-        let cmd = if exe.to_string_lossy().contains("basedpyright-langserver") {
-            vec![exe]
-        } else {
-            vec![exe, "--stdio".into()]
-        };
+        // 同 pyright：basedpyright-langserver 也必须 --stdio（servers.toml uvx 同参）。
+        let cmd = vec![exe, "--stdio".into()];
         Ok(LaunchInfo {
             cmd,
             cwd: ctx.project_root.clone(),
@@ -95,6 +92,7 @@ impl LanguageServerAdapter for BasedpyrightServerAdapter {
         use serde_json::json;
         let uri = crate::probe_uri_for_root(
             PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").as_deref().unwrap_or(Path::new(".")),
+            self.languages(),
             "file:///__basedpyright_ready_probe__",
         );
         let probe = session
