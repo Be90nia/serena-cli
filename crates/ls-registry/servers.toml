@@ -1,0 +1,47 @@
+# servers.toml —— T0 配置驱动 LS 注册表（auto-install-design.md §2）。
+#
+# Task 19 首批：marksman（A 类 download）+ crystalline（F 类 path_only）。
+# 7 个手写 T2 适配器（rust/typescript/cpp/...）不进本表——它们由 ls-adapters
+# 手写 launch_info 接管；本表服务无手写实现的语言（T0 配置驱动）。
+# 全量 73 条收录归 Task 20。
+#
+# platform key：windows-x86_64 / linux-x86_64 / macos-x86_64 / macos-aarch64。
+# sha256 真值锚：GitHub API assets[].digest（2026-09-19 查询）。
+
+[servers.marksman]
+languages = ["markdown"]
+extensions = [".md", ".markdown"]
+install = "download"
+exec = ["{bin}", "lsp"]
+source_commit = "43ae0211"
+
+[servers.marksman.download]
+version = "2026-02-08"
+archive = "raw"
+bin_path = "marksman.exe"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com"]
+
+[servers.marksman.download.url_per_platform]
+"windows-x86_64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman.exe"
+"linux-x86_64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-x64"
+"linux-arm64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-linux-arm64"
+"macos-x86_64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-macos"
+"macos-aarch64" = "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/marksman-macos"
+
+[servers.marksman.download.sha256_per_platform]
+"windows-x86_64" = "a6d05beb08ebe41b0a9f09c98a438540421436fa5531424c22e0bb1d22529705"
+"linux-x86_64" = "be5098e8213219269c47fc0d916a66fa31ce0602ec967475c722260aabf26087"
+"linux-arm64" = "db8e124527f7f8048e3e6c91821b9c52ef173d92c01e47d221bf1337afd962fb"
+"macos-x86_64" = "6a801c17b5ac0dba69787c5282b3b3bd416e66c96253fae098d311c6bbd1833b"
+"macos-aarch64" = "6a801c17b5ac0dba69787c5282b3b3bd416e66c96253fae098d311c6bbd1833b"
+
+[servers.crystalline]
+languages = ["crystal"]
+extensions = [".cr"]
+install = "path_only"
+exec = ["{bin}"]
+source_commit = "43ae0211"
+
+[servers.crystalline.path_only]
+binary_name = "crystalline"
+install_hint = "install crystalline (https://github.com/elbywan/crystalline) and ensure it is on PATH"

@@ -45,6 +45,8 @@ pub enum LanguageId {
     TypeScript,
     CSharp,
     Java,
+    /// T0 配置驱动（servers.toml，Task 19）：无手写 T2 适配器的语言从 here 起。
+    Markdown,
 }
 
 impl LanguageId {
@@ -57,6 +59,7 @@ impl LanguageId {
             Self::TypeScript => "typescript",
             Self::CSharp => "csharp",
             Self::Java => "java",
+            Self::Markdown => "markdown",
         }
     }
     /// 反向：lang 字符串 → LanguageId。未知返 None。
@@ -69,6 +72,7 @@ impl LanguageId {
             "typescript" | "javascript" => Some(Self::TypeScript),
             "csharp" => Some(Self::CSharp),
             "java" => Some(Self::Java),
+            "markdown" => Some(Self::Markdown),
             _ => None,
         }
     }
@@ -266,6 +270,12 @@ pub(crate) fn which_no_unc(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 在 PATH 中查找可执行文件并去除 Windows UNC 前缀（servers.toml path_only/下载
+/// 产物探测共用；`which_no_unc` 的公开薄壳）。
+pub fn which_path(name: &str) -> Option<PathBuf> {
+    which_no_unc(name)
 }
 
 /// `launch_info` 找不到目标时的标准错误：`LS_NOT_INSTALLED` 语义（ARCH §6.3）。

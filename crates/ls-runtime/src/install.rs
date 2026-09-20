@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime};
 use crate::deps::{verify_sha256, Arch, Os};
 use crate::process::RuntimeError;
 
-/// 解压形态（auto-install-design §2.2 `archive.kind`）。
+/// 解压形态（auto-install-design §2.2 `archive.kind`；Raw 为裸二进制扩展——
+/// marksman 等直接分发无压缩 exe，Task 19 首批需要）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveKind {
     Zip,
@@ -21,6 +22,8 @@ pub enum ArchiveKind {
     TarXz,
     /// 单文件 gzip（rust-analyzer release 形态：非 tar 容器）。
     SingleGz,
+    /// 裸二进制（marksman release 形态）：下载即 bin，无解压。
+    Raw,
 }
 
 /// A 类（单二进制下载）规格。`sha256` 空 = 未知（UnsignedRefused 门，§2.9）。
@@ -168,12 +171,25 @@ impl DownloadInstaller {
             })?;
         }
 
-        // 落临时包 + 预检 + 解压（§5.2 zip-slip）。
+        // 落临时包 + 预检 + 解压（§5.2 zip-slip）。Raw = 裸二进制，直接落 bin。
         let archive_ext = match archive {
             ArchiveKind::Zip => "zip",
             ArchiveKind::TarGz => "tar.gz",
             ArchiveKind::TarXz => "tar.xz",
             ArchiveKind::SingleGz => "gz",
+            ArchiveKind::Raw => {
+                std::fs::write(&exe, &bytes)
+                    .map_err(|e| download_err(url, &format!("write raw binary: {e}")))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
+                }
+                return Ok(InstallOutcome::Ready(Launch::Process {
+                    exe,
+                    args: Vec::new(),
+                }));
+            }
         };
         let pkg = install_dir.join(format!("download.{archive_ext}"));
         std::fs::write(&pkg, &bytes)
@@ -389,6 +405,10 @@ fn extract(pkg: &Path, kind: ArchiveKind, strip_components: usize, dest: &Path) 
             let bytes = run_tool_stdout("gunzip", &["-kc", &pkg.to_string_lossy()])
                 .map_err(|e| format!("gunzip: {e}"))?;
             std::fs::write(dest.join(out_name), bytes).map_err(|e| format!("write gunzipped: {e}"))
+        }
+        ArchiveKind::Raw => {
+            // install() 对 Raw 提前返回，永不进 extract；防御性兜底。
+            unreachable!("Raw binaries never reach extract()")
         }
     }
 }

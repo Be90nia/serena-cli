@@ -5,3 +5,9 @@ version.workspace = true
 
 [dependencies]
 ls-adapters = { path = "../ls-adapters" }
+ls-runtime = { path = "../ls-runtime" }
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

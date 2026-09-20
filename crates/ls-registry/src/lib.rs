@@ -1,4 +1,4 @@
-//! ls-registry —— 配置驱动层（PLAN Task 9 / ARCHITECTURE §4.2 最小版）。
+//! ls-registry —— 配置驱动层（PLAN Task 9 / ARCHITECTURE §4.2；Task 19 servers.toml）。
 //!
 //! M0 硬编码 C++ → clangd 一项；M2 `servers.toml` 接管后，本模块的 `resolve` /
 // `adapter_for` 改为读 `ServerSpec` 表（spec.rs 子模块），不再内联枚举。
@@ -14,6 +14,9 @@
 
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
+
+pub mod config;
+pub mod spec;
 
 use ls_adapters::{
     LanguageId, LanguageServerAdapter, clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter,
@@ -79,8 +82,10 @@ pub fn resolve(path: &Path) -> Option<LanguageId> {
         .map(|(_, lang)| *lang)
 }
 
-/// 语言字符串 → adapter 单例。M3 覆盖 7 语言。
+/// 语言字符串 → adapter 单例。M3 覆盖 7 手写语言。
 ///
+/// T0 配置驱动语言（servers.toml，如 markdown）**不走此处**——它们的启动经
+/// `config::ensure_launch`（Task 19），supervisor 接线归 Task 21。
 /// 返回 `Arc` 让调用方按 trait 对象持有；`Arc::ptr_eq` 在两次调用间成立（LazyLock 单例）。
 /// 未知语言 / 空串返回 `None`。
 pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
@@ -93,6 +98,8 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         LanguageId::TypeScript => TYPESCRIPT.clone(),
         LanguageId::CSharp => CSHARP_LS.clone(),
         LanguageId::Java => JDTLS.clone(),
+        // T0 配置驱动语言：无手写 adapter（见 config::ensure_launch）。
+        LanguageId::Markdown => return None,
     })
 }
 
