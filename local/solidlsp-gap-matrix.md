@@ -86,9 +86,10 @@
 ## 5. 后续路线建议
 
 按 ROI 排序：
-- P1: 把 fixture/rust_demo 加 Cargo.toml（让 cold-start 探针触发 workspace 索引，期望 < 5s）
-- P1: 真 download 流程 + sha256 真值替换占位（验 LLVM 18.1.5 各平台 SHA256）
-- P2: 适配器 quirk 深度（rust-analyzer rustup 探测 / clangd compile_commands / pyright venv）
+- ~~P1: 真 download 流程 + sha256 真值替换占位~~ **Task 18 已落地**（commit 0906842，2026-09-20）：install.rs 下载流（§5 三件套）+ rust-analyzer 4 平台真值矩阵；clangd sha 留空（无官方来源 → UnsignedRefused）；adapter 集成与 CLI install 命令归 Task 19/21
+- P1: Task 19 servers.toml schema + ConfigAdapter（ServerSpec→InstallSpec 映射 + override 优先级）
+- P1: Task 21 根发现 + SKIP + install 命令 + 双路径（adapter 查找链尾接 download 在此闭环）
+- P2: 适配器 quirk 深度剩余项（clangd compile_commands / pyright venv / gopls go.work）
 - P2: 7 语言 smoke CI（需 CI 装 LS）
 - P3: additional workspace folders（monorepo 支持）
 - P3: $/progress 通知等待（M3 MVP 之后）
