@@ -4,3 +4,9 @@ node_modules/
 fixtures/rust_demo/target/
 fixtures/rust_demo/Cargo.lock
 fixtures/typescript_demo/node_modules/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
