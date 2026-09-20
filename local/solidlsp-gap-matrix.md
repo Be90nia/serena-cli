@@ -82,6 +82,7 @@
 - ✅ **下载安装基建（Task 18/19/21，2026-09-20）**：install.rs 下载流（三件套：临时包/预检/zip-slip 防护）+ rust-analyzer 4 平台真值矩阵 + servers.toml schema（marksman/crystalline 首批）+ ConfigAdapter（§4 override 优先级 CLI>config>默认）+ CLI `install` 命令 + supervisor session_for 双路径（T2 adapter 优先 → T0 ensure_launch）
 - ✅ **G 类 path_only 批量收录（Task 20，2026-09-20）**：13 条新收录（ccls/deno/erlang_ls/gleam/haskell_ls/jedi/lean4/ocamllsp/qmlls/regal/sourcekit_lsp/zls + 既有 crystalline = 14/18）；exec 省略 = 裸启动默认；跳过 gopls/rust-analyzer/pyright（T2 接管）与 wolfram/perl/r（启动形态特殊按需补）；A 类 27 条不做（URL/sha256 逐条调研非纯数据，按用户语言需求添加）；B/C/D/E 类需 schema 扩展（npm/uvx/dotnet/gem 安装器）
 - ✅ **双路径 e2e 实证（2026-09-20）**：`install marksman` 幂等安装（20.5MB 真下载+sha256）→ `--direct overview readme.md` 经 T0 路径拉起 marksman `server` 子命令 → documentSymbol 返回符号（8s 冷启动）
+- ✅ **B/C/D/E/F 类批量收录（Phase 3，2026-09-20）**：24 条新收录（npm 13 + uvx 5 + dotnet 2 + gem 2 + source 2，总表 62）；包名/版本/bin/启动参数均锚 oraios@43ae0211 适配器源码 DEFAULT_*；新 install_extra.rs 三安装器（dotnet --tool-path / gem --user-install --bindir / git clone+单步 build）；npm secondary_packages 伴随包机制；语言路由避撞条目（intelephense/typescript_ls/pyright/solargraph/csharp_ls/crystalline_source）服务 `install <id>`；angular 不入表（tri-server 编排，jdtls 先例）；e2e 实证 npm bash-language-server@5.6.0 + uvx pyright==1.1.403
 - ⚠️ **适配器缺口**：66 个未落地；既有 7 个中 rust/TS 已升级（T0.5），其余 5 个仍 T0 浅壳（**接受**——用户语言驱动）
 - ⚠️ **infra 缺口**：additional workspace folders、全局 timeout（**接受**）
 - ⚠️ **测量纪律**：CLI e2e 一律 bash 完整重定向；powershell `-First N` 断管道会产生"挂死"伪影（详见 plan Phase 6）
