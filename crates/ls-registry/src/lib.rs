@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 pub mod config;
+pub mod file_detect;
 pub mod spec;
 
 use ls_adapters::{

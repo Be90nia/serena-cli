@@ -80,6 +80,23 @@ impl LanguageId {
             _ => None,
         }
     }
+    /// 扩展名（不含点，大小写不敏感） → LanguageId。未知返 None。
+    /// 锚：local/ls-lang-extensions.md（71 个 LS 真实枚举）；本表只覆盖有 LanguageId
+    /// 值的入口。其余扩展名后续按需扩 LanguageId 后同步加。
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            // C/C++：上游列了 ~28 个扩展（CUDA/HIP/OpenCL/Arduino）；本表覆盖 M3 主线。
+            "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
+            "rs" => Some(Self::Rust),
+            "py" | "pyi" => Some(Self::Python),
+            "go" => Some(Self::Go),
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" => Some(Self::TypeScript),
+            "cs" => Some(Self::CSharp),
+            "java" => Some(Self::Java),
+            "md" | "markdown" => Some(Self::Markdown),
+            _ => None,
+        }
+    }
 }
 
 /// 适配器上下文：supervisor 启动时把 `(project_root, language)` 传进来。

@@ -117,6 +117,11 @@ pub fn spec_for(lang_or_id: &str) -> Option<(&'static str, &'static ServerSpec)>
         .map(|(k, v)| (k.as_str(), v))
 }
 
+/// 枚举所有 servers.toml 条目 id（用于 `cli install --all` 幂等批量安装）。
+pub fn all_server_ids() -> impl Iterator<Item = &'static str> {
+    SERVERS.servers.keys().map(|k| k.as_str())
+}
+
 /// platform key（design §2.2）。
 pub fn platform_key(os: Os, arch: ls_runtime::deps::Arch) -> String {
     let os = match os {

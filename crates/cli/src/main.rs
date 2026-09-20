@@ -322,9 +322,26 @@ enum Cmd {
     StopAll,
     /// 安装 servers.toml 配置驱动 LS（PATH 探测 → 下载 → sha256 校验 → 落地缓存）。
     /// 手写 T2 语言（rust/python/...）不在此列——按各 LS 官方方式安装。
-    Install { lang: String },
+    /// `--all` 装全表（幂等——已装即跳过，未装按 ensure_launch 路径装）。
+    Install {
+        /// 单条 lang 装；`--all` 模式忽略。
+        #[arg(default_value = "")]
+        lang: String,
+        /// 装 servers.toml 全部条目。
+        #[arg(long)]
+        all: bool,
+    },
     /// 长连接 shell（stdin/stdout JSONL）。Task 18。
     Shell,
+    /// 环境体检（5 类：运行时 / PATH / 本机 LS / daemon / 网络）。
+    Doctor {
+        /// JSON 输出（默认人类可读）。
+        #[arg(long)]
+        json: bool,
+        /// 尝试自动安装 MISS 的 LS（仅对 servers.toml 已收录的条目）。
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -360,11 +377,23 @@ async fn main() -> ExitCode {
         Some(Cmd::Status) => return cmd_status(&lock_path).await,
         Some(Cmd::StopAll) => return cmd_stop_all(&lock_path).await,
         // install 内部自建 blocking runtime（下载），必须在阻塞线程跑。
-        Some(Cmd::Install { lang }) => {
+        Some(Cmd::Install { lang, all }) => {
+            if *all {
+                return tokio::task::spawn_blocking(cmd_install_all)
+                    .await
+                    .unwrap_or(ExitCode::from(3));
+            }
+            if lang.is_empty() {
+                eprintln!("install: --lang <ID> or --all required");
+                return ExitCode::from(2);
+            }
             let lang = lang.clone();
             return tokio::task::spawn_blocking(move || cmd_install(&lang))
                 .await
                 .unwrap_or(ExitCode::from(3));
+        }
+        Some(Cmd::Doctor { json, fix }) => {
+            return cmd_doctor(*json, *fix, &lock_path).await;
         }
         Some(Cmd::Shell) => {}
         _ => {}
@@ -396,6 +425,9 @@ async fn run_direct(cli: &Cli) -> ExitCode {
         return ExitCode::from(2);
     };
     let root = dunce::canonicalize(&root).unwrap_or(root);
+    // 用户未传 --lang 时按 file 后缀/shebang/文件名推断；显式 --lang 优先。
+    let effective_lang: Option<String> = cli.lang.clone().or_else(|| autodetect_lang(cli));
+    let lang_ref = effective_lang.as_deref();
     let sup = match Supervisor::direct().await {
         Ok(s) => s,
         Err(e) => {
@@ -405,19 +437,19 @@ async fn run_direct(cli: &Cli) -> ExitCode {
     };
     let res: Result<(), ToolError> = match &cli.cmd {
         Some(Cmd::Overview { file }) => sup
-            .tool_overview(&root, file, cli.lang.as_deref())
+            .tool_overview(&root, file, lang_ref)
             .await
             .and_then(|hits| print_json(&json!(hits))),
         Some(Cmd::SymbolTree { dir, max_files }) => sup
-            .tool_symbol_tree(&root, dir, cli.lang.as_deref(), *max_files)
+            .tool_symbol_tree(&root, dir, lang_ref, *max_files)
             .await
             .and_then(|tree| print_json(&tree)),
         Some(Cmd::Def { file, line, col }) => sup
-            .tool_def(&root, file, *line, *col, cli.lang.as_deref())
+            .tool_def(&root, file, *line, *col, lang_ref)
             .await
             .and_then(|opt| print_json(&json!(opt))),
         Some(Cmd::Refs { file, line, col }) => sup
-            .tool_refs(&root, file, *line, *col, cli.lang.as_deref())
+            .tool_refs(&root, file, *line, *col, lang_ref)
             .await
             .and_then(|vec| print_json(&json!(vec))),
         Some(Cmd::Completion {
@@ -439,7 +471,7 @@ async fn run_direct(cli: &Cli) -> ExitCode {
                 *col,
                 *limit as usize,
                 trigger.as_deref(),
-                cli.lang.as_deref(),
+                lang_ref,
             )
             .await
             .and_then(|resp| print_json(&json!(resp)))
@@ -452,12 +484,12 @@ async fn run_direct(cli: &Cli) -> ExitCode {
                 *line,
                 *col,
                 kind.as_deref(),
-                cli.lang.as_deref(),
+                lang_ref,
             )
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::Format { file, tab_size, insert_spaces }) => sup
-            .tool_format(&root, file, *tab_size, *insert_spaces, cli.lang.as_deref())
+            .tool_format(&root, file, *tab_size, *insert_spaces, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::FormatRange {
@@ -478,32 +510,32 @@ async fn run_direct(cli: &Cli) -> ExitCode {
                 *end_col,
                 *tab_size,
                 *insert_spaces,
-                cli.lang.as_deref(),
+                lang_ref,
             )
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::InlayHint { file, start_line, end_line }) => sup
-            .tool_inlay_hint(&root, file, *start_line, *end_line, cli.lang.as_deref())
+            .tool_inlay_hint(&root, file, *start_line, *end_line, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::DocumentHighlight { file, line, col }) => sup
-            .tool_document_highlight(&root, file, *line, *col, cli.lang.as_deref())
+            .tool_document_highlight(&root, file, *line, *col, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::FoldingRange { file }) => sup
-            .tool_folding_range(&root, file, cli.lang.as_deref())
+            .tool_folding_range(&root, file, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::SemanticTokens { file }) => sup
-            .tool_semantic_tokens(&root, file, cli.lang.as_deref())
+            .tool_semantic_tokens(&root, file, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::CodeLens { file }) => sup
-            .tool_code_lens(&root, file, cli.lang.as_deref())
+            .tool_code_lens(&root, file, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::DocumentLink { file }) => sup
-            .tool_document_link(&root, file, cli.lang.as_deref())
+            .tool_document_link(&root, file, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::CallHierarchy { op, file, line, col, item }) => handle_call_hierarchy(
@@ -514,7 +546,7 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             *line,
             *col,
             item.as_deref(),
-            cli.lang.as_deref(),
+            lang_ref,
         )
         .await,
         Some(Cmd::TypeHierarchy { op, file, line, col, item }) => handle_type_hierarchy(
@@ -525,15 +557,15 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             *line,
             *col,
             item.as_deref(),
-            cli.lang.as_deref(),
+            lang_ref,
         )
         .await,
         Some(Cmd::Moniker { file, line, col }) => sup
-            .tool_moniker(&root, file, *line, *col, cli.lang.as_deref())
+            .tool_moniker(&root, file, *line, *col, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
         Some(Cmd::WorkspaceDiagnostic) => sup
-            .tool_workspace_diagnostic(&root, cli.lang.as_deref())
+            .tool_workspace_diagnostic(&root, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
         other => {
@@ -700,7 +732,70 @@ async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<(), String> {
         .map(|e| e.token)
         .unwrap_or_default();
 
-    forward(cli, &base, &token).await
+    // 用户未传 --lang 时按 file 后缀/shebang/文件名推断；显式 --lang 优先。
+    let effective_lang = cli.lang.clone().or_else(|| autodetect_lang(cli));
+    forward(cli, &base, &token, effective_lang.as_deref()).await
+}
+
+/// 从子命令的第一个 file 形参（Pos 0）推断 LanguageId（仅当用户未传 --lang）。
+/// 复用 ls-registry::file_detect::detect_language（ext → shebang → filename 三层）。
+/// 推断失败 → None（保留现状：缺 lang 时 supervisor 走默认 / 报错）。
+fn autodetect_lang(cli: &Cli) -> Option<String> {
+    if cli.lang.is_some() {
+        return None; // 显式 --lang 优先
+    }
+    // 取第一个 file 形参：overview / def / refs / hover / diagnostics / read-file /
+    // find-implementations / rename-symbol / find-referencing-symbols /
+    // find-referencing-code-snippets / symbol-body / completion / containing-symbol /
+    // defining-symbol / signature-help / code-action / format / format-range /
+    // inlay-hint / document-highlight / folding-range / semantic-tokens / code-lens /
+    // document-link / call-hierarchy(prepare) / type-hierarchy(prepare) / moniker /
+    // search(pattern but uses pattern, not file) / insert-text-*-symbol / safe-delete-symbol /
+    // replace-body / replace-text-in-symbol / delete-text-in-symbol / replace-lines /
+    // delete-lines / insert-at-line
+    let file_arg: Option<&str> = match &cli.cmd {
+        Some(Cmd::Overview { file }) => Some(file),
+        Some(Cmd::Def { file, .. }) => Some(file),
+        Some(Cmd::Refs { file, .. }) => Some(file),
+        Some(Cmd::Hover { file, .. }) => Some(file),
+        Some(Cmd::Diagnostics { file, .. }) => Some(file),
+        Some(Cmd::ReadFile { file, .. }) => Some(file),
+        Some(Cmd::FindImplementations { file, .. }) => Some(file),
+        Some(Cmd::RenameSymbol { file, .. }) => Some(file),
+        Some(Cmd::FindReferencingSymbols { file, .. }) => Some(file),
+        Some(Cmd::FindReferencingCodeSnippets { file, .. }) => Some(file),
+        Some(Cmd::SymbolBody { file, .. }) => Some(file),
+        Some(Cmd::Completion { file, .. }) => Some(file),
+        Some(Cmd::ContainingSymbol { file, .. }) => Some(file),
+        Some(Cmd::DefiningSymbol { file, .. }) => Some(file),
+        Some(Cmd::SignatureHelp { file, .. }) => Some(file),
+        Some(Cmd::CodeAction { file, .. }) => Some(file),
+        Some(Cmd::Format { file, .. }) => Some(file),
+        Some(Cmd::FormatRange { file, .. }) => Some(file),
+        Some(Cmd::InlayHint { file, .. }) => Some(file),
+        Some(Cmd::DocumentHighlight { file, .. }) => Some(file),
+        Some(Cmd::FoldingRange { file }) => Some(file),
+        Some(Cmd::SemanticTokens { file }) => Some(file),
+        Some(Cmd::CodeLens { file }) => Some(file),
+        Some(Cmd::DocumentLink { file }) => Some(file),
+        Some(Cmd::Moniker { file, .. }) => Some(file),
+        Some(Cmd::SafeDeleteSymbol { file, .. }) => Some(file),
+        Some(Cmd::ReplaceBody { file, .. }) => Some(file),
+        Some(Cmd::ReplaceTextInSymbol { file, .. }) => Some(file),
+        Some(Cmd::InsertTextBeforeSymbol { file, .. }) => Some(file),
+        Some(Cmd::InsertTextAfterSymbol { file, .. }) => Some(file),
+        Some(Cmd::DeleteTextInSymbol { file, .. }) => Some(file),
+        Some(Cmd::InsertAtLine { file, .. }) => Some(file),
+        Some(Cmd::ReplaceLines { file, .. }) => Some(file),
+        Some(Cmd::DeleteLines { file, .. }) => Some(file),
+        // call-hierarchy/type-hierarchy 的 prepare 模式才有 file
+        Some(Cmd::CallHierarchy { op, file, .. }) if op == "prepare" => file.as_deref(),
+        Some(Cmd::TypeHierarchy { op, file, .. }) if op == "prepare" => file.as_deref(),
+        _ => None,
+    };
+    let file = file_arg?;
+    let lang = ls_registry::file_detect::detect_language(std::path::Path::new(file))?;
+    Some(lang.as_str().to_string())
 }
 
 /// Windows：CREATE_NO_WINDOW + CREATE_NEW_PROCESS_GROUP + 句柄不继承 + stdio→NULL。
@@ -765,7 +860,7 @@ async fn wait_ready(port: u16, timeout: Duration) -> Result<(), String> {
 }
 
 /// 按子命令转发 HTTP。
-async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
+async fn forward(cli: &Cli, base: &str, token: &str, lang: Option<&str>) -> Result<(), String> {
     let client = reqwest::Client::new();
     // 工具名与 args 组装。
     let (tool, args): (&str, serde_json::Value) = match &cli.cmd {
@@ -1076,6 +1171,7 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
         | Some(Cmd::StopAll)
         | Some(Cmd::Install { .. })
         | Some(Cmd::Shell)
+        | Some(Cmd::Doctor { .. })
         | None => {
             unreachable!("handled earlier")
         }
@@ -1087,7 +1183,7 @@ async fn forward(cli: &Cli, base: &str, token: &str) -> Result<(), String> {
     let body = json!({
         "project_root": project_root.to_string_lossy(),
         "args": args,
-        "lang": cli.lang,
+        "lang": lang,
     });
 
     let resp = client
@@ -1149,6 +1245,73 @@ fn cmd_install(lang: &str) -> ExitCode {
             ExitCode::from(3)
         }
     }
+}
+
+/// `install --all`：遍历 servers.toml 全部条目逐个 ensure_launch。
+/// 幂等——已装返 Ready（无下载），未装走 ensure_launch 完整下载路径。
+/// 累计统计 ok / skipped / failed，最后输出 JSON。
+fn cmd_install_all() -> ExitCode {
+    let ids: Vec<&str> = ls_registry::config::all_server_ids().collect();
+    let mut ok = 0usize;
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for id in ids {
+        match ls_registry::config::ensure_launch(id, None, true, false) {
+            Ok((exe, _args)) => {
+                ok += 1;
+                eprintln!("[OK]    {id:<28} -> {}", exe.display());
+            }
+            Err(msg) => {
+                failed.push((id.to_string(), msg.clone()));
+                eprintln!("[FAIL]  {id:<28} {msg}");
+            }
+        }
+    }
+    let total = ok + failed.len();
+    let payload = json!({
+        "ok": failed.is_empty(),
+        "total": total,
+        "installed": ok,
+        "failed": failed.iter().map(|(id, m)| json!({"id": id, "msg": m})).collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+    if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// `doctor` 子命令：5 类体检 + 可选 --fix 自动装 MISS 的 LS。
+async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path) -> ExitCode {
+    let report = supervisor::doctor::run_all(lock_path);
+    // 可选：--fix 尝试装 MISS 的 server 类别条目
+    if fix {
+        for c in &report.checks {
+            if c.status == supervisor::doctor::Status::Miss
+                && c.category == "ls"
+            {
+                // `id` 是 server name（如 rust-analyzer）—— 不一定在 servers.toml
+                // （如 csharp-ls 是 dotnet tool）；只对 spec_for 能命中的跑 ensure_launch。
+                if ls_registry::config::spec_for(c.id).is_some() {
+                    let _ = ls_registry::config::ensure_launch(c.id, None, true, false);
+                }
+            }
+        }
+    }
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => {
+                println!("{s}");
+            }
+            Err(e) => {
+                eprintln!("json serialize failed: {e}");
+                return ExitCode::from(3);
+            }
+        }
+    } else {
+        print!("{}", supervisor::doctor::format_text(&report));
+    }
+    ExitCode::from(report.exit_code())
 }
 
 /// `status` 子命令。

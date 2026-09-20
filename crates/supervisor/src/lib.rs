@@ -27,6 +27,7 @@ use lsp_core::init_params::base_initialize_params;
 use lsp_core::init_params::supports_pull_diagnostics;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
 use lsp_core::session::Session;
+pub mod doctor;
 pub mod edit_tools;
 pub mod fs_tools;
 pub mod root_finder;
