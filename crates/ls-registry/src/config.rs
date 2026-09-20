@@ -48,6 +48,83 @@ pub fn user_config_path() -> Option<PathBuf> {
     }
 }
 
+/// external-servers.toml 路径（Windows %APPDATA%\serena；Unix ~/.config/serena，
+/// external-ls-registration-design §2）。无 HOME/APPDATA → None（机制整体停用）。
+pub fn external_servers_path() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(|a| PathBuf::from(a).join("serena/external-servers.toml"))
+    } else {
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(".config/serena/external-servers.toml"))
+    }
+}
+
+/// external-servers.toml（运行时解析，不 include_str!；external-ls-registration-design §3）。
+/// 路径缺失/文件不存在/不可读 → None（静默，常态分支）；schema 校验失败 → warn +
+/// 当空表（永不触网、不 panic，静默容错对齐上游 entry-point discovery）。
+static EXTERNAL: LazyLock<Option<spec::ServersToml>> = LazyLock::new(|| {
+    external_servers_path().and_then(|p| load_external(&p))
+});
+
+/// `EXTERNAL` 的加载本体（路径参数化以供测试注入）。成功时对覆盖/扩展名冲突逐条 warn。
+pub(crate) fn load_external(path: &Path) -> Option<spec::ServersToml> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("warning: external-servers.toml unreadable ({}): {e}", path.display());
+            return None;
+        }
+    };
+    let parsed = match spec::parse(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("warning: external-servers.toml invalid, ignoring entire file: {e}");
+            return None;
+        }
+    };
+    warn_external_conflicts(&parsed);
+    Some(parsed)
+}
+
+/// 覆盖/冲突可观测性（PM 拍板：保留显式覆盖 + warn，非拒绝）。内置表无 priority
+/// 字段恒 0，故 external priority ≥ 0 的冲突条目必在 `merge_pick` 中胜出，加载时
+/// 逐条 warn 一行；负 priority = 显式让位内置，不告警。扩展名撞内置路由时内置优先，
+/// external 条目间互撞时命中未定义——均 warn 提醒。
+fn warn_external_conflicts(ext: &spec::ServersToml) {
+    let mut seen_exts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (eid, es) in &ext.servers {
+        if es.priority >= 0
+            && let Some((bid, _)) = SERVERS.servers.iter().find(|(bid, bs)| {
+                bid.eq_ignore_ascii_case(eid)
+                    || bs
+                        .languages
+                        .iter()
+                        .any(|l| es.languages.iter().any(|el| el.eq_ignore_ascii_case(l)))
+            })
+        {
+            eprintln!(
+                "warning: external-servers.toml `[servers.{eid}]` (priority {}) overrides built-in `[servers.{bid}]`",
+                es.priority
+            );
+        }
+        for e in &es.extensions {
+            let key = e.trim_start_matches('.').to_lowercase();
+            if crate::EXT_TABLE.iter().any(|(be, _)| *be == key) {
+                eprintln!(
+                    "warning: external-servers.toml `[servers.{eid}]` extension `.{key}` shadows built-in routing (built-in wins)"
+                );
+            }
+            if !seen_exts.insert(key) {
+                eprintln!(
+                    "warning: external-servers.toml `[servers.{eid}]` declares a duplicate extension; routing pick is unspecified"
+                );
+            }
+        }
+    }
+}
+
 /// 用户全局 config.toml 的 `[ls.<id>]` 覆盖（读取失败/文件不存在 → None，永不触网）。
 pub fn user_override(lang: &str) -> Option<LsOverride> {
     let path = user_config_path()?;
@@ -102,10 +179,12 @@ pub fn effective_index_timeout_ms(lang: &str, cli_override: Option<&LsOverride>)
     spec_for(lang).and_then(|(_, spec)| spec.index_timeout_ms)
 }
 
-/// 按 id 或语言名查找（`languages` 数组含 lang，或 id 精确匹配——`cli install
-/// marksman` 用 id，session_for 传语言名，双语义一函数）。手写 T2 语言不在表内。
-pub fn spec_for(lang_or_id: &str) -> Option<(&'static str, &'static ServerSpec)> {
-    SERVERS
+/// 按 id 或语言名在单表中查找（`languages` 数组含 lang，或 id 精确匹配）。
+fn table_hit(
+    table: &'static spec::ServersToml,
+    lang_or_id: &str,
+) -> Option<(&'static str, &'static ServerSpec)> {
+    table
         .servers
         .iter()
         .find(|(id, s)| {
@@ -117,9 +196,80 @@ pub fn spec_for(lang_or_id: &str) -> Option<(&'static str, &'static ServerSpec)>
         .map(|(k, v)| (k.as_str(), v))
 }
 
-/// 枚举所有 servers.toml 条目 id（用于 `cli install --all` 幂等批量安装）。
+/// 合并优先级（external-ls-registration-design §3）：builtin 与 external 都命中时
+/// 取 priority 大者；并列（含双方缺省 0）external 胜出（PM 拍板：保留显式覆盖能力，
+/// 可观测性由加载时 `warn_external_conflicts` 统一输出）。返回 (id, spec, is_external)。
+pub fn merge_pick<'a>(
+    builtin: Option<(&'a str, &'a ServerSpec)>,
+    external: Option<(&'a str, &'a ServerSpec)>,
+) -> Option<(&'a str, &'a ServerSpec, bool)> {
+    match (builtin, external) {
+        (Some((bi, bs)), Some((_, es))) if es.priority < bs.priority => {
+            Some((bi, bs, false))
+        }
+        (Some(_), Some((ei, es))) => Some((ei, es, true)),
+        (Some((bi, bs)), None) => Some((bi, bs, false)),
+        (None, Some((ei, es))) => Some((ei, es, true)),
+        (None, None) => None,
+    }
+}
+
+/// 内置 + external 双表合并命中（merged_spec_for / spec_source 的共享主体）。
+fn merged_hit(lang_or_id: &str) -> Option<(&'static str, &'static ServerSpec, bool)> {
+    let external = EXTERNAL.as_ref().and_then(|t| table_hit(t, lang_or_id));
+    merge_pick(table_hit(&SERVERS, lang_or_id), external)
+}
+
+/// spec_for 的合并版（§3 优先级链：CLI flag > user config.toml > external-servers.toml
+/// > 内置 servers.toml；external 为完整条目替换，user_override 为逐字段覆盖，并存不冲突）。
+pub fn merged_spec_for(lang_or_id: &str) -> Option<(&'static str, &'static ServerSpec)> {
+    merged_hit(lang_or_id).map(|(id, spec, _)| (id, spec))
+}
+
+/// merged 命中条目的来源标注（CLI install/status 展示用）：`"external"` / `"builtin"`。
+pub fn spec_source(lang_or_id: &str) -> Option<&'static str> {
+    merged_hit(lang_or_id).map(|(_, _, external)| if external { "external" } else { "builtin" })
+}
+
+/// 按 id 或语言名查找（`languages` 数组含 lang，或 id 精确匹配——`cli install
+/// marksman` 用 id，session_for 传语言名，双语义一函数）。手写 T2 语言不在表内。
+/// 走 merged 查找：external-servers.toml 条目按 §3 优先级参与命中。
+pub fn spec_for(lang_or_id: &str) -> Option<(&'static str, &'static ServerSpec)> {
+    merged_spec_for(lang_or_id)
+}
+
+/// external-servers.toml 扩展名匹配（design §2 extensions 字段）：小写命中 → 该条目
+/// `languages[0]`（session_for/spec_for 按语言名走配置驱动启动）。多条目同扩展名的
+/// 命中顺序未定义（HashMap 迭代序）——加载时已 warn。纯函数，测试可注入任意表。
+pub(crate) fn match_external_ext<'a>(
+    table: &'a spec::ServersToml,
+    ext: &str,
+) -> Option<&'a str> {
+    table
+        .servers
+        .values()
+        .find(|s| {
+            s.extensions
+                .iter()
+                .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(ext))
+        })
+        .and_then(|s| s.languages.first())
+        .map(String::as_str)
+}
+
+/// external 表只读访问（lib.rs `resolve_lang_name` 兜底层用）。
+pub(crate) fn external_table() -> Option<&'static spec::ServersToml> {
+    EXTERNAL.as_ref()
+}
+
+/// 枚举全部条目 id（内置 + external，用于 `cli install --all` 幂等批量安装）。
 pub fn all_server_ids() -> impl Iterator<Item = &'static str> {
-    SERVERS.servers.keys().map(|k| k.as_str())
+    let builtin = SERVERS.servers.keys().map(|k| k.as_str());
+    let external = EXTERNAL
+        .as_ref()
+        .into_iter()
+        .flat_map(|t| t.servers.keys().map(|k| k.as_str()));
+    builtin.chain(external)
 }
 
 /// platform key（design §2.2）。
@@ -856,5 +1006,66 @@ package = "@vue/language-server"
         );
         // 同 helper 的 uvx 路径：pyright 未装 uv → hint 带 uv 安装指引（本机有 uv 则 Ready）。
         let _ = ensure_launch("pyright", None, false, false);
+    }
+
+    // ---- external-servers.toml（external-ls-registration-design §3/§4）----
+
+    /// §3 静默容错：文件不存在 → None（常态分支，不 warn 不 panic）。
+    #[test]
+    fn load_external_missing_file_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("absent.toml");
+        assert!(load_external(&p).is_none(), "文件不存在 → None");
+    }
+
+    /// §3 静默容错：schema 校验失败 → warn + 当空表（None），永不触网不 panic。
+    #[test]
+    fn load_external_bad_toml_is_none_not_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("external-servers.toml");
+        std::fs::write(&p, "[servers.broken\nlanguages = ").expect("write bad toml");
+        assert!(load_external(&p).is_none(), "parse 失败 → None（当空表）");
+    }
+
+    /// §3 静默容错：路径不可读（目录 / 无权限）→ None。
+    #[test]
+    fn load_external_unreadable_path_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(load_external(dir.path()).is_none(), "目录路径 → 读取失败 → None");
+    }
+
+    /// §2/§3 正常路径：合法 external 表加载成功；覆盖内置条目（marksman）时走
+    /// `warn_external_conflicts` warn 分支（stderr 观测，不断言）且条目保留。
+    #[test]
+    fn load_external_valid_table_loads_and_keeps_override_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("external-servers.toml");
+        let toml_str = concat!(
+            "[servers.marksman]\n",
+            "languages = [\"markdown\"]\n",
+            "install = \"path_only\"\n",
+            "priority = 0\n",
+            "[servers.marksman.path_only]\n",
+            "binary_name = \"fake-marksman\"\n",
+            "install_hint = \"x\"\n",
+        );
+        std::fs::write(&p, toml_str).expect("write valid external toml");
+        let t = load_external(&p).expect("valid table loads");
+        assert_eq!(t.servers["marksman"].priority, 0);
+        assert_eq!(t.servers["marksman"].path_only.as_ref().unwrap().binary_name, "fake-marksman");
+    }
+
+    /// §2 extension 路由核心：小写命中条目 `languages[0]`；大小写不敏感；未命中 None。
+    #[test]
+    fn match_external_ext_routes_to_first_language() {
+        let t = spec::parse(
+            "[servers.mydsl]\nlanguages = [\"mydsl\", \"mydsl2\"]\nextensions = [\".mydsl\", \"mydsl3\"]\n\
+             install = \"path_only\"\n[servers.mydsl.path_only]\nbinary_name = \"x\"\ninstall_hint = \"x\"\n",
+        )
+        .expect("valid");
+        assert_eq!(match_external_ext(&t, "mydsl"), Some("mydsl"));
+        assert_eq!(match_external_ext(&t, "MYDSL"), Some("mydsl"), "大小写不敏感");
+        assert_eq!(match_external_ext(&t, "mydsl3"), Some("mydsl"), "无点前缀也命中");
+        assert_eq!(match_external_ext(&t, "other"), None);
     }
 }

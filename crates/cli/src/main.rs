@@ -794,8 +794,11 @@ fn autodetect_lang(cli: &Cli) -> Option<String> {
         _ => None,
     };
     let file = file_arg?;
-    let lang = ls_registry::file_detect::detect_language(std::path::Path::new(file))?;
-    Some(lang.as_str().to_string())
+    let path = std::path::Path::new(file);
+    // 内置三层探测（扩展名/shebang/文件名）→ external-servers.toml extensions 兜底。
+    ls_registry::file_detect::detect_language(path)
+        .map(|l| l.as_str().to_string())
+        .or_else(|| ls_registry::resolve_lang_name(path).map(str::to_string))
 }
 
 /// Windows：CREATE_NO_WINDOW + CREATE_NEW_PROCESS_GROUP + 句柄不继承 + stdio→NULL。
@@ -1224,6 +1227,7 @@ async fn forward(cli: &Cli, base: &str, token: &str, lang: Option<&str>) -> Resu
 }
 
 /// `install` 子命令（Task 21）：配置驱动 LS 安装（幂等——已装即返回路径）。
+/// `source` 字段标注条目来源（external-servers.toml / 内置 servers.toml）。
 fn cmd_install(lang: &str) -> ExitCode {
     match ls_registry::config::ensure_launch(lang, None, true, false) {
         Ok((exe, args)) => {
@@ -1233,6 +1237,7 @@ fn cmd_install(lang: &str) -> ExitCode {
                 serde_json::to_string_pretty(&json!({
                     "ok": true,
                     "lang": lang,
+                    "source": ls_registry::config::spec_source(lang).unwrap_or("builtin"),
                     "exe": exe.display().to_string(),
                     "cmd": args,
                 }))
@@ -1247,8 +1252,8 @@ fn cmd_install(lang: &str) -> ExitCode {
     }
 }
 
-/// `install --all`：遍历 servers.toml 全部条目逐个 ensure_launch。
-/// 幂等——已装返 Ready（无下载），未装走 ensure_launch 完整下载路径。
+/// `install --all`：遍历 servers.toml 全部条目（内置 + external-servers.toml）逐个
+/// ensure_launch。幂等——已装返 Ready（无下载），未装走 ensure_launch 完整下载路径。
 /// 累计统计 ok / skipped / failed，最后输出 JSON。
 fn cmd_install_all() -> ExitCode {
     let ids: Vec<&str> = ls_registry::config::all_server_ids().collect();
@@ -1258,7 +1263,8 @@ fn cmd_install_all() -> ExitCode {
         match ls_registry::config::ensure_launch(id, None, true, false) {
             Ok((exe, _args)) => {
                 ok += 1;
-                eprintln!("[OK]    {id:<28} -> {}", exe.display());
+                let src = ls_registry::config::spec_source(id).unwrap_or("builtin");
+                eprintln!("[OK]    {id:<28} -> {}/{}", exe.display(), src);
             }
             Err(msg) => {
                 failed.push((id.to_string(), msg.clone()));

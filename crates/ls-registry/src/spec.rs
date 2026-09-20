@@ -1,5 +1,8 @@
 //! `servers.toml` schema（auto-install-design.md v0.4 §2）。
 //!
+//! 内置表 include_str! 编译期内嵌；external-servers.toml（用户目录，运行时解析）
+//! 复用同一 schema（external-ls-registration-design.md §2）。
+//!
 //! 首批（Task 19）：A 类 download（marksman）+ F 类 path_only（crystalline）。
 //! npm/uvx/dotnet/gem/特殊形态（§2.3-2.6/2.8）随 Task 20 批量收录扩充。
 //!
@@ -10,7 +13,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-/// `servers.toml` 顶层（include_str! 内置单表，v1 无外部覆盖，design §0 非目标）。
+/// `servers.toml` 顶层（内置 include_str! 单表 + external-servers.toml 运行时表共用）。
 #[derive(Debug, Deserialize)]
 pub struct ServersToml {
     pub servers: HashMap<String, ServerSpec>,
@@ -46,6 +49,11 @@ pub struct ServerSpec {
     /// Index / workspace 类长操作超时（毫秒）；缺省沿用 `timeout_ms * 4` 计算逻辑。
     #[serde(default)]
     pub index_timeout_ms: Option<u32>,
+    /// external-servers.toml 合并优先级（external-ls-registration-design §2/§3）：
+    /// 同 id/language 与内置表冲突时取大者，并列（含缺省 0）external 胜出。
+    /// 内置 servers.toml 不使用本字段（全部缺省 0）；负值 = 显式让位内置。
+    #[serde(default)]
+    pub priority: i32,
 }
 
 /// §2.2 A 类 download 子表。

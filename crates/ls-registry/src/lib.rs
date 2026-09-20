@@ -29,7 +29,8 @@ use ls_adapters::{
 ///
 /// M3 覆盖 7 个 LanguageId（M0 仅 cpp 系）。
 /// ts/js 同走 TypeScript LS —— 解析时归到 TypeScript；adapter_for 按 lang 维度分。
-const EXT_TABLE: &[(&str, LanguageId)] = &[
+/// `pub(crate)`：config.rs 加载 external-servers.toml 时检测扩展名撞表并 warn。
+pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     // C / C++
     ("c", LanguageId::Cpp),
     ("cpp", LanguageId::Cpp),
@@ -83,6 +84,23 @@ pub fn resolve(path: &Path) -> Option<LanguageId> {
         .iter()
         .find(|(e, _)| *e == ext)
         .map(|(_, lang)| *lang)
+}
+
+/// 路径 → 语言名（external-ls-registration-design §2 extension 路由）。
+///
+/// 先查内置 `EXT_TABLE`（手写语言优先，external 声明同扩展名时内置胜）；未命中查
+/// external-servers.toml 声明的 extensions → 该条目 `languages[0]`（session_for /
+/// spec_for 按语言名走配置驱动启动）。两者皆未命中 → None。
+pub fn resolve_lang_name(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    EXT_TABLE
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, lang)| lang.as_str())
+        .or_else(|| {
+            config::external_table()
+                .and_then(|t| config::match_external_ext(t, &ext))
+        })
 }
 
 /// 语言字符串 → adapter 单例。M3 覆盖 7 手写语言。

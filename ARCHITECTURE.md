@@ -369,6 +369,8 @@ classDiagram
 
 **语言解析**：`Registry.resolve(file_ext)` 依扩展名匹配 → 候选按 `priority` 排序（超集语言如 vue/svelte 低于 typescript，`↖ mirror: ls_config.py@43ae021 get_priority`）；`experimental` 条目仅在项目配置显式指定时生效（`↖ mirror: is_experimental + "Must be explicitly specified"` 约定）。扩展名表内嵌于 `servers.toml`（抄表自 `get_source_fn_matcher`，含 CPP 的 clang Types.cpp 全表与大小写不敏感标记）。
 
+**外部 LS 注册（external-servers.toml，external-ls-registration-design）**：用户目录（Windows `%APPDATA%\serena\`；Unix `~/.config/serena/`）下的 `external-servers.toml` 运行时解析（不 include_str!），schema 与内置 `servers.toml` 100% 共用（`ServerSpec` + `priority: i32` 缺省 0）。合并语义：`merged_spec_for` 按 id/language 命中双方时取 `priority` 大者，**并列时 external 胜出**（完整条目替换；加载时对覆盖/扩展名冲突逐条 warn 保可观测）；文件缺失/不可读/校验失败 → 静默当空表（永不触网、不 panic，对齐上游 entry-point discovery 容错）。优先级链：CLI flag > user config.toml（逐字段覆盖）> external-servers.toml（整条替换）> 内置 servers.toml。扩展名路由：`EXT_TABLE` 未命中时回落 external 声明的 `extensions` → 条目 `languages[0]`，session_for 按语言名走配置驱动启动；`install` 子命令对 external id 生效（输出 `source` 字段标注来源）。
+
 ### 4.3 servers.toml schema（草案）
 
 ```toml

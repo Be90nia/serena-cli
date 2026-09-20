@@ -16,7 +16,7 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: cli_run_bin <doctor|install-all|read-file> ...");
+        eprintln!("usage: cli_run_bin <doctor|install-all|install|read-file|ext-detect> ...");
         return ExitCode::from(2);
     }
     let lock_path = daemon::serve::default_lock_path();
@@ -29,6 +29,33 @@ async fn main() -> ExitCode {
         "install-all" => tokio::task::spawn_blocking(cmd_install_all)
             .await
             .unwrap_or(ExitCode::from(3)),
+        "install" => {
+            if args.len() < 3 {
+                eprintln!("usage: cli_run_bin install <LANG|ID>");
+                return ExitCode::from(2);
+            }
+            // 与 cli cmd_install 同构（main.rs 栈溢出绕开形态）。
+            let lang = args[2].clone();
+            tokio::task::spawn_blocking(move || cmd_install_lang(&lang))
+                .await
+                .unwrap_or(ExitCode::from(3))
+        }
+        "ext-detect" => {
+            if args.len() < 3 {
+                eprintln!("usage: cli_run_bin ext-detect <FILE>");
+                return ExitCode::from(2);
+            }
+            match ls_registry::resolve_lang_name(Path::new(&args[2])) {
+                Some(lang) => {
+                    println!("{lang}");
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("no language route for {}", args[2]);
+                    ExitCode::from(2)
+                }
+            }
+        }
         "read-file" => {
             if args.len() < 3 {
                 eprintln!("usage: cli_run_bin read-file <path>");
@@ -39,6 +66,28 @@ async fn main() -> ExitCode {
         other => {
             eprintln!("unknown subcommand: {other}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `install <LANG|ID>` 等价形态（cli main.rs cmd_install 同构：ensure_launch +
+/// source 来源标注 JSON；external-servers.toml 条目即经此生效）。
+fn cmd_install_lang(lang: &str) -> ExitCode {
+    match ls_registry::config::ensure_launch(lang, None, true, false) {
+        Ok((exe, args)) => {
+            let payload = serde_json::json!({
+                "ok": true,
+                "lang": lang,
+                "source": ls_registry::config::spec_source(lang).unwrap_or("builtin"),
+                "exe": exe.display().to_string(),
+                "cmd": args,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("install failed: {msg}");
+            ExitCode::from(3)
         }
     }
 }
