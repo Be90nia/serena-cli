@@ -13,7 +13,7 @@ use std::process::Stdio;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// ls-runtime 具名错误（ARCHITECTURE §6.1）。本任务先落 `Spawn` 变体，后续任务扩充。
+/// ls-runtime 具名错误（ARCHITECTURE §6.1 + auto-install-design §3 Δ 增补）。
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error("failed to spawn `{cmd}`: {cause}")]
@@ -22,6 +22,17 @@ pub enum RuntimeError {
         #[source]
         cause: std::io::Error,
     },
+    /// 下载/校验/解压失败（auto-install-design §3；ARCH §6.1 Δ 增补，回写见 ADR）。
+    #[error("download failed: {cause} (url={url})")]
+    Download {
+        url: String,
+        expected_sha: Option<String>,
+        actual_sha: Option<String>,
+        cause: String,
+    },
+    /// 系统工具/runtime 缺失（如 tar/xz/unzip；auto-install-design §3）。
+    #[error("missing runtime `{what}`: {install_hint}")]
+    MissingRuntime { what: String, install_hint: String },
 }
 
 pub type Result<T, E = RuntimeError> = std::result::Result<T, E>;

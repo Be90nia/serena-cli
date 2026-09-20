@@ -66,30 +66,78 @@ const CLANGD_VERSION: &str = "18.1.5";
 ///
 /// 锚：llvm.org 官方 release 路径 + 上游 solidlsp `language_servers/clangd/clangd.py`
 /// 的 `find_clangd` 行为（先 PATH 后下载）。
+///
+/// sha256 **空串 = 未知**（auto-install-design §2.9：未知 → 拒绝 auto，仅
+/// `--allow-unsigned-sha` 越狱）。上游 serena 的 `downloaded_dependency_hashes.json`
+/// 不含 clangd 条目（无官方一手来源），故按设计留空——假 hash 必败校验更危险。
 pub fn clangd_release_for(os: Os, arch: Arch) -> Option<ClangdRelease> {
+    let _ = os; // 矩阵键；当前 4 条目均 x86_64/aarch64 显式列出
     match (os, arch) {
         (Os::Windows, Arch::X86_64) => Some(ClangdRelease {
             url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.5/clang+llvm-18.1.5-x86_64-pc-windows-msvc.tar.xz",
-            sha256: "f5e4e9a0e1c5b8e5e3a4b7d6c9e2f1a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9",
+            sha256: "",
             binary_path: "clang+llvm-18.1.5-x86_64-pc-windows-msvc/bin/clangd.exe",
         }),
         (Os::Linux, Arch::X86_64) => Some(ClangdRelease {
             url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.5/clang+llvm-18.1.5-x86_64-linux-gnu-ubuntu-22.04.tar.xz",
-            sha256: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+            sha256: "",
             binary_path: "clang+llvm-18.1.5-x86_64-linux-gnu-ubuntu-22.04/bin/clangd",
         }),
         (Os::Macos, Arch::X86_64) => Some(ClangdRelease {
             url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.5/clang+llvm-18.1.5-x86_64-apple-darwin.tar.xz",
-            sha256: "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3",
+            sha256: "",
             binary_path: "clang+llvm-18.1.5-x86_64-apple-darwin/bin/clangd",
         }),
         (Os::Macos, Arch::Aarch64) => Some(ClangdRelease {
             url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.5/clang+llvm-18.1.5-aarch64-apple-darwin.tar.xz",
-            sha256: "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4",
+            sha256: "",
             binary_path: "clang+llvm-18.1.5-aarch64-apple-darwin/bin/clangd",
         }),
         (Os::Windows, Arch::Aarch64) | (Os::Linux, Arch::Aarch64) => None,
     }
+}
+
+/// rust-analyzer (Os, Arch) → (url, sha256, 压缩形态) 矩阵。
+///
+/// 真值锚：GitHub API `assets[].digest`（rust-lang/rust-analyzer tag **2026-09-07**，
+/// 2026-09-19 查询）——rust-analyzer release 无 SHA256SUMS 文件，API digest 即官方分发锚。
+/// 形态：Windows `.zip`；其余 `.gz`（单文件 gzip，非 tar 容器）。
+pub fn rust_analyzer_release_for(os: Os, arch: Arch) -> Option<RustAnalyzerRelease> {
+    match (os, arch) {
+        (Os::Windows, Arch::X86_64) => Some(RustAnalyzerRelease {
+            url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-07/rust-analyzer-x86_64-pc-windows-msvc.zip".into(),
+            sha256: "cd3dddd580edac199c5e84c6cceb3addea32769c25cb6b597024a200b3359b05".into(),
+            archive: crate::install::ArchiveKind::Zip,
+            bin_name: "rust-analyzer.exe".into(),
+        }),
+        (Os::Linux, Arch::X86_64) => Some(RustAnalyzerRelease {
+            url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-07/rust-analyzer-x86_64-unknown-linux-gnu.gz".into(),
+            sha256: "a3500183aa08bf740c0da6e030ad262d4cfa1c19e7ce195ab5f772bdf9ddfb12".into(),
+            archive: crate::install::ArchiveKind::SingleGz,
+            bin_name: "rust-analyzer".into(),
+        }),
+        (Os::Macos, Arch::X86_64) => Some(RustAnalyzerRelease {
+            url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-07/rust-analyzer-x86_64-apple-darwin.gz".into(),
+            sha256: "41161c05bd7e2396a5cea86a691d37919ec0af331a06bbdc0f323979034f9dad".into(),
+            archive: crate::install::ArchiveKind::SingleGz,
+            bin_name: "rust-analyzer".into(),
+        }),
+        (Os::Macos, Arch::Aarch64) => Some(RustAnalyzerRelease {
+            url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-07/rust-analyzer-aarch64-apple-darwin.gz".into(),
+            sha256: "16e9b2af9db7c0ce015ffe88f85db27669b05c84887a59c737d697d2c5f8d349".into(),
+            archive: crate::install::ArchiveKind::SingleGz,
+            bin_name: "rust-analyzer".into(),
+        }),
+        _ => None,
+    }
+}
+
+/// rust-analyzer release 条目（install.rs 需要的信息平铺）。
+pub struct RustAnalyzerRelease {
+    pub url: String,
+    pub sha256: String,
+    pub archive: crate::install::ArchiveKind,
+    pub bin_name: String,
 }
 
 /// 用户安装失败时的 hint（ARCHITECTURE §6 `ToolError::NotInstalled.hint`）。
@@ -230,8 +278,28 @@ mod tests {
         assert!(release.is_some(), "current platform must have release");
         if let Some(r) = release {
             assert!(r.url.starts_with("https://"));
-            assert_eq!(r.sha256.len(), 64, "sha256 should be 64 chars (hex)");
+            // §2.9 语义：空 = 未知（UnsignedRefused 门）；非空必须 64hex。
+            assert!(
+                r.sha256.is_empty() || r.sha256.len() == 64,
+                "sha256 must be empty (unknown) or 64 hex chars"
+            );
         }
+    }
+
+    #[test]
+    fn rust_analyzer_matrix_pins_official_digests() {
+        for (os, arch) in [
+            (Os::Windows, Arch::X86_64),
+            (Os::Linux, Arch::X86_64),
+            (Os::Macos, Arch::X86_64),
+            (Os::Macos, Arch::Aarch64),
+        ] {
+            let r = rust_analyzer_release_for(os, arch).expect("4 主流平台必须有条目");
+            assert_eq!(r.sha256.len(), 64, "rust-analyzer 真值已锚定（GitHub digest）");
+            assert!(r.url.contains("2026-09-07"), "版本钉死: {}", r.url);
+            assert!(r.url.starts_with("https://github.com/rust-lang/"));
+        }
+        assert!(rust_analyzer_release_for(Os::Windows, Arch::Aarch64).is_none());
     }
 
     #[test]

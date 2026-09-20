@@ -3,6 +3,11 @@ name = "ls-runtime"
 edition.workspace = true
 version.workspace = true
 [dependencies]
+bytes.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 win32job.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
