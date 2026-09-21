@@ -3369,6 +3369,142 @@ fn position_in_range(r: lsp_types::Range, line: u32, col: u32) -> bool {
     }
     true
 }
+
+/// 把 `lsp_types::Location` 压成 `"file:line:col"` 紧凑字符串（plan-h-compact §1）。
+///
+/// 与 `--json` 形态互斥：`--json` 走全形态 LSP Location（range+uri）；默认走 compact
+/// 省 90%+ token。`uri_to_path` 同步处理 `d%3A` percent + 盘符小写归一，失败 fallback
+/// 到原始 URI 字符串（不丢数据，可逆）。
+///
+/// ↖ mirror: ai-token-features-design.md §10-H；vs debuginfo-mode-lite：仅 LSP 格式化层。
+fn compact_loc(loc: &Location) -> String {
+    let s = loc.uri.as_str();
+    let path = match uri_to_path(s) {
+        Some(p) => p.to_string_lossy().replace('\\', "/"),
+        None => s.to_string(),
+    };
+    let line = loc.range.start.line + 1; // LSP 0-based → 人类 1-based
+    let col = loc.range.start.character + 1;
+    format!("{path}:{line}:{col}")
+}
+
+/// Vec 适配：一次 map 出紧凑字符串数组。
+fn compact_locs(locs: &[Location]) -> Vec<String> {
+    locs.iter().map(compact_loc).collect()
+}
+
+/// `SymbolHit` 的紧凑形态（plan-h-compact §1，结构见 lsp_core::types）。
+///
+/// `SymbolHit.uri` 是 String、`range` 是 lsp_types::Range —— 适配器复用 `Location`
+/// 视图，把 `(uri, range.start)` 喂 `compact_loc`。
+fn compact_symbol_hit(hit: &SymbolHit) -> String {
+    let uri = match hit.uri.parse::<lsp_types::Uri>() {
+        Ok(u) => u,
+        // uri 非 file:// 走 fallback（保留原字符串），让 `compact_loc` 内部
+        // `uri_to_path` 走 None 分支退回 raw。
+        Err(_) => lsp_types::Uri::from_str("file:///").expect("static file uri"),
+    };
+    let fake = Location { uri, range: hit.range };
+    compact_loc(&fake)
+}
+
+/// Location[] envelope：`compact=true` → strings 数组；`false` → 原 LSP Location 列表。
+///
+/// 与 `compact_locs` 配套：保留 raw_count 字段便于 AI 识别"有没有结果"的快速路径；
+/// non-compact 形态不增字段（与既有 wire 兼容）。
+///
+/// AI-token 特性 H（plan-h-compact §1）；↖ mirror: ai-token-features-design §10-H。
+fn locations_envelope(locs: &[Location], compact: bool) -> serde_json::Value {
+    if compact {
+        serde_json::json!({
+            "compact": true,
+            "items": compact_locs(locs),
+            "raw_count": locs.len(),
+        })
+    } else {
+        serde_json::json!({ "compact": false, "items": locs })
+    }
+}
+
+/// SymbolHit[] envelope：compact 时合并 name + 紧凑位置为 `["name", "file:line:col"]` 数组
+/// （保留 name 便于 grep；位置数组内嵌为字符串，体积为原 JSON 的 ~25%）。
+fn symbol_hits_envelope(hits: &[SymbolHit], compact: bool) -> serde_json::Value {
+    if compact {
+        let items: Vec<[String; 2]> = hits
+            .iter()
+            .map(|h| [h.name.clone(), compact_symbol_hit(h)])
+            .collect();
+        serde_json::json!({
+            "compact": true,
+            "items": items,
+            "raw_count": hits.len(),
+        })
+    } else {
+        // 非 compact 形态用 serde 直接序列化回原结构，与既有 wire 一致。
+        serde_json::to_value(hits).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// RefSymbolHit[] envelope：compact 时合并 `symbol` + `refs[]` 嵌套紧凑（按容器聚类）。
+fn ref_symbol_hits_envelope(
+    hits: &[ref_tools::RefSymbolHit],
+    compact: bool,
+) -> serde_json::Value {
+    if compact {
+        let items: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "symbol": h.container_name,
+                    "loc": compact_file_line_col(&h.file, h.line, h.col),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "compact": true,
+            "items": items,
+            "raw_count": hits.len(),
+        })
+    } else {
+        serde_json::to_value(hits).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// RefSnippetHit[] envelope：compact 时保留每条 snippet（snippet 是引用上下文价值所在，
+/// 不能砍），但位置压紧凑 + `compact` 标记顶层。
+fn ref_snippet_hits_envelope(
+    hits: &[ref_tools::RefSnippetHit],
+    compact: bool,
+) -> serde_json::Value {
+    if compact {
+        let items: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "loc": compact_file_line_col(&h.file, h.line, h.col),
+                    "text": h.text,
+                    "snippet": h.snippet,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "compact": true,
+            "items": items,
+            "raw_count": hits.len(),
+        })
+    } else {
+        serde_json::to_value(hits).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// 单条 `file:line:col` 紧凑字符串 —— RefSymbolHit/RefSnippetHit 没有 Location，直接拿
+/// raw 字段拼。它们原生就是 0-based，与 LSP 一致；1-based 转换同 compact_loc。
+///
+/// ponytail: 不走 `uri_to_path` —— ref_tools 已把路径归一化（fix_index 阶段）。
+fn compact_file_line_col(file: &str, line: u32, col: u32) -> String {
+    let path = file.replace('\\', "/");
+    format!("{}:{}:{}", path, line + 1, col + 1)
+}
 /// `lsp_types::SymbolKind.0` is private. Round-trip via JSON: `SymbolKind` is
 /// `#[serde(transparent)]` over `i32`, so deserializing into i32 yields the wire number.
 fn kind_from_lsp(k: &lsp_types::SymbolKind) -> SymbolKindTag {
@@ -3606,6 +3742,14 @@ impl SupervisorTrait for Supervisor {
         // per-call override，并清掉这两个私有字段（避免传染给具体 tool 的 args 解析）。
         // 实际 timeout 在 tool_* 内部通过 `effective_tool_timeout(lang, &args)` 拿到。
         let args = sanitize_timeout_args(args);
+        // AI-token 特性 H（plan-h-compact-locations.md §1 / ai-token-features-design §10-H）：
+        // 6 个位置工具（def/refs/find-symbol/find-implementations/find-referencing-*）
+        // 默认走紧凑 `file:line:col` 字符串输出。`_compact` 在 sanitize 里**不**进过滤名单
+        // —— 与 `_timeout_ms` 同套私有约定。默认 `true` 走紧凑、`--json` 显式 `false` 走全形态。
+        let compact = args
+            .get("_compact")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         // 修 P1 #2（TTL 生产执行者）：throttled reclaim。每 32 次调用扫一次所有
         // 在线 Session 的空闲 FileBuffer（ref_count=0 + 超 60 s）→ didClose + 移表。
@@ -3638,8 +3782,8 @@ impl SupervisorTrait for Supervisor {
                     }
                 })?;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-                let resp = self.tool_find_symbol(root, query, limit, lang).await?;
-                serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
+                let raw = self.tool_find_symbol(root, query, limit, lang).await?;
+                Ok(symbol_hits_envelope(&raw, compact))
             }
             "signature-help" => {
                 let (file, line, col) = required_position(&args)?;
@@ -3877,8 +4021,11 @@ impl SupervisorTrait for Supervisor {
             }
             "def" => {
                 let (file, line, col) = required_position(&args)?;
-                serde_json::to_value(self.tool_def(root, &file, line, col, lang).await?)
-                    .map_err(|e| ToolError::Serialize(e.into()))
+                let raw = self.tool_def(root, &file, line, col, lang).await?;
+                // `def` 单 Location → 退化为单元素 envelope（AI 期望 `items[]` 统一）。
+                // None 是合法语义（位置无定义），保留为 `items: []` + `compact: true|false`。
+                let locs = raw.into_iter().collect::<Vec<_>>();
+                Ok(locations_envelope(&locs, compact))
             }
 
             "containing-symbol" => {
@@ -3900,8 +4047,8 @@ impl SupervisorTrait for Supervisor {
 
             "refs" => {
                 let (file, line, col) = required_position(&args)?;
-                serde_json::to_value(self.tool_refs(root, &file, line, col, lang).await?)
-                    .map_err(|e| ToolError::Serialize(e.into()))
+                let raw = self.tool_refs(root, &file, line, col, lang).await?;
+                Ok(locations_envelope(&raw, compact))
             }
             "completion" => {
                 let (file, line, col) = required_position(&args)?;
@@ -3914,11 +4061,10 @@ impl SupervisorTrait for Supervisor {
             }
             "find-implementations" => {
                 let (file, line, col) = required_position(&args)?;
-                serde_json::to_value(
-                    self.tool_find_implementations(root, &file, line, col, lang)
-                        .await?,
-                )
-                .map_err(|e| ToolError::Serialize(e.into()))
+                let raw = self
+                    .tool_find_implementations(root, &file, line, col, lang)
+                    .await?;
+                Ok(locations_envelope(&raw, compact))
             }
             "search" => {
                 let pattern = args
@@ -4028,7 +4174,7 @@ impl SupervisorTrait for Supervisor {
                 let hits = self
                     .tool_referencing_symbols(root, &file, line, col, lang)
                     .await?;
-                serde_json::to_value(hits).map_err(|e| ToolError::Serialize(e.into()))
+                Ok(ref_symbol_hits_envelope(&hits, compact))
             }
             "find-referencing-code-snippets" => {
                 let (file, line, col) = required_position(&args)?;
@@ -4051,7 +4197,7 @@ impl SupervisorTrait for Supervisor {
                         lang,
                     )
                     .await?;
-                serde_json::to_value(hits).map_err(|e| ToolError::Serialize(e.into()))
+                Ok(ref_snippet_hits_envelope(&hits, compact))
             }
             "replace-text-in-symbol" => {
                 let file = required_file(&args)?;
@@ -6209,10 +6355,154 @@ mod timeout_resolution_tests {
 
     #[test]
     fn sanitize_timeout_args_passes_through_non_object() {
-        // 防御：若 args 罕见形态（null/array），sanitize 不 panic、不破坏。
+        // 防御：若 args 罕见形态（null/array），sanitize 不panic、不破坏。
         let null_in = serde_json::Value::Null;
         assert!(sanitize_timeout_args(null_in.clone()).is_null());
         let arr_in = json!([1, 2, 3]);
         assert_eq!(sanitize_timeout_args(arr_in.clone()), arr_in);
+    }
+}
+
+// ---- AI-token 特性 H: compact 位置格式（plan-h-compact-locations.md §3 验收）----
+//
+// 本模块覆盖：
+// - `compact_loc` / `compact_locs` / `compact_symbol_hit` 字节级断言（盘符归一、percent
+//   解码、LSP 0-based → 人类 1-based 三件套）
+// - 三个 envelope builder（locations_envelope / symbol_hits_envelope / ref_*_envelope）
+//   序列化形状 + compact 开关标志
+// - 不拉起 LS，纯函数 + 构造的 Location/SymbolHit 即可验证。
+
+#[cfg(test)]
+mod compact_locations_tests {
+    use super::*;
+    use lsp_types::{Location, Position, Range, Uri};
+
+    fn loc(uri: &str, line: u32, col: u32) -> Location {
+        let uri: Uri = uri.parse().unwrap();
+        Location {
+            uri,
+            range: Range {
+                start: Position::new(line, col),
+                end: Position::new(line, col + 4),
+            },
+        }
+    }
+
+    /// `compact_loc` 3 件套：URI percent 解码 + 盘符大写 + 1-based 行/列。
+    /// 输入 LSP 0-based line:9 char:4 → 期望人类 1-based "10:5"。
+    #[test]
+    fn compact_loc_decodes_percent_and_normalizes_drive_and_one_based() {
+        let s = compact_loc(&loc("file:///d%3A/proj/foo.rs", 9, 4));
+        // 盘符大写归一 + percent 解码 + 1-based 行:列
+        assert!(
+            s.starts_with("D:/proj/foo.rs:"),
+            "盘符归一 + percent 解码失败: got {s}"
+        );
+        assert!(s.ends_with(":10:5"), "1-based 转换失败: got {s}");
+        assert!(!s.contains('%'), "percent 噪音未消: {s}");
+    }
+
+    /// 路径解析可逆：`compact_loc` 输出 → 反解 → 拿回 1-based line/col。
+    #[test]
+    fn compact_loc_round_trip_preserves_one_based_line_col() {
+        let out = compact_loc(&loc("file:///D:/proj/main.rs", 9, 4));
+        // 末尾 `:` 分三段：file / line / col
+        let parts: Vec<&str> = out.rsplitn(3, ':').collect();
+        assert_eq!(parts.len(), 3, "期望 file:line:col 三段: got {out}");
+        let col: u32 = parts[0].parse().unwrap();
+        let line: u32 = parts[1].parse().unwrap();
+        assert_eq!(line - 1, 9, "1-based line 应回 0-based 9");
+        assert_eq!(col - 1, 4, "1-based col 应回 0-based 4");
+    }
+
+    /// `compact_locs` 一次 vec 适配（多 Location → Vec<String>）。
+    #[test]
+    fn compact_locs_maps_each_location() {
+        let locs = vec![
+            loc("file:///D:/proj/a.rs", 0, 0),
+            loc("file:///D:/proj/b.rs", 10, 5),
+        ];
+        let out = compact_locs(&locs);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].ends_with("a.rs:1:1"));
+        assert!(out[1].ends_with("b.rs:11:6"));
+    }
+
+    /// `compact_symbol_hit` 走 SymbolHit.uri + SymbolHit.range。
+    #[test]
+    fn compact_symbol_hit_uses_uri_and_range() {
+        let hit = SymbolHit {
+            name: "add".to_string(),
+            kind: SymbolKindTag::Function,
+            uri: "file:///D:/proj/x.rs".to_string(),
+            range: Range {
+                start: Position::new(0, 3),
+                end: Position::new(0, 6),
+            },
+            container: None,
+        };
+        let s = compact_symbol_hit(&hit);
+        assert_eq!(s, "D:/proj/x.rs:1:4", "name 不参与紧凑字段");
+    }
+
+    /// locations_envelope 形状：`compact: bool` 顶层 + `items[]` + 条件 raw_count。
+    #[test]
+    fn locations_envelope_compact_true_drops_range_uri_and_keeps_count() {
+        let locs = vec![loc("file:///D:/a.rs", 0, 0), loc("file:///D:/b.rs", 4, 7)];
+        let v = locations_envelope(&locs, true);
+        assert_eq!(v["compact"], serde_json::Value::Bool(true));
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_string(), "compact path 应是字符串");
+        assert!(items[0].as_str().unwrap().ends_with("a.rs:1:1"));
+        assert_eq!(v["raw_count"], serde_json::json!(2));
+    }
+
+    /// non-compact path 保留原 LSP Location（range+uri），无 raw_count 噪音。
+    #[test]
+    fn locations_envelope_compact_false_keeps_lsp_locations() {
+        let locs = vec![loc("file:///D:/a.rs", 0, 0)];
+        let v = locations_envelope(&locs, false);
+        assert_eq!(v["compact"], serde_json::Value::Bool(false));
+        assert!(v.get("raw_count").is_none(), "non-compact 应不增字段");
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0]["uri"].is_string(), "LSP Location.uri 必须保留");
+        assert!(items[0]["range"]["start"]["line"].is_u64());
+    }
+
+    /// symbol_hits_envelope compact 形态：`[name, "file:line:col"]` 二元组。
+    #[test]
+    fn symbol_hits_envelope_compact_true_pairs_name_with_loc() {
+        let hits = vec![SymbolHit {
+            name: "add".into(),
+            kind: SymbolKindTag::Function,
+            uri: "file:///D:/p/x.rs".into(),
+            range: Range {
+                start: Position::new(0, 0),
+                end: Position::new(1, 0),
+            },
+            container: None,
+        }];
+        let v = symbol_hits_envelope(&hits, true);
+        assert_eq!(v["compact"], serde_json::Value::Bool(true));
+        let items = v["items"].as_array().unwrap();
+        let pair = items[0].as_array().expect("pair array");
+        assert_eq!(pair[0].as_str().unwrap(), "add");
+        assert!(pair[1].as_str().unwrap().ends_with("x.rs:1:1"));
+    }
+
+    /// `_compact=false` 在 execute_tool 入口被透传到 envelope —— 至少一处走完整 +
+    /// `items[0]` 是 LSP Location（确保现有 wire 兼容）。
+    #[test]
+    fn locations_envelope_compact_false_preserves_wire_shape_for_ai_compat() {
+        let locs = vec![loc("file:///D:/a.rs", 2, 3)];
+        let v = locations_envelope(&locs, false);
+        // 必须保留 `items[0].uri` + `items[0].range.start` 两个字段（与既有 wire 同步）
+        assert!(v["items"][0]["uri"].is_string());
+        assert_eq!(
+            v["items"][0]["range"]["start"]["line"],
+            serde_json::json!(2)
+        );
     }
 }
