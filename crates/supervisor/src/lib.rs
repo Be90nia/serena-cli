@@ -35,6 +35,7 @@ pub mod root_finder;
 
 pub mod ref_tools;
 pub mod repo_map;
+pub mod warm;
 pub mod write_gate;
 
 use lsp_core::types::{SymbolHit, SymbolKindTag};
@@ -4181,6 +4182,19 @@ impl SupervisorTrait for Supervisor {
                     .unwrap_or(20) as usize;
                 let report = crate::repo_map::build(self, root, lang, top_n).await;
                 serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "warm" => {
+                // M: 预热 LS + 索引（ai-token-features-design §13-M / plan-m-warm.md）。
+                let lang = args.get("lang").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::BadArgs {
+                        detail: "missing 'lang'".into(),
+                    }
+                })?;
+                let timeout_secs = args
+                    .get("timeout_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30);
+                crate::warm::warm(self, root, lang, Duration::from_secs(timeout_secs)).await
             }
             "replace-body" => {
                 let (file, symbol, new_body) = required_replace_args(&args)?;
