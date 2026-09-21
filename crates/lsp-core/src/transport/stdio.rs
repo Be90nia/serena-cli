@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::framing::{JsonRpc, decode, encode};
+use crate::framing::{Decoder, JsonRpc, encode};
 use crate::recording::Recorder;
 
 /// 内联分发回调（保序；Task 5：返回 `Some(reply)` 表示 server→client request 需回执）。
@@ -118,6 +118,7 @@ pub fn pump(
     let stdout_task = tokio::spawn(async move {
         let mut stdout = stdout;
         let mut buf = BytesMut::new();
+        let mut decoder = Decoder::default();
         let mut chunk = [0u8; 8192];
         let mut saw_eof = false;
         while !saw_eof {
@@ -132,7 +133,7 @@ pub fn pump(
                 }
             }
             loop {
-                match decode(&mut buf) {
+                match decoder.decode(&mut buf) {
                     Ok(Some(msg)) => dispatch(msg, &on_msg, &reply_tx_for_dispatch),
                     Ok(None) => break,
                     Err(e) => {
@@ -245,6 +246,7 @@ pub fn record_pump(
     let stdout_task = tokio::spawn(async move {
         let mut stdout = stdout;
         let mut buf = BytesMut::new();
+        let mut decoder = Decoder::default();
         let mut chunk = [0u8; 8192];
         let mut saw_eof = false;
         while !saw_eof {
@@ -257,7 +259,7 @@ pub fn record_pump(
                 }
             }
             loop {
-                match decode(&mut buf) {
+                match decoder.decode(&mut buf) {
                     Ok(Some(m)) => {
                         rec_r.record_inbound(&m);
                         dispatch(m, &on_msg, &reply_tx_for_dispatch);

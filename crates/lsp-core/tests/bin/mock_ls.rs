@@ -21,7 +21,7 @@
 //! 路径会丢。`track_file_events` 钩子负责把这些通知记下来给测试断言。
 
 use bytes::BytesMut;
-use lsp_core::framing::{JsonRpc, RpcError, decode, encode};
+use lsp_core::framing::{Decoder, JsonRpc, RpcError, encode};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -173,6 +173,7 @@ async fn main() {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut buf = BytesMut::new();
+    let mut decoder = Decoder::default();
     let mut chunk = [0u8; 4096];
     let mut initialized = false;
     loop {
@@ -180,7 +181,7 @@ async fn main() {
             Ok(0) | Err(_) => return,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
-        while let Ok(Some(msg)) = decode(&mut buf) {
+        while let Ok(Some(msg)) = decoder.decode(&mut buf) {
             // 文件事件跟踪：didOpen/didChange/didClose 是通知（无 id），默认「忽略」
             // 路径会丢；这里按方法名前缀判断追加写日志。
             track_event(&config.track_file_events, &msg).await;

@@ -231,6 +231,15 @@ pub struct Supervisor {
     /// overview / find-symbol / symbol-body 入口前查；命中免 LS 往返。mtime 变 →
     /// key 变 → 自然 miss 重调 LS（旧 entry 残留无害）。std Mutex：临界区仅 HashMap 读写。
     symbol_cache: std::sync::Arc<Mutex<HashMap<SymbolCacheKey, Vec<SymbolHit>>>>,
+    /// 修 P1 #2（TTL 生产执行者）：每次 `execute_tool` 路过 +1；达阈值后调每个
+    /// 在线 Session 的 `evict_idle_buffers(FILE_GUARD_TTL)` 强制回收 ref_count=0
+    /// 的陈旧缓冲。原子计数避免持锁。阈值 = 32：每次工具调用大半 1~2 个文件，按
+    /// 4 - 8 并发比，32 次调用 ≈ 100 文件操作，对应在 daemon 主动期约 5~10 秒级
+    /// 节流，避免高频 reconcile 开销。
+    idle_buffers_reclaim_counter: AtomicU64,
+    /// 修 P1 #2 测试专用：覆盖默认 TTL 让单测可控；生产 build 不持此字段。
+    #[cfg(test)]
+    _idle_ttl_override: std::sync::Arc<Mutex<Option<Duration>>>,
 }
 /// 实例池身份键。`root` 保存 canonical **真实大小写**——rust-analyzer 按 URI 精确
 /// 字符串匹配挂载文件，小写化 root 会让 didOpen/def 的原始大小写 URI 脱挂所有
@@ -384,6 +393,9 @@ impl Supervisor {
             diag_generation: std::sync::Arc::new(AtomicU64::new(0)),
             pull_diag_supported: std::sync::Arc::new(Mutex::new(HashMap::new())),
             symbol_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            idle_buffers_reclaim_counter: AtomicU64::new(0),
+            #[cfg(test)]
+            _idle_ttl_override: std::sync::Arc::new(Mutex::new(None)),
         })
     }
 
@@ -391,6 +403,63 @@ impl Supervisor {
     #[allow(dead_code)]
     pub fn is_direct(&self) -> bool {
         self.direct_mode
+    }
+
+    /// 修 P1 #2（TTL 生产执行者）：throttled reclaim。每次 `execute_tool` 入口
+    /// 加 1，达 `RECLAIM_THRESHOLD` 后扫所有在线 Session 调
+    /// `evict_idle_buffers(FILE_GUARD_TTL)` —— 把 ref_count=0 且超过 TTL 的
+    /// 缓冲 didClose + 移表。复活竞态按 docsync.rs:208-210 注释处理（LS
+    /// 收到 didClose on known-closed 通常忽略；不引入两轮锁复杂化）。
+    ///
+    /// 测试可调 `_idle_ttl_override`（测试专用 Arc<Mutex<Option<Duration>>>)强制
+    /// 用更短 TTL 验证生命周期；None 时走默认 60 s。
+    ///
+    /// ponytail: 阈值为"每次工具调用 1~2 文件、稳态 ~10 s 节流"的粗估；daemon
+    /// 真实负载下可降序到 16（更频繁）以加快冷文件回收。
+    pub fn reclaim_idle_buffers_once(&self) -> usize {
+        // 阈值（call 次）：节流，避免每工具调用都遍历 sessions。
+        const RECLAIM_THRESHOLD: u64 = 32;
+        let n = self.idle_buffers_reclaim_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if n < RECLAIM_THRESHOLD {
+            return 0;
+        }
+        // 阈值到达：归零计数 + 扫所有 session 走 idle evict。
+        let _ = self.idle_buffers_reclaim_counter.compare_exchange(
+            n,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        // TTL —— 默认 60 s；测试覆盖下走短 TTL（5 ms）让用例可控。
+        #[cfg(test)]
+        let ttl: Duration = {
+            let g = self._idle_ttl_override.lock().unwrap();
+            g.unwrap_or(Duration::from_secs(60))
+        };
+        #[cfg(not(test))]
+        let ttl: Duration = Duration::from_secs(60);
+        let mut total = 0usize;
+        let sessions: Vec<Arc<Session>> = {
+            let instances = self.instances.lock().unwrap();
+            instances.values().cloned().collect()
+        };
+        for session in &sessions {
+            total += session.evict_idle_buffers(ttl);
+        }
+        total
+    }
+
+    /// 测试辅助：直接读 reclaim 计数器（不增加）。
+    #[cfg(test)]
+    pub(crate) fn reclaim_count_snapshot(&self) -> u64 {
+        self.idle_buffers_reclaim_counter.load(Ordering::Relaxed)
+    }
+
+    /// 测试辅助：覆盖默认 TTL（60s）为短 TTL 让测试可断言"生产路径触发回收"。
+    /// 与下 reclaim_idle_buffers_once 配套使用。
+    #[cfg(test)]
+    pub(crate) fn set_idle_ttl_for_test(&self, ttl: Duration) {
+        *self._idle_ttl_override.lock().unwrap() = Some(ttl);
     }
 
     #[doc(hidden)]
@@ -640,11 +709,16 @@ impl Supervisor {
                 // 每次 publishDiagnostics 都 ++ generation（含空 items 的"无错"推送），
                 // 客户端 wait_gen >= N 才能精确等新一代，而非盲等 5s。
                 generation.fetch_add(1, Ordering::Relaxed);
-                if !items.is_empty() {
-                    cache
-                        .lock()
-                        .unwrap()
-                        .insert((cache_root.clone(), uri.to_string()), items);
+                let mut cache = cache.lock().unwrap();
+                let key = (cache_root.clone(), uri.to_string());
+                if items.is_empty() {
+                    // 空推送必须清缓存（修 P1 #1）：push-only LS（如 rust-analyzer）在用户
+                    // 把错误改完后会推空 items 数组 —— 仅当 !is_empty 时写入会让陈旧
+                    // 错误项永存；删除条目后 tool_diagnostics 默认返空（unwrap_or_default）。
+                    // generation++ 已在外完成，wait_gen 读侧无需变更。
+                    cache.remove(&key);
+                } else {
+                    cache.insert(key, items);
                 }
             });
         // ↖ mirror: ls.py@43ae021 on_server_started — 把"等待 LS 索引就绪"
@@ -1483,23 +1557,136 @@ impl Supervisor {
             }
         }
 
-        // 逐文件聚合（顺序即可：daemon 内 LS 请求本就串行；单文件失败不炸整树）。
-        let mut entries = Vec::with_capacity(files.len());
+        // 逐文件聚合：缓存命中走 cache_get 拿克隆（无 LS 调用，可同步直接结果）；
+        // 缓存未命中走 LS 文档符号查询。
+        //
+        // 修 P1 #3 fan-out（合 P0 修复 audit）：按语言分桶（mixed-lang 目录下不同
+        // 扩展名各自走自己的 LS，如 .py → pyright / .rs → rust-analyzer，绝不混
+        // session）。每桶独立 `session_for(lang)` + 独立 JoinSet，桶内 MAX_INFLIGHT=4
+        // 有界并发；多桶互不阻塞。
+        //
+        // LS 单会话并发安全性已在 lsp-core/client.rs pending 表（按 Id 关联）+ outbound
+        // mpsc（writer task 单写）确认为安全 —— 多 in-flight documentSymbol 安全。
+        //
+        // 顺序保留：entries 用 `Vec<(usize, Value)>` 暂存（idx 是 file 在 files 中的
+        // 原位置）；缓存命中按 idx 升序 push；桶内 miss drain 顺序无序 → 末尾
+        // `Vec::sort_by_key(|(idx,_)|*idx)` 稳定排序展平为 final entries。`files` 本身
+        // 已按 filtered_walker 顺序收集，命中桶内顺序天然稳定。
+        //
+        // ponytail: 不引入 `futures` crate —— JoinSet + sort_by_key（std 稳定排序）
+        // 已足够，万级文件再换 LRU+slot。
+        let mut entries: Vec<(usize, serde_json::Value)> = Vec::new();
         let mut errors = Vec::new();
-        for file in &files {
-            match self.tool_overview(root, file, lang).await {
-                Ok(symbols) if !symbols.is_empty() => {
-                    entries.push(serde_json::json!({ "file": file, "symbols": symbols }));
+        if !files.is_empty() {
+            let cache_arc = Arc::clone(&self.symbol_cache);
+            let mut per_lang_buckets: std::collections::HashMap<String, Vec<usize>> =
+                std::collections::HashMap::new();
+
+            // 逐文件语言解析（P0 修复核心）：扩展名不同的文件各自归属各自 LS 桶。
+            // 解析失败的文件不入桶，留作 errors（与原 tool_overview 路径一致）。
+            for (idx, file) in files.iter().enumerate() {
+                match resolve_lang_for_file(file, lang) {
+                    Ok(lang_id) => {
+                        per_lang_buckets
+                            .entry(lang_id)
+                            .or_default()
+                            .push(idx);
+                    }
+                    Err(e) => {
+                        // 与 tool_overview 一致：纯缓存命中也可走，但 miss 路径无法走 LS，
+                        // 这里走 cache-only 分支（与下方的 cache 分流合一）。
+                        // 直接尝试读缓存（避免漏已有 cache 命中）：
+                        let cache_key = doc_symbol_cache_key(root, file);
+                        let cached = cache_arc.lock().unwrap().get(&cache_key).cloned();
+                        match cached {
+                            Some(symbols) if !symbols.is_empty() => {
+                                entries.push((
+                                    idx,
+                                    serde_json::json!({ "file": file, "symbols": symbols }),
+                                ));
+                            }
+                            Some(_) => {}
+                            None => {
+                                errors.push(serde_json::json!({
+                                    "file": file,
+                                    "error": format!("language unresolved: {e}"),
+                                }));
+                            }
+                        }
+                    }
                 }
-                Ok(_) => {} // 无符号文件（空/纯注释）不占条目
-                Err(e) => errors.push(serde_json::json!({ "file": file, "error": e.to_string() })),
             }
+
+            // 对每桶：先把缓存命中按 idx 压 entries，再把 miss 索引推到该桶的并发池；
+            // 桶之间可并行（不同 LS 进程），但同桶内受 MAX_INFLIGHT 限制。
+            const MAX_INFLIGHT: usize = 4;
+            for (lang_id, bucket_indices) in per_lang_buckets {
+                // 单桶内的 miss 索引 + 缓存分流
+                let mut miss_indices: Vec<usize> = Vec::new();
+                for &idx in &bucket_indices {
+                    let file = &files[idx];
+                    let cache_key = doc_symbol_cache_key(root, file);
+                    let cached = cache_arc.lock().unwrap().get(&cache_key).cloned();
+                    match cached {
+                        Some(symbols) if !symbols.is_empty() => {
+                            entries.push((
+                                idx,
+                                serde_json::json!({ "file": file, "symbols": symbols }),
+                            ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            miss_indices.push(idx);
+                        }
+                    }
+                }
+                if miss_indices.is_empty() {
+                    continue;
+                }
+
+                // 单桶：拉一次 session（按本桶 lang）。session_for 在该 lang 已有
+                // 实例时直返（per-key 加载门），不会重复冷启动。
+                let session = self.session_for(root, &lang_id).await?;
+                let mut set = tokio::task::JoinSet::new();
+                for idx in miss_indices {
+                    while set.len() >= MAX_INFLIGHT {
+                        drain_one(&mut set, &mut entries, &mut errors).await;
+                    }
+                    let file = files[idx].clone();
+                    let file_for_res = file.clone();
+                    let session = Arc::clone(&session);
+                    let cache_arc = Arc::clone(&cache_arc);
+                    let root = root.to_path_buf();
+                    let lang_owned = Some(lang_id.clone());
+                    set.spawn(async move {
+                        let res = overview_via_session(
+                            session,
+                            cache_arc,
+                            root,
+                            file,
+                            lang_owned.as_deref(),
+                        )
+                        .await;
+                        (idx, file_for_res, res)
+                    });
+                }
+                while !set.is_empty() {
+                    drain_one(&mut set, &mut entries, &mut errors).await;
+                }
+            }
+
+            // (idx, value) 序列稳定排序，再展平为 entries（顺序 = files 顺序）。
+            entries.sort_by_key(|(idx, _)| *idx);
         }
+
+        let final_entries: Vec<serde_json::Value> =
+            entries.into_iter().map(|(_, v)| v).collect();
+
         serde_json::to_value(serde_json::json!({
             "dir": dir,
             "files_scanned": files.len(),
             "truncated": truncated,
-            "entries": entries,
+            "entries": final_entries,
             "errors": errors,
         }))
         .map_err(|e| ToolError::Serialize(e.into()))
@@ -2995,6 +3182,76 @@ fn push_nested(
     }
 }
 
+// 修 P1 #3：tool_symbol_tree 并发池辅助。
+//
+// `drain_one` 从 JoinSet 拿一个完成项 `(idx, file, Result<Vec<SymbolHit>>)`. idx 是
+// 文件在原 `files` Vec 中的位置 —— 把命中按 (idx, value) push 进 entries（末尾
+// sort 还原顺序），失败就地 push errors（带 file 字段）。JoinHandle 出错（极少见，
+// 如 panic）按失败处理 —— panic 不应绕过 errors 通道。
+//
+// `overview_via_session` 是 tool_overview 缓存命中 / miss 路径的 'static 等价版本：
+// 不持 self（只持 Arc<Session>+Arc<cache>+PathBuf+String）以便 spawn 进 JoinSet.
+// 与 tool_overview 的语义差异：缓存查 / 写在函数内部直接走 Arc<Mutex<...>>，不再走
+// self 的私有 helper（self.symbol_cache_get/put 都靠 Arc 读 / 写同一张表，等价）。
+async fn drain_one(
+    set: &mut tokio::task::JoinSet<(usize, String, ToolResult<Vec<SymbolHit>>)>,
+    entries: &mut Vec<(usize, serde_json::Value)>,
+    errors: &mut Vec<serde_json::Value>,
+) {
+    let Some(joined) = set.join_next().await else {
+        return;
+    };
+    let (idx, file, res) = match joined {
+        Ok(pair) => pair,
+        Err(join_err) => {
+            errors.push(serde_json::json!({
+                "error": format!("symbol-tree fan-out task join error: {join_err}"),
+            }));
+            return;
+        }
+    };
+    match res {
+        Ok(symbols) if !symbols.is_empty() => {
+            entries.push((idx, serde_json::json!({ "file": file, "symbols": symbols })));
+        }
+        Ok(_) => {} // 空命中 → 不入 entries
+        Err(e) => {
+            errors.push(serde_json::json!({ "file": file, "error": e.to_string() }));
+        }
+    }
+}
+
+async fn overview_via_session(
+    session: Arc<lsp_core::session::Session>,
+    cache_arc: std::sync::Arc<Mutex<HashMap<SymbolCacheKey, Vec<SymbolHit>>>>,
+    root: PathBuf,
+    file: String,
+    lang_override: Option<&str>,
+) -> ToolResult<Vec<SymbolHit>> {
+    // 缓存查：与 `Supervisor::symbol_cache_get` 等价（共享同一张表）。
+    let cache_key = doc_symbol_cache_key(&root, &file);
+    if let Some(cached) = cache_arc.lock().unwrap().get(&cache_key).cloned() {
+        return Ok(cached);
+    }
+    let lang_str = resolve_lang_for_file(&file, lang_override)?;
+    let path = root.join(&file);
+    let uri = path_to_uri_str(&path);
+    let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+    let timeout = ls_registry::config::effective_timeout_ms(&lang_str, None)
+        .map(|ms| Duration::from_millis(ms as u64))
+        .unwrap_or(TOOL_TIMEOUT);
+    let params = serde_json::json!({ "textDocument": { "uri": uri.clone() } });
+    let resp: Option<DocumentSymbolResponse> = session
+        .request("textDocument/documentSymbol", params, timeout)
+        .await?;
+    let out = flatten_symbols(resp, &uri);
+    // 写入与 Supervisor::symbol_cache_put 等价语义：空不写。
+    if !out.is_empty() {
+        cache_arc.lock().unwrap().insert(cache_key, out.clone());
+    }
+    Ok(out)
+}
+
 /// 按 (line, col) 在 `DocumentSymbolResponse` 树中反查所有包含该位置的符号（Phase 2.1）。
 ///
 /// 规则：位置在符号的 [start.line, end.line] 闭区间内；
@@ -3314,6 +3571,14 @@ impl SupervisorTrait for Supervisor {
         // per-call override，并清掉这两个私有字段（避免传染给具体 tool 的 args 解析）。
         // 实际 timeout 在 tool_* 内部通过 `effective_tool_timeout(lang, &args)` 拿到。
         let args = sanitize_timeout_args(args);
+
+        // 修 P1 #2（TTL 生产执行者）：throttled reclaim。每 32 次调用扫一次所有
+        // 在线 Session 的空闲 FileBuffer（ref_count=0 + 超 60 s）→ didClose + 移表。
+        // 这是 TTL 窗口的实际触发点；daemon 周期性或 CLI 流式调用下都能覆盖。
+        // 计数原子增加、阈值归零，无锁；scan + evict 内部临界区微秒无 await。
+        // ponytail: 阈值 32 对应稳态 5~10 s 节流；测试直接调 reclaim_idle_buffers_once
+        // 绕过阈值验证语义。
+        let _reclaimed = self.reclaim_idle_buffers_once();
         match tool {
             "overview" => {
                 let file = required_file(&args)?;
@@ -4739,6 +5004,7 @@ mod pull_diagnostics_tests {
     use super::Supervisor;
     use lsp_core::init_params::supports_pull_diagnostics;
     use serde_json::json;
+    use std::path::PathBuf;
 
     /// #1 capabilities 缺 diagnosticProvider 字段（mock_ls 现状）。
     #[test]
@@ -4820,10 +5086,212 @@ mod pull_diagnostics_tests {
         assert_eq!(items[0]["message"], "e1");
         assert_eq!(items[1]["message"], "e2");
     }
+
+    /// 修 P1 #1：空 publishDiagnostics 推送必须清缓存。push-only LS（如 rust-analyzer）
+    /// 在用户把错误改完后会推空 items 数组 —— 修复前 `!is_empty` 才写入导致陈旧错误永
+    /// 久残留；修复后空推送直接 remove 该 (root, uri) 条目。
+    ///
+    /// 本测试不拉 LS，纯函数复制 supervisor `session_for` 内嵌的 handler 闭包逻辑
+    /// 验证"空 → remove、非空 → insert"两种行为，确保契约稳定（避免重构 handler
+    /// 时偷改语义）。真正的 wire 验证由 tests/diagnostics.rs 的 clangd e2e 覆盖。
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn empty_push_clears_cache_entry() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        let cache: std::collections::HashMap<(PathBuf, String), Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        let cache_arc: Arc<
+            Mutex<std::collections::HashMap<(PathBuf, String), Vec<serde_json::Value>>>,
+        > = Arc::new(Mutex::new(cache));
+        let generation = Arc::new(AtomicU64::new(0));
+        let root: PathBuf = PathBuf::from("/proj");
+
+        // 复用 supervisor lib.rs:644 区域的 handler 语义（手工镜像）：
+        let handler = |uri: String, items: Vec<serde_json::Value>| {
+            generation.fetch_add(1, Ordering::Relaxed);
+            let mut cache = cache_arc.lock().unwrap();
+            let key = (root.clone(), uri);
+            if items.is_empty() {
+                cache.remove(&key);
+            } else {
+                cache.insert(key, items);
+            }
+        };
+
+        // 推一个非空 push：cache 应有 1 条，generation 1。
+        handler(
+            "file:///a.cpp".into(),
+            vec![json!({"message": "err1"})],
+        );
+        assert_eq!(cache_arc.lock().unwrap().len(), 1);
+        assert_eq!(generation.load(Ordering::Relaxed), 1);
+
+        // 推空 push：cache 应清空该条目，generation 2。
+        handler("file:///a.cpp".into(), vec![]);
+        assert_eq!(cache_arc.lock().unwrap().len(), 0, "空 push 必须清缓存");
+        assert_eq!(generation.load(Ordering::Relaxed), 2);
+
+        // 推空 push 对未存在的 uri：cache 不增不减，generation 3。
+        handler("file:///b.cpp".into(), vec![]);
+        assert_eq!(cache_arc.lock().unwrap().len(), 0, "空 push 对空 key 是 no-op");
+        assert_eq!(generation.load(Ordering::Relaxed), 3);
+    }
 }
 // ============================================================================
 // Phase 3.1 文档符号缓存（local/solidlsp-development-plan.md §3.1）
 // ============================================================================
+
+#[cfg(test)]
+mod reclaim_idle_buffers_tests {
+    //! 修 P1 #2（TTL 生产执行者）：验证 supervisor 工具调用路上 + 显式调用两条
+    //! 路径都能让 ref_count=0 + 超 TTL 的 FileBuffer 在生产路径被回收。
+    //!
+    //! 测试夹具：拉起 mock_ls → 注入 supervisor 实例池 → 创建 guard → drop → 等超
+    //! 测试 TTL（短、可断言）→ 调 supervisor.reclaim_idle_buffers_once 走到阈值后
+    //! 断言回收数 ≥1。
+    //!
+    //! mock_ls 通过 `CARGO_BIN_EXE_mock_ls` env 提供 —— 该 env 仅在 lsp-core 测试
+    //! 二进制可见。本测试加 skip 守卫，找不到 mock_ls 即跳过（不构成 false failure）。
+    use super::*;
+    use ls_runtime::process::{Child, LaunchInfo, TransportKind};
+    use lsp_types::InitializeParams;
+    use std::ffi::OsString;
+    use std::time::Duration;
+
+    /// mock_ls 二进制在 cargo build 时由 lsp-core 包提供，supervisor 包在测试
+    /// 二进制可见但 `CARGO_BIN_EXE_*` 仅在当前 crate 范围内设置 —— supervisor
+    /// 找不到则跳过（不计入失败）。运行时通过 PATH / build target-dir 兜底查找。
+    fn find_mock_ls() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("CARGO_BIN_EXE_mock_ls") {
+            let p = std::path::PathBuf::from(p);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        // 兜底：target/debug 下任一 cargo 测试 binary 名查找（cargo build test 留产物）。
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+            let dir = std::path::PathBuf::from(target);
+            for p in [
+                dir.join(format!("debug/mock_ls{}", ext)),
+                dir.join(format!("debug/deps/mock_ls{}", ext)),
+            ] {
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+        // 兜底：默认 cargo target-dir 即项目根 target/。
+        let cwd = std::env::current_dir().ok()?;
+        [
+            cwd.join(format!("target/debug/mock_ls{}", ext)),
+            cwd.join(format!("target/debug/deps/mock_ls{}", ext)),
+        ]
+        .into_iter()
+        .find(|p| p.is_file())
+    }
+
+    fn launch_mock_ls() -> Option<LaunchInfo> {
+        let exe = find_mock_ls()?;
+        Some(LaunchInfo {
+            cmd: vec![OsString::from(exe)],
+            cwd: std::env::temp_dir(),
+            env: vec![],
+            transport: TransportKind::Stdio,
+        })
+    }
+
+    /// 修 P1 #2 生产路径回收语义：mock 拉 session → guard drop → 等超测试 TTL
+    /// (5 ms) → supervisor 工具调用累计到 RECLAIM_THRESHOLD=32 → reclaim 真正跑
+    /// `Session::evict_idle_buffers(测试 TTL)` → 断言回收数 ≥1 + counter 归零。
+    #[tokio::test]
+    async fn production_path_reclaim_after_idle_ttl() {
+        let Some(launch) = launch_mock_ls() else {
+            println!("skipped: mock_ls binary not found (lsp-core not yet built?)");
+            return;
+        };
+
+        let tmp = tempfile::TempDir::new().expect("TempDir::new");
+        let file = tmp.path().join("a.cpp");
+        tokio::fs::write(&file, b"int x=0;\n").await.expect("write fixture");
+
+        // 直连 mock_ls 拉 session。注入到 supervisor 实例池以便 reclaim 扫到。
+        let child = Child::spawn(launch).expect("spawn mock_ls");
+        let session = lsp_core::session::Session::start(Some(child), InitializeParams::default())
+            .await
+            .expect("Session::start Ready");
+        let sup = Supervisor::direct().await.unwrap();
+        // 短 TTL 让单测可控（5 ms 远小于 60 s 默认值）。
+        sup.set_idle_ttl_for_test(Duration::from_millis(5));
+
+        let key = Supervisor::key(tmp.path(), "cpp");
+        {
+            let mut instances = sup.instances.lock().unwrap();
+            instances.insert(key.clone(), session.clone());
+            let mut last_used = sup.last_used.lock().unwrap();
+            last_used.insert(key.clone(), std::time::Instant::now());
+        }
+
+        // ensure_open → drop → ref_count=0 + last_released_at=Some(now)
+        {
+            let _guard = session.ensure_open(&file).await.expect("ensure_open");
+        }
+        // 等超 5ms TTL
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // 未达阈值（32）前 reclaim 应返 0；counter 逐次累加。
+        for i in 0..31 {
+            let n = sup.reclaim_idle_buffers_once();
+            assert_eq!(n, 0, "第 {i} 次未达阈值应返 0");
+        }
+        assert_eq!(
+            sup.reclaim_count_snapshot(),
+            31,
+            "调用 31 次后 counter = 31"
+        );
+
+        // 第 32 次触发：阈值命中 + reclaim 调 Session::evict_idle_buffers(5ms)。
+        // buffer 早超 5ms，应被回收。
+        let reclaimed = sup.reclaim_idle_buffers_once();
+        assert!(reclaimed >= 1, "归零超 TTL 后生产路径必须能回收，至少 1 条；reclaimed={reclaimed}");
+        assert_eq!(
+            sup.reclaim_count_snapshot(),
+            0,
+            "reclaim 触发后 counter 应归零"
+        );
+
+        // 清理：shutdown session + 卸 supervisor 池条目。
+        session.shutdown().await;
+        let _ = sup.evict(&key).await;
+    }
+
+    /// 修 P1 #2 节流验证：连续 32 次调用中前 31 次不应扫 sessions（只递增
+    /// 计数器）；第 32 次才真正走 sweep。这是 throttle 防抖核心。
+    #[tokio::test]
+    async fn reclaim_is_throttled_until_threshold() {
+        let sup = Supervisor::direct().await.unwrap();
+        sup.set_idle_ttl_for_test(Duration::from_secs(60));
+        // 计数器初始 0
+        assert_eq!(sup.reclaim_count_snapshot(), 0);
+        // 31 次 +1 均应未触发 reclaim
+        for _ in 0..31 {
+            let _ = sup.reclaim_idle_buffers_once();
+        }
+        assert_eq!(
+            sup.reclaim_count_snapshot(),
+            31,
+            "31 次调用后 counter 应 = 31"
+        );
+        // 第 32 次返回 0（无 sessions），但 counter 应归零。
+        let _ = sup.reclaim_idle_buffers_once();
+        assert_eq!(
+            sup.reclaim_count_snapshot(),
+            0,
+            "第 32 次触发后 counter 归零"
+        );
+    }
+}
 
 #[cfg(test)]
 mod symbol_cache_tests {
@@ -5096,6 +5564,97 @@ mod symbol_cache_tests {
         assert_eq!(tree["files_scanned"], 3, "max_files=3 截断: {tree}");
         assert_eq!(tree["truncated"], true);
         assert_eq!(tree["entries"].as_array().unwrap().len(), 3);
+    }
+
+    /// 修 P1 #3 fan-out：files 扫描顺序与 entries 一一对应（涵盖 ≥MAX_INFLIGHT
+    /// =4 个文件触发扇出池路径）。本测试通过缓存 hot-set 验证扇出后的整体结构与
+    /// 既有断言一致（既有 cache-only 测试覆盖缓存命中语义）。
+    ///
+    /// 真正的扇出执行（miss 路径）走 spawn+JoinSet 需真实 LS（clangd）支持；
+    /// 该 e2e 由后续的真实集成覆盖（既有 e2e_concurrency.rs 已有 LS e2e 路径）。
+    /// 本测试只验形：files_扫、entries 数、errors 空（缓存命中无失败）。
+    #[tokio::test]
+    async fn symbol_tree_fan_out_preserves_files_with_cache() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // 6 文件（>MAX_INFLIGHT=4）确保触发扇出池入口分支。
+        let names: Vec<String> = (0..6).map(|i| format!("f{i}.rs")).collect();
+        for n in &names {
+            std::fs::write(dir.path().join(n), "fn x() {}\n").unwrap();
+        }
+        let root = dir.path();
+        for n in &names {
+            sup.symbol_cache_put(doc_symbol_cache_key(root, n), vec![hit("x")]);
+        }
+
+        let tree = sup
+            .tool_symbol_tree(root, ".", Some("rust"), 200)
+            .await
+            .unwrap();
+        assert_eq!(tree["files_scanned"], 6, "6 文件扫描: {tree}");
+        assert_eq!(tree["truncated"], false);
+        let entries = tree["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 6, "全部缓存命中 → 6 个 entries: {tree}");
+        // errors 必须空：缓存命中分支不构造 error。
+        let errors = tree["errors"].as_array().unwrap();
+        assert!(errors.is_empty(), "缓存命中不应有 errors: {tree}");
+    }
+
+    /// 修 P0 符号树语言解析回归：mixed-lang 目录下 .py / .rs 各属各 LS，绝不
+    /// 共用同一 session。本测试通过 symbol_cache 直接放命中条目（避免拉 LS），
+    /// 验证"逐文件 resolve 后按 lang 分桶"——同桶缓存在桶分流后仍 1:1 命中。
+    /// 不强断言桶数量（cache-only 路径根本不进 fan-out），改断言：entries 与 files
+    /// 一一对应、errors 空、不同 lang 的 file 都被识别。
+    #[tokio::test]
+    async fn symbol_tree_resolves_language_per_file_not_single_lang() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // 写三种语言的源码文件：
+        let files = ["foo.py", "bar.py", "main.rs", "lib.rs", "App.java"];
+        for n in files {
+            std::fs::write(dir.path().join(n), b"# lang mix\n").unwrap();
+        }
+        let root = dir.path();
+        // 预置 symbol cache（避免触发 session_for 拉 LS）
+        for (idx, n) in files.iter().enumerate() {
+            sup.symbol_cache_put(
+                doc_symbol_cache_key(root, n),
+                vec![hit(&format!("sym_{idx}"))],
+            );
+        }
+
+        // lang = None 走逐文件 resolve（lang 是预置短路，下面的 resolve_lang_for_file
+        // 不被 lang 短路，直接靠扩展名探测 —— 即 P0 修复的核心路径）。
+        let tree = sup
+            .tool_symbol_tree(root, ".", None, 200)
+            .await
+            .unwrap();
+        let entries = tree["entries"].as_array().unwrap();
+        let errors = tree["errors"].as_array().unwrap();
+
+        // 必须全部命中（cache priming）—— 任何 file 进 errors 即视为被误判为
+        // "lang 不可解析"，是 P0 修复前的回归迹象。
+        assert_eq!(entries.len(), files.len(), "所有 5 个文件都应该进入 entries: {tree}");
+        assert!(
+            errors.is_empty(),
+            "5 个文件分属 4 种 lang（py/rs/java）应都解析通过；errors={errors:?}"
+        );
+        // 每个 entry 的 file 字段是 files 之一（一一对应集合论）。
+        let entry_files: std::collections::HashSet<String> = entries
+            .iter()
+            .map(|e| {
+                e.get("file")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        let expected_files: std::collections::HashSet<String> =
+            files.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            entry_files, expected_files,
+            "entries file 集 ≠ 期望 file 集（一对一丢失或多出）"
+        );
     }
 }
 

@@ -14,12 +14,23 @@
 //! - mtime 用 `std::time::SystemTime` 直接比较；stat 失败记 None，后续按「变了」处理。
 //!
 //! **drop 不跨 await**：guard drop 时 outbound 可能已关，`try_send` 失败被忽略。
+//!
+//! ## TTL 窗口（修 P1 #2）
+//!
+//! `FileGuard` 归零不再立即 didClose+移表。改为记 `last_released_at` 戳；保留
+//! entry 留在表里供下次 `ensure_open` 复用——窗口内同文件二次访问走 Some(buf)
+//! 分支（mtime/size 未变 → 无 didOpen），LS 端文档状态连续，缓存不重放。
+//! 窗口到期或显式 `evict_all_buffers()` 才同步 didClose + 移除。
+//! 锁纪律不变：drop 路径纯同步（仅戳时间），显式 evict 锁内取 list、锁外发通知。
+//!
+//! `FileBuffer` 不存文本——只存 mtime/size/version/ref_count/last_released_at，
+//! 缓冲复用靠 LS 自身文档表（设计拍板的，勿改）。
 
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use lsp_types::Uri;
 use serde_json::{Value, json};
@@ -29,6 +40,17 @@ use crate::session::Session;
 
 /// LSP `didOpen` 起始版本号（LSP spec §3.1.1：每次变更递增，初始为 1）。
 const INITIAL_VERSION: i64 = 1;
+
+/// FileGuard TTL 窗口：归零到显式 evict 之间的"复用宽限"。串行工具调用场景下
+/// 几乎都覆盖；后台并发/批处理场景下 `evict_all_buffers()` 提供强制回收出口。
+///
+/// 60s：捕获 daemon 上一工具调用到下一工具调用之间正常间隙；超过此值可认定
+/// 当前文件真正"无人用了"，release LS 上的文档状态（rust-analyzer 等内存
+/// 偏紧的 LS 在大量 didOpen 不 didClose 时会 OOM）。
+///
+/// 测试与 supervisor 调用方按需传同值；这里只宣告默认 ttl。
+#[allow(dead_code)]
+const FILE_GUARD_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 单文件状态：uri + 上次记账 mtime/size + 当前 LSP 版本 + 引用计数。
 #[derive(Debug)]
@@ -40,6 +62,10 @@ pub struct FileBuffer {
     pub size: Option<u64>,
     pub content_version: i64,
     pub ref_count: usize,
+    /// ref_count 归零时刻；修 P1 #2 引入，归零后不立即 didClose+移表，
+    /// 等 evict 主动回收或 `last_released_at + FILE_GUARD_TTL` 超时。
+    /// `None` = 当前有活 guard 持住，或归零时间未到。
+    pub last_released_at: Option<Instant>,
 }
 
 /// `ensure_open` 返回的 RAII guard。drop 时 ref_count--，归零 → didClose + 移除。
@@ -57,28 +83,22 @@ impl FileGuard {
 
 impl Drop for FileGuard {
     fn drop(&mut self) {
-        let did_close = {
-            let mut map = self
-                .session
-                .buffers
-                .lock()
-                .expect("docsync buffers mutex poisoned");
-            match map.get_mut(&self.uri) {
-                Some(buf) => {
-                    buf.ref_count = buf.ref_count.saturating_sub(1);
-                    if buf.ref_count == 0 {
-                        map.remove(&self.uri);
-                        Some(make_did_close(&self.uri))
-                    } else {
-                        None
-                    }
+        // 修 P1 #2：归零不立即 didClose+移表，只记 last_released_at。
+        // 窗口内下次 ensure_open 命中 Some(buf) 分支 → ref_count++ + 戳清 None，
+        // 无 LS 重放。窗口到期或显式 evict 才走 didClose + 移除路径。
+        // 锁纪律不变：纯同步、临界区微秒、不跨 await。
+        let _ = self
+            .session
+            .buffers
+            .lock()
+            .expect("docsync buffers mutex poisoned")
+            .get_mut(&self.uri)
+            .map(|buf| {
+                buf.ref_count = buf.ref_count.saturating_sub(1);
+                if buf.ref_count == 0 {
+                    buf.last_released_at = Some(Instant::now());
                 }
-                None => None,
-            }
-        };
-        if let Some(notif) = did_close {
-            let _ = self.session.client().notify("textDocument/didClose", notif);
-        }
+            });
     }
 }
 
@@ -109,6 +129,7 @@ impl Session {
                             size,
                             content_version: version,
                             ref_count: 1,
+                            last_released_at: None,
                         },
                     );
                     (
@@ -121,6 +142,9 @@ impl Session {
                 }
                 Some(buf) => {
                     buf.ref_count += 1;
+                    // 复用命中（同 file 在 TTL 窗口内再访问）：戳清释放时间，
+                    // 让 next drop 的 last_released_at 重新起算。
+                    buf.last_released_at = None;
                     // mtime+size 双因子：同 mtime 粒度窗口内的外部改写靠 size 检出。
                     // 记账侧任一为 None（stat 异常）→ 保守按「变了」处理。
                     let unchanged = mtime.is_some()
@@ -158,6 +182,60 @@ impl Session {
             session: Arc::clone(self),
             uri,
         })
+    }
+
+    /// 强制回收所有缓冲：发 didClose + 移表。仅当调用方确认要立即关闭所有文档
+    /// 时使用（daemon shutdown / 测试清理 / LS 内存压力回收）。
+    /// 锁内 drain 取待发列表，锁外发通知（outbound 关 send 会失败，吞错兜底）。
+    pub fn evict_all_buffers(&self) {
+        let to_close: Vec<Uri> = {
+            let mut map = self
+                .buffers
+                .lock()
+                .expect("docsync buffers mutex poisoned");
+            map.drain()
+                .map(|(uri, _)| uri)
+                .collect()
+        };
+        for uri in &to_close {
+            let _ = self
+                .client()
+                .notify("textDocument/didClose", make_did_close(uri));
+        }
+    }
+
+/// 回收超过 TTL 的空闲缓冲：ref_count=0 且 last_released_at + ttl < now。
+    /// 复用路径（ref_count>0）一律不动。`FILE_GUARD_TTL` 为默认 ttl。
+    /// 锁内 drain 取待发列表，锁外发通知（outbound 关 send 失败忽略）。
+    ///
+    /// 锁外 notify 期间可能并发 ensure_open 导致条目标记 ref_count>0 的"复活"；
+    /// 该状态下再 didClose 会让 LS 收到"关闭已开文档" —— LS 通常忽略。
+    /// 若需要严格语义，可换『两轮锁 + 比较戳』模式，本场景不引入复杂度。
+    pub fn evict_idle_buffers(&self, ttl: std::time::Duration) -> usize {
+        let now_idle: Vec<Uri> = {
+            let mut map = self
+                .buffers
+                .lock()
+                .expect("docsync buffers mutex poisoned");
+            let now_idle: Vec<Uri> = map
+                .iter()
+                .filter(|(_, buf)| {
+                    buf.ref_count == 0
+                        && buf.last_released_at.is_some_and(|t| t.elapsed() >= ttl)
+                })
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            for uri in &now_idle {
+                map.remove(uri);
+            }
+            now_idle
+        };
+        for uri in &now_idle {
+            let _ = self
+                .client()
+                .notify("textDocument/didClose", make_did_close(uri));
+        }
+        now_idle.len()
     }
 }
 

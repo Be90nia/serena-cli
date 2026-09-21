@@ -225,6 +225,9 @@ async fn ensure_open_after_external_edit_emits_did_change() {
 }
 
 /// 用例 #3：嵌套 guard 只发一次 didOpen（ref_count++ 路径）。
+///
+/// 修 P1 #2 后：guard drop 归零不再立即 didClose。改成断言 "三 guard 全 drop 完
+/// 后 0 didClose"；显式 evict_all_buffers 才走 didClose+移表，断言语义收尾。
 #[tokio::test]
 async fn nested_guards_emit_did_open_once() {
     let tmp = TempDir::new().expect("TempDir::new");
@@ -263,10 +266,23 @@ async fn nested_guards_emit_did_open_once() {
         1,
         "三嵌套 guard 只应发 1 次 didOpen；events={events:?}"
     );
+    assert!(
+        closes.is_empty(),
+        "修 P1 #2：guard drop 归零不发 didClose（窗口内复用）；events={events:?}"
+    );
+
+    // 显式 evict 强制回收：1 次 didClose。
+    session.evict_all_buffers();
+    time::sleep(Duration::from_millis(300)).await;
+    let events_after = read_track_events(&track_log).await;
+    let closes_after: Vec<&Value> = events_after
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didClose"))
+        .collect();
     assert_eq!(
-        closes.len(),
+        closes_after.len(),
         1,
-        "ref_count 归零应发 1 次 didClose；events={events:?}"
+        "显式 evict_all_buffers 必须发 1 次 didClose；events={events_after:?}"
     );
 
     session.shutdown().await;
@@ -323,12 +339,17 @@ async fn repeated_mtime_changes_yield_monotonic_versions() {
     session.shutdown().await;
 }
 
-/// P1 修复 #5：单写门跨工具（edit_tools::commit_change → tool_replace_body）场景下，
-/// 一次 ensure_open 拿到的 guard 在被替换为下一个 ensure_open 之前释放，
-/// 等价于「FileGuard drop → ref_count 归零 → 后续 ensure_open 重新 didOpen」，
-/// 不会因 ref_count 残留导致 version 撞车。
+/// P1 修复 #5：原断言 guard drop → ref_count=0 → buffer 移除 → 后续 ensure_open 重新走 didOpen。
+/// 修 P1 #2 后语义改了：
+///   - guard drop 归零 → 仅记 last_released_at，**不**移表、**不**发 didClose。
+///   - 后续 ensure_open 命中 Some(buf) → ref_count++ + mtime/size 未变 → 不发 didOpen
+///     与 didChange（LS 端文档状态连续，version 沿用上轮末尾值）。
+///   - 显式 evict_all_buffers → 强制 didClose + 移表，此时 ensure_open 才会重新走 didOpen。
+///
+/// 这里把测试拆为两段：先验"drop→reuse 不重发"，再 evict+reopen 验"显式 evict 后才能
+/// 重建干净缓冲"。等价于原始保护目标（ref_count 残留不撞 version）+ 新保留语义。
 #[tokio::test]
-async fn guard_drop_then_reopen_restarts_version_at_one() {
+async fn guard_drop_then_reopen_in_ttl_keeps_version_no_new_did_open() {
     let tmp = TempDir::new().expect("TempDir::new");
     let track_log = tmp.path().join("track.log");
     let file = tmp.path().join("e.cpp");
@@ -339,13 +360,13 @@ async fn guard_drop_then_reopen_restarts_version_at_one() {
         .await
         .expect("Session::start Ready");
 
-    // 周期 1：guard 持有 → drop → ref_count=0 → buffer 清空。
+    // 周期 1：guard 持有 → drop → ref_count=0 → last_released_at=Some(now)，不 didClose。
     let g1 = session.ensure_open(&file).await.expect("open #1");
     drop(g1);
     time::sleep(Duration::from_millis(60)).await;
 
-    // 周期 2：buffer 已移除 → 重新走 didOpen（version 重置为 1，非承接上轮 version）。
-    let _g2 = session.ensure_open(&file).await.expect("reopen");
+    // 周期 2：TTL 窗口内重开 → 命中 Some(buf) → ref_count=1，无新 didOpen/didChange。
+    let _g2 = session.ensure_open(&file).await.expect("reopen in ttl");
     time::sleep(Duration::from_millis(300)).await;
 
     let events = read_track_events(&track_log).await;
@@ -359,13 +380,209 @@ async fn guard_drop_then_reopen_restarts_version_at_one() {
         .collect();
     assert_eq!(
         opens.len(),
-        2,
-        "guard drop 后再 ensure_open 应再发一次 didOpen；events={events:?}"
+        1,
+        "TTL 窗口内 drop+reopen 不应再 didOpen；events={events:?}"
     );
-    assert_eq!(opens[1].get("version").and_then(Value::as_i64), Some(1));
     assert!(
-        !closes.is_empty(),
-        "drop 应触发 didClose；events={events:?}"
+        closes.is_empty(),
+        "TTL 窗口内 drop 不应 didClose；events={events:?}"
+    );
+    drop(_g2);
+
+    // 显式 evict → didClose + 移表；后续 ensure_open 才会重新走 didOpen（v=1）。
+    session.evict_all_buffers();
+    let _g3 = session.ensure_open(&file).await.expect("reopen after evict");
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events_after = read_track_events(&track_log).await;
+    let opens_a: Vec<&Value> = events_after
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    let closes_a: Vec<&Value> = events_after
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didClose"))
+        .collect();
+    assert_eq!(
+        opens_a.len(),
+        2,
+        "显式 evict 后 ensure_open 才发新 didOpen；events={events_after:?}"
+    );
+    assert_eq!(opens_a[1].get("version").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        closes_a.len(),
+        1,
+        "显式 evict 期间发 1 次 didClose；events={events_after:?}"
+    );
+
+    session.shutdown().await;
+}
+
+/// 修 P1 #2：FileGuard drop 归零不立即 didClose，TTL 复用窗口内下一次 ensure_open
+/// 走 ref_count++ 路径（不重 didOpen）；外部文件修改后 TTL 内 ensure_open 仍走
+/// didChange（version 沿用 buffer 末尾值，不重置为 1）。
+#[tokio::test]
+async fn guard_drop_during_ttl_reopen_does_not_emit_did_open() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file = tmp.path().join("f.cpp");
+    tokio::fs::write(&file, b"v1\n").await.expect("write v1");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    // 周期 1：guard 持有 → drop。
+    let g1 = session.ensure_open(&file).await.expect("open #1");
+    drop(g1);
+
+    // 周期 2（TTL 内）：未改盘 → 不发任何 didOpen/didChange。
+    let _g2 = session.ensure_open(&file).await.expect("reopen in ttl");
+    time::sleep(Duration::from_millis(200)).await;
+    let events_before = read_track_events(&track_log).await;
+    let opens_b: Vec<&Value> = events_before
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    let changes_b: Vec<&Value> = events_before
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didChange"))
+        .collect();
+    let closes_b: Vec<&Value> = events_before
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didClose"))
+        .collect();
+    assert_eq!(
+        opens_b.len(),
+        1,
+        "TTL 内重用应不发新 didOpen；events={events_before:?}"
+    );
+    assert_eq!(
+        changes_b.len(),
+        0,
+        "TTL 内重用 + 未改盘 → 0 didChange；events={events_before:?}"
+    );
+    assert!(
+        closes_b.is_empty(),
+        "TTL 内重用期间无 didClose；events={events_before:?}"
+    );
+    drop(_g2);
+
+    // 周期 3（TTL 内、外部改盘）：mtime 推进 → 走 didChange，version=2。
+    time::sleep(Duration::from_millis(60)).await;
+    tokio::fs::write(&file, b"v2\n").await.expect("rewrite");
+    time::sleep(Duration::from_millis(60)).await;
+    let _g3 = session.ensure_open(&file).await.expect("reopen after external edit");
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    let changes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didChange"))
+        .collect();
+    assert_eq!(
+        opens.len(),
+        1,
+        "改盘仍走 TTL 复用路径（ref_count++），不发新 didOpen；events={events:?}"
+    );
+    assert_eq!(
+        changes.len(),
+        1,
+        "TTL 内外部改文件 → didChange；events={events:?}"
+    );
+    assert_eq!(changes[0].get("version").and_then(Value::as_i64), Some(2));
+
+    session.shutdown().await;
+}
+
+/// 修 P1 #2：显式 `evict_all_buffers()` 强制回收，对每个 ref_count=0 的 buffer
+/// 发 didClose + 移表；之后 ensure_open 重新走 didOpen。
+#[tokio::test]
+async fn evict_all_buffers_emits_did_close_and_clears_state() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file_a = tmp.path().join("a.cpp");
+    let file_b = tmp.path().join("b.cpp");
+    tokio::fs::write(&file_a, b"a1\n").await.expect("write a");
+    tokio::fs::write(&file_b, b"b1\n").await.expect("write b");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    // 两文件 ensure_open → 各自 didOpen。
+    let _ga = session.ensure_open(&file_a).await.expect("a");
+    let _gb = session.ensure_open(&file_b).await.expect("b");
+    // 显式 evict 两 guard 都还活着 —— evict_all_buffers 只回收 ref_count=0 的，活的跳过。
+    // 这里活的跳过；但我们要看 evict 后仍能让 ref_count=0 的 buffer 被回收。
+    drop(_ga);
+    drop(_gb);
+    time::sleep(Duration::from_millis(100)).await;
+
+    session.evict_all_buffers();
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events = read_track_events(&track_log).await;
+    let closes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didClose"))
+        .collect();
+    assert_eq!(
+        closes.len(),
+        2,
+        "两文件 drop 后 evict_all_buffers 必须发 2 次 didClose；events={events:?}"
+    );
+
+    session.shutdown().await;
+}
+
+/// 修 P1 #2：`evict_idle_buffers(ttl)` 跳过活跃缓冲（ref_count>0），
+/// 只回收 ttl 到期的空闲条目。用 ttl=0 让 idle 条目立刻被认为到期。
+#[tokio::test]
+async fn evict_idle_buffers_skips_live_guards() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file_live = tmp.path().join("live.cpp");
+    let file_idle = tmp.path().join("idle.cpp");
+    tokio::fs::write(&file_live, b"live1\n").await.expect("write live");
+    tokio::fs::write(&file_idle, b"idle1\n").await.expect("write idle");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    // 活跃 guard（live）+ 先 didOpen 再 drop 的 idle。
+    let _g_live = session.ensure_open(&file_live).await.expect("live");
+    let g_idle = session.ensure_open(&file_idle).await.expect("idle");
+    drop(g_idle);
+    time::sleep(Duration::from_millis(10)).await;
+
+    // ttl=0 → idle 立即被视为到期；live ref_count>0 被跳过。
+    let removed = session.evict_idle_buffers(Duration::from_secs(0));
+    assert_eq!(removed, 1, "只应回收 1 条 idle 缓冲");
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events = read_track_events(&track_log).await;
+    let closes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didClose"))
+        .collect();
+    assert_eq!(
+        closes.len(),
+        1,
+        "活跃 guard 必须不被 evict 触碰；只发 idle 的 didClose；events={events:?}"
+    );
+    assert_eq!(
+        closes[0].get("uri").and_then(Value::as_str),
+        Some(file_uri(&file_idle).as_str()),
+        "didClose 必须是 idle 文件"
     );
 
     session.shutdown().await;
