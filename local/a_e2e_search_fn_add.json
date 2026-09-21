@@ -1,0 +1,26 @@
+{
+  "files_scanned": 3,
+  "hits": [
+    {
+      "col": 5,
+      "container": null,
+      "file": "lib.rs",
+      "line": 1,
+      "match_end": 10,
+      "match_start": 4,
+      "symbol": "add",
+      "text": "pub fn add(a: i32, b: i32) -> i32 {"
+    },
+    {
+      "col": 1,
+      "container": null,
+      "file": "main.rs",
+      "line": 1,
+      "match_end": 6,
+      "match_start": 0,
+      "symbol": "add",
+      "text": "fn add(a: i32, b: i32) -> i32 { a + b + 999 }"
+    }
+  ],
+  "truncated": false
+}

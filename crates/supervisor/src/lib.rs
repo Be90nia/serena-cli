@@ -2625,6 +2625,8 @@ impl Supervisor {
                         text: line.trim_end().to_string(),
                         match_start: m.start() as u32,
                         match_end: m.end() as u32,
+                        symbol: None,
+                        container: None,
                     });
                 }
             }
@@ -3156,6 +3158,11 @@ pub struct SearchHit {
     pub text: String,
     pub match_start: u32,
     pub match_end: u32,
+    /// 覆盖该行的最小符号名（None：行不在任何符号内 / 符号信息不可用）。
+    /// A（ai-token-features §10-A）：由 enrich_search_with_symbols 增量填充。
+    pub symbol: Option<String>,
+    /// 覆盖符号的容器名（如 method 所在 class/impl；顶层符号为 None）。
+    pub container: Option<String>,
 }
 /// 搜索响应。
 #[derive(Debug, Serialize)]
@@ -3370,6 +3377,69 @@ fn position_in_range(r: lsp_types::Range, line: u32, col: u32) -> bool {
         return false;
     }
     true
+}
+
+/// A（ai-token-features §10-A）：给 search 命中增量补 `symbol`/`container`。
+///
+/// 按 file 分桶，逐桶走 `tool_overview`（Phase 3.1 缓存兜着，同文件仅一次 LS 往返）；
+/// 每条命中按 0-based line/col 找覆盖它的最小符号。单桶 overview 失败（LS 未就绪、
+/// 语言不可解析等）该桶保持 None —— 装饰失败绝不影响 search 主结果。
+async fn enrich_search_with_symbols(
+    sup: &Supervisor,
+    root: &Path,
+    hits: &mut [SearchHit],
+    lang: Option<&str>,
+) {
+    let mut per_file: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (idx, hit) in hits.iter().enumerate() {
+        per_file.entry(hit.file.clone()).or_default().push(idx);
+    }
+    for (file, indices) in per_file {
+        let syms = sup.tool_overview(root, &file, lang).await.ok();
+        let Some(syms) = syms else { continue };
+        for idx in indices {
+            // SearchHit 的 line/col 是 1-based；LSP Range 是 0-based。
+            let line_0 = hits[idx].line.saturating_sub(1);
+            let col_0 = hits[idx].col.saturating_sub(1);
+            if let Some((sym, container)) = find_covering_symbol(&syms, line_0, col_0) {
+                hits[idx].symbol = Some(sym);
+                hits[idx].container = container;
+            }
+        }
+    }
+}
+
+/// 找覆盖 `(line, col)` 的最小符号（span 最短者；嵌套子符号 span 严格更小）+ 其容器。
+///
+/// 复用 `position_in_range` 闭区间语义（与 `collect_containing_hits` 一致）。
+/// 容器沿用 flatten 结果；`push_nested` 给顶层符号记 container=自身名，
+/// 此处滤掉该 artifact —— SearchHit 顶层符号的容器应为 None。
+fn find_covering_symbol(
+    syms: &[SymbolHit],
+    line: u32,
+    col: u32,
+) -> Option<(String, Option<String>)> {
+    fn span(h: &SymbolHit) -> u32 {
+        h.range.end.line - h.range.start.line
+    }
+    let mut best: Option<&SymbolHit> = None;
+    for s in syms {
+        if !position_in_range(s.range, line, col) {
+            continue;
+        }
+        let deeper = match best {
+            Some(b) => span(s) < span(b),
+            None => true,
+        };
+        if deeper {
+            best = Some(s);
+        }
+    }
+    best.map(|s| {
+        let container = s.container.clone().filter(|c| c != &s.name);
+        (s.name.clone(), container)
+    })
 }
 
 /// 把 `lsp_types::Location` 压成 `"file:line:col"` 紧凑字符串（plan-h-compact §1）。
@@ -4084,9 +4154,11 @@ impl SupervisorTrait for Supervisor {
                     .get("case_sensitive")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let resp = self
+                let mut resp = self
                     .tool_search_for_pattern(root, pattern, path_glob, max_results, case_sensitive)
                     .await?;
+                // A（§10-A）：命中带所属符号；装饰失败静默（该字段留 None）。
+                enrich_search_with_symbols(self, root, &mut resp.hits, lang).await;
                 serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
             }
             "symbol-body" => {
@@ -4909,6 +4981,8 @@ mod safe_delete_tests {
             text: text.to_string(),
             match_start: 0,
             match_end: 3,
+            symbol: None,
+            container: None,
         }
     }
 
@@ -6522,5 +6596,194 @@ mod compact_locations_tests {
             v["items"][0]["range"]["start"]["line"],
             serde_json::json!(2)
         );
+    }
+}
+
+// ============================================================================
+// A（ai-token-features §10-A）：search 命中带 symbol/container
+// ============================================================================
+//
+// mock_ls 回 FLAT 单行符号（mock_main@L0 / mock_helper@L5，无 container_name），
+// 测试走 execute_tool("search") 全链路（分桶 → tool_overview → 覆盖匹配 → JSON）。
+// container=Some 路径 mock 拉不出（FLAT 无嵌套）→ find_covering_symbol 纯函数测试
+// 用手拼嵌套 Vec 覆盖；真实嵌套由 CLI e2e（fixtures/rust_demo + rust-analyzer）兜底。
+
+#[cfg(test)]
+mod search_symbol_tests {
+    use super::*;
+    use ls_runtime::process::{Child, LaunchInfo, TransportKind};
+    use lsp_types::InitializeParams;
+    use std::ffi::OsString;
+
+    /// mock_ls 直连注入 lang="rust" 实例池位；返回 (sup, tempdir)。
+    /// 缺 mock_ls 二进制 → None（skip，不计失败）—— 同 reclaim_idle_buffers_tests 约定。
+    async fn mock_sup_with_symbols() -> Option<(Supervisor, tempfile::TempDir)> {
+        let exe = find_mock_ls_for_search_tests()?;
+        let child = Child::spawn(LaunchInfo {
+            cmd: vec![OsString::from(exe)],
+            cwd: std::env::temp_dir(),
+            env: vec![],
+            transport: TransportKind::Stdio,
+        })
+        .expect("spawn mock_ls");
+        let session = lsp_core::session::Session::start(Some(child), InitializeParams::default())
+            .await
+            .expect("Session::start Ready");
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let tmp = tempfile::TempDir::new().expect("TempDir::new");
+        let key = Supervisor::key(tmp.path(), "rust");
+        sup.instances.lock().unwrap().insert(key, session);
+        Some((sup, tmp))
+    }
+
+    /// 同 reclaim_idle_buffers_tests::find_mock_ls，但兜底改从 CARGO_MANIFEST_DIR
+    /// （crates/supervisor）上溯 workspace 根找 target/debug —— cargo test 运行时
+    /// cwd 是 crate 目录，`current_dir()/target` 永远 miss（否则 mock 测试静默 skip）。
+    fn find_mock_ls_for_search_tests() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("CARGO_BIN_EXE_mock_ls") {
+            let p = std::path::PathBuf::from(p);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        let ws = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?)
+            .parent()?
+            .parent()?
+            .to_path_buf();
+        [
+            ws.join(format!("target/debug/mock_ls{ext}")),
+            ws.join(format!("target/debug/deps/mock_ls{ext}")),
+        ]
+        .into_iter()
+        .find(|p| p.is_file())
+    }
+
+    /// 临时文件按 mock_ls 固定符号行摆位：L1=mock_main 命中、L6=mock_helper 命中、
+    /// L7=孤儿行（不在任何符号 range 内，1-based）。
+    async fn write_fixture(tmp: &tempfile::TempDir) -> String {
+        let content =
+            "mock_main hit\nfiller\nfiller\nfiller\nfiller\nmock_helper hit\nmock_orphan\n";
+        tokio::fs::write(tmp.path().join("a.rs"), content)
+            .await
+            .expect("write fixture");
+        tmp.path().to_string_lossy().to_string()
+    }
+
+    /// 命中行落进符号 range → symbol 填充为覆盖符号名（FLAT 无 container → null）。
+    #[tokio::test]
+    async fn search_hits_carry_symbol_and_container() {
+        let Some((sup, tmp)) = mock_sup_with_symbols().await else {
+            println!("skipped: mock_ls binary not found (lsp-core not yet built?)");
+            return;
+        };
+        let root = write_fixture(&tmp).await;
+        let v = sup
+            .execute_tool("search", &root, json!({ "pattern": "mock_" }), None)
+            .await
+            .expect("search ok");
+        let hits = v["hits"].as_array().expect("hits array");
+        assert_eq!(hits.len(), 3, "3 行各一命中: {hits:?}");
+        let by_line = |l: u32| {
+            hits.iter()
+                .find(|h| h["line"] == json!(l))
+                .expect("hit at line")
+        };
+        assert_eq!(
+            by_line(1)["symbol"],
+            json!("mock_main"),
+            "L1 落进 mock_main range → 填符号名"
+        );
+        assert_eq!(
+            by_line(1)["container"],
+            json!(null),
+            "FLAT 无 container_name → 容器 null"
+        );
+        assert_eq!(by_line(6)["symbol"], json!("mock_helper"), "L6 = mock_helper");
+        let _ = sup.evict(&Supervisor::key(tmp.path(), "rust")).await;
+    }
+
+    /// 孤儿行（不在任何符号 range）→ symbol/container 保持 null；全部命中值合法非空。
+    #[tokio::test]
+    async fn search_top_level_returns_none_or_valid() {
+        let Some((sup, tmp)) = mock_sup_with_symbols().await else {
+            println!("skipped: mock_ls binary not found (lsp-core not yet built?)");
+            return;
+        };
+        let root = write_fixture(&tmp).await;
+        let v = sup
+            .execute_tool("search", &root, json!({ "pattern": "mock_" }), None)
+            .await
+            .expect("search ok");
+        let hits = v["hits"].as_array().expect("hits array");
+        for h in hits {
+            let sym = &h["symbol"];
+            assert!(
+                sym.is_null() || sym.as_str().is_some_and(|s| !s.is_empty()),
+                "symbol 必须是 null 或非空字符串: {sym}"
+            );
+        }
+        let orphan = hits
+            .iter()
+            .find(|h| h["line"] == json!(7))
+            .expect("orphan hit");
+        assert!(orphan["symbol"].is_null(), "孤儿行不得误标符号");
+        assert!(orphan["container"].is_null(), "孤儿行不得误标容器");
+        let _ = sup.evict(&Supervisor::key(tmp.path(), "rust")).await;
+    }
+
+    /// tool_overview 失败（语言不可解析，未触 LS）→ 静默保留 None，不传播错误。
+    #[tokio::test]
+    async fn enrich_fails_silently_on_tool_overview_failure() {
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let mut hits = vec![SearchHit {
+            file: "note.txt".into(),
+            line: 1,
+            col: 1,
+            text: "x".into(),
+            match_start: 0,
+            match_end: 1,
+            symbol: None,
+            container: None,
+        }];
+        enrich_search_with_symbols(
+            &sup,
+            Path::new("Z:/nonexistent_xyz_root"),
+            &mut hits,
+            None,
+        )
+        .await;
+        assert!(hits[0].symbol.is_none(), "overview 失败 → symbol 保持 None");
+        assert!(hits[0].container.is_none());
+    }
+
+    /// 嵌套符号最小覆盖 + 容器传递 + 顶层自身名 artifact 过滤（mock FLAT 拉不出嵌套）。
+    #[test]
+    fn find_covering_symbol_picks_smallest_with_container() {
+        let hit = |name: &str, container: Option<&str>, sl: u32, el: u32| SymbolHit {
+            name: name.into(),
+            kind: SymbolKindTag::Function,
+            uri: "file:///t.rs".into(),
+            range: lsp_types::Range {
+                start: Position::new(sl, 0),
+                end: Position::new(el, 1),
+            },
+            container: container.map(Into::into),
+        };
+        // impl Foo(L0..L10) ⊃ bar(L2..L5) ⊃ helper(L3..L4)：L3 的最小覆盖 = helper。
+        let syms = vec![
+            hit("Foo", Some("Foo"), 0, 10), // flatten 给顶层符号记自身名为 container
+            hit("bar", Some("Foo"), 2, 5),
+            hit("helper", Some("bar"), 3, 4),
+        ];
+        let (name, container) = find_covering_symbol(&syms, 3, 0).expect("covered");
+        assert_eq!(name, "helper", "嵌套中应选 span 最小（最深）者");
+        assert_eq!(container.as_deref(), Some("bar"), "容器 = 直接父名");
+        // L1 只被 Foo 覆盖 → 容器 artifact（自身名）滤成 None。
+        let (name, container) = find_covering_symbol(&syms, 1, 0).expect("covered");
+        assert_eq!(name, "Foo");
+        assert_eq!(container, None, "顶层符号容器应为 None（滤 flatten 自身名）");
+        // L11 无覆盖 → None。
+        assert!(find_covering_symbol(&syms, 11, 0).is_none());
     }
 }
