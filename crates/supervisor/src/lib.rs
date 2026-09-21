@@ -2337,8 +2337,14 @@ impl Supervisor {
         let mut walker = WalkBuilder::new(&root);
         walker
             .standard_filters(true)
-            .hidden(false)
-            .require_git(false);
+            .require_git(false)
+            // 内置 ignore 目录（target/node_modules/.idea 等）—— .git 由
+            // standard_filters 的 hidden filter 默认排除，但 target/node_modules
+            // 不一定在 .gitignore 里，需显式表驱动过滤；与 fs_tools::filtered_walker 语义一致。
+            .filter_entry(|e| {
+                e.depth() == 0
+                    || !e.file_name().to_str().is_some_and(fs_tools::should_ignore)
+            });
 
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut truncated = false;
@@ -5094,6 +5100,56 @@ mod symbol_cache_tests {
 }
 
 // ============================================================================
+// tool_search_for_pattern 噪音目录过滤回归测
+// ============================================================================
+//
+// 根因回归：walker 之前用 `hidden(false)` 关掉 hidden 过滤，导致 `.git/` 内部
+// commit message 等被搜到、污染 AI agent 信号。修复方案：删 `hidden(false)` 让
+// `standard_filters` 默认 hidden 过滤生效（`.git/` 是 hidden），再叠加
+// `fs_tools::should_ignore` 过滤 target/node_modules/.idea 等内置噪音。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod search_filter_tests {
+    use super::*;
+    use std::fs;
+
+    /// `.git/` 是 hidden —— 默认被 `standard_filters` 排除。
+    /// 同时 `target/` 等通过 `fs_tools::should_ignore` 表驱动排除。
+    #[tokio::test]
+    async fn skips_git_and_target_dirs() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // 真代码（含目标关键词）
+        fs::write(root.join("a.rs"), "fn foo_drain_window() {}\n").unwrap();
+        // 噪音：build 产物里同名命中
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/foo.rs"), "fn foo_drain_window() {}\n").unwrap();
+        // 噪音：.git 内部 commit message
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(
+            root.join(".git/COMMIT_EDITMSG"),
+            "fix: foo_drain_window regression",
+        )
+        .unwrap();
+
+        let resp = sup
+            .tool_search_for_pattern(root, "foo_drain_window", None, 50, false)
+            .await
+            .unwrap();
+        let files: Vec<&str> = resp.hits.iter().map(|h| h.file.as_str()).collect();
+        assert!(
+            files.iter().all(|f| !f.starts_with(".git/") && !f.starts_with("target/")),
+            "search 不应扫到 .git/target，实际命中: {files:?}"
+        );
+        assert!(
+            files.contains(&"a.rs"),
+            "应扫到真代码文件，实际命中: {files:?}"
+        );
+    }
+}// ============================================================================
 // Phase 1 · 13 wrapper 测试（纯 LSP 协议层；不拉 LS / 不依赖 fix-ls-adapters）
 // ============================================================================
 
