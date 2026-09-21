@@ -1,8 +1,8 @@
 # AI-token 特性集设计（方案三：薄增强 ×N + 聚合 ×1 + 地图 ×1）
 
 > 日期：2026-09-21 ｜ 状态：待用户审查
-> 来源：本会话实测 token 数据 + 竞品调研（Aider/Cursor/Sourcegraph/opencode/repomix/Continue）
-> bd：8gz(A) 6x5(B) gej(C) bqc(F2) d1d(E) i0l(G)
+> 来源：本会话实测 token 数据 + 竞品调研（Aider/Cursor/Sourcegraph/opencode/repomix/Continue）+ 自研优化（§10-15）
+> bd：8gz(A) 6x5(B) gej(C) bqc(F2) d1d(E) i0l(G) + H/I/J/K/L/M（见各节）
 
 ## 0. 目标与原则
 
@@ -111,7 +111,101 @@ A/B/C/E 相互无硬依赖，可并行派单；G 最后收口。
 - 子代理隔离检索：agent 框架层职责，非 CLI 工具层
 - 任务枚举式元命令（ctx --task "modify"）：edit-context 单命令已覆盖最高频场景，防枚举爆炸
 
-## 9. 风险
+## 10. H：紧凑位置格式（自研，白捡 90%）
+
+**问题**：refs/def/find-symbol/find-implementations 每条引用 = 完整 JSON Range + 绝对 URI
+（`{"range":{"start":{"line":4,"character":7},...},"uri":"file:///d%3A/..."}` ≈ 120 B/条），
+真实工程 200 条引用 ≈ 12KB。
+
+**设计**：新 `--compact`（或作为 `--json` 的对照默认人类态）：每条位置压成
+`"crates/daemon/src/http.rs:42:9"`（相对路径，**0-based 行:列保持与现有基线一致**）。
+URI 统一转相对路径（复用 `file_path_from_uri`），消灭 `d%3A` percent-encode 噪音。
+
+**兼容**：`--json` 全形态不动；新增 `--compact` 或 `serde` 紧凑序列化形态二选一（实现期定，
+默认形态不破坏）。
+
+**验收**：本仓真实 refs 场景输出 bytes 对比报告（预期 ≥80% 缩减）；行:列值与 JSON 形态逐条一致。
+
+## 11. I：search --comments-only（自研，服务于「按注释找符号」）
+
+**设计**：`search` 加 `--comments-only`：命中行粗滤只保留注释行——trim 后前缀
+`//` / `/*` / `*` / `#`（Python/C 预处理）/ `--`（SQL/Lua）/ `"""`/`'''`（docstring 行）。
+逻辑复用 `textual_occurrences_outside_def` 的注释粗滤分支（lib.rs 已有，抽公共函数）。
+
+**定位**：与 A（标注符号）组合 = 「忘了名字 → 按功能注释找符号」一步到位且零噪音。
+
+**验收**：本仓 search 'drain 窗口' --comments-only 只回注释行；`#[attr]`（rust 属性）已知误判为
+注释——粗滤即此，文档标注；测试全绿。
+
+## 12. J：refs/overview --delta 增量模式（自研，迭代工作流 50-80%）
+
+**问题**：AI 编辑后重查同样 refs/overview，95% 内容未变却全额重收。
+
+**设计**：`refs`/`overview`/`find-referencing-symbols` 加 `--delta <handle>`：
+- 首次不带 `--delta`：响应附 `delta_handle`（= 文件集 mtime 信号 + 查询键哈希，复用
+  `root_source_mtime` + SymbolCacheKey 基建）
+- 带 `--delta <handle>`：对照缓存结果，只返回**新增/消失/位移**的条目 + `unchanged_count`
+- handle 失效（mtime 推进之外的语义变化）→ 优雅降级返回全量 + `delta_stale: true`
+
+**排序**：放最后期——依赖前面各特性稳定后的输出形态。
+
+**验收**：mock 编辑后 delta 只含变化条目；无变化时 `changes: []`；测试全绿。
+
+## 13. K：find-symbol 兜底降级（自研，修 TS 符号查找真空）
+
+**问题**：本会话实测 typescript-language-server 的 `workspace/symbol` 对部分词（如 multiply）
+返空数组——TS 下跨文件符号查找真空。
+
+**设计**：`find-symbol` 收到空结果且未截断时，兜底逐文件 documentSymbol 扫描
+（`filtered_walker` + 3.1 文档符号缓存，限 max_files=200 保险丝与 symbol-tree 同款），
+合并去重后按名称精确匹配过滤。响应附 `fallback: "document-scan"` 标注来源。
+
+**验收**：fixtures/typescript_demo find-symbol multiply 非空且位置正确；RA/gopls 等正常 LS
+不触发 fallback（行为不变）；扫描有 max_files 保险丝；测试全绿。
+
+## 14. L：daemon POST /batch 并行批量（自研，墙钟 3×→1×）
+
+**设计**：daemon 新端点 `POST /batch`：body = `[{tool, args}, ...]`（≤8 条），
+并行执行（tokio joinset，共享 per-key load_gate 语义不变），响应按序返回
+`[{ok, data|error}, ...]`。wire 错误模型复用（每条独立 ok/error，互不拖垮）。
+
+**CLI**：shell JSONL 主循环（main.rs cmd_shell）改并发 dispatch（读一行派一批可行即发），
+或新增 `batch` 子命令透传。**限制**：写类工具在 batch 中强制串行（写门互斥已保证，但避免
+语义困惑——batch 内写工具按序执行）。
+
+**验收**：3 只读工具 batch 墙钟 ≈ 最慢单条（非求和）；一条失败不拖垮其余；测试全绿。
+
+## 15. M：warm <lang> 预热命令（自研，冷启动 30-60s 前置）
+
+**设计**：`warm [--project ROOT] <lang>`：ensure_daemon → 对 root 触发该 lang 的
+session 拉起（复用 `session_for`）→ 探针文件触发索引（复用 adapter 探针链）→
+轮询首个 documentSymbol 成功即返回 `{warm: true, elapsed_ms}`。异步即回（`--wait` 阻塞到底）。
+
+**价值**：AI 开工前一发预热，首个真实工具调用免吃 30-60s 冷启动（本会话实测 RA/TS 冷启痛点）。
+
+**验收**：warm 后首个 overview <1s（热路径）；重复 warm 幂等秒回；测试全绿。
+
+## 16. 更新后的实施顺序
+
+| 序 | 特性 | 一句话 | 依赖 |
+|---|---|---|---|
+| 1 | F2 | 编辑回执带诊断（易+ROI 王者） | 无 |
+| 2 | H | 紧凑位置格式（白捡 90%） | 无 |
+| 3 | B | edit-context 聚合 | 无 |
+| 4 | K | find-symbol 兜底（修 TS 真空） | 无 |
+| 5 | I | search --comments-only | 无 |
+| 6 | E | repo-map（价值最大工时最长） | 3.1 缓存 |
+| 7 | A | search 标注符号 | 无 |
+| 8 | C | refs --grouped | 无 |
+| 9 | L | /batch 并行 | 无 |
+| 10 | M | warm 预热 | 无 |
+| 11 | G | --max-tokens 护栏收口 | A-E/H 稳定后 |
+| 12 | J | --delta 增量 | 各输出形态稳定后 |
+
+F2/H/B/K/I 相互无硬依赖可并行；E/A/C 随后；L/M 性能面；G/J 收口。
+
+
+## 17. 风险
 
 | 风险 | 缓解 |
 |---|---|
