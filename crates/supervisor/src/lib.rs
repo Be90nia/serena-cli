@@ -234,6 +234,10 @@ pub struct Supervisor {
     /// overview / find-symbol / symbol-body 入口前查；命中免 LS 往返。mtime 变 →
     /// key 变 → 自然 miss 重调 LS（旧 entry 残留无害）。std Mutex：临界区仅 HashMap 读写。
     symbol_cache: std::sync::Arc<Mutex<HashMap<SymbolCacheKey, Vec<SymbolHit>>>>,
+    /// AI-token 特性 J（§11-J）：delta 响应缓存，key = `"{tool}|{root_key}"` → 上次完整响应。
+    /// 空集不缓存：LS 就绪窗口返空若入库，就绪后 delta 恒漏报（宁重查不可错缓存）。
+    /// ponytail: 全表无淘汰 —— AI 一次会话只查几个 key；OOM 再换 LRU。
+    delta_cache: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     /// 修 P1 #2（TTL 生产执行者）：每次 `execute_tool` 路过 +1；达阈值后调每个
     /// 在线 Session 的 `evict_idle_buffers(FILE_GUARD_TTL)` 强制回收 ref_count=0
     /// 的陈旧缓冲。原子计数避免持锁。阈值 = 32：每次工具调用大半 1~2 个文件，按
@@ -396,6 +400,7 @@ impl Supervisor {
             diag_generation: std::sync::Arc::new(AtomicU64::new(0)),
             pull_diag_supported: std::sync::Arc::new(Mutex::new(HashMap::new())),
             symbol_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            delta_cache: Arc::new(Mutex::new(HashMap::new())),
             idle_buffers_reclaim_counter: AtomicU64::new(0),
             #[cfg(test)]
             _idle_ttl_override: std::sync::Arc::new(Mutex::new(None)),
@@ -1500,6 +1505,51 @@ impl Supervisor {
             .lock()
             .unwrap()
             .retain(|key, _| key.0 != root);
+    }
+
+    /// AI-token 特性 J（plan-j-delta §2 / design §11-J）：迭代工作流（改→查→改）
+    /// 下只返回上次以来变化的条目。
+    /// - `delta=false`（默认）：原样透传（wire 不变），顺带缓存供下次 delta 对照。
+    /// - `delta=true` 且有缓存：`{delta:true, added, removed}`（hit_key set diff）。
+    /// - `delta=true` 无缓存（首次/曾遇空集）：`{delta:false, items:全集}`。
+    ///
+    /// 空集不缓存：LS 就绪窗口返空若入库，就绪后 delta 恒漏报 —— 宁重查不可错缓存。
+    ///
+    /// ponytail: 不做字符级 diff —— hit_key（file:line:col 归一）set diff 足够回答
+    /// "新增了哪些引用"；临界区仅 HashMap 读写，无 await 持锁。
+    async fn maybe_delta(
+        &self,
+        tool: &str,
+        root_key: &str,
+        current: serde_json::Value,
+        delta: bool,
+    ) -> serde_json::Value {
+        let key = format!("{}|{}", tool, root_key);
+        if !delta {
+            if !is_empty_response(&current) {
+                self.delta_cache.lock().unwrap().insert(key, current.clone());
+            }
+            return current;
+        }
+        let prev = self.delta_cache.lock().unwrap().get(&key).cloned();
+        if !is_empty_response(&current) {
+            self.delta_cache
+                .lock()
+                .unwrap()
+                .insert(key, current.clone());
+        }
+        let Some(prev) = prev else {
+            return serde_json::json!({
+                "delta": false,
+                "items": items_of(&current)
+                    .cloned()
+                    .map(serde_json::Value::Array)
+                    .unwrap_or(current),
+            });
+        };
+        let added = diff_hits(&current, &prev);
+        let removed = diff_hits(&prev, &current);
+        serde_json::json!({ "delta": true, "added": added, "removed": removed })
     }
 
     /// `textDocument/documentSymbol` → 平铺递归 `DocumentSymbol::children` → `Vec<SymbolHit>`。
@@ -3570,6 +3620,74 @@ fn ref_snippet_hits_envelope(
     }
 }
 
+// ==== AI-token 特性 J（§11-J）：delta set-diff helpers ====
+
+/// 统一取 items 数组视图：`{items:[...]}` envelope → 数组；裸数组（overview /
+/// find-symbol 非 compact 形态）→ 自身；其余 → None。
+fn items_of(v: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    v.get("items")
+        .and_then(|i| i.as_array())
+        .or_else(|| v.as_array())
+}
+
+/// 空响应判定：envelope `items:[]` 或裸 `[]`。无 items 且非数组的形态视为非空。
+fn is_empty_response(v: &serde_json::Value) -> bool {
+    items_of(v).is_some_and(|a| a.is_empty())
+}
+
+/// `a` 中有而 `b` 中没有的条目（`added = diff(current, prev)`；参数对调即 removed）。
+fn diff_hits(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let b_keys: std::collections::HashSet<String> = items_of(b)
+        .map(|arr| arr.iter().map(hit_key).collect())
+        .unwrap_or_default();
+    items_of(a)
+        .map(|arr| {
+            arr.iter()
+                .filter(|h| !b_keys.contains(&hit_key(h)))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// hit 身份键：`file|line:col`。兼容四种形态 ——
+/// 紧凑字符串 `"file:line:col"`（locations_envelope compact）、
+/// `["name", "file:line:col"]` 对（symbol_hits_envelope compact）、
+/// LSP Location / SymbolHit 对象（uri + range.start）、
+/// 平面对象 `{file, line, col}`（测试用）。
+fn hit_key(h: &serde_json::Value) -> String {
+    if let Some(s) = h.as_str() {
+        return s.to_string();
+    }
+    if let Some(pair) = h.as_array() {
+        let name = pair.first().and_then(|v| v.as_str()).unwrap_or("");
+        let loc = pair.get(1).and_then(|v| v.as_str()).unwrap_or("");
+        return format!("{}|{}", name, loc);
+    }
+    let file = h
+        .get("file")
+        .or_else(|| h.get("uri"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let (line, col) = match h.get("range").and_then(|r| r.get("start")) {
+        Some(s) => (
+            s.get("line").and_then(|v| v.as_u64()).unwrap_or(0),
+            s.get("character").and_then(|v| v.as_u64()).unwrap_or(0),
+        ),
+        None => (
+            h.get("line").and_then(|v| v.as_u64()).unwrap_or(0),
+            h.get("col")
+                .or_else(|| h.get("character"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        ),
+    };
+    format!("{}|{}:{}", file, line, col)
+}
+
 /// 单条 `file:line:col` 紧凑字符串 —— RefSymbolHit/RefSnippetHit 没有 Location，直接拿
 /// raw 字段拼。它们原生就是 0-based，与 LSP 一致；1-based 转换同 compact_loc。
 ///
@@ -3823,6 +3941,13 @@ impl SupervisorTrait for Supervisor {
             .get("_compact")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        // AI-token 特性 J（§11-J）：`_delta` 与 `_compact` 同套私有约定（sanitize
+        // 不清）。true 时 refs/overview/find-symbol/find-implementations 末尾走
+        // maybe_delta 增量编排；默认 false，wire 与 J 之前完全一致。
+        let delta = args
+            .get("_delta")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // 修 P1 #2（TTL 生产执行者）：throttled reclaim。每 32 次调用扫一次所有
         // 在线 Session 的空闲 FileBuffer（ref_count=0 + 超 60 s）→ didClose + 移表。
@@ -3834,8 +3959,11 @@ impl SupervisorTrait for Supervisor {
         match tool {
             "overview" => {
                 let file = required_file(&args)?;
-                serde_json::to_value(self.tool_overview(root, &file, lang).await?)
-                    .map_err(|e| ToolError::Serialize(e.into()))
+                let raw = self.tool_overview(root, &file, lang).await?;
+                let value =
+                    serde_json::to_value(raw).map_err(|e| ToolError::Serialize(e.into()))?;
+                let root_key = format!("{}|{}", root.display(), file);
+                Ok(self.maybe_delta("overview", &root_key, value, delta).await)
             }
             "symbol-tree" => {
                 let dir = args.get("dir").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -3856,7 +3984,9 @@ impl SupervisorTrait for Supervisor {
                 })?;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
                 let raw = self.tool_find_symbol(root, query, limit, lang).await?;
-                Ok(symbol_hits_envelope(&raw, compact))
+                let value = symbol_hits_envelope(&raw, compact);
+                let root_key = format!("{}|{}|{}", root.display(), query, limit);
+                Ok(self.maybe_delta("find-symbol", &root_key, value, delta).await)
             }
             "signature-help" => {
                 let (file, line, col) = required_position(&args)?;
@@ -4121,7 +4251,9 @@ impl SupervisorTrait for Supervisor {
             "refs" => {
                 let (file, line, col) = required_position(&args)?;
                 let raw = self.tool_refs(root, &file, line, col, lang).await?;
-                Ok(locations_envelope(&raw, compact))
+                let value = locations_envelope(&raw, compact);
+                let root_key = format!("{}|{}|{}|{}", root.display(), file, line, col);
+                Ok(self.maybe_delta("refs", &root_key, value, delta).await)
             }
             "completion" => {
                 let (file, line, col) = required_position(&args)?;
@@ -4137,7 +4269,9 @@ impl SupervisorTrait for Supervisor {
                 let raw = self
                     .tool_find_implementations(root, &file, line, col, lang)
                     .await?;
-                Ok(locations_envelope(&raw, compact))
+                let value = locations_envelope(&raw, compact);
+                let root_key = format!("{}|{}|{}|{}", root.display(), file, line, col);
+                Ok(self.maybe_delta("find-implementations", &root_key, value, delta).await)
             }
             "search" => {
                 let pattern = args
@@ -6635,6 +6769,52 @@ mod compact_locations_tests {
 // 测试走 execute_tool("search") 全链路（分桶 → tool_overview → 覆盖匹配 → JSON）。
 // container=Some 路径 mock 拉不出（FLAT 无嵌套）→ find_covering_symbol 纯函数测试
 // 用手拼嵌套 Vec 覆盖；真实嵌套由 CLI e2e（fixtures/rust_demo + rust-analyzer）兜底。
+
+#[cfg(test)]
+mod delta_tests {
+    //! AI-token 特性 J（§11-J）：maybe_delta 首调全集 / 二调增量 / 空集不缓存。
+    use super::*;
+
+    #[tokio::test]
+    async fn maybe_delta_first_call_returns_full() {
+        let sup = Supervisor::direct().await.unwrap();
+        let cur = serde_json::json!({"items": [{"file": "a.rs", "line": 1, "col": 0}]});
+        let v = sup.maybe_delta("refs", "k", cur, true).await;
+        assert_eq!(v["delta"], serde_json::Value::Bool(false));
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn maybe_delta_second_call_returns_added_only() {
+        let sup = Supervisor::direct().await.unwrap();
+        let first = serde_json::json!({"items": [{"file": "a.rs", "line": 1, "col": 0}]});
+        sup.maybe_delta("refs", "k", first, true).await;
+        let second = serde_json::json!({"items": [
+            {"file": "a.rs", "line": 1, "col": 0},
+            {"file": "b.rs", "line": 5, "col": 2},
+        ]});
+        let v = sup.maybe_delta("refs", "k", second, true).await;
+        assert_eq!(v["delta"], serde_json::Value::Bool(true));
+        let added = v["added"].as_array().unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0]["file"], "b.rs");
+        assert_eq!(v["removed"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn maybe_delta_empty_response_not_cached() {
+        let sup = Supervisor::direct().await.unwrap();
+        let empty = serde_json::json!({"items": []});
+        sup.maybe_delta("refs", "k", empty, true).await;
+        let real = serde_json::json!({"items": [{"file": "a.rs", "line": 1, "col": 0}]});
+        let v = sup.maybe_delta("refs", "k", real, true).await;
+        assert_eq!(
+            v["delta"],
+            serde_json::Value::Bool(false),
+            "空响应不得入缓存：第二次仍等于首次"
+        );
+    }
+}
 
 #[cfg(test)]
 mod search_symbol_tests {

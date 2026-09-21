@@ -77,7 +77,12 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// 列出文件顶层符号。
-    Overview { file: String },
+    Overview {
+        file: String,
+        /// J（§11-J）：返上次调用以来增量（added/removed）而非全集；首次返全集。
+        #[arg(long)]
+        delta: bool,
+    },
     /// 聚合目录下源码文件符号（跨文件符号树；依赖 LS，逐文件可复用缓存）。
     SymbolTree {
         dir: String,
@@ -88,7 +93,14 @@ enum Cmd {
     /// 跳转到符号定义（textDocument/definition）。line/col 为 0-based。
     Def { file: String, line: u32, col: u32 },
     /// 列出引用（textDocument/references）。line/col 0-based。
-    Refs { file: String, line: u32, col: u32 },
+    Refs {
+        file: String,
+        line: u32,
+        col: u32,
+        /// J（§11-J）：返上次调用以来增量（added/removed）而非全集；首次返全集。
+        #[arg(long)]
+        delta: bool,
+    },
     /// 鼠标位置符号的 type / doc（textDocument/hover）。line/col 为 0-based。
     Hover { file: String, line: u32, col: u32 },
     Diagnostics {
@@ -104,9 +116,19 @@ enum Cmd {
         /// 上限。
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// J（§11-J）：返上次调用以来增量（added/removed）而非全集；首次返全集。
+        #[arg(long)]
+        delta: bool,
     },
     /// 符号的所有实现位置（textDocument/implementation）。line/col 为 0-based。
-    FindImplementations { file: String, line: u32, col: u32 },
+    FindImplementations {
+        file: String,
+        line: u32,
+        col: u32,
+        /// J（§11-J）：返上次调用以来增量（added/removed）而非全集；首次返全集。
+        #[arg(long)]
+        delta: bool,
+    },
     /// 跨文件 rename（textDocument/rename）。line/col 为 0-based。
     RenameSymbol {
         file: String,
@@ -500,7 +522,7 @@ async fn run_direct(cli: &Cli) -> ExitCode {
         }
     };
     let res: Result<(), ToolError> = match &cli.cmd {
-        Some(Cmd::Overview { file }) => sup
+        Some(Cmd::Overview { file, .. }) => sup
             .tool_overview(&root, file, lang_ref)
             .await
             .and_then(|hits| print_json(&json!(hits))),
@@ -512,7 +534,7 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             .tool_def(&root, file, *line, *col, lang_ref)
             .await
             .and_then(|opt| print_json(&json!(opt))),
-        Some(Cmd::Refs { file, line, col }) => sup
+        Some(Cmd::Refs { file, line, col, .. }) => sup
             .tool_refs(&root, file, *line, *col, lang_ref)
             .await
             .and_then(|vec| print_json(&json!(vec))),
@@ -842,7 +864,7 @@ fn autodetect_lang(cli: &Cli) -> Option<String> {
     // replace-body / replace-text-in-symbol / delete-text-in-symbol / replace-lines /
     // delete-lines / insert-at-line
     let file_arg: Option<&str> = match &cli.cmd {
-        Some(Cmd::Overview { file }) => Some(file),
+        Some(Cmd::Overview { file, .. }) => Some(file),
         Some(Cmd::Def { file, .. }) => Some(file),
         Some(Cmd::Refs { file, .. }) => Some(file),
         Some(Cmd::Hover { file, .. }) => Some(file),
@@ -963,7 +985,7 @@ async fn forward(
     // 工具名与 args 组装。
     let (tool, args): (&str, serde_json::Value) = match &cli.cmd {
         // 本地管理命令已在 main 提前 return；到达此处即编程错误。
-        Some(Cmd::Overview { file }) => ("overview", json!({"file": file})),
+        Some(Cmd::Overview { file, .. }) => ("overview", json!({"file": file})),
         Some(Cmd::SymbolTree { dir, max_files }) => (
             "symbol-tree",
             json!({"dir": dir, "max_files": max_files}),
@@ -971,7 +993,7 @@ async fn forward(
         Some(Cmd::Def { file, line, col }) => {
             ("def", json!({"file": file, "line": line, "col": col}))
         }
-        Some(Cmd::Refs { file, line, col }) => {
+        Some(Cmd::Refs { file, line, col, .. }) => {
             ("refs", json!({"file": file, "line": line, "col": col}))
         }
         Some(Cmd::Hover { file, line, col }) => {
@@ -980,10 +1002,10 @@ async fn forward(
         Some(Cmd::Diagnostics { file, wait_gen }) => {
             ("diagnostics", json!({"file": file, "wait_gen": wait_gen}))
         }
-        Some(Cmd::FindSymbol { query, limit }) => {
+        Some(Cmd::FindSymbol { query, limit, .. }) => {
             ("find-symbol", json!({"query": query, "limit": limit}))
         }
-        Some(Cmd::FindImplementations { file, line, col }) => (
+        Some(Cmd::FindImplementations { file, line, col, .. }) => (
             "find-implementations",
             json!({"file": file, "line": line, "col": col}),
         ),
@@ -1299,6 +1321,13 @@ async fn forward(
     // Phase 4 基建 Task 22b：CLI flag → args 私有字段 → supervisor 三层合并。
     let mut args = args;
     inject_timeout_args(&mut args, cli.request_timeout, cli.index_timeout);
+    // J（§11-J）：--delta → args._delta（supervisor maybe_delta 消费；sanitize 不清，
+    // 与 _compact 同套私有约定）。仅 4 个集合型位置工具。
+    if cmd_requests_delta(&cli.cmd)
+        && let Some(obj) = args.as_object_mut()
+    {
+        obj.insert("_delta".into(), serde_json::json!(true));
+    }
     let body = json!({
         "project_root": project_root.to_string_lossy(),
         "args": args,
@@ -1771,6 +1800,17 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// J（§11-J）：4 个集合型位置工具是否带 `--delta`（其余子命令无该 flag）。
+fn cmd_requests_delta(cmd: &Option<Cmd>) -> bool {
+    matches!(
+        cmd,
+        Some(Cmd::Overview { delta: true, .. })
+            | Some(Cmd::Refs { delta: true, .. })
+            | Some(Cmd::FindSymbol { delta: true, .. })
+            | Some(Cmd::FindImplementations { delta: true, .. })
+    )
 }
 
 /// Phase 4 基建 Task 22b：把 CLI flag `--request-timeout` / `--index-timeout` 注入
