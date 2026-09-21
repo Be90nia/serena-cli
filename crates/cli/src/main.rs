@@ -169,6 +169,12 @@ enum Cmd {
         /// 符号名。
         symbol: String,
     },
+    /// 全 workspace 符号地图（按调用热度 top N）。ai-token §10-E。
+    RepoMap {
+        /// top N 符号（默认 20；超过会按 direct_refs 降序截断）。
+        #[arg(long, default_value_t = 20)]
+        top_n: u32,
+    },
     /// 替换符号体（写门 + hash 对账 + 原子写）。
     ReplaceBody {
         file: String,
@@ -1026,6 +1032,7 @@ async fn forward(
         Some(Cmd::EditContext { file, symbol }) => {
             ("edit-context", json!({"file": file, "symbol": symbol}))
         }
+        Some(Cmd::RepoMap { top_n }) => ("repo-map", json!({"top_n": top_n})),
         Some(Cmd::ReplaceBody {
             file,
             symbol,

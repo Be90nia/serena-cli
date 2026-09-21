@@ -34,6 +34,7 @@ pub mod fs_tools;
 pub mod root_finder;
 
 pub mod ref_tools;
+pub mod repo_map;
 pub mod write_gate;
 
 use lsp_core::types::{SymbolHit, SymbolKindTag};
@@ -4097,6 +4098,16 @@ impl SupervisorTrait for Supervisor {
                 // B: 单次调用拿 body + callers + doc + tests（ai-token-features §10-B）。
                 let (file, symbol) = required_symbol_body_args(&args)?;
                 let report = crate::edit_context::collect(self, root, &file, &symbol, lang).await;
+                serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "repo-map" => {
+                // E: workspace 级符号地图（ai-token-features §10-E）。
+                // 走 symbol-tree + per-symbol refs 计数，top_n 降序输出。
+                let top_n = args
+                    .get("top_n")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20) as usize;
+                let report = crate::repo_map::build(self, root, lang, top_n).await;
                 serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
             }
             "replace-body" => {
