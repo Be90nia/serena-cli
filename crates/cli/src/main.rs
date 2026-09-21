@@ -21,11 +21,19 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use supervisor::{Supervisor, ToolError};
 
-/// 转发超时（工具请求 300s；管理命令 5s）。
+/// 转发超时（工具请求 300s；管理命令 3s，daemon 卡死时 stop-all 快速失败）。
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(300);
-const MGMT_TIMEOUT: Duration = Duration::from_secs(5);
+const MGMT_TIMEOUT: Duration = Duration::from_secs(3);
 /// lazy-spawn 后等 daemon 就绪的总窗口。
 const SPAWN_WAIT: Duration = Duration::from_secs(10);
+
+/// CLI 侧共享 HTTP client：本机回环，建连 2s 封顶（管理面失败即报，daemon 侧自愈）。
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .expect("reqwest client build")
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "serena-cli", version, about = "serena-rust LSP CLI")]
@@ -351,8 +359,24 @@ enum Cmd {
     },
 }
 
+fn main() -> ExitCode {
+    // Windows 主线程默认栈 1MB：clap derive 的大命令枚举在解析期递归构造/
+    // 析构会打爆浅栈（Phase 5 stack overflow）。整个入口搬进 16MB 栈线程；
+    // tokio multi_thread runtime 语义不变（属性宏挂在内层 async fn）。
+    match std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(cli_main)
+        .expect("spawn cli main thread")
+        .join()
+    {
+        Ok(code) => code,
+        // panic hook 已输出信息；重抛保持原 panic 退出语义（rc=101）。
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> ExitCode {
+async fn cli_main() -> ExitCode {
     #[cfg(windows)]
     unsafe {
         let r = windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
@@ -868,7 +892,7 @@ fn probe(port: u16) -> bool {
 async fn wait_ready(port: u16, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let url = format!("http://127.0.0.1:{port}/status");
-    let client = reqwest::Client::new();
+    let client = http_client();
     let mut token: Option<String> = None;
     while Instant::now() < deadline {
         // 抓 token：spawn 后 daemon 写 lock 通常几 ms 内完成。
@@ -901,7 +925,7 @@ async fn forward(
     lock_path: &Path,
     lang: Option<&str>,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     // 工具名与 args 组装。
     let (tool, args): (&str, serde_json::Value) = match &cli.cmd {
         // 本地管理命令已在 main 提前 return；到达此处即编程错误。
@@ -1381,7 +1405,7 @@ async fn cmd_status(lock_path: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let client = reqwest::Client::new();
+    let client = http_client();
     match client
         .get(format!("http://127.0.0.1:{}/status", entry.port))
         .header("X-Serena-Token", &entry.token)
@@ -1407,7 +1431,7 @@ async fn cmd_stop_all(lock_path: &Path) -> ExitCode {
         println!("daemon: not running");
         return ExitCode::SUCCESS;
     };
-    let client = reqwest::Client::new();
+    let client = http_client();
     let res = client
         .post(format!("http://127.0.0.1:{}/shutdown", entry.port))
         .header("X-Serena-Token", &entry.token)
@@ -1464,7 +1488,7 @@ async fn cmd_shell(cli: &Cli) -> ExitCode {
         }
     };
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     use tokio::io::{AsyncBufReadExt, BufReader};
     let project_root = resolve_project_root(cli.project.clone());
     let mut lines = BufReader::new(tokio::io::stdin()).lines();

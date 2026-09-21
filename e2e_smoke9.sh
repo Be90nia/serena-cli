@@ -8,15 +8,14 @@
 #   - crates/daemon/src/reaper.rs::reaper_loop  drain 信号感知
 #   - crates/daemon/src/http.rs::shutdown_post  Notify 触发
 #
-# 用例二进制：target/debug/examples/daemon_serve_bin.exe
-#  等价于 cli --daemon 但绕开 cli 入口的 pre-existing stack overflow
-# （Phase 5 待修 —— cli main.rs:330 #[tokio::main(multi_thread, 2)]）。
+# 用例二进制：target/debug/cli.exe --daemon（cli 主入口 Phase 5 stack overflow 已修，
+# 不再绕开）。
 #
-# 用法：bash e2e_smoke9.sh  （依赖 Git Bash + 已构建 daemon_serve_bin example）
+# 用法：bash e2e_smoke9.sh  （依赖 Git Bash + 已构建 cli.exe）
 
 set -u
 cd "D:/Project/serena-rust"
-BIN="target/debug/examples/daemon_serve_bin.exe"
+BIN="target/debug/cli.exe"
 LOCK="$LOCALAPPDATA/serena/daemon.lock"
 ROOT="D:/Project/serena-rust"
 PASS=0
@@ -32,8 +31,8 @@ tl() { MSYS_NO_PATHCONV=1 tasklist "$@"; }
 tk() { MSYS_NO_PATHCONV=1 taskkill "$@" >/dev/null 2>&1 || true; }
 
 kill_daemon() {
-  tk /IM daemon_serve_bin.exe /F /T
-  tl /FI "IMAGENAME eq daemon_serve_bin.exe" 2>/dev/null | awk '/daemon_serve_bin\.exe/ {print $2}' | while read pid; do
+  tk /IM cli.exe /F /T
+  tl /FI "IMAGENAME eq cli.exe" 2>/dev/null | awk '/cli\.exe/ {print $2}' | while read pid; do
     tk /PID "$pid" /F /T
   done
   rm -f "$LOCK" 2>/dev/null || true
@@ -64,7 +63,7 @@ echo "[A] daemon startup + lock arbitration"
 
 if [ -f "$LOCK" ]; then bad "A1" "lock 启动前不存在" "残留 lock"; else ok "A1" "启动前无 lock 文件"; fi
 
-"$BIN" > "$LOG" 2>&1 &
+"$BIN" --daemon > "$LOG" 2>&1 &
 DAEMON_PID=$!
 sleep 1
 
@@ -87,8 +86,8 @@ else
   bad "A7" "port $PORT LISTENING" "未监听"
 fi
 
-if tl /FI "IMAGENAME eq daemon_serve_bin.exe" 2>/dev/null | grep -q "daemon_serve_bin.exe"; then
-  ok "A8" "daemon 进程 daemon_serve_bin.exe 存在"
+if tl /FI "IMAGENAME eq cli.exe" 2>/dev/null | grep -q "cli.exe"; then
+  ok "A8" "daemon 进程 cli.exe 存在"
 else
   bad "A8" "daemon 进程存在" "未找到"
 fi
@@ -165,7 +164,7 @@ else
 fi
 
 sleep 2
-DAEMON_PROCS=$(tl /FI "IMAGENAME eq daemon_serve_bin.exe" 2>/dev/null | awk '/daemon_serve_bin\.exe/ {c++} END {print c+0}')
+DAEMON_PROCS=$(tl /FI "IMAGENAME eq cli.exe" 2>/dev/null | awk '/cli\.exe/ {c++} END {print c+0}')
 if [ "$DAEMON_PROCS" -eq 0 ]; then
   ok "B10" "daemon 进程 0 残留（僵尸终结）"
 else
@@ -185,7 +184,7 @@ fi
 
 [ ! -f "$LOCK" ] && ok "C2" "lock 不残留" || bad "C2" "lock 不残留" "仍存在"
 
-"$BIN" > "$LOG" 2>&1 &
+"$BIN" --daemon > "$LOG" 2>&1 &
 DAEMON_PID2=$!
 sleep 1
 if wait_lock; then
@@ -205,7 +204,7 @@ sleep 1
 echo ""
 echo "[D] lock arbitration"
 
-"$BIN" > "$LOG" 2>&1 &
+"$BIN" --daemon > "$LOG" 2>&1 &
 DAEMON_A=$!
 sleep 1
 if wait_lock; then
@@ -216,13 +215,13 @@ else
 fi
 PID_A=$(grep -oE '"pid":[[:space:]]*[0-9]+' "$LOCK" 2>/dev/null | head -1 | grep -o '[0-9]*' || echo "")
 
-COUNT=$(tl /FI "IMAGENAME eq daemon_serve_bin.exe" 2>/dev/null | awk '/daemon_serve_bin\.exe/ {c++} END {print c+0}')
+COUNT=$(tl /FI "IMAGENAME eq cli.exe" 2>/dev/null | awk '/cli\.exe/ {c++} END {print c+0}')
 [ "$COUNT" -ge 1 ] && ok "D2" "daemon A 进程存在 ($COUNT)" || bad "D2" "daemon A 存在" "got=$COUNT"
 
 TOK2=$(grep -oE '"token":[[:space:]]*"[a-f0-9]+"' "$LOCK" 2>/dev/null | head -1 | sed 's/.*"\([a-f0-9]*\)".*/\1/' || echo "")
 [ "${#TOK2}" = "32" ] && ok "D3" "token 长度 32 (got ${#TOK2})" || bad "D3" "token 长度" "got ${#TOK2}"
 
-if tl /FI "PID eq $PID_A" 2>/dev/null | grep -q "daemon_serve_bin.exe"; then
+if tl /FI "PID eq $PID_A" 2>/dev/null | grep -q "cli.exe"; then
   ok "D4" "lock.pid=$PID_A 进程存在"
 else
   bad "D4" "pid 一致" "未找到 PID $PID_A"
@@ -246,7 +245,7 @@ RES=$(curl -s -o /dev/null -w "%{http_code}" -H "X-Serena-Token: $TOK_A" "http:/
 sleep 4
 [ ! -f "$LOCK" ] && ok "E3" "shutdown 后 lock 必删" || bad "E3" "lock 删" "仍存在"
 
-DAEMON_PROCS=$(tl /FI "IMAGENAME eq daemon_serve_bin.exe" 2>/dev/null | awk '/daemon_serve_bin\.exe/ {c++} END {print c+0}')
+DAEMON_PROCS=$(tl /FI "IMAGENAME eq cli.exe" 2>/dev/null | awk '/cli\.exe/ {c++} END {print c+0}')
 [ "$DAEMON_PROCS" -eq 0 ] && ok "E4" "daemon 0 残留 (反僵尸 P0 验收)" || bad "E4" "僵尸终结" "found=$DAEMON_PROCS"
 
 if ! netstat -ano 2>/dev/null | grep -q ":$PORT_A.*LISTENING"; then
@@ -265,7 +264,7 @@ sleep 1
 echo ""
 echo "[F] lock file integrity"
 
-"$BIN" > "$LOG" 2>&1 &
+"$BIN" --daemon > "$LOG" 2>&1 &
 DAEMON_F=$!
 sleep 1
 if wait_lock; then
@@ -286,7 +285,7 @@ else
   bad "F2" "boot_ms 合理" "got=$BOOT"
 fi
 
-[ -n "$PID_F" ] && tl /FI "PID eq $PID_F" 2>/dev/null | grep -q "daemon_serve_bin.exe" \
+[ -n "$PID_F" ] && tl /FI "PID eq $PID_F" 2>/dev/null | grep -q "cli.exe" \
   && ok "F3" "lock.pid=$PID_F 存活" || bad "F3" "lock.pid 存活" "got=$PID_F"
 
 PORT_F=$(grep -oE '"port":[[:space:]]*[0-9]+' "$LOCK" 2>/dev/null | head -1 | grep -o '[0-9]*' || echo "")
@@ -299,7 +298,7 @@ sleep 1
 echo ""
 echo "[G] process-level zombie termination"
 
-"$BIN" > "$LOG" 2>&1 &
+"$BIN" --daemon > "$LOG" 2>&1 &
 DAEMON_G=$!
 sleep 1
 if wait_lock; then
@@ -312,7 +311,7 @@ TOK_G=$(grep -oE '"token":[[:space:]]*"[a-f0-9]+"' "$LOCK" 2>/dev/null | head -1
 PORT_G=$(grep -oE '"port":[[:space:]]*[0-9]+' "$LOCK" 2>/dev/null | head -1 | grep -o '[0-9]*' || echo "")
 PID_G=$(grep -oE '"pid":[[:space:]]*[0-9]+' "$LOCK" 2>/dev/null | head -1 | grep -o '[0-9]*' || echo "")
 
-tl /FI "PID eq $PID_G" 2>/dev/null | grep -q "daemon_serve_bin.exe" && ok "G2" "PID $PID_G 存活" || bad "G2" "daemon 存活" "PID=$PID_G"
+tl /FI "PID eq $PID_G" 2>/dev/null | grep -q "cli.exe" && ok "G2" "PID $PID_G 存活" || bad "G2" "daemon 存活" "PID=$PID_G"
 
 RES=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "X-Serena-Token: $TOK_G" "http://127.0.0.1:$PORT_G/shutdown" 2>&1)
 { [ "$RES" = "200" ] || [ "$RES" = "000" ]; } && ok "G3" "/shutdown 200/000 (got=$RES)" || bad "G3" "/shutdown" "got=$RES"
@@ -327,7 +326,7 @@ else
   bad "G5" "port 释放" "仍 LISTENING — 僵尸"
 fi
 
-DAEMON_PROCS=$(tl /FI "IMAGENAME eq daemon_serve_bin.exe" 2>/dev/null | awk '/daemon_serve_bin\.exe/ {c++} END {print c+0}')
+DAEMON_PROCS=$(tl /FI "IMAGENAME eq cli.exe" 2>/dev/null | awk '/cli\.exe/ {c++} END {print c+0}')
 [ "$DAEMON_PROCS" -eq 0 ] && ok "G6" "daemon 进程 0 残留（P0 终结僵尸）" || bad "G6" "0 残留" "found=$DAEMON_PROCS"
 
 kill_daemon
