@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::dto::{
@@ -111,6 +112,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/tools/{name}", post(tools_post))
+        .route("/batch", post(batch_handler))
         .route("/status", get(status_get))
         .route("/shutdown", post(shutdown_post))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
@@ -123,15 +125,7 @@ async fn tools_post(
     Json(req): Json<crate::dto::ToolRequest>,
 ) -> Response {
     if state.draining.load(std::sync::atomic::Ordering::Acquire) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [("Retry-After", "10")],
-            Json(json!({
-                "ok": false,
-                "error": {"code": "DAEMON_DRAINING", "message": "daemon in ShutdownDraining; refusing new requests", "retryable": false}
-            })),
-        )
-            .into_response();
+        return draining_response();
     }
     state.in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     crate::reaper::note_activity();
@@ -224,6 +218,156 @@ pub fn not_found_tool(name: &str) -> Response {
         .into_response()
 }
 
+// ── L：POST /batch —— 多工具并行执行（local/plan-l-batch / AI-token §12-L）──
+
+/// 单批上限：防一个请求占满 supervisor 并发（N≤32）。
+pub const MAX_BATCH_SIZE: usize = 32;
+
+/// `POST /batch` 请求体。
+#[derive(Debug, Deserialize)]
+pub struct BatchRequest {
+    pub calls: Vec<BatchCall>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchCall {
+    pub tool: String,
+    pub project_root: String,
+    /// 工具参数（各工具自行解析；与 /tools 的 ToolRequest.args 同语义）。
+    pub args: serde_json::Value,
+    pub lang: Option<String>,
+}
+
+/// 单条调用结果：`value`/`error` 按 ok 互斥。失败隔离——error 形状与 /tools
+/// 的 WireError 一致（9 错误码），客户端复用同一解析路径。
+#[derive(Debug, Serialize)]
+pub struct BatchResult {
+    pub tool: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<WireError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchResponse {
+    pub results: Vec<BatchResult>,
+}
+
+/// `POST /batch`：并行执行工具数组，结果按请求顺序返回。生命周期与
+/// tools_post 同套（draining 503 / in_flight / note_activity）；空批与超限
+/// 走 200 + `{ok:false}` + 既有 BAD_ARGS 码——wire 契约 9 码不变。
+async fn batch_handler(State(state): State<AppState>, Json(req): Json<BatchRequest>) -> Response {
+    if state.draining.load(std::sync::atomic::Ordering::Acquire) {
+        return draining_response();
+    }
+    // 尺寸校验在 in_flight 计数前：拒收不占排空窗口。
+    let n = req.calls.len();
+    if n == 0 || n > MAX_BATCH_SIZE {
+        let wire = WireError {
+            code: WireErrorCode::BadArgs,
+            message: if n == 0 {
+                "calls array empty".into()
+            } else {
+                format!("batch has {n} calls; max {MAX_BATCH_SIZE}")
+            },
+            ls: None,
+            retryable: false,
+        };
+        return (
+            StatusCode::OK, // 工具级失败走 200（A5）；batch 尺寸违规同契约
+            Json(json!({"ok": false, "error": wire})),
+        )
+            .into_response();
+    }
+    state.in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    crate::reaper::note_activity();
+    // batch 可混多项目；active_project 记最后一个请求的 root（「最近请求」语义同 tools_post）。
+    if let Some(root) = req.calls.last().map(|c| c.project_root.clone()) {
+        *state.active_project.lock().unwrap() = Some(root);
+    }
+    let results = run_batch(&state, req.calls).await;
+    state.in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    (StatusCode::OK, Json(BatchResponse { results })).into_response()
+}
+
+/// 并发执行（≤8 同时在飞）+ 顺序恢复：JoinSet 配 Semaphore 限流，收集
+/// (idx, result) 后按 idx 排序——JoinSet 完成序 ≠ 请求序。
+async fn run_batch(state: &AppState, calls: Vec<BatchCall>) -> Vec<BatchResult> {
+    let sem = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut set: tokio::task::JoinSet<(usize, BatchResult)> = tokio::task::JoinSet::new();
+    for (idx, call) in calls.into_iter().enumerate() {
+        let sem = Arc::clone(&sem);
+        let sup = Arc::clone(&state.supervisor);
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("semaphore never closed");
+            (idx, execute_batch_call(&sup, call).await)
+        });
+    }
+    let mut results: Vec<(usize, BatchResult)> = Vec::with_capacity(set.len());
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(pair) => results.push(pair),
+            // 不可达：任务体无 panic 源。防御兜底保失败隔离，usize::MAX 沉底
+            // 不冒充任何请求位。
+            Err(e) => results.push((
+                usize::MAX,
+                BatchResult {
+                    tool: String::new(),
+                    ok: false,
+                    value: None,
+                    error: Some(WireError {
+                        code: WireErrorCode::Internal,
+                        message: format!("batch task failed: {e}"),
+                        ls: None,
+                        retryable: false,
+                    }),
+                },
+            )),
+        }
+    }
+    results.sort_by_key(|(idx, _)| *idx);
+    results.into_iter().map(|(_, r)| r).collect()
+}
+
+/// 单条调用：工具级失败隔离为 `{ok:false}`，绝不短路整批。
+async fn execute_batch_call(
+    sup: &Arc<dyn supervisor::SupervisorTrait>,
+    call: BatchCall,
+) -> BatchResult {
+    match sup
+        .execute_tool(&call.tool, &call.project_root, call.args, call.lang.as_deref())
+        .await
+    {
+        Ok(value) => BatchResult {
+            tool: call.tool,
+            ok: true,
+            value: Some(value),
+            error: None,
+        },
+        Err(e) => BatchResult {
+            tool: call.tool,
+            ok: false,
+            value: None,
+            error: Some(wire_error_from_tool_error(&e)),
+        },
+    }
+}
+
+/// draining 503 响应（tools_post / batch_handler 共用；形状被测试断言锁定）。
+fn draining_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("Retry-After", "10")],
+        Json(json!({
+            "ok": false,
+            "error": {"code": "DAEMON_DRAINING", "message": "daemon in ShutdownDraining; refusing new requests", "retryable": false}
+        })),
+    )
+        .into_response()
+}
+
 /// CLI exit code 取 wire 错误码（ARCH §6.3 表）。
 #[allow(dead_code)] // 给 CLI 复用
 pub fn cli_exit_from_wire_code(code: WireErrorCode) -> u8 {
@@ -243,6 +387,9 @@ mod tests {
     struct MockSupervisor {
         /// execute_tool 前的延迟：模拟慢工具，供 in-flight 计数断言。
         delay: Option<std::time::Duration>,
+        /// 按工具名回显模式（batch 用）：`slow_x` 延迟 50ms 后 Ok("x")，
+        /// `bad_*` → Err(BadArgs)，其余 Ok(tool)。并发下完成序 ≠ 请求序。
+        echo: bool,
         result: tokio::sync::Mutex<
             Option<Box<dyn FnOnce() -> Result<serde_json::Value, supervisor::ToolError> + Send>>,
         >,
@@ -252,19 +399,29 @@ mod tests {
         fn ok(data: serde_json::Value) -> Self {
             Self {
                 delay: None,
+                echo: false,
                 result: tokio::sync::Mutex::new(Some(Box::new(move || Ok(data)))),
             }
         }
         fn err(e: supervisor::ToolError) -> Self {
             Self {
                 delay: None,
+                echo: false,
                 result: tokio::sync::Mutex::new(Some(Box::new(move || Err(e)))),
             }
         }
         fn slow(data: serde_json::Value, delay: std::time::Duration) -> Self {
             Self {
                 delay: Some(delay),
+                echo: false,
                 result: tokio::sync::Mutex::new(Some(Box::new(move || Ok(data)))),
+            }
+        }
+        fn echo_by_tool() -> Self {
+            Self {
+                delay: None,
+                echo: true,
+                result: tokio::sync::Mutex::new(None),
             }
         }
     }
@@ -278,6 +435,18 @@ mod tests {
             _args: serde_json::Value,
             _lang: Option<&str>,
         ) -> Result<serde_json::Value, supervisor::ToolError> {
+            if self.echo {
+                if let Some(name) = _tool.strip_prefix("slow_") {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    return Ok(json!(name));
+                }
+                if _tool.starts_with("bad_") {
+                    return Err(supervisor::ToolError::BadArgs {
+                        detail: format!("rejected: {_tool}"),
+                    });
+                }
+                return Ok(json!(_tool));
+            }
             if let Some(d) = self.delay {
                 tokio::time::sleep(d).await;
             }
@@ -538,5 +707,100 @@ mod tests {
             0,
             "完成后 in_flight 应归零"
         );
+    }
+
+    /// 保序：首个 call 最慢（最后完成），结果数组仍必须按请求顺序对应。
+    #[tokio::test]
+    async fn batch_returns_results_in_request_order() {
+        let st = state("secret", MockSupervisor::echo_by_tool());
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post(
+                "/batch",
+                Some("secret"),
+                json!({"calls": [
+                    {"tool": "slow_alpha", "project_root": "D:/x", "args": {}, "lang": null},
+                    {"tool": "beta", "project_root": "D:/x", "args": {}, "lang": null},
+                    {"tool": "gamma", "project_root": "D:/x", "args": {}, "lang": null},
+                ]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK);
+        let body = body.expect("json body");
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 3);
+        // 完成序是 beta/gamma/…/slow_alpha；若丢 idx 排序，首位必不是 slow_alpha。
+        assert_eq!(results[0]["tool"], "slow_alpha");
+        assert_eq!(results[1]["tool"], "beta");
+        assert_eq!(results[2]["tool"], "gamma");
+        // value 回显去前缀的名字——位置 i 的 value 必须来自请求 i 的调用。
+        assert_eq!(results[0]["value"], "alpha");
+        assert_eq!(results[1]["value"], "beta");
+        assert_eq!(results[2]["value"], "gamma");
+    }
+
+    /// 失败隔离：一条 Err 不影响其余，各自带 ok 标志与 9 码 wire error。
+    #[tokio::test]
+    async fn batch_isolates_failures() {
+        let st = state("secret", MockSupervisor::echo_by_tool());
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post(
+                "/batch",
+                Some("secret"),
+                json!({"calls": [
+                    {"tool": "alpha", "project_root": "D:/x", "args": {}, "lang": null},
+                    {"tool": "bad_beta", "project_root": "D:/x", "args": {}, "lang": null},
+                    {"tool": "gamma", "project_root": "D:/x", "args": {}, "lang": null},
+                ]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK);
+        let body = body.expect("json body");
+        let results = body["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[1]["ok"], false);
+        assert_eq!(results[1]["error"]["code"], "BAD_ARGS");
+        assert_eq!(results[1]["error"]["retryable"], false);
+        assert_eq!(results[2]["ok"], true);
+    }
+
+    /// 超 32 拒收：200 + {ok:false} + 既有 BAD_ARGS（9 码不变，不新发明）。
+    #[tokio::test]
+    async fn batch_rejects_too_large() {
+        let st = state("secret", MockSupervisor::echo_by_tool());
+        let calls: Vec<_> = (0..=MAX_BATCH_SIZE)
+            .map(|i| {
+                json!({"tool": format!("t{i}"), "project_root": "D:/x", "args": {}, "lang": null})
+            })
+            .collect();
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post("/batch", Some("secret"), json!({"calls": calls})),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK);
+        let body = body.expect("json body");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "BAD_ARGS");
+        assert!(body.get("results").is_none(), "拒收响应不含 results");
+    }
+
+    /// 空批同契约拒收。
+    #[tokio::test]
+    async fn batch_rejects_empty() {
+        let st = state("secret", MockSupervisor::echo_by_tool());
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post("/batch", Some("secret"), json!({"calls": []})),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK);
+        let body = body.expect("json body");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "BAD_ARGS");
     }
 }
