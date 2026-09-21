@@ -397,3 +397,10 @@ taskkill /F /IM cli.exe & tasklist | findstr clangd   # 空输出=无孤儿(C2)
 计划已保存到 `D:/Project/serena-rust/PLAN.md`。两种执行选项：
 1. **subagent-driven（推荐）**——每 Task 派新鲜 subagent + 两阶段审查，Task 间天然并行度低（强依赖链），但审查质量高；
 2. **内联执行**——本会话按批次执行带检查点。
+
+---
+
+## 事后补记（2026-09-21，文档回写轮）
+
+- 本计划是 M0-M4 开工基线，任务锚位随演进漂移：`doctor.rs`/`file_detect.rs` 头注原引「PLAN Task 17」（= M1 验收压测，非其实际来源），实际锚 **`local/auto-install-design.md` Task 31**——两个头注已改引。
+- Task 16 的 9 命令工具集与 Task 17 验收面已被后续里程碑大幅超出：CLI 现为 **47 子命令**（42 工具 + status/stop-all/install/shell/doctor）；工具面权威清单以 **ARCHITECTURE.md**（唯一事实源）与 `local/serena-feature-coverage.md` v5 为准，本计划 M1 后任务表不再逐项维护。

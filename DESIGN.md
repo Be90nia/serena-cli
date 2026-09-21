@@ -126,6 +126,8 @@ serena-cli.exe（Rust，单二进制，双模式）
 - **符号解析组合层（I3）**：`find-symbol` 的 regex/模糊编排不在上游 solidlsp（在其未复刻的 agent 层 symbol_tools.py，34.5KB），由 supervisor 自建：精确名走 workspace/symbol；regex/模糊走全库 documentSymbol 遍历（虚拟 didOpen + ref-count，抄 ls.py open_file_buffers@43ae021）。**遍历有界**：文件数上限 2000 或软超时 5s，超出即停并在输出尾部标注 `…truncated`，防大仓库把 LS 灌爆。实现在 `supervisor` crate。
 - **符号缓存失效（I4）**：统一为 fingerprint 每次校验（抄 ls.py@43ae021 `_raw_document_symbols_cache_fingerprint`），不做事件驱动失效——上游实证此路可靠。
 
+> **演进注（2026-09-21，文档回写轮）**：上表为 M0 定稿的 9 命令基线；现 CLI 实为 **47 子命令**（42 工具 + status/stop-all/install/shell/doctor，权威清单见 ARCHITECTURE.md / coverage v5）。此后新增方向：LSP wrapper 批（signature-help / code-action / format·format-range / inlay-hint / document-highlight / folding-range / semantic-tokens / code-lens / document-link / call·type-hierarchy / moniker）、补全与符号反查（completion / containing-symbol / defining-symbol）、跨文件符号树（symbol-tree）、workspace 诊断（workspace-diagnostic、diagnostics --wait-gen）、安装与体检（install / doctor）。M0 核心语义不变：position-free 符号工具 + 写门一致性链路。
+
 ## 7. 里程碑
 
 | 里程碑 | 内容 | 预估（全职口径） |
