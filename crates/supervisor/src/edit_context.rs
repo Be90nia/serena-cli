@@ -258,7 +258,7 @@ mod tests {
 
     /// B: 4 字段各自填充（fixture 里有 `add` 函数 + `main.rs` 调用）。
     /// `add` 函数体必非空；callers 必≥1（lib.rs 自身声明）+ doc 看 hover 实现 + tests 必为 Some。
-    /// ponytail: RA cold-start 索引窗口用 busy-retry 而非 sleep（避免 flake；上限 5s）。
+    /// ponytail: RA cold-start 索引窗口用 busy-retry 而非 sleep（避免 flake；满载机实测 >30s，上限 45s）。
     #[tokio::test]
     async fn edit_context_collects_all_four_fields() {
         if !rust_analyzer_available() {
@@ -271,11 +271,13 @@ mod tests {
             return;
         }
         let sup = crate::Supervisor::direct().await.expect("supervisor");
-        // 预热 + busy-retry 直到 callers 非空（RA cold-start 索引就绪）。
+        // 预热 + busy-retry 直到 callers 非空且 doc Some（RA cold-start 索引就绪；
+        // refs 与 hover 就绪时间不同步，只盯 callers 会在 hover 仍冷时漏出循环）。
         let mut report = collect(&sup, &root, "lib.rs", "add", Some("rust")).await;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
         while std::time::Instant::now() < deadline {
-            if report.callers.as_ref().map(|c| !c.is_empty()).unwrap_or(false) {
+            let callers_ok = report.callers.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+            if callers_ok && report.doc.is_some() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
