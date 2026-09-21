@@ -147,12 +147,42 @@ fn doc_symbol_cache_key(root: &Path, file: &str) -> SymbolCacheKey {
     )
 }
 
-/// find-symbol（workspace/symbol）缓存 key：按 query 键控。
-/// ponytail: workspace 级结果不锚 mtime —— 文件变更后同 query 返缓存，重启 daemon 或换
-/// query 才刷新；换取索引型查询免全仓重复扫描（上游 ls.py 缓存同样按 (root, query) 键控）。
+/// find-symbol（workspace/symbol）缓存 key：按 query 键控，mtime 位锚 root 信号。
 /// `?` 是 Windows 非法文件名字符，`ws?` 前缀与真实文件 key 天然不撞。
-fn find_symbol_cache_key(root: &Path, query: &str) -> SymbolCacheKey {
-    (root.to_path_buf(), format!("ws?{query}"), None)
+/// mtime 信号 = `root_source_mtime`：root 下任一源码文件被外部修改/新增 → 信号推进
+/// → 旧缓存 key 失效重查（外部修改感知）。取不到信号（无源码文件/stat 全失败）→ None。
+fn find_symbol_cache_key(
+    root: &Path,
+    query: &str,
+    root_mtime: Option<SystemTime>,
+) -> SymbolCacheKey {
+    (root.to_path_buf(), format!("ws?{query}"), root_mtime)
+}
+
+/// root 下（depth ≤3，标准 ignore 过滤）源码文件的最大 mtime —— workspace 级
+/// 缓存的变化信号。只 stat 能被 `resolve_lang_name` 识别的文件（非源码文件变化
+/// 不该失效符号缓存）。删除文件不推进 max —— 残留已知边界，重启 daemon 兜底。
+fn root_source_mtime(root: &Path) -> Option<SystemTime> {
+    use ignore::WalkBuilder;
+    let mut max: Option<SystemTime> = None;
+    for entry in WalkBuilder::new(root)
+        .standard_filters(true)
+        .max_depth(Some(3))
+        .build()
+        .flatten()
+    {
+        if entry.file_type().is_some_and(|t| t.is_file())
+            && ls_registry::resolve_lang_name(entry.path()).is_some()
+            && let Ok(meta) = entry.metadata()
+            && let Ok(m) = meta.modified()
+        {
+            max = Some(match max {
+                Some(prev) if prev >= m => prev,
+                _ => m,
+            });
+        }
+    }
+    max
 }
 
 /// Daemon 工具语义层抽象；实现负责按工具名分派只读请求。
@@ -1390,7 +1420,8 @@ impl Supervisor {
         )
         .map(|ms| Duration::from_millis(ms as u64))
         .unwrap_or(TOOL_TIMEOUT);
-        let resp: DocumentSymbolResponse = session
+        // Option 宽容：RA 等对未就绪文档返 null（untagged enum 不匹配 null → 硬错）。
+        let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, timeout)
             .await?;
 
@@ -1497,11 +1528,12 @@ impl Supervisor {
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         let params = json!({ "textDocument": { "uri": uri.clone() } });
-        let resp: DocumentSymbolResponse = session
+        // Option 宽容：RA 等对未就绪文档返 null（untagged enum 不匹配 null → 硬错）。
+        let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
 
-        Ok(collect_containing_hits(&resp, &uri, line, col))
+        Ok(collect_containing_hits(resp.as_ref(), &uri, line, col))
     }
 
     /// `defining-symbol`：位置 → `tool_def` 拿 Location → 在该 Location 上 documentSymbol
@@ -1556,13 +1588,14 @@ impl Supervisor {
             .await
             .map_err(ToolError::Core)?;
         let params = json!({ "textDocument": { "uri": target_uri.clone() } });
-        let resp: DocumentSymbolResponse = session
+        // Option 宽容：RA 等对未就绪文档返 null（untagged enum 不匹配 null → 硬错）。
+        let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
 
         // 用 def 的目标位置作为 walk key（注意：来自 LSP 的 line/col 是 0-based）。
         let hits = collect_containing_hits(
-            &resp,
+            resp.as_ref(),
             &target_uri,
             def_loc.range.start.line,
             def_loc.range.start.character,
@@ -1638,8 +1671,9 @@ impl Supervisor {
             });
         }
 
-        // Phase 3.1 缓存：同 (root, query) 二次调用免全仓 workspace/symbol 往返。
-        let cache_key = find_symbol_cache_key(root, query);
+        // Phase 3.1 缓存：同 (root, query, root-mtime 信号) 二次调用免全仓
+        // workspace/symbol 往返；信号变（任一源码文件被外部改/新增）→ 自然 miss。
+        let cache_key = find_symbol_cache_key(root, query, root_source_mtime(root));
         if let Some(mut cached) = self.symbol_cache_get(&cache_key) {
             cached.truncate(limit);
             return Ok(cached); // cache_hit
@@ -2050,12 +2084,13 @@ impl Supervisor {
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         let params = json!({ "textDocument": { "uri": uri.clone() } });
-        let resp: DocumentSymbolResponse = session
+        // Option 宽容：RA 等对未就绪文档返 null（untagged enum 不匹配 null → 硬错）。
+        let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
 
         // 递归找第一个 name == symbol 的 DocumentSymbol（Nested 形态）。
-        let range = find_symbol_range(&resp, symbol).ok_or_else(|| ToolError::BadArgs {
+        let range = find_symbol_range(resp.as_ref(), symbol).ok_or_else(|| ToolError::BadArgs {
             detail: format!("symbol `{symbol}` not found in {file}"),
         })?;
         let out = read_and_slice(&path, file, range).await?;
@@ -2147,10 +2182,12 @@ impl Supervisor {
         // 1) 锁内解析符号 range（杜绝客户端 range 过期）。
         let _guard = session.ensure_open(path).await.map_err(ToolError::Core)?;
         let params = json!({ "textDocument": { "uri": uri_str } });
-        let resp: DocumentSymbolResponse = session
+        // Option 宽容：RA 等对未就绪文档返 null（untagged enum 不匹配 null → 硬错）。
+        let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
-        let range = find_symbol_range(&resp, symbol).ok_or_else(|| ToolError::BadArgs {
+        let range =
+            find_symbol_range(resp.as_ref(), symbol).ok_or_else(|| ToolError::BadArgs {
             detail: format!("symbol `{symbol}` not found in {}", path.display()),
         })?;
 
@@ -2565,11 +2602,12 @@ impl Supervisor {
 
         // 1) 锁内解析符号（杜绝过期 range）。
         let params = json!({ "textDocument": { "uri": uri_str.clone() } });
-        let resp: DocumentSymbolResponse = session
+        // Option 宽容：RA 等对未就绪文档返 null（untagged enum 不匹配 null → 硬错）。
+        let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
         let (range, selection) =
-            find_symbol_node(&resp, symbol).ok_or_else(|| ToolError::BadArgs {
+            find_symbol_node(resp.as_ref(), symbol).ok_or_else(|| ToolError::BadArgs {
                 detail: format!("symbol `{symbol}` not found in {file}"),
             })?;
 
@@ -2905,10 +2943,11 @@ pub struct SearchResponse {
 ///
 /// M0 客户端声明 `hierarchicalDocumentSymbolSupport=true`，clangd 一定回 Nested 形态；
 /// Flat 仅 mock_ls 用得到，但本模块不耦合 mock_ls，故对两种形态都处理。
-fn flatten_symbols(resp: DocumentSymbolResponse, file_uri: &str) -> Vec<SymbolHit> {
+/// `None`（LS 对未就绪/未加载文档返 `null`，如 rust-analyzer）按无符号（合法空）处理。
+fn flatten_symbols(resp: Option<DocumentSymbolResponse>, file_uri: &str) -> Vec<SymbolHit> {
     let mut out = Vec::new();
     match resp {
-        DocumentSymbolResponse::Flat(items) => {
+        Some(DocumentSymbolResponse::Flat(items)) => {
             for it in items {
                 out.push(SymbolHit {
                     name: it.name,
@@ -2919,11 +2958,12 @@ fn flatten_symbols(resp: DocumentSymbolResponse, file_uri: &str) -> Vec<SymbolHi
                 });
             }
         }
-        DocumentSymbolResponse::Nested(items) => {
+        Some(DocumentSymbolResponse::Nested(items)) => {
             for it in items {
                 push_nested(&it, None, file_uri, &mut out);
             }
         }
+        None => {}
     }
     out
 }
@@ -2958,12 +2998,16 @@ fn push_nested(
 ///
 /// 返回从最外层到最深命中的 `SymbolHit` 链（所有命中的祖先）。无命中返空 Vec。
 /// Nested 形态递归 `children`；Flat 形态只按顶层项判断（mock_ls 路径）。
+/// `None`（LS 对未就绪/未加载文档返 `null`）视为无命中。
 fn collect_containing_hits(
-    resp: &DocumentSymbolResponse,
+    resp: Option<&DocumentSymbolResponse>,
     file_uri: &str,
     line: u32,
     col: u32,
 ) -> Vec<SymbolHit> {
+    let Some(resp) = resp else {
+        return Vec::new();
+    };
     fn walk(
         items: &[DocumentSymbol],
         file_uri: &str,
@@ -3600,7 +3644,7 @@ impl SupervisorTrait for Supervisor {
                 let (file, symbol, new_body) = required_replace_args(&args)?;
                 self.tool_replace_body(root, &file, &symbol, &new_body, lang)
                     .await?;
-                Ok(serde_json::Value::Null)
+                Ok(serde_json::json!({ "applied": true, "file": file, "symbol": symbol }))
             }
             "rename-symbol" => {
                 let (file, line, col, new_name) = required_rename_args(&args)?;
@@ -3722,7 +3766,7 @@ impl SupervisorTrait for Supervisor {
                     .to_owned();
                 self.tool_edit_replace_text(root, &file, &symbol, &old_text, &new_text, lang)
                     .await?;
-                Ok(serde_json::Value::Null)
+                Ok(serde_json::json!({ "applied": true, "file": file, "symbol": symbol }))
             }
             "insert-text-after-symbol" => {
                 let (file, symbol, text) = required_edit_args(&args)?;
@@ -3761,7 +3805,7 @@ impl SupervisorTrait for Supervisor {
                     })? as u32;
                 self.tool_edit_delete_text(root, &file, &symbol, start_line, end_line, lang)
                     .await?;
-                Ok(serde_json::Value::Null)
+                Ok(serde_json::json!({ "applied": true, "file": file, "symbol": symbol }))
             }
             "safe-delete-symbol" => {
                 let (file, symbol) = required_symbol_body_args(&args)?;
@@ -3820,7 +3864,7 @@ impl SupervisorTrait for Supervisor {
                     lang,
                 )
                 .await?;
-                Ok(serde_json::Value::Null)
+                Ok(serde_json::json!({ "applied": true, "file": file }))
             }
             "delete-lines" => {
                 let (file, start_line, end_line) = required_line_range(&args)?;
@@ -3833,7 +3877,7 @@ impl SupervisorTrait for Supervisor {
                     lang,
                 )
                 .await?;
-                Ok(serde_json::Value::Null)
+                Ok(serde_json::json!({ "applied": true, "file": file }))
             }
             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
@@ -3915,7 +3959,11 @@ pub(crate) fn normalize_implementations(raw: Option<&serde_json::Value>) -> Vec<
 }
 /// 递归在 Nested documentSymbol 里找第一个 name == `symbol` 的 range。
 /// Flat 形态（SymbolInformation）不含子符号，这里只处理 Nested —— clangd/mock_ls 都是 Nested。
-fn find_symbol_range(resp: &DocumentSymbolResponse, symbol: &str) -> Option<lsp_types::Range> {
+/// `None`（LS 对未就绪/未加载文档返 `null`）视为未找到。
+fn find_symbol_range(
+    resp: Option<&DocumentSymbolResponse>,
+    symbol: &str,
+) -> Option<lsp_types::Range> {
     fn walk(items: &[DocumentSymbol], symbol: &str) -> Option<lsp_types::Range> {
         for it in items {
             if it.name == symbol {
@@ -3929,7 +3977,7 @@ fn find_symbol_range(resp: &DocumentSymbolResponse, symbol: &str) -> Option<lsp_
         }
         None
     }
-    match resp {
+    match resp? {
         DocumentSymbolResponse::Nested(items) => walk(items, symbol),
         DocumentSymbolResponse::Flat(_) => None,
     }
@@ -3960,8 +4008,9 @@ async fn read_and_slice(path: &Path, file: &str, range: lsp_types::Range) -> Too
 /// 找符号的 `(range, selectionRange)`：range = 删除范围，selectionRange = 标识符
 /// 位置（references 锚点）。Flat 形态无 selectionRange，用 location.range 起点近似
 /// （SymbolInformation 的 location 即标识符所在位置）。
+/// `None`（LS 对未就绪/未加载文档返 `null`）视为未找到。
 fn find_symbol_node(
-    resp: &DocumentSymbolResponse,
+    resp: Option<&DocumentSymbolResponse>,
     symbol: &str,
 ) -> Option<(lsp_types::Range, lsp_types::Range)> {
     fn walk(
@@ -3980,7 +4029,7 @@ fn find_symbol_node(
         }
         None
     }
-    match resp {
+    match resp? {
         DocumentSymbolResponse::Nested(items) => walk(items, symbol),
         DocumentSymbolResponse::Flat(items) => items
             .iter()
@@ -4534,7 +4583,7 @@ mod containing_symbol_tests {
     fn deepest_match_wins_inside_nested_function_body() {
         let resp = nested_two_level();
         // inner @ 4-5；位置 line=4 col=10 落在 inner 内（且在 outer 内）。
-        let hits = collect_containing_hits(&resp, "file://x", 4, 10);
+        let hits = collect_containing_hits(Some(&resp), "file://x", 4, 10);
         assert_eq!(hits.len(), 2, "expected outer+inner chain, got {hits:?}");
         assert_eq!(hits[0].name, "outer");
         assert_eq!(hits[0].container, None);
@@ -4546,7 +4595,7 @@ mod containing_symbol_tests {
     fn position_outside_any_symbol_returns_empty() {
         let resp = single_module();
         // outer @ line 0-10；line=20 越过 end.line。
-        let hits = collect_containing_hits(&resp, "file://x", 20, 0);
+        let hits = collect_containing_hits(Some(&resp), "file://x", 20, 0);
         assert!(hits.is_empty(), "expected empty, got {hits:?}");
     }
 
@@ -4554,7 +4603,7 @@ mod containing_symbol_tests {
     fn position_at_first_char_of_first_line_hits_only_outer() {
         let resp = nested_two_level();
         // outer @ 0-10；inner @ 4-5；line=0 落在 outer（不在 inner）。
-        let hits = collect_containing_hits(&resp, "file://x", 0, 0);
+        let hits = collect_containing_hits(Some(&resp), "file://x", 0, 0);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "outer");
     }
@@ -4585,7 +4634,7 @@ mod containing_symbol_tests {
             container_name: None,
         };
         let resp = DocumentSymbolResponse::Flat(vec![foo, bar]);
-        let hits = collect_containing_hits(&resp, "file://x", 6, 0);
+        let hits = collect_containing_hits(Some(&resp), "file://x", 6, 0);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "bar");
     }
@@ -4798,7 +4847,10 @@ mod symbol_cache_tests {
         let root = Path::new("Z:/no/such/project");
         let other = Path::new("Z:/no/such/other");
         sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs"), vec![hit("main")]);
-        sup.symbol_cache_put(find_symbol_cache_key(root, "main"), vec![hit("main")]);
+        sup.symbol_cache_put(
+            find_symbol_cache_key(root, "main", None),
+            vec![hit("main")],
+        );
         sup.symbol_cache_put(doc_symbol_cache_key(other, "a.rs"), vec![hit("helper")]);
 
         // 模拟 (root, lang) 会话换代（session_for 挂入新会话前的失效动作）。
@@ -4810,7 +4862,7 @@ mod symbol_cache_tests {
             "会话换代后同 root 文档符号缓存必须 miss"
         );
         assert!(
-            sup.symbol_cache_get(&find_symbol_cache_key(root, "main"))
+            sup.symbol_cache_get(&find_symbol_cache_key(root, "main", None))
                 .is_none(),
             "会话换代后同 root workspace 级缓存必须 miss"
         );
@@ -4898,6 +4950,37 @@ mod symbol_cache_tests {
         );
     }
 
+    /// 外部修改感知（workspace 级）：root 下源码文件 mtime 变 → `root_source_mtime`
+    /// 信号推进 → find_symbol 缓存 key 变 → miss 重查。旧实现 (root,query) 键控时
+    /// 外部改文件后 find-symbol 永远返回陈旧结果。
+    #[tokio::test]
+    async fn root_source_mtime_change_invalidates_find_symbol_cache() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "fn f() {}\n").unwrap();
+        let root = dir.path();
+
+        let key1 = find_symbol_cache_key(root, "f", root_source_mtime(root));
+        sup.symbol_cache_put(key1.clone(), vec![hit("f")]);
+        assert!(sup.symbol_cache_get(&key1).is_some(), "warm cache must hit");
+
+        // 外部改源码文件 mtime（set_modified 推进，不依赖真实时钟粒度）。
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(42))
+            .unwrap();
+
+        let key2 = find_symbol_cache_key(root, "f", root_source_mtime(root));
+        assert_ne!(key1, key2, "root source mtime signal must advance key");
+        assert!(
+            sup.symbol_cache_get(&key2).is_none(),
+            "changed root must miss (invalidate find-symbol cache)"
+        );
+    }
+
     /// 不同 file 不同 key（不串扰）。
     #[tokio::test]
     async fn different_files_do_not_share_entries() {
@@ -4912,12 +4995,15 @@ mod symbol_cache_tests {
     }
 
     /// find-symbol 缓存：query 命中 + limit 对缓存全量截断；不同 query 不串扰。
+    /// root 用真实空 tempdir：tool_find_symbol 命中路径会 walk root 算 mtime 信号，
+    /// 不存在的假盘符路径（Z:/...）walk 探测可达 10ms+ 网络超时量级，污染 <10ms 断言。
     #[tokio::test]
     async fn find_symbol_cache_hits_by_query_and_respects_limit() {
         let sup = Supervisor::direct().await.unwrap();
-        let root = Path::new("Z:/no/such/project");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         sup.symbol_cache_put(
-            find_symbol_cache_key(root, "parse"),
+            find_symbol_cache_key(root, "parse", None),
             vec![hit("parse_a"), hit("parse_b"), hit("parse_c")],
         );
 
@@ -4927,8 +5013,10 @@ mod symbol_cache_tests {
             .await
             .unwrap();
         let elapsed = t0.elapsed();
+        // 50ms：仍远低于 LS 往返（60ms+），防「命中路径意外走了慢路径」；
+        // 10ms 在 86 测试并行满载下会被 tempdir+walk 抖破（实测 16ms）。
         assert!(
-            elapsed < Duration::from_millis(10),
+            elapsed < Duration::from_millis(50),
             "cache hit took {elapsed:?}"
         );
         assert_eq!(out.len(), 2, "limit must apply to cached full list");

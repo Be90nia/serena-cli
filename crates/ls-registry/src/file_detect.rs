@@ -1,4 +1,5 @@
-//! 文件 → LanguageId 自动探测（PLAN Task 17）。
+//! 文件 → LanguageId 自动探测（auto-install-design.md Task 31；原「PLAN Task 17」锚位有误，
+//! 2026-09-21 文档回写轮已对齐）。
 //!
 //! 三层 fallback：
 //! 1. 文件扩展名（→ LanguageId::from_extension）。

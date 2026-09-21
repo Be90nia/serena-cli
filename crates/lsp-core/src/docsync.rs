@@ -2,8 +2,8 @@
 //! ref-count `didClose`（PLAN Task 7 / ARCHITECTURE §3.2 BUF + §3.4 锁）。
 //!
 //! ↖ mirror: ls.py@43ae021 `LSPFileBuffer._open_in_ls` + `open_file_buffers`：
-//! - 文件 → 首次 ensure_open：读盘 + 记录 mtime/version + 全量 didOpen。
-//! - 后续 ensure_open：stat 拿 mtime，与记账不符 → 全量 didChange（version++）。
+//! - 文件 → 首次 ensure_open：读盘 + 记录 mtime/size/version + 全量 didOpen。
+//! - 后续 ensure_open：stat 拿 mtime+size，与记账不符 → 全量 didChange（version++）。
 //! - 同一 URI 多次 ensure_open → ref_count++，drop 归零 → didClose + 从表移除。
 //!
 //! 设计要点（ARCHITECTURE §3.4 锁纪律 + Task 7 设计）：
@@ -30,11 +30,14 @@ use crate::session::Session;
 /// LSP `didOpen` 起始版本号（LSP spec §3.1.1：每次变更递增，初始为 1）。
 const INITIAL_VERSION: i64 = 1;
 
-/// 单文件状态：uri + 上次记账 mtime + 当前 LSP 版本 + 引用计数。
+/// 单文件状态：uri + 上次记账 mtime/size + 当前 LSP 版本 + 引用计数。
 #[derive(Debug)]
 pub struct FileBuffer {
     pub uri: Uri,
     pub mtime: Option<SystemTime>,
+    /// 外部修改感知的第二因子：同 mtime 粒度窗口内的改写靠 size 检出
+    /// （NTFS 等文件系统 mtime 精度有限，mtime+size 双对账堵住漏检窗口）。
+    pub size: Option<u64>,
     pub content_version: i64,
     pub ref_count: usize,
 }
@@ -80,11 +83,12 @@ impl Drop for FileGuard {
 }
 
 impl Session {
-    /// 打开一个文件供 LSP 操作：首次 → 全量 didOpen；mtime 变了 → 全量 didChange。
+    /// 打开一个文件供 LSP 操作：首次 → 全量 didOpen；mtime/size 变了 → 全量 didChange。
     pub async fn ensure_open(self: &Arc<Self>, path: &Path) -> Result<FileGuard> {
         let uri = path_to_uri(path)?;
         let meta = fs::metadata(path).map_err(CoreError::Io)?;
         let mtime = meta.modified().ok();
+        let size = Some(meta.len());
 
         enum Action {
             Send { method: &'static str, params: Value },
@@ -102,6 +106,7 @@ impl Session {
                         FileBuffer {
                             uri: uri.clone(),
                             mtime,
+                            size,
                             content_version: version,
                             ref_count: 1,
                         },
@@ -116,12 +121,19 @@ impl Session {
                 }
                 Some(buf) => {
                     buf.ref_count += 1;
-                    if matches!(mtime, Some(new) if Some(new) == buf.mtime) {
+                    // mtime+size 双因子：同 mtime 粒度窗口内的外部改写靠 size 检出。
+                    // 记账侧任一为 None（stat 异常）→ 保守按「变了」处理。
+                    let unchanged = mtime.is_some()
+                        && size.is_some()
+                        && mtime == buf.mtime
+                        && size == buf.size;
+                    if unchanged {
                         (Action::None, buf.content_version)
                     } else {
                         let text = fs::read_to_string(path).map_err(CoreError::Io)?;
                         let version = buf.content_version + 1;
                         buf.mtime = mtime;
+                        buf.size = size;
                         buf.content_version = version;
                         (
                             Action::Send {

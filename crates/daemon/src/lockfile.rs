@@ -138,7 +138,13 @@ fn try_become_daemon_impl(lock_path: &Path, candidate_port: u16) -> Result<Outco
             let raw = std::fs::read_to_string(lock_path)?;
             let existing: LockEntry = serde_json::from_str(&raw)?;
             let addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, existing.port).into();
-            if is_alive_graceful(existing.port) {
+            // bind-first 仲裁：走到这里时本进程已 bind 成功 candidate_port，端口上
+            // 必无其他 listener。若 lock 记录的端口 == candidate_port，宽限探活的
+            // connect 只会打进**自己** listener 的 accept backlog（内核握手，无需
+            // 应用 accept）→ 必然假阳性 → 死 lock 永远无人接管，daemon 自杀循环。
+            // 故 port 相同直接按死 lock 接管；端口不同才以 TCP 探活区分真主人生死。
+            let probing_self = existing.port == candidate_port;
+            if !probing_self && is_alive_graceful(existing.port) {
                 Ok(Outcome::Lost { addr })
             } else {
                 // 宽限后仍无响应 → 残留死 lock → 清理重建（自己当胜者）。
@@ -242,17 +248,47 @@ mod tests {
     #[test]
     fn second_create_loses_when_peer_alive() {
         let (_dir, path) = fresh_lock();
-        // 第一次：创建
-        let _ = try_become_daemon(&path, 7860).expect("first wins");
-        // 起一个真监听 7860 的进程，让"探活"返回 true
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 7860)).expect("bind 7860");
+        // lock 记录 peer 在 7861（不同端口）：真实流中 candidate 端口已被自己 bind
+        // 成功才会走到仲裁，Lost 只可能发生在 lock 记录端口 != candidate 时。
+        let peer = LockEntry {
+            pid: 999,
+            port: 7861,
+            boot_ms: 1,
+            token: "peer".into(),
+        };
+        write_final(&path, &peer).expect("write peer lock");
+        // 起一个真监听 7861 的进程，让"探活"返回 true
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 7861)).expect("bind 7861");
         listener.set_nonblocking(false).ok();
-        // 第二次：应 Lost，端口 7860
+        // 应 Lost，指向 peer 端口 7861
         let out = try_become_daemon(&path, 7860).expect("second call");
         match out {
-            Outcome::Lost { addr } => assert_eq!(addr.port(), 7860),
-            Outcome::Won { .. } => panic!("second create must lose when peer alive"),
+            Outcome::Lost { addr } => assert_eq!(addr.port(), 7861),
+            Outcome::Won { .. } => panic!("must lose when lock peer alive on its own port"),
         }
+    }
+
+    /// 回归（bd lazy-spawn 自杀循环）：死 lock 记录的端口 == 自己刚 bind 成功的
+    /// candidate 端口时，宽限探活的 connect 打进**自己** listener 的 backlog 必然
+    /// "成功"——旧实现据此误判 Lost → daemon 自杀循环，lazy-spawn 全挂。
+    /// 必须按死 lock 接管（Won）。
+    #[test]
+    fn same_port_dead_lock_is_taken_over_not_lost() {
+        let (_dir, path) = fresh_lock();
+        let dead = LockEntry {
+            pid: 1,
+            port: 7860,
+            boot_ms: 1,
+            token: "dead".into(),
+        };
+        write_final(&path, &dead).expect("write dead lock on 7860");
+        // candidate == 7860 == lock 记录端口；本进程无任何真 daemon 在（测试环境
+        // 该端口空闲），connect 的"成功"只可能来自自己（真实流中已 bind 的 listener）。
+        let out = try_become_daemon(&path, 7860).expect("take over");
+        assert!(
+            matches!(out, Outcome::Won { port: 7860, .. }),
+            "same-port dead lock must be taken over, not Lost; got {out:?}"
+        );
     }
 
     #[test]

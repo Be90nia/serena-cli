@@ -32,6 +32,8 @@ Completion (1): `completion` (with `--limit` and per-file-suffix trigger inferen
 
 Admin (4): `status` · `stop-all` · `install <lang>` · `shell` (JSONL stdin/stdout session)
 
+**Position baseline convention**: commands taking `line`/`col` (position-addressed: `def`, `refs`, `hover`, `find-implementations`, `rename-symbol`, `find-referencing-*`, `containing-symbol`, `defining-symbol`, `signature-help`, `code-action`, `document-highlight`, `completion`, `format-range`, `inlay-hint`, `call-hierarchy prepare`, `type-hierarchy prepare`, `moniker`) are **0-based**, passed straight through as LSP `Position`. Line-range and line-editing commands (`read-file`, `insert-at-line`, `replace-lines`, `delete-lines`, `delete-text-in-symbol`) are **1-based inclusive**. Every command also states this in its `--help`.
+
 vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses). Not implemented: `documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint` — none of these have an agent-side consumer today; see [Phase 6 limitations](#limitations) for the criterion.
 
 ### Language servers (7 of 73 in upstream catalog)

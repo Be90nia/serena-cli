@@ -77,11 +77,11 @@ enum Cmd {
         #[arg(long, value_name = "N", default_value_t = 200)]
         max_files: usize,
     },
-    /// 跳转到符号定义（textDocument/definition）。
+    /// 跳转到符号定义（textDocument/definition）。line/col 为 0-based。
     Def { file: String, line: u32, col: u32 },
     /// 列出引用（textDocument/references）。line/col 0-based。
     Refs { file: String, line: u32, col: u32 },
-    /// 鼠标位置符号的 type / doc（textDocument/hover）。
+    /// 鼠标位置符号的 type / doc（textDocument/hover）。line/col 为 0-based。
     Hover { file: String, line: u32, col: u32 },
     Diagnostics {
         file: String,
@@ -97,9 +97,9 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
-    /// 符号的所有实现位置（textDocument/implementation）。
+    /// 符号的所有实现位置（textDocument/implementation）。line/col 为 0-based。
     FindImplementations { file: String, line: u32, col: u32 },
-    /// 跨文件 rename（textDocument/rename）。
+    /// 跨文件 rename（textDocument/rename）。line/col 为 0-based。
     RenameSymbol {
         file: String,
         line: u32,
@@ -138,9 +138,9 @@ enum Cmd {
         /// glob 模式（如 main.cpp）。
         name_pattern: String,
     },
-    /// 所有引用 + 每个 ref 落在哪个外层符号里。
+    /// 所有引用 + 每个 ref 落在哪个外层符号里。line/col 为 0-based。
     FindReferencingSymbols { file: String, line: u32, col: u32 },
-    /// 所有引用 + 每个 ref 前后 N 行。
+    /// 所有引用 + 每个 ref 前后 N 行。line/col 为 0-based。
     FindReferencingCodeSnippets {
         file: String,
         line: u32,
@@ -221,6 +221,7 @@ enum Cmd {
         expected_hash: Option<String>,
     },
     /// 代码补全（textDocument/completion）—— AI-friendly 字段裁剪 + 自动推断 trigger。
+    /// line/col 为 0-based（与 def/refs 同基线，均直传 LSP Position）。
     Completion {
         file: String,
         line: u32,
@@ -233,14 +234,18 @@ enum Cmd {
         trigger: Option<String>,
     },
     /// 按位置反查最深层包含符号（documentSymbol walk）。无命中返空数组（合法）。
+    /// line/col 为 0-based。
     ContainingSymbol { file: String, line: u32, col: u32 },
     /// 跳到定义并取完整符号信息（def + documentSymbol walk + body 切片）。
     /// def 返空 → null；定义无符号覆盖 → 空数组；C++ 重载等多定义 → 多元素。
+    /// line/col 为 0-based。
     DefiningSymbol { file: String, line: u32, col: u32 },
 
     /// 函数调用位置的参数签名提示（textDocument/signatureHelp）。无调用位置返 null。
+    /// line/col 为 0-based。
     SignatureHelp { file: String, line: u32, col: u32 },
     /// 列出可用 codeAction（textDocument/codeAction）。可选 `--kind` 过滤（如 quickfix / refactor）。
+    /// line/col 为 0-based。
     CodeAction {
         file: String,
         line: u32,
@@ -256,7 +261,7 @@ enum Cmd {
         #[arg(long)]
         insert_spaces: Option<bool>,
     },
-    /// range 内格式化（textDocument/rangeFormatting）。返 edits[]。
+    /// range 内格式化（textDocument/rangeFormatting）。返 edits[]。行/列为 0-based。
     FormatRange {
         file: String,
         start_line: u32,
@@ -268,13 +273,13 @@ enum Cmd {
         #[arg(long)]
         insert_spaces: Option<bool>,
     },
-    /// 行范围内类型提示（textDocument/inlayHint）。
+    /// 行范围内类型提示（textDocument/inlayHint）。行号为 0-based。
     InlayHint {
         file: String,
         start_line: u32,
         end_line: u32,
     },
-    /// 光标位置的同符号高亮（textDocument/documentHighlight）。
+    /// 光标位置的同符号高亮（textDocument/documentHighlight）。line/col 为 0-based。
     DocumentHighlight {
         file: String,
         line: u32,
@@ -289,6 +294,7 @@ enum Cmd {
     /// 文档链接（textDocument/documentLink）。
     DocumentLink { file: String },
     /// 调用层级：prepare / incoming / outgoing 三件套（callHierarchy/*）。
+    /// prepare 的 line/col 为 0-based。
     CallHierarchy {
         /// "prepare" 用 file/line/col；"incoming"/"outgoing" 用 --item。
         op: String,
@@ -300,6 +306,7 @@ enum Cmd {
         item: Option<String>,
     },
     /// 类型层级：prepare / supertypes / subtypes 三件套（typeHierarchy/*）。
+    /// prepare 的 line/col 为 0-based。
     TypeHierarchy {
         op: String,
         file: Option<String>,
@@ -308,7 +315,7 @@ enum Cmd {
         #[arg(long)]
         item: Option<String>,
     },
-    /// 全局符号标识（textDocument/moniker）。
+    /// 全局符号标识（textDocument/moniker）。line/col 为 0-based。
     Moniker {
         file: String,
         line: u32,

@@ -1,4 +1,5 @@
-//! `serena doctor` —— 环境体检（PLAN Task 17）。
+//! `serena doctor` —— 环境体检（auto-install-design.md Task 31「CLI install/doctor 子命令」；
+//! 原「PLAN Task 17」锚位有误——PLAN Task 17 = M1 验收压测，2026-09-21 文档回写轮已对齐）。
 //!
 //! 5 类检查（输出状态：OK / MISS / WARN + 描述 + 修复建议）：
 //! 1. 系统运行时：node / npm / uv / uvx / dotnet / gem / java / go / cargo / rustup /
@@ -13,7 +14,7 @@
 //!   - 人类可读（默认）
 //!   - `--json`：标准 JSON（machine-readable）。
 //!
-//! exit code：0 全绿 / 1 有 MISS / 2 致命错。
+//! exit code：0 全绿（含 WARN）/ 1 有 MISS（`exit_code()` 仅产 0/1；原注「2 致命错」不可达，已删）。
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};

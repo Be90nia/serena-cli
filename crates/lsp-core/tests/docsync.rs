@@ -441,3 +441,60 @@ async fn different_files_keep_independent_versions() {
 
     session.shutdown().await;
 }
+
+/// 用例 #4：外部改文件但 mtime 被拨回原值（mtime 粒度窗口内的改写）→
+/// size 因子检出，仍触发 didChange。旧实现只对账 mtime 时此场景漏检。
+#[tokio::test]
+async fn ensure_open_same_mtime_different_size_emits_did_change() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file = tmp.path().join("d.cpp");
+    tokio::fs::write(&file, b"v1\n")
+        .await
+        .expect("write fixture v1");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    let _g1 = session.ensure_open(&file).await.expect("first ensure_open");
+
+    // 改成不同长度的内容，再把 mtime 拨回记账值 —— 模拟 mtime
+    // 粒度窗口内的外部改写（只有 size 能区分）。
+    let old_mtime = tokio::fs::metadata(&file)
+        .await
+        .expect("stat v1")
+        .modified()
+        .expect("mtime");
+    tokio::fs::write(&file, b"v2 with a much longer body\n")
+        .await
+        .expect("rewrite fixture v2");
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .expect("open for set_times");
+    f.set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+        .expect("set_times");
+
+    let _g2 = session
+        .ensure_open(&file)
+        .await
+        .expect("second ensure_open");
+
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events = read_track_events(&track_log).await;
+    let changes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didChange"))
+        .collect();
+    assert_eq!(
+        changes.len(),
+        1,
+        "同 mtime 不同 size 的外部改写必须被 size 因子检出并发 didChange；events={events:?}"
+    );
+    assert_eq!(changes[0].get("version").and_then(Value::as_i64), Some(2));
+
+    session.shutdown().await;
+}

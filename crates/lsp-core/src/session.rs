@@ -131,6 +131,11 @@ pub struct Session {
     progress_waiters: tokio::sync::Mutex<
         std::collections::HashMap<String, Arc<Notify>>,
     >,
+    /// 早到通知记录：LS 在 `wait_for_progress` 登记前就发出的 token（mock_ls「握手后
+    /// 立刻发」/RA 快速索引进度都会命中此窗口）。handler 无 waiter 可唤醒时记在此处，
+    /// wait 侧优先消费一次。没有它，早到通知被 `Notify::notify_waiters` 空发丢弃，
+    /// wait 永远超时。std Mutex：handler 在 stdout 泵 task 内同步执行，仅 try_lock。
+    progress_resolved: std::sync::Mutex<std::collections::HashSet<String>>,
     /// `didOpen` 上送的 `languageId`。supervisor 在 session_for 拿到会话后注入真实
     /// adapter 语言；默认 `"cpp"` 仅兜底 lsp-core 直连路径——硬编码错语言会让
     /// rust-analyzer 等严格 LS 拒收文档（语义层挂）。
@@ -225,6 +230,7 @@ impl Session {
             buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
             server_capabilities: std::sync::Arc::new(Mutex::new(None)),
             progress_waiters: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            progress_resolved: std::sync::Mutex::new(std::collections::HashSet::new()),
             language_id: std::sync::Mutex::new("cpp".into()),
         });
 
@@ -246,8 +252,16 @@ impl Session {
                 let Ok(waiters) = waiters else {
                     return;
                 };
-                if let Some(notify) = waiters.get(&token) {
-                    notify.notify_waiters();
+                match waiters.get(&token) {
+                    Some(notify) => notify.notify_waiters(),
+                    None => {
+                        // 无 waiter：早到通知 —— 记入 resolved 供后续 wait 立即
+                        // 消费，否则 Notify::notify_waiters 空发 = 通知永久丢失。
+                        drop(waiters);
+                        if let Ok(mut resolved) = session.progress_resolved.try_lock() {
+                            resolved.insert(token);
+                        }
+                    }
                 }
             }
         });
@@ -359,6 +373,15 @@ impl Session {
                 ls: "ls".into(),
                 cause: "session failed before progress wait".into(),
             });
+        }
+        // 早到通知已在 waiter 登记前到达（handler 记入 resolved）→ 立即消费一次。
+        if self
+            .progress_resolved
+            .lock()
+            .unwrap()
+            .remove(token)
+        {
+            return Ok(());
         }
         let notify = {
             let mut waiters = self.progress_waiters.lock().await;
