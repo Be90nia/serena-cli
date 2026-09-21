@@ -759,6 +759,41 @@ impl Supervisor {
         Ok(session)
     }
 
+    /// 写工具收尾：拉一次 file-level 诊断快照；失败/超时/未就绪一律降级为 `[]`。
+    ///
+    /// F2 设计：写完后 AI 最常见的下一步是 `diagnostics <file>` 验证；本 helper 把这步
+    /// 折叠进写工具返回值（`post_write_diagnostics` 字段）。不阻塞主结果。
+    ///
+    /// 锁纪律：与 tool_diagnostics 同样走 push 缓存 + 2s 兜底超时；不进诊断时不阻塞。
+    /// ponytail: 不为失败建新错误路径 —— 任何 err 都 `tracing::debug!` + 返 []。
+    async fn post_diag_for_write(
+        &self,
+        root: &Path,
+        file: &str,
+        lang: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.tool_diagnostics(root, file, lang, None),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, file, "F2 post-write diag failed; degrading");
+                Vec::new()
+            }
+            Err(_elapsed) => {
+                tracing::debug!(file, "F2 post-write diag timeout 2s; degrading");
+                Vec::new()
+            }
+        }
+    }
+
     /// `textDocument/diagnostic` 诊断（PLAN Phase 2.5）。
     ///
     /// 主路径选择：
@@ -3915,7 +3950,13 @@ impl SupervisorTrait for Supervisor {
                 let (file, symbol, new_body) = required_replace_args(&args)?;
                 self.tool_replace_body(root, &file, &symbol, &new_body, lang)
                     .await?;
-                Ok(serde_json::json!({ "applied": true, "file": file, "symbol": symbol }))
+                let diag = self.post_diag_for_write(root, &file, lang).await;
+                Ok(serde_json::json!({
+                    "applied": true,
+                    "file": file,
+                    "symbol": symbol,
+                    "post_write_diagnostics": diag,
+                }))
             }
             "rename-symbol" => {
                 let (file, line, col, new_name) = required_rename_args(&args)?;
@@ -4037,21 +4078,37 @@ impl SupervisorTrait for Supervisor {
                     .to_owned();
                 self.tool_edit_replace_text(root, &file, &symbol, &old_text, &new_text, lang)
                     .await?;
-                Ok(serde_json::json!({ "applied": true, "file": file, "symbol": symbol }))
+                let diag = self.post_diag_for_write(root, &file, lang).await;
+                Ok(serde_json::json!({
+                    "applied": true,
+                    "file": file,
+                    "symbol": symbol,
+                    "post_write_diagnostics": diag,
+                }))
             }
             "insert-text-after-symbol" => {
                 let (file, symbol, text) = required_edit_args(&args)?;
                 let (end_line, end_col) = self
                     .tool_edit_insert_after_symbol(root, &file, &symbol, &text, lang)
                     .await?;
-                Ok(serde_json::json!({ "end_line": end_line, "end_col": end_col }))
+                let diag = self.post_diag_for_write(root, &file, lang).await;
+                Ok(serde_json::json!({
+                    "end_line": end_line,
+                    "end_col": end_col,
+                    "post_write_diagnostics": diag,
+                }))
             }
             "insert-text-before-symbol" => {
                 let (file, symbol, text) = required_edit_args(&args)?;
                 let (end_line, end_col) = self
                     .tool_edit_insert_before_symbol(root, &file, &symbol, &text, lang)
                     .await?;
-                Ok(serde_json::json!({ "end_line": end_line, "end_col": end_col }))
+                let diag = self.post_diag_for_write(root, &file, lang).await;
+                Ok(serde_json::json!({
+                    "end_line": end_line,
+                    "end_col": end_col,
+                    "post_write_diagnostics": diag,
+                }))
             }
             "delete-text-in-symbol" => {
                 let file = required_file(&args)?;
@@ -4076,15 +4133,28 @@ impl SupervisorTrait for Supervisor {
                     })? as u32;
                 self.tool_edit_delete_text(root, &file, &symbol, start_line, end_line, lang)
                     .await?;
-                Ok(serde_json::json!({ "applied": true, "file": file, "symbol": symbol }))
+                let diag = self.post_diag_for_write(root, &file, lang).await;
+                Ok(serde_json::json!({
+                    "applied": true,
+                    "file": file,
+                    "symbol": symbol,
+                    "post_write_diagnostics": diag,
+                }))
             }
             "safe-delete-symbol" => {
                 let (file, symbol) = required_symbol_body_args(&args)?;
-                serde_json::to_value(
+                let mut value = serde_json::to_value(
                     self.tool_safe_delete_symbol(root, &file, &symbol, lang)
                         .await?,
                 )
-                .map_err(|e| ToolError::Serialize(e.into()))
+                .map_err(|e| ToolError::Serialize(e.into()))?;
+                // F2: 写完后挂诊断。`SafeDeleteReport` 不含 `file` 字段，
+                // 直接读 args 拿到 file（required_symbol_body_args 已保证存在）。
+                let diag = self.post_diag_for_write(root, &file, lang).await;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("post_write_diagnostics".into(), serde_json::json!(diag));
+                }
+                Ok(value)
             }
             "insert-at-line" => {
                 let file = required_file(&args)?;
@@ -4111,9 +4181,11 @@ impl SupervisorTrait for Supervisor {
                         lang,
                     )
                     .await?;
+                let diag = self.post_diag_for_write(root, &file, lang).await;
                 Ok(serde_json::json!({
                     "end_line": end_line,
                     "end_col": end_col,
+                    "post_write_diagnostics": diag,
                 }))
             }
             "replace-lines" => {
@@ -4135,7 +4207,12 @@ impl SupervisorTrait for Supervisor {
                     lang,
                 )
                 .await?;
-                Ok(serde_json::json!({ "applied": true, "file": file }))
+                let diag = self.post_diag_for_write(root, &file, lang).await;
+                Ok(serde_json::json!({
+                    "applied": true,
+                    "file": file,
+                    "post_write_diagnostics": diag,
+                }))
             }
             "delete-lines" => {
                 let (file, start_line, end_line) = required_line_range(&args)?;
@@ -4148,7 +4225,12 @@ impl SupervisorTrait for Supervisor {
                     lang,
                 )
                 .await?;
-                Ok(serde_json::json!({ "applied": true, "file": file }))
+                let diag = self.post_diag_for_write(root, &file, lang).await;
+                Ok(serde_json::json!({
+                    "applied": true,
+                    "file": file,
+                    "post_write_diagnostics": diag,
+                }))
             }
             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
@@ -5136,6 +5218,47 @@ mod pull_diagnostics_tests {
         handler("file:///b.cpp".into(), vec![]);
         assert_eq!(cache_arc.lock().unwrap().len(), 0, "空 push 对空 key 是 no-op");
         assert_eq!(generation.load(Ordering::Relaxed), 3);
+    }
+
+    /// F2 验收：post_diag_for_write 三种失败模式都降级为 `[]`。
+    ///
+    /// 写工具返回值挂诊断快照是设计目标，但降级路径才是契约核心 —— 任何失败
+    /// 都不能影响主结果（写工具仍正常返回 applied=true）。三种路径：
+    /// - 场景 A：session_for 抛 NotInstalled/NotFound（root 不存在 / 文件无
+    ///   LanguageServer 可拉）→ tool_diagnostics 返 Err → helper 降级 []。
+    /// - 场景 B：根路径不存在 / 完全无法解析 → resolve_lang_for_file / 早期错误
+    ///   路径 → helper 降级 []。
+    /// - 场景 C：合法且无错误 → 无 items → helper 返回 []（is_empty）。
+    #[tokio::test]
+    async fn post_diag_for_write_degrades_on_each_failure_mode() {
+        let sup = Supervisor::direct().await.expect("supervisor");
+
+        // 场景 A：根路径不存在 → session_for 失败（要么 resolve_lang 失败，
+        // 要么 launch 抛 ToolError::NotInstalled）。helper 必须降级 []。
+        let bad_root = std::path::PathBuf::from("Z:/nonexistent_for_test_xyz_42");
+        let a = sup
+            .post_diag_for_write(&bad_root, "x.rs", Some("rust"))
+            .await;
+        assert!(a.is_empty(), "root 不存在 → 必须降级为空数组");
+
+        // 场景 B：root 存在但 lang 完全无法解析（未装 LS + 无 override 路径探测
+        // 也未命中）→ tool_diagnostics 返 Err → helper 降级 []。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let b = sup
+            .post_diag_for_write(
+                tmp.path(),
+                "no_extension_file_with_unknown_lang_qq",
+                Some("__definitely_not_a_real_lang__"),
+            )
+            .await;
+        assert!(b.is_empty(), "lang 无法解析 → 必须降级为空数组");
+
+        // 场景 C：合法 + 文件不存在 → 走 session_for + ensure_open 路径。
+        // 写工具超时/失败兜底 helper 验证降级；LS 未拉起场景下 helper 也必须返 []。
+        let c = sup
+            .post_diag_for_write(tmp.path(), "does_not_exist_xyz_42.rs", Some("rust"))
+            .await;
+        assert!(c.is_empty(), "文件不存在 → 必须降级为空数组");
     }
 }
 // ============================================================================
