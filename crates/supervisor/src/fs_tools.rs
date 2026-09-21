@@ -238,3 +238,56 @@ pub fn find_file(
     }
     Ok(out)
 }
+
+/// 注释行判定：按文件扩展名查注释前缀表，匹配即注释。
+///
+/// ponytail: 不用 AST——粗滤够用，AST 让 LSP 做。命中=0 时返空数组；命中=1 也可能误判，
+/// AI 看到命中行会自检。12+ 语言注释风格覆盖：// /* * # -- """ ''' <!-- % %% ; 。
+pub fn looks_like_comment(file: &str, line_text: &str) -> bool {
+    let trimmed = line_text.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let ext = std::path::Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let prefixes: &[&str] = match ext {
+        "rs" | "js" | "ts" | "jsx" | "tsx" | "go" | "java" | "cs" | "cpp" | "cc" | "cxx" | "c"
+        | "h" | "hpp" | "swift" | "kt" | "scala" => &["//", "/*", "*"],
+        "py" | "rb" | "sh" | "yaml" | "yml" | "toml" | "conf" => &["#"],
+        "lua" => &["--"],
+        "sql" => &["--", "/*"],
+        "html" | "xml" | "vue" | "svelte" => &["<!--"],
+        "tex" | "matlab" | "m" => &["%"],
+        "lisp" | "clj" => &[";"],
+        _ => &["//", "#", "--", "/*", "*", "<!--", "%"],
+    };
+    prefixes.iter().any(|p| trimmed.starts_with(p))
+}
+
+#[cfg(test)]
+mod comment_tests {
+    use super::looks_like_comment;
+
+    #[test]
+    fn looks_like_comment_recognizes_major_languages() {
+        assert!(looks_like_comment("a.rs", "// todo: refactor"));
+        assert!(looks_like_comment("a.rs", "/* block */"));
+        assert!(looks_like_comment("a.rs", " * continued block"));
+        assert!(looks_like_comment("a.py", "# comment"));
+        assert!(looks_like_comment("a.lua", "-- comment"));
+        assert!(looks_like_comment("a.html", "<!-- comment -->"));
+        assert!(looks_like_comment("a.sql", "-- comment"));
+        assert!(looks_like_comment("a.tex", "% note"));
+        // 反例：代码行不算注释。
+        assert!(!looks_like_comment("a.rs", "fn main() {}"));
+        assert!(!looks_like_comment("a.py", "def foo():"));
+        assert!(!looks_like_comment("a.lua", "local x = 1"));
+        assert!(!looks_like_comment("a.html", "<div>TODO</div>"));
+        assert!(!looks_like_comment("a.sql", "SELECT 1"));
+        // 空行/未知扩展名 fallback。
+        assert!(!looks_like_comment("a.rs", "   "));
+        assert!(looks_like_comment("a.unknown", "# shebang-ish"));
+    }
+}

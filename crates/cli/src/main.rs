@@ -156,6 +156,9 @@ enum Cmd {
         /// 最大结果数。
         #[arg(long, default_value_t = 100)]
         max_results: u32,
+        /// 仅保留注释行命中（I：--comments-only）。
+        #[arg(long, default_value_t = false)]
+        comments_only: bool,
         /// 大小写敏感（默认不敏感）。
         #[arg(long, default_value_t = false)]
         case_sensitive: bool,
@@ -1031,6 +1034,7 @@ async fn forward(
             pattern,
             path_glob,
             max_results,
+            comments_only,
             case_sensitive,
         }) => (
             "search",
@@ -1038,6 +1042,7 @@ async fn forward(
                 "pattern": pattern,
                 "path_glob": path_glob,
                 "max_results": max_results,
+                "comments_only": comments_only,
                 "case_sensitive": case_sensitive,
             }),
         ),

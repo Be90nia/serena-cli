@@ -4362,6 +4362,15 @@ impl SupervisorTrait for Supervisor {
                 let mut resp = self
                     .tool_search_for_pattern(root, pattern, path_glob, max_results, case_sensitive)
                     .await?;
+                // I（§11-I）：--comments-only 注释行过滤，先滤后 enrich 省 LSP 缓存查询。
+                let comments_only = args
+                    .get("comments_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if comments_only {
+                    resp.hits
+                        .retain(|h| fs_tools::looks_like_comment(&h.file, &h.text));
+                }
                 // A（§10-A）：命中带所属符号；装饰失败静默（该字段留 None）。
                 enrich_search_with_symbols(self, root, &mut resp.hits, lang).await;
                 serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
@@ -6312,6 +6321,48 @@ mod search_filter_tests {
             files.contains(&"a.rs"),
             "应扫到真代码文件，实际命中: {files:?}"
         );
+    }
+
+    /// I（§11-I）：execute_tool("search", comments_only=true) 只留注释行；
+    /// 默认（false）形态不变，代码行照常返回。
+    #[tokio::test]
+    async fn search_filters_to_comments_only() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("a.rs"),
+            "// TODO: foo\nfn foo() {}\n// foo done\n",
+        )
+        .unwrap();
+
+        let all = sup
+            .execute_tool(
+                "search",
+                &root.to_string_lossy(),
+                serde_json::json!({ "pattern": "foo" }),
+                None,
+            )
+            .await
+            .expect("default search ok");
+        let all_hits = all["hits"].as_array().unwrap();
+        assert!(all_hits.len() >= 2, "默认形态应含代码+注释，实际: {all_hits:?}");
+
+        let filtered = sup
+            .execute_tool(
+                "search",
+                &root.to_string_lossy(),
+                serde_json::json!({ "pattern": "foo", "comments_only": true }),
+                None,
+            )
+            .await
+            .expect("comments-only search ok");
+        let hits = filtered["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "应只留 2 行注释，实际: {hits:?}");
+        assert!(hits.iter().all(|h| fs_tools::looks_like_comment(
+            h["file"].as_str().unwrap(),
+            h["text"].as_str().unwrap()
+        )));
     }
 }// ============================================================================
 // Phase 1 · 13 wrapper 测试（纯 LSP 协议层；不拉 LS / 不依赖 fix-ls-adapters）
