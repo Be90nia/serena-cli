@@ -4264,7 +4264,21 @@ impl SupervisorTrait for Supervisor {
                 let hits = self
                     .tool_referencing_symbols(root, &file, line, col, lang)
                     .await?;
-                Ok(ref_symbol_hits_envelope(&hits, compact))
+                let grouped = args
+                    .get("grouped")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if grouped {
+                    let page = args.get("page").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                    let page_size = args
+                        .get("page_size")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(20) as usize;
+                    let report = ref_tools::group_refs(hits, page, page_size);
+                    serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
+                } else {
+                    Ok(ref_symbol_hits_envelope(&hits, compact))
+                }
             }
             "find-referencing-code-snippets" => {
                 let (file, line, col) = required_position(&args)?;

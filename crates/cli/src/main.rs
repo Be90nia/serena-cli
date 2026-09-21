@@ -147,7 +147,18 @@ enum Cmd {
         name_pattern: String,
     },
     /// 所有引用 + 每个 ref 落在哪个外层符号里。line/col 为 0-based。
-    FindReferencingSymbols { file: String, line: u32, col: u32 },
+    FindReferencingSymbols {
+        file: String,
+        line: u32,
+        col: u32,
+        /// 按 (container, file) 分桶聚合 + 翻页（ai-token §10-C）。
+        #[arg(long)]
+        grouped: bool,
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+        #[arg(long, default_value_t = 20)]
+        page_size: usize,
+    },
     /// 所有引用 + 每个 ref 前后 N 行。line/col 为 0-based。
     FindReferencingCodeSnippets {
         file: String,
@@ -1006,9 +1017,23 @@ async fn forward(
         Some(Cmd::FindFile { name_pattern }) => {
             ("find-file", json!({"name_pattern": name_pattern}))
         }
-        Some(Cmd::FindReferencingSymbols { file, line, col }) => (
+        Some(Cmd::FindReferencingSymbols {
+            file,
+            line,
+            col,
+            grouped,
+            page,
+            page_size,
+        }) => (
             "find-referencing-symbols",
-            json!({"file": file, "line": line, "col": col}),
+            json!({
+                "file": file,
+                "line": line,
+                "col": col,
+                "grouped": grouped,
+                "page": page,
+                "page_size": page_size,
+            }),
         ),
         Some(Cmd::FindReferencingCodeSnippets {
             file,

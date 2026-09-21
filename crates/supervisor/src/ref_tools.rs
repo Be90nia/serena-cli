@@ -234,6 +234,67 @@ pub async fn find_referencing_symbols(
     Ok(out)
 }
 
+/// 单个分组容器：相同 (container_name, file) 的 refs 聚合。
+#[derive(Debug, Serialize)]
+pub struct RefGroup {
+    /// 外层符号名（类/方法/函数名）。顶层时为空字符串（与 RefSymbolHit 语义一致）。
+    pub container: String,
+    pub file: String,
+    pub count: usize,
+    /// 容器下前 3 条 ref 样本（保留完整 RefSymbolHit 字段）。
+    pub samples: Vec<RefSymbolHit>,
+}
+
+/// `find-referencing-symbols --grouped` 的分组翻页报告。
+#[derive(Debug, Serialize)]
+pub struct GroupedRefReport {
+    /// 原始 ref 总数（未分页）。
+    pub total: usize,
+    /// 全部 group 数（未分页）。
+    pub group_count: usize,
+    /// 1-based 当前页号。
+    pub page: usize,
+    pub page_size: usize,
+    pub groups: Vec<RefGroup>,
+}
+
+/// 按 (container_name, file) 分桶聚合：每桶保留前 3 条样本，按 BTreeMap 排序保证
+/// 跨页顺序稳定；page/page_size 1-based 翻页（page 越界返回空 groups）。
+///
+/// ponytail: 单次 in-memory 分桶；hits 万级以下足够。再大需要外部 sort。
+pub fn group_refs(hits: Vec<RefSymbolHit>, page: usize, page_size: usize) -> GroupedRefReport {
+    use std::collections::BTreeMap;
+    let total = hits.len();
+    let mut buckets: BTreeMap<(String, String), Vec<RefSymbolHit>> = BTreeMap::new();
+    for h in hits {
+        let key = (h.container_name.clone(), h.file.clone());
+        buckets.entry(key).or_default().push(h);
+    }
+    let all_groups: Vec<RefGroup> = buckets
+        .into_iter()
+        .map(|((container, file), mut hits)| {
+            let count = hits.len();
+            hits.truncate(3);
+            RefGroup {
+                container,
+                file,
+                count,
+                samples: hits,
+            }
+        })
+        .collect();
+    let group_count = all_groups.len();
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let groups: Vec<RefGroup> = all_groups.into_iter().skip(start).take(page_size).collect();
+    GroupedRefReport {
+        total,
+        group_count,
+        page,
+        page_size,
+        groups,
+    }
+}
+
 pub async fn find_referencing_code_snippets(
     session: &Arc<Session>,
     root: &Path,
@@ -297,4 +358,79 @@ pub async fn find_referencing_code_snippets(
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(file: &str, container: &str, line: u32, col: u32) -> RefSymbolHit {
+        RefSymbolHit {
+            file: file.into(),
+            line,
+            col,
+            container_name: container.into(),
+        }
+    }
+
+    #[test]
+    fn group_refs_aggregates_by_container_and_file() {
+        let hits = vec![
+            hit("a.rs", "Foo", 1, 0),
+            hit("a.rs", "Foo", 2, 0),
+            hit("b.rs", "Foo", 3, 0),
+            hit("a.rs", "Bar", 4, 0),
+            hit("c.rs", "", 5, 0),
+        ];
+        let r = group_refs(hits, 1, 20);
+        assert_eq!(r.total, 5);
+        // 4 buckets: (Foo,a), (Foo,b), (Bar,a), (None-as-empty,c)
+        assert_eq!(r.group_count, 4);
+        // BTreeMap key (String,String) 排序：空串 "" 排在所有非空前 → 第一组
+        assert!(r.groups[0].container.is_empty());
+        assert_eq!(r.groups[0].file, "c.rs");
+        assert_eq!(r.groups[0].count, 1);
+        // (Foo, a) 桶：2 条
+        let foo_a = r
+            .groups
+            .iter()
+            .find(|g| g.container == "Foo" && g.file == "a.rs")
+            .expect("Foo/a bucket");
+        assert_eq!(foo_a.count, 2);
+    }
+
+    #[test]
+    fn group_refs_pagination_works() {
+        // 50 个不同 (container,file) → 50 groups；page_size=20 → 20/20/10。
+        let mk = || -> Vec<RefSymbolHit> {
+            (0..50)
+                .map(|i| hit(&format!("f{i}.rs"), &format!("C{i}"), i, 0))
+                .collect()
+        };
+        let p1 = group_refs(mk(), 1, 20);
+        let p2 = group_refs(mk(), 2, 20);
+        let p3 = group_refs(mk(), 3, 20);
+        assert_eq!(p1.group_count, 50);
+        assert_eq!(p1.groups.len(), 20);
+        assert_eq!(p2.groups.len(), 20);
+        assert_eq!(p3.groups.len(), 10);
+        // 翻页互不重叠 + 顺序稳定（BTreeMap key 已保序）
+        assert_ne!(p1.groups[0].file, p2.groups[0].file);
+        assert_ne!(p2.groups[0].file, p3.groups[0].file);
+    }
+
+    #[test]
+    fn samples_capped_at_three_per_group() {
+        let hits: Vec<RefSymbolHit> = (0..10)
+            .map(|i| hit("x.rs", "C", i, 0))
+            .collect();
+        let r = group_refs(hits, 1, 20);
+        assert_eq!(r.group_count, 1);
+        assert_eq!(r.groups[0].count, 10);
+        assert_eq!(r.groups[0].samples.len(), 3);
+        // sample 保留前 3 条
+        assert_eq!(r.groups[0].samples[0].line, 0);
+        assert_eq!(r.groups[0].samples[1].line, 1);
+        assert_eq!(r.groups[0].samples[2].line, 2);
+    }
 }
