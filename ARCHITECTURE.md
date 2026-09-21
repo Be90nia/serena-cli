@@ -270,7 +270,7 @@ flowchart TB
 ```
 
 - **读并行**：`find-symbol/refs/def/hover/overview` 直接并发调用 Session —— LSP 请求天然并发（DESIGN §3.1），Session 内部无全局长锁（§3.2 拓扑）。
-- **in_flight 挂点与 LRU 全忙策略**：`in_flight` 由 supervisor 在工具入口/出口增减，**读工具同样计数**——reaper 卸载与 ShutdownDraining 的 `in_flight==0` 前置依赖它。LRU 驱逐遇候选全部 in-flight>0 时允许临时超 `max_loaded_ls`（新实例照起），reaper 下轮巡检再驱逐收敛。
+- **in_flight 挂点与 LRU 全忙策略**：`in_flight` 挂 daemon `AppState`（`crates/daemon/src/http.rs`），由 http 层在工具请求通过 draining 检查后增减（`tools_post` 入口 +1 / 响应返回 -1），drain 窗口排空判据用它；`draining` 期间新请求直接 503 `DAEMON_DRAINING` 不计数。LRU 驱逐遇候选全部 in-flight>0 时允许临时超 `max_loaded_ls`（新实例照起），reaper 下轮巡检再驱逐收敛。（`↖ 挂点修订: bd serena-rust-7hq drain 窗口显式化，计数落在 http 层而非 supervisor`）
 - **写互斥**：DESIGN §3.1 的"全局互斥队列"落地为 supervisor 内**一把全局 `tokio::sync::Mutex`**。tokio Mutex 本身 FIFO 公平，等待者天然排队，不需要独立的队列数据结构。`ponytail: 全局单写门，若未来证明同文件高频并发写是热点，再按 project_root 分键`
 - **写事务的持锁范围**（工具：`replace-body`；客户端只传符号名）：acquire 门 → **锁内**经 documentSymbol 解析符号 range（杜绝客户端 range 过期）→ 读盘 + content-hash 对账 → 临时文件写 + rename（`tempfile` 原子写，共享冲突重试 5×50ms，I5）→ **读回 diff 校验，不符则从写前临时副本回滚并报 `WRITE_CONFLICT`**（DESIGN C3 ③）→ `didChange` 全量同步 → 等诊断代际推进（§3.4，带 2s 超时，超时不回滚只告警）→ 失效 symbol 缓存 → release。**盘上内容与 LSP 已知内容 fingerprint 不符时拒绝执行**（§6.3）——这是两个子代理先后写同一文件的防线。
 - **per-key 加载门**：`Entry.load_gate: Arc<tokio::sync::Mutex<()>>`，防止同 key 并发冷启动双拉 LS（`↖ mirror（形态）: serena project_server.py 的 per-root 加载锁`）。

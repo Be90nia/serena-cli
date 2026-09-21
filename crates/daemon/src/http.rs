@@ -38,11 +38,36 @@ pub struct AppState {
     /// /shutdown 触发：axum::serve.with_graceful_shutdown 等此 Notify。
     /// 一拍即过（notify_waiters 一次性广播）。
     pub shutdown_notify: Arc<tokio::sync::Notify>,
+    /// 正在执行的工具请求数（tools_post 通过 draining 检查后 +1，返回前 -1）。
+    /// drain 窗口的排空判据。
+    pub in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// drain 窗口上限：/shutdown 后保持 listener 可接受、新请求拿
+    /// 503 DAEMON_DRAINING 的时长（生产 2s；测试注入短值）。
+    pub drain_window: std::time::Duration,
 }
 
 impl AppState {
     pub fn uptime_secs(&self) -> u64 {
         self.start_ts.elapsed().as_secs()
+    }
+
+    /// drain 排空等待：in-flight 持续归零（quiet 期）或窗口尽先走。
+    /// /shutdown 与 reaper 收尾共用。quiet 期防并发请求间隙的瞬时归零
+    /// 被误判为排空（20 worker 请求间隙 ~ms 级，竞速归零会让 daemon
+    /// 在请求洪水中提前自杀）。
+    pub async fn wait_drain(&self) {
+        use std::time::Duration;
+        let deadline = std::time::Instant::now() + self.drain_window;
+        let quiet = Duration::from_millis(500);
+        let mut last_busy = std::time::Instant::now();
+        while std::time::Instant::now() < deadline {
+            if self.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                last_busy = std::time::Instant::now();
+            } else if last_busy.elapsed() >= quiet {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
 
@@ -103,17 +128,18 @@ async fn tools_post(
             [("Retry-After", "10")],
             Json(json!({
                 "ok": false,
-                "error": {"code": "SHUTTING_DOWN", "message": "daemon in ShutdownDraining; refusing new requests"}
+                "error": {"code": "DAEMON_DRAINING", "message": "daemon in ShutdownDraining; refusing new requests", "retryable": false}
             })),
         )
             .into_response();
     }
+    state.in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     crate::reaper::note_activity();
 
     // 记录最近请求的 project_root（供 /status 观察；不区分成败，只要请求到达）。
     *state.active_project.lock().unwrap() = Some(req.project_root.clone());
 
-    match state
+    let resp = match state
         .supervisor
         .execute_tool(&name, &req.project_root, req.args, req.lang.as_deref())
         .await
@@ -135,7 +161,9 @@ async fn tools_post(
             };
             (status, Json(serde_json::to_value(&resp).unwrap())).into_response()
         }
-    }
+    };
+    state.in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    resp
 }
 
 async fn status_get(State(state): State<AppState>) -> Response {
@@ -157,11 +185,23 @@ async fn status_get(State(state): State<AppState>) -> Response {
 }
 
 async fn shutdown_post(State(state): State<AppState>) -> Response {
-    state
-        .draining
-        .store(true, std::sync::atomic::Ordering::Release);
-    // 触发 axum::serve.with_graceful_shutdown：notify_waiters 一次性广播给所有 waiter。
-    state.shutdown_notify.notify_waiters();
+    // 幂等：重复 /shutdown（stop-all 重试）不叠加 drain 窗口。
+    if state.draining.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return (
+            StatusCode::OK,
+            Json(json!({"ok": true, "message": "already draining"})),
+        )
+            .into_response();
+    }
+    // drain 窗口后台跑：notify_waiters 延迟到窗口尽才发——axum 未收到通知前
+    // 持续 accept，窗口内新请求在 tools_post 拿 503 DAEMON_DRAINING（客户端
+    // 可区分「daemon 在拒绝」vs「已死」）。handler 立即返回：CLI stop-all 对
+    // 管理命令只有 3s 超时，不能挂 2s 窗口。
+    let st = state.clone();
+    tokio::spawn(async move {
+        st.wait_drain().await;
+        st.shutdown_notify.notify_waiters();
+    });
     (
         StatusCode::OK,
         Json(json!({"ok": true, "message": "draining set; will exit when in-flight drains"})),
@@ -201,6 +241,8 @@ mod tests {
     /// 跨 .await 拿闭包、call 一次即丢。
     #[allow(clippy::type_complexity)]
     struct MockSupervisor {
+        /// execute_tool 前的延迟：模拟慢工具，供 in-flight 计数断言。
+        delay: Option<std::time::Duration>,
         result: tokio::sync::Mutex<
             Option<Box<dyn FnOnce() -> Result<serde_json::Value, supervisor::ToolError> + Send>>,
         >,
@@ -209,12 +251,20 @@ mod tests {
     impl MockSupervisor {
         fn ok(data: serde_json::Value) -> Self {
             Self {
+                delay: None,
                 result: tokio::sync::Mutex::new(Some(Box::new(move || Ok(data)))),
             }
         }
         fn err(e: supervisor::ToolError) -> Self {
             Self {
+                delay: None,
                 result: tokio::sync::Mutex::new(Some(Box::new(move || Err(e)))),
+            }
+        }
+        fn slow(data: serde_json::Value, delay: std::time::Duration) -> Self {
+            Self {
+                delay: Some(delay),
+                result: tokio::sync::Mutex::new(Some(Box::new(move || Ok(data)))),
             }
         }
     }
@@ -228,6 +278,9 @@ mod tests {
             _args: serde_json::Value,
             _lang: Option<&str>,
         ) -> Result<serde_json::Value, supervisor::ToolError> {
+            if let Some(d) = self.delay {
+                tokio::time::sleep(d).await;
+            }
             let f = self.result.lock().await.take().expect("mock called once");
             f()
         }
@@ -249,6 +302,8 @@ mod tests {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_project: Arc::new(std::sync::Mutex::new(None)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drain_window: std::time::Duration::from_millis(100),
         }
     }
 
@@ -379,17 +434,23 @@ mod tests {
             .unwrap();
         let (status, _) = oneshot_json(r.clone(), req).await;
         assert_eq!(status, AxStatus::OK);
-        // 2) 再请求工具：应 503
-        let (status, _) = oneshot_json(
-            r,
-            req_post(
+        // 2) 再请求工具：503 + 可区分信号（transport 层 code，非 9 工具错误码）。
+        let resp = r
+            .oneshot(req_post(
                 "/tools/overview",
                 Some("secret"),
                 json!({"project_root": "D:/x", "args": {}}),
-            ),
-        )
-        .await;
-        assert_eq!(status, AxStatus::SERVICE_UNAVAILABLE);
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), AxStatus::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("Retry-After").unwrap(), "10");
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["error"]["code"], "DAEMON_DRAINING");
+        assert_eq!(body["error"]["retryable"], false);
     }
 
     #[tokio::test]
@@ -397,5 +458,85 @@ mod tests {
         let st = state("secret", MockSupervisor::ok(json!(null)));
         let (status, _) = oneshot_json(router(st), req_get("/no-such-path", Some("secret"))).await;
         assert_eq!(status, AxStatus::NOT_FOUND);
+    }
+
+    /// drain 窗口核心语义：无 in-flight 时 quiet 期（500ms）满即 notify（不傻等窗口）。
+    #[tokio::test]
+    async fn shutdown_notifies_immediately_when_no_inflight() {
+        let mut st = state("secret", MockSupervisor::ok(json!(null)));
+        // 窗口设 5s：若实现错误地等满窗口，下面的 2s timeout 必失败。
+        st.drain_window = std::time::Duration::from_secs(5);
+        let notify = st.shutdown_notify.clone();
+        let waiter = tokio::spawn(async move {
+            notify.notified().await;
+            true
+        });
+        let req = Request::post("/shutdown")
+            .header("X-Serena-Token", "secret")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = oneshot_json(router(st), req).await;
+        assert_eq!(status, AxStatus::OK);
+        let fired = tokio::time::timeout(std::time::Duration::from_secs(2), waiter).await;
+        assert!(
+            fired.is_ok(),
+            "无 in-flight 时 notify 应在 quiet 期（500ms）后发出，不等满窗口"
+        );
+    }
+
+    /// in-flight 未排空时 notify 必须推迟到窗口尽（窗口内新请求拿 503
+    /// DAEMON_DRAINING 而非 connection refused 的前提）。
+    #[tokio::test]
+    async fn shutdown_defers_notify_until_inflight_drains() {
+        let mut st = state("secret", MockSupervisor::ok(json!(null)));
+        st.drain_window = std::time::Duration::from_millis(200);
+        st.in_flight
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let notify = st.shutdown_notify.clone();
+        let mut waiter = tokio::spawn(async move {
+            notify.notified().await;
+            true
+        });
+        let req = Request::post("/shutdown")
+            .header("X-Serena-Token", "secret")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = oneshot_json(router(st), req).await;
+        assert_eq!(status, AxStatus::OK);
+        // 窗口（200ms）内不得提前 notify。
+        let early = tokio::time::timeout(std::time::Duration::from_millis(80), &mut waiter).await;
+        assert!(early.is_err(), "in-flight 未归零时 notify 必须推迟到窗口尽");
+        let fired = tokio::time::timeout(std::time::Duration::from_secs(2), waiter).await;
+        assert!(fired.is_ok(), "窗口尽后必须 notify");
+    }
+
+    /// 真实计数路径：请求执行中 in_flight==1，完成后归零。
+    #[tokio::test]
+    async fn inflight_tracks_active_tool_call() {
+        let st = state(
+            "secret",
+            MockSupervisor::slow(json!(null), std::time::Duration::from_millis(100)),
+        );
+        let counter = st.in_flight.clone();
+        let handle = tokio::spawn(oneshot_json(
+            router(st),
+            req_post(
+                "/tools/overview",
+                Some("secret"),
+                json!({"project_root": "D:/x", "args": {}}),
+            ),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "执行中 in_flight 应为 1"
+        );
+        let _ = handle.await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "完成后 in_flight 应归零"
+        );
     }
 }

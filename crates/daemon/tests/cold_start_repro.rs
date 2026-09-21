@@ -61,6 +61,8 @@ async fn cold_start_overview_via_daemon_http() {
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         active_project: Arc::new(std::sync::Mutex::new(None)),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        drain_window: std::time::Duration::from_secs(2),
     };
     let app = daemon::http::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

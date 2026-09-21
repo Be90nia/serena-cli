@@ -82,6 +82,11 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         active_project: Arc::new(Mutex::new(None)),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        // 15s：上限而非固定窗——in-flight 归零即退（空载秒退）。压测 20
+        // 并发的残余请求流 ~10-12s，10s 上限时窗口外仍有 ~17% refused；
+        // 15s 把 stop-all 触发后仍在途的请求基本都覆盖成 503 DAEMON_DRAINING。
+        drain_window: std::time::Duration::from_secs(15),
     };
 
     // reaper 常驻：draining → 删 lock → 卸 LS。lock 归属戳 (path, boot_ms)

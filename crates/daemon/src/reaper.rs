@@ -3,8 +3,8 @@
 //! 常驻 tokio task，30s 巡检（测试可调到 100ms 级）：
 //! - 单 LS 10min 未用 → 卸载
 //! - 超 `max_loaded_ls=3` → LRU 驱逐（卸最久未用的）
-//! - 全局 15min 空闲 → ShutdownDraining：503 + Retry-After → 等 in-flight ≤10s
-//!   → 逐 LS shutdown（单 LS 5s 超时转 kill）→ 删 lock → exit 0
+//! - 全局 15min 空闲 → ShutdownDraining：503 + Retry-After（http 层）→
+//!   删 lock → exit 0（排空窗口由 http 层 wait_drain 承担，此处不重复等）
 //!
 //! ponytail: 全部状态复用 supervisor.last_used + daemon AppState.draining，
 //! 不另建 reaper 私有状态表。
@@ -82,7 +82,7 @@ async fn reaper_loop(
 
         // 已在 draining：走收尾并退出 task（进程随后自然退出）。
         if state.draining.load(Ordering::Acquire) {
-            finish_shutdown(&sup, &state, &lock).await;
+            finish_shutdown(&state, &lock).await;
             return;
         }
 
@@ -105,7 +105,7 @@ async fn reaper_loop(
         if now.duration_since(newest) >= iv.global_idle {
             tracing::info!("global idle reached; entering ShutdownDraining");
             state.draining.store(true, Ordering::Release);
-            finish_shutdown(&sup, &state, &lock).await;
+            finish_shutdown(&state, &lock).await;
             return;
         }
 
@@ -131,7 +131,7 @@ async fn reaper_loop(
     }
 }
 
-/// ShutdownDraining 收尾：等排空窗口 → 逐 LS shutdown → 删 lock → 强退进程。
+/// ShutdownDraining 收尾：删 lock → 强退进程（排空窗口在 http 层已给过）。
 ///
 /// 末尾 `std::process::exit(0)` 是必需的：Windows 下 `cli --daemon` 走
 /// `CREATE_NEW_PROCESS_GROUP` + stdin/stdout→NULL 启动，tokio runtime 的
@@ -139,34 +139,32 @@ async fn reaper_loop(
 /// 残留；`process::exit` 直接终止并跳过 drop，等同 systemd / svchost 的
 /// SIGTERM-then-SIGKILL 语义（ARCH §3.2）。
 async fn finish_shutdown(
-    sup: &Arc<Supervisor>,
     state: &AppState,
     lock: &Option<(std::path::PathBuf, u128)>,
 ) {
-    shutdown_cleanup(sup, state, lock).await;
+    shutdown_cleanup(state, lock).await;
     // cfg(not(test))：单测里 reaper_loop 走 finish_shutdown 时不强退——
     // 会把整个测试 binary 拽下来。生产 build 始终带这段。
     #[cfg(not(test))]
     std::process::exit(0);
 }
 
-/// ShutdownDraining 可单测的核心清理：sleep 排空 → evict LS → 删 lock → notify。
+/// ShutdownDraining 可单测的核心清理：删 lock → notify（进程随后强退）。
 ///
 /// 从 `finish_shutdown` 抽出，让测试能断言"删 lock / notify 都做了"而不触发
 /// `process::exit`（强退会拽走测试 binary）。
 pub(crate) async fn shutdown_cleanup(
-    sup: &Arc<Supervisor>,
     state: &AppState,
     lock: &Option<(std::path::PathBuf, u128)>,
 ) {
-    // ponytail: in-flight 精确计数需要 http 层埋点；M1 用 draining 拒新 +
-    // 固定 1s 排空窗口近似。正确性由 A6 双实例容忍兜底。
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // 逐 LS shutdown（单 LS 5s 超时转 kill 在 Session::shutdown 内部实现）。
-    for (key, _) in sup.loaded_entries() {
-        let _ = tokio::time::timeout(Duration::from_secs(5), sup.evict(&key)).await;
-    }
+    // 不逐 LS evict、不再等 in-flight：两条调用路径（/shutdown、idle 15min）
+    // 的排空窗口都已在 http 层给过（wait_drain），且最终都以 process::exit(0)
+    // 收场——Windows Job 句柄随进程关闭带崩整个 LS 树（ARCH §3.2），优雅
+    // evict（最长 5s/LS）只会把「listener 已停 accept、进程未退」的黑洞窗口
+    // 拉长到 5s+，客户端既拿不到 503 也拿不到 refused。窗口尽仍有慢
+    // in-flight（如冷索引的 16s 请求）就由下面的 process::exit 掐断，客户端
+    // 拿连接重置可重试（daemon 已退，重试 lazy-spawn 新 daemon）。优雅卸载
+    // LS 是 reaper 主循环单 LS 空闲路径的事。
 
     // 删 lock + 通知 axum（保险触发，shutdown_post 已 notify_waiters 过一次）。
     // 归属校验：drain 期间 lock 可能已被 lazy-spawn 的新 daemon 接管——
@@ -209,6 +207,9 @@ mod tests {
             draining: Arc::new(AtomicBool::new(false)),
             active_project: Arc::new(Mutex::new(None)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            // 短窗口：reaper 收尾测试不必等满生产 2s。
+            drain_window: Duration::from_millis(100),
         }
     }
 
@@ -281,8 +282,6 @@ mod tests {
     /// Notify，否则 daemon 会变僵尸（lock 删但进程不退 / 反之亦然）。
     #[tokio::test]
     async fn shutdown_cleanup_removes_lock_and_fires_notify() {
-        // 用真 Supervisor::direct() 空实例：loaded_entries() 空 → evict 循环 no-op。
-        let sup = Arc::new(Supervisor::direct().await.unwrap());
         let state = test_state();
         let tmp = tempfile::tempdir().expect("tempdir");
         let lock_path = tmp.path().join("daemon.lock");
@@ -295,8 +294,12 @@ mod tests {
             notify.notified().await;
             true
         });
+        // 确保 waiter 已挂起在 notified() 上：notify_waiters 只唤醒已等待者。
+        // （原先隐式依赖 cleanup 的固定排空 sleep 提供调度窗口；wait_drain
+        // 快路径 in_flight=0 立即返回，先行关系必须显式建立。）
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        shutdown_cleanup(&sup, &state, &Some((lock_path.clone(), own_boot))).await;
+        shutdown_cleanup(&state, &Some((lock_path.clone(), own_boot))).await;
 
         assert!(!lock_path.exists(), "shutdown_cleanup 必须删自有 lock");
         let res = tokio::time::timeout(Duration::from_secs(2), notified)
@@ -310,7 +313,6 @@ mod tests {
     /// 不再是自己）→ shutdown_cleanup 不得删除他人的 lock。
     #[tokio::test]
     async fn shutdown_cleanup_spares_taken_over_lock() {
-        let sup = Arc::new(Supervisor::direct().await.unwrap());
         let state = test_state();
         let tmp = tempfile::tempdir().expect("tempdir");
         let lock_path = tmp.path().join("daemon.lock");
@@ -323,7 +325,7 @@ mod tests {
         };
         lockfile::write_final(&lock_path, &taken).expect("write taken-over lock");
 
-        shutdown_cleanup(&sup, &state, &Some((lock_path.clone(), 42))).await;
+        shutdown_cleanup(&state, &Some((lock_path.clone(), 42))).await;
 
         assert!(lock_path.exists(), "易主 lock 必须保留，不得误删");
     }
