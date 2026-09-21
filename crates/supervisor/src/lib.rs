@@ -28,6 +28,7 @@ use lsp_core::init_params::supports_pull_diagnostics;
 use lsp_core::offsets::{OffsetEncoding, Position as LspPos};
 use lsp_core::session::Session;
 pub mod doctor;
+pub mod edit_context;
 pub mod edit_tools;
 pub mod fs_tools;
 pub mod root_finder;
@@ -4091,6 +4092,12 @@ impl SupervisorTrait for Supervisor {
                 let (file, symbol) = required_symbol_body_args(&args)?;
                 serde_json::to_value(self.tool_symbol_body(root, &file, &symbol, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "edit-context" => {
+                // B: 单次调用拿 body + callers + doc + tests（ai-token-features §10-B）。
+                let (file, symbol) = required_symbol_body_args(&args)?;
+                let report = crate::edit_context::collect(self, root, &file, &symbol, lang).await;
+                serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
             }
             "replace-body" => {
                 let (file, symbol, new_body) = required_replace_args(&args)?;

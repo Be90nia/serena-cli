@@ -162,6 +162,13 @@ enum Cmd {
     },
     /// 取符号体切片（position-free；documentSymbol 定位）。
     SymbolBody { file: String, symbol: String },
+    /// AI 编辑主路径聚合：单次返回 body + callers + doc + tests（ai-token §10-B）。
+    EditContext {
+        /// 目标文件（相对 root）。
+        file: String,
+        /// 符号名。
+        symbol: String,
+    },
     /// 替换符号体（写门 + hash 对账 + 原子写）。
     ReplaceBody {
         file: String,
@@ -820,6 +827,7 @@ fn autodetect_lang(cli: &Cli) -> Option<String> {
         Some(Cmd::FindReferencingSymbols { file, .. }) => Some(file),
         Some(Cmd::FindReferencingCodeSnippets { file, .. }) => Some(file),
         Some(Cmd::SymbolBody { file, .. }) => Some(file),
+        Some(Cmd::EditContext { file, .. }) => Some(file),
         Some(Cmd::Completion { file, .. }) => Some(file),
         Some(Cmd::ContainingSymbol { file, .. }) => Some(file),
         Some(Cmd::DefiningSymbol { file, .. }) => Some(file),
@@ -1014,6 +1022,9 @@ async fn forward(
         ),
         Some(Cmd::SymbolBody { file, symbol }) => {
             ("symbol-body", json!({"file": file, "symbol": symbol}))
+        }
+        Some(Cmd::EditContext { file, symbol }) => {
+            ("edit-context", json!({"file": file, "symbol": symbol}))
         }
         Some(Cmd::ReplaceBody {
             file,
