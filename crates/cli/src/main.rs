@@ -69,6 +69,15 @@ struct Cli {
     #[arg(long, global = true, value_name = "MS")]
     index_timeout: Option<u32>,
 
+    /// G（§10-G）：响应 token 预算（4 bytes ≈ 1 token，soft limit）。集合型响应超出
+    /// 时截断 items 并标 truncated:true（success 语义，退出码不变）。
+    #[arg(long, global = true, value_name = "N")]
+    max_tokens: Option<u64>,
+
+    /// G（§10-G）：签名压缩——删响应中 container/container_name/kind 冗余字段。
+    #[arg(long, global = true)]
+    compress: bool,
+
     /// 子命令；`--daemon` 模式下可省略。
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -1327,6 +1336,16 @@ async fn forward(
         && let Some(obj) = args.as_object_mut()
     {
         obj.insert("_delta".into(), serde_json::json!(true));
+    }
+    // G（§10-G）：--max-tokens/--compress → args 私有字段（supervisor 末尾统一
+    // 后处理消费；sanitize 不清，与 _compact/_delta 同套私有约定）。
+    if let Some(obj) = args.as_object_mut() {
+        if let Some(n) = cli.max_tokens {
+            obj.insert("_max_tokens".into(), serde_json::json!(n));
+        }
+        if cli.compress {
+            obj.insert("_compress".into(), serde_json::json!(true));
+        }
     }
     let body = json!({
         "project_root": project_root.to_string_lossy(),

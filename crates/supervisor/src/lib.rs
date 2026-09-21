@@ -3761,6 +3761,76 @@ fn sanitize_timeout_args(mut args: serde_json::Value) -> serde_json::Value {
     args
 }
 
+/// AI-token 特性 G（plan-g-budget.md §Task1 / ai-token-features-design §10-G）：
+/// 工具响应 token 预算护栏。超出预算则截断顶层 `items` 数组到最大可容纳条数，
+/// 并写入 `truncated: true` + `original_count`；未超预算零改动（返回 false）。
+/// 返回值 = 是否发生截断。截断是 **success 语义**（wire/退出码不变，仅加标志）。
+///
+/// 估算：4 字节 ≈ 1 token（BPE 粗略近似，soft limit）。
+/// delta 响应（有 `added`/`removed` 键）跳过截断——items 语义已归一为增量集，
+/// 按条截断会破坏增量对照关系，直接放行。
+///
+/// ponytail: 不做精确 BPE 计数——预算护栏是 soft limit，精确度不是核心。
+fn apply_budget(value: &mut serde_json::Value, max_tokens: usize) -> bool {
+    // J（§11-J）delta 形态：二选一集，跳过截断（见函数 doc）。
+    if value.get("added").is_some() || value.get("removed").is_some() {
+        return false;
+    }
+    let budget_bytes = max_tokens.saturating_mul(4);
+    let current_bytes = serde_json::to_vec(value).map(|v| v.len()).unwrap_or(0);
+    if current_bytes <= budget_bytes {
+        return false;
+    }
+    let Some(items) = value.get_mut("items").and_then(|v| v.as_array_mut()) else {
+        return false; // 无 items 数组的响应（标量/树形）不在预算护栏范围
+    };
+    let original_count = items.len();
+    // 二分查找预算内最大保留条数；+18 字节为 truncated/original_count 标志开销余量。
+    let mut lo = 0usize;
+    let mut hi = items.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let trial = serde_json::json!({ "items": &items[..mid] });
+        let trial_bytes = serde_json::to_vec(&trial).map(|v| v.len()).unwrap_or(0);
+        if trial_bytes + 18 <= budget_bytes {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    items.truncate(lo);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("truncated".into(), serde_json::json!(true));
+        obj.insert("original_count".into(), serde_json::json!(original_count));
+    }
+    true
+}
+
+/// AI-token 特性 G（§10-G）：签名压缩——递归删除 `container` / `container_name` /
+/// `kind` 三个"二级"冗余字段（保留 name + 位置）。截断/压缩与 `_compact`/`_delta`
+/// 同套私有约定（sanitize 不清）。按需未来扩展字段名单。
+fn apply_compress(value: &mut serde_json::Value) {
+    fn strip(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Array(arr) => {
+                for item in arr.iter_mut() {
+                    strip(item);
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                obj.remove("container");
+                obj.remove("container_name");
+                obj.remove("kind");
+                for sub in obj.values_mut() {
+                    strip(sub);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip(value);
+}
+
 fn required_file(args: &serde_json::Value) -> ToolResult<String> {
     args.get("file")
         .and_then(|v| v.as_str())
@@ -3956,7 +4026,7 @@ impl SupervisorTrait for Supervisor {
         // ponytail: 阈值 32 对应稳态 5~10 s 节流；测试直接调 reclaim_idle_buffers_once
         // 绕过阈值验证语义。
         let _reclaimed = self.reclaim_idle_buffers_once();
-        match tool {
+        let mut value: serde_json::Value = match tool {
             "overview" => {
                 let file = required_file(&args)?;
                 let raw = self.tool_overview(root, &file, lang).await?;
@@ -4633,7 +4703,19 @@ impl SupervisorTrait for Supervisor {
             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
             }),
+        }?;
+        // AI-token 特性 G（§10-G）：execute_tool 末尾统一后处理。_max_tokens 按预算
+        // 截断 items（4 bytes ≈ 1 token，soft limit）；_compress 删 container/kind
+        // 冗余字段。两者与 _compact/_delta 同套私有约定（sanitize 不清）。
+        // 偏离 plan：原建议逐分支改造为统一变量；实际 match 整体即 Result，
+        // `?` 一行收口零分支改动（11 特性已改动各分支，最小侵入）。
+        if let Some(max_tokens) = args.get("_max_tokens").and_then(|v| v.as_u64()) {
+            apply_budget(&mut value, max_tokens as usize);
         }
+        if args.get("_compress").and_then(|v| v.as_bool()).unwrap_or(false) {
+            apply_compress(&mut value);
+        }
+        Ok(value)
     }
 
     fn loaded_entries(&self) -> Vec<Key> {
@@ -6993,5 +7075,69 @@ mod search_symbol_tests {
         assert_eq!(container, None, "顶层符号容器应为 None（滤 flatten 自身名）");
         // L11 无覆盖 → None。
         assert!(find_covering_symbol(&syms, 11, 0).is_none());
+    }
+
+    // ==== AI-token 特性 G（§10-G）：budget 截断 + compress 字段清理 ====
+
+    #[test]
+    fn apply_budget_truncates_items_when_exceeded() {
+        let mut v = serde_json::json!({
+            "items": (0..100)
+                .map(|i| serde_json::json!({"name": format!("f{}", i), "container": "x"}))
+                .collect::<Vec<_>>(),
+        });
+        let truncated = apply_budget(&mut v, 50); // 50 tokens ≈ 200 bytes 预算
+        assert!(truncated, "超预算应发生截断");
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["original_count"], 100);
+        let kept = v["items"].as_array().unwrap().len();
+        assert!(kept < 100, "items 应被截短（实际保留 {kept}）");
+        assert!(kept >= 1, "预算 200 bytes 至少容得下 1 条");
+    }
+
+    #[test]
+    fn apply_budget_passes_through_when_under() {
+        let mut v = serde_json::json!({"items": [{"name": "x"}]});
+        let truncated = apply_budget(&mut v, 10000);
+        assert!(!truncated);
+        assert!(v.get("truncated").is_none(), "未超预算不得加标志");
+        assert!(v.get("original_count").is_none());
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "零改动");
+    }
+
+    #[test]
+    fn apply_budget_skips_delta_response() {
+        // J×G 交互：delta 增量形态（added/removed 二选一集）不参与按条截断。
+        let mut v = serde_json::json!({
+            "delta": true,
+            "added": (0..100).map(|i| serde_json::json!({"name": format!("f{}", i)}))
+                .collect::<Vec<_>>(),
+            "removed": [],
+        });
+        let truncated = apply_budget(&mut v, 10); // 远小于 payload
+        assert!(!truncated, "delta 响应跳过截断");
+        assert!(v.get("truncated").is_none());
+        assert_eq!(v["added"].as_array().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn apply_compress_removes_container_and_kind() {
+        let mut v = serde_json::json!({
+            "items": [
+                {"name": "x", "container": "Foo", "kind": "Function", "file": "a.rs"},
+                {"name": "y", "container_name": "Bar", "kind": "Method", "file": "b.rs"},
+            ],
+            "meta": {"kind": "summary", "file": "c.rs"},
+        });
+        apply_compress(&mut v);
+        let items = v["items"].as_array().unwrap();
+        assert!(items[0].get("container").is_none());
+        assert!(items[0].get("kind").is_none());
+        assert!(items[1].get("container_name").is_none());
+        assert_eq!(items[0]["name"], "x", "name 保留");
+        assert_eq!(items[0]["file"], "a.rs", "位置字段保留");
+        assert_eq!(items[1]["file"], "b.rs");
+        assert!(v["meta"].get("kind").is_none(), "递归删非 items 层的同名字段");
+        assert_eq!(v["meta"]["file"], "c.rs", "非目标字段不动");
     }
 }
