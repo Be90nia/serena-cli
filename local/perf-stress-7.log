@@ -1,0 +1,31 @@
+=== warmup (daemon hot from manual start) ===
+hot overview rc=0
+
+=== A: find-symbol (cache + signal TTL hot path) ===
+  warming find-symbol hot... ok
+find-symbol hot                  n=  30  err=1  p50=  78.20ms p95= 561.88ms p99= 569.38ms max= 569.38ms  rps= 8.37
+
+=== B: list-dir / find-file 替代 symbol-tree ===
+  warming list-dir .... ok
+list-dir .                       n=  30  err=0  p50= 102.23ms p95= 165.55ms p99= 313.42ms max= 313.42ms  rps= 9.01
+  warming find-file f0... ok
+find-file f0                     n=  30  err=1  p50=  67.69ms p95= 160.11ms p99= 699.18ms max= 699.18ms  rps= 9.93
+
+=== C: search 全仓 regex ===
+  warming search f0... ok
+search f0                        n=  20  err=3  p50= 111.53ms p95= 135.07ms p99= 135.07ms max= 135.07ms  rps= 9.87
+  warming search pub... ok
+search pub                       n=   5  err=0  p50=  74.92ms p95=  90.07ms p99=  90.07ms max=  90.07ms  rps=12.81
+
+=== D: overview 单文件 ===
+  warming overview lib.rs... ok
+overview lib.rs                  n=  30  err=2  p50=  62.20ms p95= 367.83ms p99= 369.33ms max= 369.33ms  rps= 9.61
+
+=== E: refs / def (LS 真实查询，需 FILE LINE COL) ===
+  warming def multiply... ok
+def multiply                     n=  30  err=4  p50=  57.64ms p95= 437.29ms p99= 644.78ms max= 644.78ms  rps= 8.51
+  warming refs multiply... ok
+refs multiply                    n=  30  err=0  p50=  45.06ms p95= 339.26ms p99= 354.01ms max= 354.01ms  rps=15.91
+
+=== cleanup ===
+stop-all sent
