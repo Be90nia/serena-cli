@@ -1342,6 +1342,10 @@ async fn forward(
     {
         obj.insert("_delta".into(), serde_json::json!(true));
     }
+    // H（§10-H）：--json → args._compact=false（supervisor 位置工具 envelope 消费；
+    // sanitize 不清，与 _delta/_max_tokens 同套私有约定）。默认（无 --json）不注入
+    // → 老 wire（紧凑形态）完全不变。
+    inject_compact_arg(&mut args, cli.json);
     // G（§10-G）：--max-tokens/--compress → args 私有字段（supervisor 末尾统一
     // 后处理消费；sanitize 不清，与 _compact/_delta 同套私有约定）。
     if let Some(obj) = args.as_object_mut() {
@@ -1837,6 +1841,19 @@ fn cmd_requests_delta(cmd: &Option<Cmd>) -> bool {
     )
 }
 
+/// H（§10-H）：`--json` → `args._compact=false`（supervisor 位置工具
+/// envelope 消费；sanitize 不清，与 `_delta` 同套私有约定）。非 object
+/// 形态静默跳过（同 `inject_timeout_args`）。`json_flag=false` 时不动 args
+/// —— 默认紧凑 wire 零变化。
+fn inject_compact_arg(args: &mut serde_json::Value, json_flag: bool) {
+    if !json_flag {
+        return;
+    }
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("_compact".into(), serde_json::json!(false));
+    }
+}
+
 /// Phase 4 基建 Task 22b：把 CLI flag `--request-timeout` / `--index-timeout` 注入
 /// `args._timeout_ms` / `args._index_timeout_ms` 私有字段（supervisor
 /// `execute_tool` 入口 `sanitize_timeout_args` 会清掉）。`args` 必须是 object
@@ -1850,5 +1867,28 @@ fn inject_timeout_args(args: &mut serde_json::Value, req_ms: Option<u32>, idx_ms
     }
     if let Some(ms) = idx_ms {
         obj.insert("_index_timeout_ms".into(), serde_json::json!(ms));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// --json：args 注入 `_compact=false`（supervisor envelope 走原始 LSP 形态）。
+    #[test]
+    fn json_flag_injects_compact_false() {
+        let mut args = json!({"file": "a.rs", "line": 1, "col": 2});
+        inject_compact_arg(&mut args, true);
+        assert_eq!(args["_compact"], serde_json::Value::Bool(false));
+        assert_eq!(args["file"], "a.rs"); // 原有 args 不丢
+    }
+
+    /// 无 --json：args 一字不动 → 默认紧凑 wire 零变化。
+    #[test]
+    fn no_json_flag_leaves_args_untouched() {
+        let mut args = json!({"file": "a.rs"});
+        inject_compact_arg(&mut args, false);
+        assert!(args.get("_compact").is_none());
+        assert_eq!(args, json!({"file": "a.rs"}));
     }
 }
