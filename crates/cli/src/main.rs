@@ -78,6 +78,11 @@ struct Cli {
     #[arg(long, global = true)]
     compress: bool,
 
+    /// d3a：编排 invocation id（UUID v4）。缺省自动生成；显式指定用于
+    /// 幂等重放与跨 agent 排障（daemon 重放日志按此索引）。
+    #[arg(long, global = true, value_name = "ID")]
+    invocation_id: Option<String>,
+
     /// 子命令；`--daemon` 模式下可省略。
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -1356,16 +1361,35 @@ async fn forward(
             obj.insert("_compress".into(), serde_json::json!(true));
         }
     }
+    // d3a：编排 envelope——invocation_id 来源 --invocation-id 覆写 > 自动生成
+    // （UUID v4，std 熵）。header + body envelope 双通道携带；daemon 按
+    // invocation_id 记重放日志（成功失败都记）。
+    let invocation_id = cli
+        .invocation_id
+        .clone()
+        .unwrap_or_else(daemon::http::new_invocation_id);
+    let envelope = daemon::dto::InvocationEnvelope {
+        invocation_id: invocation_id.clone(),
+        server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        protocol_version: Some(daemon::dto::WIRE_PROTOCOL_VERSION.to_string()),
+        compat_evidence: Some(daemon::dto::CompatEvidence {
+            env: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            protocol_version: daemon::dto::WIRE_PROTOCOL_VERSION.to_string(),
+            capabilities: vec![],
+        }),
+    };
     let body = json!({
         "project_root": project_root.to_string_lossy(),
         "args": args,
         "lang": lang,
+        "envelope": envelope,
     });
 
     let url = format!("{base}/tools/{tool}");
     let mut resp = client
         .post(&url)
         .header("X-Serena-Token", &*token)
+        .header("X-Invocation-Id", &invocation_id)
         .json(&body)
         .timeout(FORWARD_TIMEOUT)
         .send()
@@ -1379,6 +1403,7 @@ async fn forward(
         resp = client
             .post(&url)
             .header("X-Serena-Token", &*token)
+            .header("X-Invocation-Id", &invocation_id)
             .json(&body)
             .timeout(FORWARD_TIMEOUT)
             .send()

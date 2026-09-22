@@ -48,6 +48,15 @@ pub fn default_lock_path() -> PathBuf {
     }
 }
 
+/// 工具调用重放日志（d3a）：daemon.lock 同目录 `invocations.jsonl`。
+/// 行首键即 invocation_id，`grep <id> invocations.jsonl` 即索引。
+pub fn default_invocation_log_path() -> PathBuf {
+    default_lock_path()
+        .parent()
+        .map(|p| p.join("invocations.jsonl"))
+        .unwrap_or_else(|| PathBuf::from("invocations.jsonl"))
+}
+
 /// daemon serve 主入口。胜者才走到 axum::serve（阻塞直至 shutdown）。
 pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     // lock 父目录可能不存在（首次运行）。
@@ -73,16 +82,18 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         }
     };
 
-    let sup = Arc::new(Supervisor::direct().await?);
+let sup = Arc::new(Supervisor::direct().await?);
     let state = AppState {
         supervisor: sup.clone(),
         token: Arc::new(token),
         start_ts: Instant::now(),
         loaded_ls: Arc::new(Mutex::new(vec![])),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        active_project: Arc::new(Mutex::new(None)),
+        active_project: Arc::new(std::sync::Mutex::new(None)),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        // envelope 日志（d3a）：生产路径写 daemon.lock 同目录 invocations.jsonl。
+        invocation_log_path: default_invocation_log_path(),
         // 15s：上限而非固定窗——in-flight 归零即退（空载秒退）。压测 20
         // 并发的残余请求流 ~10-12s，10s 上限时窗口外仍有 ~17% refused；
         // 15s 把 stop-all 触发后仍在途的请求基本都覆盖成 503 DAEMON_DRAINING。

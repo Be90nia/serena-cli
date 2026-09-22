@@ -62,6 +62,8 @@ async fn cold_start_overview_via_daemon_http() {
         active_project: Arc::new(std::sync::Mutex::new(None)),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        // 空路径 = 不写 envelope 日志（压测探活不需要 d3a 重放索引）。
+        invocation_log_path: std::path::PathBuf::new(),
         drain_window: std::time::Duration::from_secs(2),
     };
     let app = daemon::http::router(state);

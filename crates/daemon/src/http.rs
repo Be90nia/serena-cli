@@ -45,6 +45,9 @@ pub struct AppState {
     /// drain 窗口上限：/shutdown 后保持 listener 可接受、新请求拿
     /// 503 DAEMON_DRAINING 的时长（生产 2s；测试注入短值）。
     pub drain_window: std::time::Duration,
+    /// 工具调用重放日志（d3a，JSONL 索引按 invocation_id）。空路径 = 不写
+    /// （不关心日志的测试用；生产由 serve 注入 default_invocation_log_path()）。
+    pub invocation_log_path: std::path::PathBuf,
 }
 
 impl AppState {
@@ -122,6 +125,7 @@ pub fn router(state: AppState) -> Router {
 async fn tools_post(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<crate::dto::ToolRequest>,
 ) -> Response {
     if state.draining.load(std::sync::atomic::Ordering::Acquire) {
@@ -130,34 +134,138 @@ async fn tools_post(
     state.in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     crate::reaper::note_activity();
 
+    // d3a：invocation_id 三级来源——body envelope > X-Invocation-Id header >
+    // 自动生成（向后兼容：老客户端两处都不发）。body envelope 优先：编排器
+    // 的幂等键语义完整（带版本与证据），header 只是轻量透传。
+    let invocation_id = req
+        .envelope
+        .as_ref()
+        .map(|e| e.invocation_id.clone())
+        .or_else(|| {
+            headers
+                .get("X-Invocation-Id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(new_invocation_id);
+
     // 记录最近请求的 project_root（供 /status 观察；不区分成败，只要请求到达）。
     *state.active_project.lock().unwrap() = Some(req.project_root.clone());
 
+    let started = std::time::Instant::now();
     let resp = match state
         .supervisor
         .execute_tool(&name, &req.project_root, req.args, req.lang.as_deref())
         .await
     {
         Ok(data) => {
+            log_invocation(
+                &state.invocation_log_path,
+                &invocation_id,
+                &name,
+                &req.project_root,
+                true,
+                None,
+                started.elapsed(),
+            );
             let resp = ToolResponse::Ok {
                 ok: true,
                 data,
                 format: None,
             };
-            (StatusCode::OK, Json(serde_json::to_value(&resp).unwrap())).into_response()
+            // Direct Serialize (no intermediate Value clone). For large responses
+            // (search 200+ hits, refs, repo-map) saves ~500µs / 84% vs the prior
+            // to_value+serialize double walk — see local/p2-0bq-bench.rs.
+            (StatusCode::OK, Json(resp)).into_response()
         }
         Err(err) => {
             let wire = wire_error_from_tool_error(&err);
+            log_invocation(
+                &state.invocation_log_path,
+                &invocation_id,
+                &name,
+                &req.project_root,
+                false,
+                Some(wire.code),
+                started.elapsed(),
+            );
             let status = StatusCode::OK; // 工具级失败走 200（A5）
             let resp = ToolResponse::Err {
                 ok: false,
                 error: wire,
             };
-            (status, Json(serde_json::to_value(&resp).unwrap())).into_response()
+            (status, Json(resp)).into_response()
         }
     };
     state.in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     resp
+}
+
+/// 生成 invocation_id（d3a）：UUID v4 形状。std 熵源（时间纳秒 + pid +
+/// 进程内计数器，同 lockfile `gen_token` 惯例）；排障/重放键用途，非加密。
+pub fn new_invocation_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let cnt = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // 三路熵混出 128 bit；高位 32 bit 取 now 保证跨进程不撞。
+    let a = now;
+    let b = (std::process::id() as u64) ^ cnt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let c = now.rotate_left(17) ^ cnt;
+    let d = now ^ cnt.rotate_left(29).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    // 变体段（第四段）：bit15=1 + bit14=0 即 `10xx`，其余 14 bit 取 c。
+    let variant = 0x8000u16 | ((c >> 48) as u16 & 0x3fff);
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        a as u16,
+        (b >> 48) as u16 & 0x0fff,
+        variant,
+        (d ^ (b << 13)) & 0xffff_ffff_ffff
+    )
+}
+
+/// 追加一条工具调用记录到重放日志（d3a）。JSONL，行首键即 invocation_id
+/// （`grep <id> invocations.jsonl` 即索引）。写失败只 warn 不影响工具执行。
+fn log_invocation(
+    path: &std::path::Path,
+    invocation_id: &str,
+    tool: &str,
+    project_root: &str,
+    ok: bool,
+    error_code: Option<WireErrorCode>,
+    elapsed: std::time::Duration,
+) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let line = json!({
+        "invocation_id": invocation_id,
+        "ts_ms": ts_ms,
+        "tool": tool,
+        "project_root": project_root,
+        "ok": ok,
+        // Option<WireErrorCode> 直接走 serde：Some → SCREAMING_SNAKE_CASE，None → null。
+        "error_code": error_code,
+        "duration_ms": elapsed.as_millis() as u64,
+    });
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()))
+    {
+        eprintln!(
+            "[serena] invocation log append failed (path={path:?}): {e}; tool execution unaffected"
+        );
+    }
 }
 
 async fn status_get(State(state): State<AppState>) -> Response {
@@ -463,6 +571,15 @@ mod tests {
     }
 
     fn state(token: &str, mock: MockSupervisor) -> AppState {
+        state_with_log(token, mock, std::path::PathBuf::new())
+    }
+
+    /// d3a：注入重放日志路径的 fixture（tempdir 即可断言日志内容）。
+    fn state_with_log(
+        token: &str,
+        mock: MockSupervisor,
+        invocation_log_path: std::path::PathBuf,
+    ) -> AppState {
         AppState {
             supervisor: Arc::new(mock),
             token: Arc::new(token.into()),
@@ -473,7 +590,30 @@ mod tests {
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drain_window: std::time::Duration::from_millis(100),
+            invocation_log_path,
         }
+    }
+
+    /// d3a：带 X-Invocation-Id header 的请求。
+    fn req_post_invocation(
+        path: &str,
+        token: Option<&str>,
+        invocation_id: &str,
+        body: serde_json::Value,
+    ) -> Request<Body> {
+        let mut b = req_post(path, token, body);
+        b.headers_mut()
+            .insert("X-Invocation-Id", invocation_id.parse().unwrap());
+        b
+    }
+
+    /// d3a：读重放日志全部行（JSONL）。
+    fn read_log(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("log line json"))
+            .collect()
     }
 
     /// 内存请求：免端口绑定；返回 (status, body_json)。
@@ -555,6 +695,143 @@ mod tests {
         let body = body.expect("json body");
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"], json!([{"name": "main"}]));
+    }
+
+    // ── d3a：编排 envelope + invocation 重放日志 ──
+
+    /// UUID v4 形状：8-4-4-4-12，版本位 4，变体位 [89ab]。
+    fn assert_uuid_v4(id: &str) {
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "not uuid-shaped: {id}"
+        );
+        assert_eq!(id.len(), 36);
+        assert_eq!(parts[2].chars().next(), Some('4'), "version nibble: {id}");
+        let variant = parts[3].chars().next().unwrap();
+        assert!(matches!(variant, '8' | '9' | 'a' | 'b'), "variant: {id}");
+    }
+
+    #[test]
+    fn new_invocation_id_uuid_v4_shape_and_uniqueness() {
+        let a = new_invocation_id();
+        let b = new_invocation_id();
+        assert_uuid_v4(&a);
+        assert_uuid_v4(&b);
+        assert_ne!(a, b, "consecutive ids must differ");
+    }
+
+    #[tokio::test]
+    async fn envelope_body_id_wins_over_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations.jsonl");
+        let st = state_with_log("secret", MockSupervisor::ok(json!(null)), log.clone());
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post_invocation(
+                "/tools/overview",
+                Some("secret"),
+                "from-header-should-lose",
+                json!({
+                    "project_root": "D:/x",
+                    "args": {},
+                    "envelope": {"invocation_id": "from-envelope-wins"}
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK);
+        assert_eq!(body.unwrap()["ok"], true);
+        let rows = read_log(&log);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["invocation_id"], "from-envelope-wins");
+    }
+
+    #[tokio::test]
+    async fn header_id_used_when_no_body_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations.jsonl");
+        let st = state_with_log("secret", MockSupervisor::ok(json!(null)), log.clone());
+        oneshot_json(
+            router(st),
+            req_post_invocation(
+                "/tools/overview",
+                Some("secret"),
+                "hdr-123",
+                json!({"project_root": "D:/x", "args": {}}),
+            ),
+        )
+        .await;
+        let rows = read_log(&log);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["invocation_id"], "hdr-123");
+    }
+
+    /// P0-2：老客户端（无 envelope 无 header）→ 自动生成 v4 + 日志索引可查；
+    /// 响应结构不变（wire 无 envelope 泄漏）。
+    #[tokio::test]
+    async fn missing_invocation_id_generates_uuid_v4_and_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations.jsonl");
+        let st = state_with_log("secret", MockSupervisor::ok(json!({"n": 1})), log.clone());
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post(
+                "/tools/overview",
+                Some("secret"),
+                json!({"project_root": "D:/x", "args": {}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK);
+        let body = body.expect("json body");
+        // 响应结构不动：只有 ok/data（/format），无 envelope 字段。
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"], json!({"n": 1}));
+        assert!(body.get("invocation_id").is_none());
+        assert!(body.get("envelope").is_none());
+        let rows = read_log(&log);
+        assert_eq!(rows.len(), 1);
+        let logged = rows[0]["invocation_id"].as_str().expect("id logged");
+        assert_uuid_v4(logged);
+        assert_eq!(rows[0]["tool"], "overview");
+        assert_eq!(rows[0]["ok"], true);
+        assert!(rows[0]["error_code"].is_null());
+    }
+
+    /// P0-3：失败路径同样带 envelope 索引；9 错误码 wire 契约不动。
+    #[tokio::test]
+    async fn error_path_logged_with_wire_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations.jsonl");
+        let st = state_with_log(
+            "secret",
+            MockSupervisor::err(supervisor::ToolError::BadArgs {
+                detail: "missing pattern".into(),
+            }),
+            log.clone(),
+        );
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post_invocation(
+                "/tools/find-symbol",
+                Some("secret"),
+                "err-42",
+                json!({"project_root": "D:/x", "args": {}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK); // 工具级失败走 200（A5 不变）
+        let body = body.expect("json body");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "BAD_ARGS");
+        assert!(body.get("envelope").is_none());
+        let rows = read_log(&log);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["invocation_id"], "err-42");
+        assert_eq!(rows[0]["ok"], false);
+        assert_eq!(rows[0]["error_code"], "BAD_ARGS");
     }
 
     #[tokio::test]

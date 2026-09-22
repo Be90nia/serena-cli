@@ -7,6 +7,32 @@
 
 use serde::{Deserialize, Serialize};
 
+/// wire 协议版本（d3a）。9 错误码 + `{ok,data|error}` 契约 = v1。
+pub const WIRE_PROTOCOL_VERSION: &str = "1";
+
+/// 编排兼容证据（d3a / orca review §2.1）：调用方环境自述，仅入重放日志。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompatEvidence {
+    /// 调用方运行环境（如 `windows-x86_64`）。
+    pub env: String,
+    pub protocol_version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// 编排 envelope（d3a）：请求侧可选附加，响应结构不动。
+/// 优先级：body envelope > `X-Invocation-Id` header > daemon 自动生成。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvocationEnvelope {
+    pub invocation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat_evidence: Option<CompatEvidence>,
+}
+
 /// `POST /tools/{name}` 请求体。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRequest {
@@ -16,6 +42,9 @@ pub struct ToolRequest {
     /// 多语言项目用：覆盖文件扩展名探测（如 `--lang typescript`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// 编排 envelope（d3a）：老客户端不发 → None（向后兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<InvocationEnvelope>,
 }
 
 /// 响应包装：`{ok, data|error}` 或 `data`+`format`。
@@ -151,10 +180,45 @@ mod tests {
             project_root: "D:/proj".into(),
             args: serde_json::json!({"pattern": "Foo"}),
             lang: Some("rust".into()),
+            envelope: None,
         };
         let j = serde_json::to_string(&req).unwrap();
         let back: ToolRequest = serde_json::from_str(&j).unwrap();
         assert_eq!(back.project_root, "D:/proj");
+    }
+
+    /// d3a：老客户端 body 无 envelope 字段 → 反序列化为 None（wire 向后兼容）。
+    #[test]
+    fn legacy_request_without_envelope_deserializes() {
+        let req: ToolRequest =
+            serde_json::from_str(r#"{"project_root":"D:/proj","args":{}}"#).unwrap();
+        assert!(req.envelope.is_none());
+    }
+
+    /// d3a：envelope 三键 + 可选 compat_evidence roundtrip。
+    #[test]
+    fn envelope_roundtrip_with_compat_evidence() {
+        let j = serde_json::json!({
+            "project_root": "D:/proj",
+            "args": {},
+            "envelope": {
+                "invocation_id": "0f0e1d2c-3b4a-5968-7788-99aabbccddee",
+                "server_version": "0.1.0",
+                "protocol_version": WIRE_PROTOCOL_VERSION,
+                "compat_evidence": {
+                    "env": "windows-x86_64",
+                    "protocol_version": WIRE_PROTOCOL_VERSION,
+                    "capabilities": []
+                }
+            }
+        });
+        let req: ToolRequest = serde_json::from_value(j).unwrap();
+        let env = req.envelope.expect("envelope present");
+        assert_eq!(env.invocation_id, "0f0e1d2c-3b4a-5968-7788-99aabbccddee");
+        assert_eq!(env.server_version.as_deref(), Some("0.1.0"));
+        let ev = env.compat_evidence.expect("evidence present");
+        assert_eq!(ev.env, "windows-x86_64");
+        assert!(ev.capabilities.is_empty());
     }
 
     #[test]

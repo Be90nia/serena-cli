@@ -208,6 +208,8 @@ mod tests {
             active_project: Arc::new(Mutex::new(None)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            // 空路径 = 不写 envelope 日志（测试不需要 d3a 重放索引）。
+            invocation_log_path: std::path::PathBuf::new(),
             // 短窗口：reaper 收尾测试不必等满生产 2s。
             drain_window: Duration::from_millis(100),
         }
