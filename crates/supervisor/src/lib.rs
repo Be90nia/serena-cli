@@ -50,6 +50,14 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// workspace/symbol / background-index 长操作。clangd 首次索引大项目可能 >30s。
 const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 符号缓存条目上限（ARCH §3.2 容量闸门：512 文件）。put 时超过则整表清空重建——
+/// fingerprint/mtime 对每张缓存表每次校验（doc_symbol_cache_key / find_symbol_cache_key
+/// 内置），全清后旧 mtime 命中的是清空而非 miss；旧 entry 不会"误中"。ponytail: 定长全清；
+/// 若实测命中率明显下降再换 LRU。上一行不是 LRU 决策失败的解释，是基于 ARCH §3.2 的
+/// 实施记录——LRU 必然引入 LinkedHashMap/indexmap 类非 std 依赖或手写双向链表，本项目
+/// 禁 dashmap/parking_lot/3rd party ordered-map（ARCH §6）。
+const SYMBOL_CACHE_MAX_ENTRIES: usize = 512;
+
 /// Phase 4 基建 Task 22b：三层 timeout 合并（CLI > servers.toml > 默认）。
 /// CLI flag 透传走 `args._timeout_ms` / `args._index_timeout_ms`（私有约定，
 /// CLI daemon HTTP / shell JSONL 都按 args 字段透传），`None` = 走 servers.toml 或默认。
@@ -135,31 +143,61 @@ pub enum ToolError {
 /// diagnostics 缓存条目类型：uri -> items。
 pub type DiagCache = std::sync::Arc<Mutex<HashMap<(PathBuf, String), Vec<serde_json::Value>>>>;
 pub type ToolResult<T> = std::result::Result<T, ToolError>;
-/// 文档符号缓存 key（Phase 3.1）：(root, file, mtime)。
-/// find-symbol（workspace 级）无单文件锚点：file 位放 `ws?{query}`、mtime 位放 None。
-type SymbolCacheKey = (PathBuf, String, Option<SystemTime>);
+/// 文档符号缓存 key（Phase 3.1）：(root, file, (mtime, size))。
+/// find-symbol（workspace 级）无单文件锚点：file 位放 `ws?{query}`、信号位放 root 信号。
+/// 信号位双因子（P2-18h）：同 mtime 粒度窗口内的外部改写靠 size 检出 —— 对齐
+/// docsync `ensure_open` 的 mtime+size 双对账（Windows mtime 缓存 / FAT 2s 粒度
+/// 会漏检同粒度改写，命中旧 SymbolHit → replace-body 切片错位）。
+type SymbolCacheKey = (PathBuf, String, Option<(SystemTime, u64)>);
 
-/// overview / symbol-body 的缓存 key；mtime 取不到（文件不存在/不可 stat）→ None（确定性 key）。
+/// overview / symbol-body 的缓存 key；文件不可 stat（不存在/失败）→ None（确定性 key）。
 fn doc_symbol_cache_key(root: &Path, file: &str) -> SymbolCacheKey {
     (
         root.to_path_buf(),
         file.to_string(),
         std::fs::metadata(root.join(file))
             .ok()
-            .and_then(|m| m.modified().ok()),
+            .and_then(|m| Some((m.modified().ok()?, m.len()))),
     )
 }
 
-/// find-symbol（workspace/symbol）缓存 key：按 query 键控，mtime 位锚 root 信号。
+/// find-symbol（workspace/symbol）缓存 key：按 query 键控，信号位锚 root 信号。
 /// `?` 是 Windows 非法文件名字符，`ws?` 前缀与真实文件 key 天然不撞。
-/// mtime 信号 = `root_source_mtime`：root 下任一源码文件被外部修改/新增 → 信号推进
+/// 信号 = `root_source_mtime`：root 下任一源码文件被外部修改/新增 → 信号推进
 /// → 旧缓存 key 失效重查（外部修改感知）。取不到信号（无源码文件/stat 全失败）→ None。
+/// workspace 级信号无单一 size 语义，size 位恒 0（`ws?` 前缀保证不与真实文件 key 撞）。
 fn find_symbol_cache_key(
     root: &Path,
     query: &str,
     root_mtime: Option<SystemTime>,
 ) -> SymbolCacheKey {
-    (root.to_path_buf(), format!("ws?{query}"), root_mtime)
+    (
+        root.to_path_buf(),
+        format!("ws?{query}"),
+        root_mtime.map(|m| (m, 0)),
+    )
+}
+
+/// 符号缓存写入内核（容量闸门 + 空集跳过）。P2-a5k 抽出供 `Supervisor::symbol_cache_put`
+/// 与并发 fan-out 路径 `overview_via_session` 共用——两处写同一 `Arc<Mutex<HashMap>>`，
+/// 把"空不写"与"超限全清"绑成原子决策避免任何写入路径绕过容量闸门。
+///
+/// 容量闸门（ARCH §3.2）：超 `SYMBOL_CACHE_MAX_ENTRIES` 整表清空再建。key 内 mtime
+/// 单调推进，旧 mtime 命中是清空而非误中；全清比 LRU 更安全（无 stale 窗口、无
+/// insertion-order 维护开销，禁 dashmap/indexmap）。ponytail: 全清；若实测命中率
+/// 明显下降再换 LRU。
+fn symbol_cache_put_impl(
+    cache: &mut HashMap<SymbolCacheKey, Vec<SymbolHit>>,
+    key: SymbolCacheKey,
+    hits: Vec<SymbolHit>,
+) {
+    if hits.is_empty() {
+        return;
+    }
+    if cache.len() >= SYMBOL_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, hits);
 }
 
 /// root 下（depth ≤3，标准 ignore 过滤）源码文件的最大 mtime —— workspace 级
@@ -1483,14 +1521,27 @@ impl Supervisor {
         self.symbol_cache.lock().unwrap().get(key).cloned()
     }
 
+    /// 符号缓存写入内核（容量闸门 + 空集跳过）。P2-a5k 抽出供 `Supervisor::symbol_cache_put`
+    /// 与并发 fan-out 路径 `overview_via_session` 共用——两处写同一 `Arc<Mutex<HashMap>>`，
+    /// 把"空不写"与"超限全清"绑成原子决策避免任何写入路径绕过容量闸门。
+    ///
+    /// 容量闸门（ARCH §3.2）：超 `SYMBOL_CACHE_MAX_ENTRIES` 整表清空再建。key 内 mtime
+    /// 单调推进，旧 mtime 命中是清空而非误中；全清比 LRU 更安全（无 stale 窗口、无
+    /// insertion-order 维护开销，禁 dashmap/indexmap）。ponytail: 全清；若实测命中率
+    /// 明显下降再换 LRU。
+    ///
     /// cache_miss 后写入。LS 错误路径不经过这里（失败不进 cache）。
     /// 空结果不写：语义未就绪窗口的空响应（RA/gopls 加载期）会被永久缓存，
     /// 导致就绪后仍 miss 假象；空是合法语义结果，宁可重查不可错缓存。
     fn symbol_cache_put(&self, key: SymbolCacheKey, hits: Vec<SymbolHit>) {
-        if hits.is_empty() {
-            return;
-        }
-        self.symbol_cache.lock().unwrap().insert(key, hits);
+        let mut cache = self.symbol_cache.lock().unwrap();
+        symbol_cache_put_impl(&mut cache, key, hits);
+    }
+
+    /// 暴露给测试/排障：当前缓存条目数。std::sync::Mutex 而非 parking_lot（ARCH §6）。
+    #[cfg(test)]
+    fn symbol_cache_len(&self) -> usize {
+        self.symbol_cache.lock().unwrap().len()
     }
 
     /// 低层（LS 会话）版本变化 → 该 root 的全部高层符号缓存失效。
@@ -1505,6 +1556,25 @@ impl Supervisor {
             .lock()
             .unwrap()
             .retain(|key, _| key.0 != root);
+    }
+
+    /// P2-18h 外部修改对账：盘上 (mtime,size) 与缓存记账不符 → 清该文件全部缓存
+    /// 条目（force miss → 本次调用重走 LS），返 true。一致/无记账/不可 stat → false。
+    ///
+    /// 挂在单文件工具（overview/symbol-body）的 miss 路径：key 双因子保证盘变必
+    /// miss，但旧 stamp 残留条目会一直占表 —— 这里顺带清掉（context 契约"不一致
+    /// 即清该文件缓存"）。didChange 重放由 miss 路径既有的 `ensure_open` 承担
+    /// （mtime/size 变 → 全量 didChange），不在此重复发。
+    fn reconcile_symbol_cache_for_file(&self, root: &Path, file: &str) -> bool {
+        let stamp = doc_symbol_cache_key(root, file).2;
+        let mut cache = self.symbol_cache.lock().unwrap();
+        let stale = cache
+            .keys()
+            .any(|k| k.0 == root && k.1 == file && k.2 != stamp);
+        if stale {
+            cache.retain(|k, _| !(k.0 == root && k.1 == file));
+        }
+        stale
     }
 
     /// AI-token 特性 J（plan-j-delta §2 / design §11-J）：迭代工作流（改→查→改）
@@ -1564,6 +1634,9 @@ impl Supervisor {
         if let Some(cached) = self.symbol_cache_get(&cache_key) {
             return Ok(cached); // cache_hit
         }
+        // P2-18h miss 路径对账：清同文件残留旧 stamp 条目（didChange 由下方
+        // ensure_open 按 mtime/size 差异自动重放）。
+        self.reconcile_symbol_cache_for_file(root, file);
         let lang_str = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, &lang_str).await?;
         let path = root.join(file);
@@ -2353,6 +2426,9 @@ impl Supervisor {
                 }),
             }; // cache_hit
         }
+        // P2-18h miss 路径对账：清同文件残留旧 stamp 条目（didChange 由下方
+        // ensure_open 按 mtime/size 差异自动重放）。
+        self.reconcile_symbol_cache_for_file(root, file);
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let uri = path_to_uri_str(&path);
@@ -3340,10 +3416,10 @@ async fn overview_via_session(
         .request("textDocument/documentSymbol", params, timeout)
         .await?;
     let out = flatten_symbols(resp, &uri);
-    // 写入与 Supervisor::symbol_cache_put 等价语义：空不写。
-    if !out.is_empty() {
-        cache_arc.lock().unwrap().insert(cache_key, out.clone());
-    }
+    // 写入走 `symbol_cache_put_impl`（与 `Supervisor::symbol_cache_put` 同语义：
+    // 空不写 + 超 SYMBOL_CACHE_MAX_ENTRIES 全清）。直 .insert 会绕过容量闸门。
+    let mut cache = cache_arc.lock().unwrap();
+    symbol_cache_put_impl(&mut cache, cache_key, out.clone());
     Ok(out)
 }
 
@@ -5776,7 +5852,8 @@ mod reclaim_idle_buffers_tests {
     /// mock_ls 二进制在 cargo build 时由 lsp-core 包提供，supervisor 包在测试
     /// 二进制可见但 `CARGO_BIN_EXE_*` 仅在当前 crate 范围内设置 —— supervisor
     /// 找不到则跳过（不计入失败）。运行时通过 PATH / build target-dir 兜底查找。
-    fn find_mock_ls() -> Option<std::path::PathBuf> {
+    /// pub(crate)：symbol_cache_tests（P2-18h）跨 mod 复用。
+    pub(crate) fn find_mock_ls() -> Option<std::path::PathBuf> {
         if let Ok(p) = std::env::var("CARGO_BIN_EXE_mock_ls") {
             let p = std::path::PathBuf::from(p);
             if p.is_file() {
@@ -5796,14 +5873,18 @@ mod reclaim_idle_buffers_tests {
                 }
             }
         }
-        // 兜底：默认 cargo target-dir 即项目根 target/。
-        let cwd = std::env::current_dir().ok()?;
-        [
-            cwd.join(format!("target/debug/mock_ls{}", ext)),
-            cwd.join(format!("target/debug/deps/mock_ls{}", ext)),
-        ]
-        .into_iter()
-        .find(|p| p.is_file())
+        // 兜底：默认 cargo target-dir 即项目根 target/。测试进程 cwd 是 package
+        // 目录（crates/supervisor），workspace 共享 target 在其上两级 —— 用编译期
+        // CARGO_MANIFEST_DIR 锚定，`cargo test -p supervisor` 单包跑法也能找到。
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join(format!("target/debug/mock_ls{}", ext)));
+            candidates.push(cwd.join(format!("target/debug/deps/mock_ls{}", ext)));
+        }
+        if let Some(ws) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2) {
+            candidates.push(ws.join(format!("target/debug/mock_ls{}", ext)));
+        }
+        candidates.into_iter().find(|p| p.is_file())
     }
 
     fn launch_mock_ls() -> Option<LaunchInfo> {
@@ -6268,6 +6349,372 @@ mod symbol_cache_tests {
         assert_eq!(
             entry_files, expected_files,
             "entries file 集 ≠ 期望 file 集（一对一丢失或多出）"
+        );
+    }
+
+    // ==== P2-18h · 外部修改感知（mtime+size 双因子对账）====
+
+    /// mock_ls 带 track 钩子启动（didOpen/didChange/didClose 事件追加落盘，断言用）。
+    fn launch_mock_ls_track(track_log: &std::path::Path) -> Option<ls_runtime::process::LaunchInfo> {
+        let exe = crate::reclaim_idle_buffers_tests::find_mock_ls()?;
+        Some(ls_runtime::process::LaunchInfo {
+            cmd: vec![std::ffi::OsString::from(exe)],
+            cwd: std::env::temp_dir(),
+            env: vec![(
+                "MOCK_LS_TRACK_FILE_EVENTS".to_string(),
+                track_log.display().to_string(),
+            )],
+            transport: ls_runtime::process::TransportKind::Stdio,
+        })
+    }
+
+    /// 读 track 日志（先等 mock_ls writer 异步落盘）；读不到当空表。
+    async fn read_track_events(log: &std::path::Path) -> Vec<serde_json::Value> {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let raw = tokio::fs::read_to_string(log).await.unwrap_or_default();
+        raw.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// P2-18h（判据 1+2）：walk → 外部覆写（同 mtime 粒度窗口内 size 变化，模拟
+    /// Windows mtime 缓存 / FAT 2s 粒度）→ 再 walk + symbol-body。
+    ///
+    /// 修前（key 只含 mtime）：symbol-body 缓存 hit 旧 SymbolHit —— LS 与盘脱钩
+    /// （无 didChange）且切片来自陈旧 walk。修复后：key 含 size → miss → 对账清
+    /// 旧条目 + ensure_open 检出 size 变 → didChange 重放（track 日志可断言）→
+    /// 重 walk 以最新结果为准。
+    ///
+    /// mock_ls 恒回固定假 range（mock_helper@5）——返回值修前/修后巧合相同，判定
+    /// 性证据 = didChange 事件到达 mock_ls + fast path 零新事件（判据 3）。
+    #[tokio::test]
+    async fn external_modify_same_mtime_replays_did_change_and_rewalks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let track = tmp.path().join("track.log");
+        let Some(launch) = launch_mock_ls_track(&track) else {
+            println!("skipped: mock_ls binary not found (lsp-core not yet built?)");
+            return;
+        };
+
+        let file = tmp.path().join("a.cpp");
+        // v1：line5（0-based）= HELPER 行 —— mock 假 range(5:0-5:12) 在 v1 上恰好命中。
+        tokio::fs::write(&file, "l0\nl1\nl2\nl3\nl4\nHELPER_V1_LINE\n")
+            .await
+            .unwrap();
+        let m0 = std::fs::metadata(&file).unwrap().modified().unwrap();
+
+        let child = ls_runtime::process::Child::spawn(launch).unwrap();
+        let session = lsp_core::session::Session::start(Some(child), lsp_types::InitializeParams::default())
+            .await
+            .unwrap();
+        let sup = Supervisor::direct().await.unwrap();
+        let key = Supervisor::key(tmp.path(), "cpp");
+        sup.instances
+            .lock()
+            .unwrap()
+            .insert(key.clone(), session.clone());
+        sup.last_used
+            .lock()
+            .unwrap()
+            .insert(key, std::time::Instant::now());
+
+        // ① walk：overview miss → didOpen + documentSymbol → mock 假 hits 入缓存。
+        let hits = sup
+            .tool_overview(tmp.path(), "a.cpp", Some("cpp"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "mock_ls 固定回 2 个符号");
+        assert!(
+            read_track_events(&track)
+                .await
+                .iter()
+                .any(|e| e["event"] == "didOpen"),
+            "walk 必须先 didOpen"
+        );
+
+        // ② 外部覆写：更长内容（size 变）+ mtime 拨回记账值 —— 粒度窗口漏检形态。
+        tokio::fs::write(&file, "l0\nl1\nl2\nl3\nl4\nTAIL_MARKER_LINE_X\nx1\nx2\n")
+            .await
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(m0)
+            .unwrap();
+
+        // ③ 再 walk + symbol-body：修复后必走 miss（key 含 size）→ didChange + 重 walk。
+        let _ = sup
+            .tool_overview(tmp.path(), "a.cpp", Some("cpp"))
+            .await
+            .unwrap();
+        let body = sup
+            .tool_symbol_body(tmp.path(), "a.cpp", "mock_helper", Some("cpp"))
+            .await
+            .unwrap();
+        assert!(
+            body.contains("TAIL_MARKER"),
+            "symbol-body 必须以最新 walk 的 range 切盘上现文，实际: {body:?}"
+        );
+        let events = read_track_events(&track).await;
+        assert!(
+            events.iter().any(|e| e["event"] == "didChange"),
+            "外部修改（同 mtime + size 变）必须触发 didChange 重放；events={events:?}"
+        );
+
+        // ④ fast path（判据 3）：无外部修改再 walk —— 缓存命中，零新 LS 事件。
+        let before = read_track_events(&track).await.len();
+        let _ = sup
+            .tool_overview(tmp.path(), "a.cpp", Some("cpp"))
+            .await
+            .unwrap();
+        let after = read_track_events(&track).await.len();
+        assert_eq!(before, after, "无修改 fast path 不得产生新 LS 事件");
+
+        session.shutdown().await;
+        let _ = sup.evict(&Supervisor::key(tmp.path(), "cpp")).await;
+    }
+
+    /// P2-18h 机制单测：同 mtime 粒度窗口内的外部改写（size 变）必须 miss + 对账
+    /// 清残留 —— key 双因子是判据 1 集成测试翻转的根因层。
+    #[tokio::test]
+    async fn same_mtime_size_change_invalidates_symbol_cache() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "fn f() {}\n").unwrap();
+        let root = dir.path();
+
+        let key1 = doc_symbol_cache_key(root, "a.rs");
+        sup.symbol_cache_put(key1.clone(), vec![hit("f")]);
+        assert!(sup.symbol_cache_get(&key1).is_some(), "warm cache must hit");
+
+        // 外部覆写：内容变长（size 变）+ mtime 拨回记账值 —— 粒度窗口漏检形态。
+        let (m0, _) = key1.2.unwrap();
+        std::fs::write(&file, "fn f() {}\n// external edit\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(m0)
+            .unwrap();
+
+        let key2 = doc_symbol_cache_key(root, "a.rs");
+        assert_ne!(key1, key2, "同 mtime 下 size 变化必须产生新 key（双因子）");
+        assert!(sup.symbol_cache_get(&key2).is_none(), "size 变必须 miss");
+        // 对账：检出不一致 → 清旧 stamp 残留；二次调用已一致 → false（幂等）。
+        assert!(sup.reconcile_symbol_cache_for_file(root, "a.rs"));
+        assert!(sup.symbol_cache_get(&key1).is_none(), "残留旧条目必须被清");
+        assert!(!sup.reconcile_symbol_cache_for_file(root, "a.rs"));
+    }
+
+    /// P2-18h 机制单测：fast path —— 无外部修改（mtime,size 均不变）时 key 稳定、
+    /// 缓存照用、对账返 false 不误清；他文件条目不受波及。
+    #[tokio::test]
+    async fn unchanged_file_keeps_fast_path_and_does_not_touch_others() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        let other = dir.path().join("b.rs");
+        std::fs::write(&file, "fn f() {}\n").unwrap();
+        std::fs::write(&other, "fn g() {}\n").unwrap();
+        let root = dir.path();
+
+        let key = doc_symbol_cache_key(root, "a.rs");
+        let other_key = doc_symbol_cache_key(root, "b.rs");
+        sup.symbol_cache_put(key.clone(), vec![hit("f")]);
+        sup.symbol_cache_put(other_key.clone(), vec![hit("g")]);
+
+        assert_eq!(
+            doc_symbol_cache_key(root, "a.rs"),
+            key,
+            "无修改 key 必须稳定（fast path 前提）"
+        );
+        assert!(
+            !sup.reconcile_symbol_cache_for_file(root, "a.rs"),
+            "无修改不得误报 stale"
+        );
+        assert!(sup.symbol_cache_get(&key).is_some(), "fast path 缓存保留");
+        assert!(sup.symbol_cache_get(&other_key).is_some(), "他文件不受波及");
+    }
+
+    // ==== P2-a5k · 容量闸门（ARCH §3.2）+ 增长曲线（长会话内存有界）====
+
+    /// 闸门语义：put 第 N 次后 len 仍 < N — 第 N+1 次触发全清，归 1（满阈即清，禁无界增长）。
+    /// 上限值硬编码 512 以保持测试对 ARCH 决策敏感（防误调成 1）。
+    #[tokio::test]
+    async fn capacity_gate_clears_when_over_limit() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        let cap = SYMBOL_CACHE_MAX_ENTRIES; // 512
+        // 灌满：put cap 次后 len == cap。
+        for i in 0..cap {
+            sup.symbol_cache_put(
+                doc_symbol_cache_key(root, &format!("f{i}.rs")),
+                vec![hit("x")],
+            );
+        }
+        assert_eq!(
+            sup.symbol_cache_len(),
+            cap,
+            "刚好达到上限时不清空（< 阈值）"
+        );
+        // 第 cap+1 次 → 触发闸门 → 全清后只剩本条。
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "overflow.rs"),
+            vec![hit("y")],
+        );
+        assert_eq!(
+            sup.symbol_cache_len(),
+            1,
+            "超上限触发全清后只剩新插入的 1 条"
+        );
+        assert!(
+            sup.symbol_cache_get(&doc_symbol_cache_key(root, "overflow.rs"))
+                .is_some(),
+            "新写入的 key 必须可命中"
+        );
+        assert!(
+            sup.symbol_cache_get(&doc_symbol_cache_key(root, "f0.rs")).is_none(),
+            "旧 entry 被全清"
+        );
+    }
+
+    /// 闸门边界：本测试在 N = cap * 2 + 5 次 put 内断言 len ≤ cap —— 若有人把上限
+    /// 调到 1024 / 关掉闸门，本测试会拒绝合并（CAP 来自 ARCH §3.2，改它 = 改架构
+    /// 决策，须同步 ARCH + ADR）。
+    #[tokio::test]
+    async fn capacity_gate_never_overshoots_max() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        let cap = SYMBOL_CACHE_MAX_ENTRIES;
+        let total = cap * 2 + 5;
+        for i in 0..total {
+            sup.symbol_cache_put(
+                doc_symbol_cache_key(root, &format!("g{i}.rs")),
+                vec![hit("x")],
+            );
+            let n = sup.symbol_cache_len();
+            assert!(
+                n <= cap,
+                "第 {i} 次 put 后 len={n} 超过上限 {cap}（闸门未生效）"
+            );
+        }
+    }
+
+    /// 增长曲线：1000 次 put 模拟长会话（修改→查→修改→查）；最终 len 有界 ≤ cap。
+    /// 选 1000：远超 512 强制闸门至少一次以上；≈"长会话"基线。
+    #[tokio::test]
+    async fn growth_curve_long_session_bounded() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        let cap = SYMBOL_CACHE_MAX_ENTRIES;
+        let total = 1000usize;
+        // root 不存在 → mtime = None → 每个 file 都是新 key
+        let mut prev_len = 0usize;
+        let mut triggered = 0usize;
+        for i in 0..total {
+            sup.symbol_cache_put(
+                doc_symbol_cache_key(root, &format!("edit_{i}.rs")),
+                vec![hit("x")],
+            );
+            let cur = sup.symbol_cache_len();
+            if prev_len > 0 && cur < prev_len / 2 {
+                triggered += 1;
+            }
+            prev_len = cur;
+        }
+        assert!(
+            sup.symbol_cache_len() <= cap,
+            "1000 次 put 后 len={} > cap={cap}（闸门失效）",
+            sup.symbol_cache_len()
+        );
+        assert!(
+            triggered >= 1,
+            "1000 次 put 应至少触发 1 次闸门清空（观察: {triggered}）"
+        );
+    }
+
+    /// 快速路径：未超上限时 put 不应触发全清（仅 insert）。本测试在 256 次 put 内
+    /// 保持 len 单调递增 — 闸门不在快速路径上。
+    #[tokio::test]
+    async fn fast_path_under_limit_grows_monotonically() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        for i in 0..256 {
+            sup.symbol_cache_put(
+                doc_symbol_cache_key(root, &format!("f{i}.rs")),
+                vec![hit("x")],
+            );
+            assert_eq!(
+                sup.symbol_cache_len(),
+                i + 1,
+                "未超上限时 put 不应清表（len 应单调递增到 i+1={}）",
+                i + 1
+            );
+        }
+    }
+
+    /// 闸门 + ARCH 全清替代 LRU 的语义保证：全清后任何旧 key 都 miss（无 stale）——
+    /// 旧 mtime 命中走清空而非误中。这是 ARCH 决策的安全依据。
+    #[tokio::test]
+    async fn capacity_gate_clears_all_no_stale() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        let cap = SYMBOL_CACHE_MAX_ENTRIES;
+        for i in 0..cap {
+            sup.symbol_cache_put(
+                doc_symbol_cache_key(root, &format!("s{i}.rs")),
+                vec![hit("x")],
+            );
+        }
+        // 触发全清
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "trigger.rs"),
+            vec![hit("y")],
+        );
+        let mut all_miss = true;
+        for i in 0..cap {
+            if sup
+                .symbol_cache_get(&doc_symbol_cache_key(root, &format!("s{i}.rs")))
+                .is_some()
+            {
+                all_miss = false;
+                break;
+            }
+        }
+        assert!(all_miss, "全清后任何旧 key 都应 miss（无 stale）");
+        assert_eq!(sup.symbol_cache_len(), 1, "全清后只剩新 entry");
+    }
+
+    /// 闸门不串扰：单次 put 触发全清后，invalidate_symbol_cache_for_root 仍按 root 删，
+    /// —— 全清路径不会损坏 invalidation 语义（不同失效维度，互相独立）。
+    #[tokio::test]
+    async fn capacity_gate_independent_of_invalidate() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root_a = Path::new("Z:/no/such/project_a");
+        let root_b = Path::new("Z:/no/such/project_b");
+        let cap = SYMBOL_CACHE_MAX_ENTRIES;
+        // root_a 灌满 + root_b 灌 1 条
+        for i in 0..cap {
+            sup.symbol_cache_put(
+                doc_symbol_cache_key(root_a, &format!("a{i}.rs")),
+                vec![hit("a")],
+            );
+        }
+        sup.symbol_cache_put(doc_symbol_cache_key(root_b, "b0.rs"), vec![hit("b")]);
+        // 触发全清
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root_a, "trigger.rs"),
+            vec![hit("t")],
+        );
+        // 全清后 root_a 只有 trigger.rs + root_b 的 b0.rs
+        // invalidate root_a → 只剩 root_b 的 1 条
+        sup.invalidate_symbol_cache_for_root(root_a);
+        assert_eq!(sup.symbol_cache_len(), 1, "只 root_b 一条存活");
+        assert!(
+            sup.symbol_cache_get(&doc_symbol_cache_key(root_b, "b0.rs"))
+                .is_some()
         );
     }
 }
