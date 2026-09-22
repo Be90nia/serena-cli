@@ -94,6 +94,19 @@ pub enum SessionState {
     Failed(String),
 }
 
+/// Phase 4 Task 22c：`$/progress` waiter + 早到通知合并登记表。handler 与 wait 侧
+/// 共用一把 `std::Mutex<ProgressRegistry>` 临界区，原子完成「resolved 消费 + waiter
+/// 注册 / waiter 唤醒 + resolved 记录」三步，杜绝早期实现中两把锁之间的通知丢失窗口
+/// （见 `Session::progress` 注释）。
+#[derive(Default)]
+struct ProgressRegistry {
+    /// token（String 形态）→ Notify。`wait_for_progress` 入口插 waiter + 等门。
+    waiters: std::collections::HashMap<String, Arc<Notify>>,
+    /// 早到通知记录：LS 在 `wait_for_progress` 登记前就发出的 token。handler 无 waiter
+    /// 可唤醒时记入；wait 侧优先消费一次。否则早到通知被 `Notify::notify_waiters` 空发丢弃。
+    resolved: std::collections::HashSet<String>,
+}
+
 /// 单 LS 进程的完整 LSP 会话。`Arc<Session>` 是 supervisor 实例池的最小单元。
 pub struct Session {
     pub(crate) state: Mutex<SessionState>,
@@ -125,17 +138,17 @@ pub struct Session {
     /// 非 null，不需要类型结构。
     pub(crate) server_capabilities:
         std::sync::Arc<Mutex<Option<serde_json::Value>>>,
-    /// Phase 4 基建 Task 22c：`$/progress` 通知等待登记表。token（String 形态）
-    /// → Notify。`Session::start` 内部注册唯一 `$/progress` handler，解析 params
-    /// 找 token → notify 对应 waiter。`wait_for_progress` 入口插 waiter + 等门。
-    progress_waiters: tokio::sync::Mutex<
-        std::collections::HashMap<String, Arc<Notify>>,
-    >,
-    /// 早到通知记录：LS 在 `wait_for_progress` 登记前就发出的 token（mock_ls「握手后
-    /// 立刻发」/RA 快速索引进度都会命中此窗口）。handler 无 waiter 可唤醒时记在此处，
-    /// wait 侧优先消费一次。没有它，早到通知被 `Notify::notify_waiters` 空发丢弃，
-    /// wait 永远超时。std Mutex：handler 在 stdout 泵 task 内同步执行，仅 try_lock。
-    progress_resolved: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Phase 4 基建 Task 22c：`$/progress` 通知等待登记表。
+    ///
+    /// 一次合并：waiter 表（token → Notify）+ 早到通知记录（token 已到达但尚无 waiter）
+    /// 共用一把 `std::sync::Mutex`。handler 在 stdout 泵 task 内同步执行，必须能
+    /// 「无 waiter 时记入 resolved」；wait 侧要「先消费 resolved 再插 waiter」。
+    /// 这两步必须**原子**：分两把锁时（早期实现：waiters=tokio::Mutex、resolved=std::Mutex），
+    /// handler 可在 wait 侧 drop resolved 锁到抢到 waiters 锁之间夹缝触发
+    /// （try_lock 抢到 resolved → 抢到 waiters → 无 waiter → 记 resolved → 退出），
+    /// wait 侧随后插 waiter 但通知已消费，永久不醒。50×8 并发压测复现 ~35/400 失败率。
+    /// 合并到一把 `std::Mutex<ProgressRegistry>` 后临界区同步、原子，杜绝该窗口。
+    progress: std::sync::Mutex<ProgressRegistry>,
     /// `didOpen` 上送的 `languageId`。supervisor 在 session_for 拿到会话后注入真实
     /// adapter 语言；默认 `"cpp"` 仅兜底 lsp-core 直连路径——硬编码错语言会让
     /// rust-analyzer 等严格 LS 拒收文档（语义层挂）。
@@ -229,15 +242,18 @@ impl Session {
             stdout_eof,
             buffers: std::sync::Mutex::new(std::collections::HashMap::new()),
             server_capabilities: std::sync::Arc::new(Mutex::new(None)),
-            progress_waiters: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            progress_resolved: std::sync::Mutex::new(std::collections::HashSet::new()),
+            progress: std::sync::Mutex::new(ProgressRegistry::default()),
             language_id: std::sync::Mutex::new("cpp".into()),
         });
 
         // Phase 4 基建 Task 22c：注册唯一 `$/progress` handler。LS 触发进度时会发
         // 通知 params = {token: <val>, value: {kind: "begin"|"report"|"end", ...}}。
-        // 我们查 token 字符串 → 在 progress_waiters 找对应 Notify → notify。
+        // 我们查 token 字符串 → 在 progress 找对应 Notify → notify。
         // token 可能是 number（i64）或 string；统一 stringify 当 key。
+        //
+        // 临界区原子性：`Session::progress` 单一 std::Mutex 保护 waiter + resolved。
+        // handler 在 stdout 泵 task 同步执行（不 .await），lock + 操作 + drop 全程不挂起，
+        // 与 `wait_for_progress` 的同一把锁原子互斥——杜绝两锁间夹缝导致的通知丢失。
         session.client.on_notification("$/progress", {
             let session = Arc::clone(&session);
             move |msg| {
@@ -247,21 +263,15 @@ impl Session {
                 let Some(token) = progress_token_to_string(params.get("token")) else {
                     return;
                 };
-                // 同步查找 waiter（handler 在 stdout 泵 task 同步执行；不 .await）
-                let waiters = session.progress_waiters.try_lock();
-                let Ok(waiters) = waiters else {
+                let Ok(mut registry) = session.progress.lock() else {
                     return;
                 };
-                match waiters.get(&token) {
-                    Some(notify) => notify.notify_waiters(),
-                    None => {
-                        // 无 waiter：早到通知 —— 记入 resolved 供后续 wait 立即
-                        // 消费，否则 Notify::notify_waiters 空发 = 通知永久丢失。
-                        drop(waiters);
-                        if let Ok(mut resolved) = session.progress_resolved.try_lock() {
-                            resolved.insert(token);
-                        }
-                    }
+                if let Some(notify) = registry.waiters.get(&token) {
+                    notify.notify_waiters();
+                } else {
+                    // 无 waiter：早到通知 —— 记入 resolved 供后续 wait 立即
+                    // 消费。否则 Notify::notify_waiters 空发 = 通知永久丢失。
+                    registry.resolved.insert(token);
                 }
             }
         });
@@ -357,11 +367,19 @@ impl Session {
     /// - 阻塞直到收到 token 字符串匹配的 progress 通知（任何 kind: begin/report/end 都算
     ///   「到达」；调用方语义解读 kind）。
     /// - 通知到达后 waiter **不自动清理**——这是有意设计：调用方可能多次复用同一 token
-    ///   触发 handler（如 watch 模式）。`progress_waiters` 字段是 Session 内态，
+    ///   触发 handler（如 watch 模式）。`progress` 字段是 Session 内态，
     ///   `Arc<Session>` drop 时自然清理。
     ///
     /// 返回 `Ok(())` 表进度通知已到达；`Err(Timeout)` 表等待窗口内无通知。
     /// `Err(Terminated)` 表 Session 已 Failed（start 内失败 / LS EOF）。
+    ///
+    /// 实现细节（修复 race）：早期版本分两把锁（waiters=tokio::Mutex、
+    /// resolved=std::Mutex），handler 在 wait 侧 drop resolved 锁到抢到 waiters 锁之间
+    /// 的夹缝触发 → handler 记 resolved 但通知已消费 → wait 侧随后插 waiter 永久不醒。
+    /// 50×8 并发压测复现 ~35/400 失败率。修复：resolved 消费与 waiter 注册合并到
+    /// `Session::progress` 同一把 `std::Mutex` 临界区，原子完成；如 resolved 命中直接返
+    /// Ok，否则同临界区内插 waiter 并 Clone 出 Notify（之后才 .await 等门）。
+    /// 临界区不持锁 .await——不会死锁当前 std Mutex。
     pub async fn wait_for_progress(
         &self,
         token: &str,
@@ -374,18 +392,17 @@ impl Session {
                 cause: "session failed before progress wait".into(),
             });
         }
-        // 早到通知已在 waiter 登记前到达（handler 记入 resolved）→ 立即消费一次。
-        if self
-            .progress_resolved
-            .lock()
-            .unwrap()
-            .remove(token)
-        {
-            return Ok(());
-        }
+        // 合并临界区：先消费 resolved 再注册 waiter。任一路径在临界区内完成，
+        // handler 拿到锁时要么看到 resolved（不再重复插入）要么看到 waiter（直接 notify）。
         let notify = {
-            let mut waiters = self.progress_waiters.lock().await;
-            waiters
+            let mut registry = self.progress.lock().unwrap();
+            if registry.resolved.remove(token) {
+                // 早到通知已在 waiter 登记前到达（handler 记入 resolved）→ 立即消费。
+                // 关键：这里直接返 Ok，不插 waiter——避免后续 handler 再 fire 时无谓 notify。
+                return Ok(());
+            }
+            registry
+                .waiters
                 .entry(token.to_string())
                 .or_insert_with(|| Arc::new(Notify::new()))
                 .clone()
