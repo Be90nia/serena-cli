@@ -38,6 +38,9 @@ struct Config {
     /// Phase 4 Task 22c：初始化后立刻发 `$/progress` 通知（token, kind="end"）。
     /// e2e 测试用：让 client wait_for_progress 能等到真通知。
     progress_token: Option<String>,
+    /// P2-y5u 复现：握手后立刻发 N 个 unique progress token —— 模拟长会话 progress
+    /// 风暴，触发 `Session::progress.resolved` 表容量上限测试。
+    progress_tokens_multi: Option<u32>,
     /// 文档事件跟踪日志路径（Task 7）。设了就把 didOpen/didChange/didClose 追加写入。
     track_file_events: Option<std::path::PathBuf>,
     /// 开启后 capabilities 加 `diagnosticProvider: { ... }`，
@@ -69,8 +72,13 @@ fn load_config() -> Config {
         send_server_requests: std::env::var("MOCK_LS_SEND_SERVER_REQUESTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
-        progress_token: std::env::var("MOCK_LS_PROGRESS_TOKEN").ok(),
-        track_file_events: std::env::var("MOCK_LS_TRACK_FILE_EVENTS")
+progress_token: std::env::var("MOCK_LS_PROGRESS_TOKEN").ok(),
+    // 发 N 个 unique progress token（每个 kind="end"，递增编号）—— 模拟 LS 长索引期
+    // 大量 progress 通知。验证 Session::progress.resolved 表容量上限（P2-y5u）。
+    progress_tokens_multi: std::env::var("MOCK_LS_PROGRESS_TOKENS_MULTI")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok()),
+    track_file_events: std::env::var("MOCK_LS_TRACK_FILE_EVENTS")
             .ok()
             .map(std::path::PathBuf::from),
         diagnostic_provider: std::env::var("MOCK_LS_DIAGNOSTIC_PROVIDER")
@@ -267,20 +275,36 @@ async fn main() {
             }
 
             // Phase 4 Task 22c：发 `$/progress` 通知（kind="end"，模拟 LS 完成）。
-            if let Some(token) = &config.progress_token
-                && msg.method.as_deref() == Some("initialize")
-            {
-                let progress = JsonRpc::notification(
-                    "$/progress",
-                    json!({
-                        "token": token,
-                        "value": { "kind": "end", "message": "mock_ls progress done" },
-                    }),
-                );
-                if stdout.write_all(&encode(&progress)).await.is_err() {
-                    return;
+            if msg.method.as_deref() == Some("initialize") {
+                if let Some(token) = &config.progress_token {
+                    let progress = JsonRpc::notification(
+                        "$/progress",
+                        json!({
+                            "token": token,
+                            "value": { "kind": "end", "message": "mock_ls progress done" },
+                        }),
+                    );
+                    if stdout.write_all(&encode(&progress)).await.is_err() {
+                        return;
+                    }
+                    let _ = stdout.flush().await;
                 }
-                let _ = stdout.flush().await;
+                // P2-y5u 复现：发 N 个 unique token（模拟长会话 progress 风暴）。
+                if let Some(n) = config.progress_tokens_multi {
+                    for i in 0..n {
+                        let progress = JsonRpc::notification(
+                            "$/progress",
+                            json!({
+                                "token": format!("burst-{i}"),
+                                "value": { "kind": "end", "message": "burst progress" },
+                            }),
+                        );
+                        if stdout.write_all(&encode(&progress)).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = stdout.flush().await;
+                }
             }
 
             if msg.method.as_deref() == Some("exit") {

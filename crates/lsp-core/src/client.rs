@@ -148,6 +148,13 @@ impl Client {
         guard.insert(method.into(), Arc::new(f));
     }
 
+    /// 移除指定方法的通知 handler。返回是否曾注册。P2-y5u 配套：`Session::shutdown`
+    /// 显式清 `$/progress` 闭包，主动断开 Session↔ClientInner 的 Arc 环路径。
+    pub fn clear_notification(&self, method: &str) -> bool {
+        let mut guard = self.inner.notification_handlers.lock().unwrap();
+        guard.remove(method).is_some()
+    }
+
     /// 注册 server→client request handler。返回 `None` 即默认 null 成功。
     pub fn on_server_request<F>(&self, method: impl Into<String>, f: F)
     where

@@ -98,14 +98,25 @@ pub enum SessionState {
 /// 共用一把 `std::Mutex<ProgressRegistry>` 临界区，原子完成「resolved 消费 + waiter
 /// 注册 / waiter 唤醒 + resolved 记录」三步，杜绝早期实现中两把锁之间的通知丢失窗口
 /// （见 `Session::progress` 注释）。
+///
+/// P2-y5u：resolved 表加容量上限 —— 长会话（clangd 索引 / rust-analyzer crate 解析）
+/// 持续发 unique progress 通知时，handler 无 waiter 可唤醒，全落 resolved → 无界膨胀。
+/// 上限触达时按插入顺序淘汰最旧（FIFO，HashMap 默认迭代序）—— 早到通知只对短窗口内的
+/// `wait_for_progress` 有意义；超窗口外的旧 token 命中概率极低，淘汰可接受。
 #[derive(Default)]
 struct ProgressRegistry {
     /// token（String 形态）→ Notify。`wait_for_progress` 入口插 waiter + 等门。
     waiters: std::collections::HashMap<String, Arc<Notify>>,
     /// 早到通知记录：LS 在 `wait_for_progress` 登记前就发出的 token。handler 无 waiter
     /// 可唤醒时记入；wait 侧优先消费一次。否则早到通知被 `Notify::notify_waiters` 空发丢弃。
-    resolved: std::collections::HashSet<String>,
+    ///
+    /// P2-y5u：容量有界 —— `RESOLVED_CAP` 条以上时淘汰最旧（FIFO）；无限增长会致 OOM。
+    resolved: std::collections::HashMap<String, ()>,
 }
+
+/// P2-y5u：resolved 表容量上限。8192 覆盖 clangd / rust-analyzer 长会话 burst 场景；
+/// 早到通知短窗口有效，窗口外 token 命中率极低 —— 淘汰旧 key 不影响当前 wait 链路。
+const RESOLVED_CAP: usize = 8192;
 
 /// 单 LS 进程的完整 LSP 会话。`Arc<Session>` 是 supervisor 实例池的最小单元。
 pub struct Session {
@@ -254,9 +265,21 @@ impl Session {
         // 临界区原子性：`Session::progress` 单一 std::Mutex 保护 waiter + resolved。
         // handler 在 stdout 泵 task 同步执行（不 .await），lock + 操作 + drop 全程不挂起，
         // 与 `wait_for_progress` 的同一把锁原子互斥——杜绝两锁间夹缝导致的通知丢失。
+        //
+        // P2-y5u 修 Arc 环 —— handler 闭包改持 `Weak<Session>` 而非强 Arc：
+        // 旧实现 `Arc::clone(&session)` 把 session 锚定到 ClientInner.notification_handlers，
+        // 与 Session.client = Client(Arc<ClientInner>) 构成双向 Arc 强环，
+        // drop(session) 后 Arc 强计数不归零 → 已关停会话资源长期滞留。
+        // Weak 持引用每次触发前 `upgrade()`：session 还活着才操作 progress 表；
+        // 已被 drop 的 session 升级失败 → handler 安全 no-op。
+        // 配合 `Session::shutdown` 调 `client.clear_notification("$/progress")` 显式
+        // 清表，主动断开环（weak 升级失败 + 闭包从表里移除 → ClientInner 整体释放）。
         session.client.on_notification("$/progress", {
-            let session = Arc::clone(&session);
+            let session = Arc::downgrade(&session);
             move |msg| {
+                let Some(session) = session.upgrade() else {
+                    return;
+                };
                 let Some(params) = msg.params.as_ref() else {
                     return;
                 };
@@ -271,7 +294,14 @@ impl Session {
                 } else {
                     // 无 waiter：早到通知 —— 记入 resolved 供后续 wait 立即
                     // 消费。否则 Notify::notify_waiters 空发 = 通知永久丢失。
-                    registry.resolved.insert(token);
+                    // P2-y5u：超 RESOLVED_CAP 时按插入顺序淘汰最旧（FIFO），
+                    // 避免长会话 burst 场景无界增长。
+                    if registry.resolved.len() >= RESOLVED_CAP
+                        && let Some(oldest) = registry.resolved.keys().next().cloned()
+                    {
+                        registry.resolved.remove(&oldest);
+                    }
+                    registry.resolved.insert(token, ());
                 }
             }
         });
@@ -396,7 +426,7 @@ impl Session {
         // handler 拿到锁时要么看到 resolved（不再重复插入）要么看到 waiter（直接 notify）。
         let notify = {
             let mut registry = self.progress.lock().unwrap();
-            if registry.resolved.remove(token) {
+            if registry.resolved.remove(token).is_some() {
                 // 早到通知已在 waiter 登记前到达（handler 记入 resolved）→ 立即消费。
                 // 关键：这里直接返 Ok，不插 waiter——避免后续 handler 再 fire 时无谓 notify。
                 return Ok(());
@@ -419,6 +449,12 @@ impl Session {
     /// 当前状态快照。
     pub fn state(&self) -> SessionState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// `ProgressRegistry.resolved` 当前条目数（P2-y5u 容量上限测试用 / 诊断）。
+    /// 早到通知表，超过 `RESOLVED_CAP` 时按 FIFO 淘汰最旧。
+    pub fn resolved_len(&self) -> usize {
+        self.progress.lock().unwrap().resolved.len()
     }
 
     /// 注入 `didOpen` 用的真实语言 id（如 "rust"）。session_for 拿到新会话后、
@@ -537,6 +573,20 @@ impl Session {
         // 步骤 4：等 stdout EOF 通知确认进程退（最长 5s）。permit 先拿再 await。
         let notified = self.stdout_eof.notified();
         let _ = time::timeout(SHUTDOWN_WAIT_TIMEOUT, notified).await;
+
+        // 步骤 5（P2-y5u）：清 `$/progress` handler + 清空 progress 表
+        // —— 显式断开 Session↔ClientInner 的 Arc 环路径。
+        //   handler 闭包持 `Weak<Session>` 已把强引用断开，但闭包本身仍占据
+        //   `ClientInner.notification_handlers` 表 —— 不主动 remove，ClientInner 与其
+        //   表里 Arc 计数不归零（Session drop 后 ClientInner 仍被持），孤儿 handler
+        //   与 session.progress 残留永久不回收。同步清空 progress 表（resolved/waiters）
+        //   避免长会话积累 Notify 实例。
+        self.client.clear_notification("$/progress");
+        {
+            let mut registry = self.progress.lock().unwrap();
+            registry.waiters.clear();
+            registry.resolved.clear();
+        }
 
         // 把状态标 Failed("shutdown") —— 调用方可读 session.state() 知道已走完。
         let mut state = self.state.lock().unwrap();
