@@ -50,7 +50,18 @@ const INITIAL_VERSION: i64 = 1;
 ///
 /// 测试与 supervisor 调用方按需传同值；这里只宣告默认 ttl。
 #[allow(dead_code)]
-const FILE_GUARD_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const FILE_GUARD_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// docsync 缓冲池容量上限（修 P1 #1 LRU）：当缓冲池条目数 ≥ 此值时，新插入触发
+/// LRU 回收 —— 把 idle 条目按 `last_released_at` 升序淘汰，直到腾出空位。
+///
+/// 32：与 `crates/supervisor/src/lib.rs` 的 `RECLAIM_THRESHOLD` 对齐——前 32 次工具
+/// 调用累积的活跃文件数；超过此值假定"冷文件"可丢。真实负载（rust-analyzer
+/// 等内存偏紧的 LS）下此值应远低于单 LS 自身文档表上限。
+///
+/// 修 P1 #1：原实现无容量闸门，长驻 daemon 累计几千文件会让 RA 报 OOM。容量限制
+/// + LRU 兜底 —— 复用窗口（60s TTL）内同文件访问不丢；窗口外冷文件被强制回收。
+pub const FILE_BUFFER_CAPACITY: usize = 32;
 
 /// 单文件状态：uri + 上次记账 mtime/size + 当前 LSP 版本 + 引用计数。
 #[derive(Debug)]
@@ -115,8 +126,9 @@ impl Session {
             None,
         }
 
-        let (to_send, _version_after) = {
+        let (to_send, _version_after, lru_evicted) = {
             let mut map = self.buffers.lock().expect("docsync buffers mutex poisoned");
+            let mut lru_evicted: Vec<Uri> = Vec::new();
             match map.get_mut(&uri) {
                 None => {
                     let text = fs::read_to_string(path).map_err(CoreError::Io)?;
@@ -132,13 +144,14 @@ impl Session {
                             last_released_at: None,
                         },
                     );
-                    (
-                        Action::Send {
-                            method: "textDocument/didOpen",
-                            params: make_did_open(&uri, &text, version, &self.language_id()),
-                        },
-                        version,
-                    )
+                    // 修 P1 #1：插入新条目后立即跑 LRU 容量闸门。
+                    // 此时池大小 = capacity + 1（newly inserted），evict 把池收回到 capacity。
+                    lru_evicted = evict_lru_idle_locked(&mut map, FILE_BUFFER_CAPACITY);
+                    let action = Action::Send {
+                        method: "textDocument/didOpen",
+                        params: make_did_open(&uri, &text, version, &self.language_id()),
+                    };
+                    (action, version, lru_evicted)
                 }
                 Some(buf) => {
                     buf.ref_count += 1;
@@ -152,20 +165,18 @@ impl Session {
                         && mtime == buf.mtime
                         && size == buf.size;
                     if unchanged {
-                        (Action::None, buf.content_version)
+                        (Action::None, buf.content_version, lru_evicted)
                     } else {
                         let text = fs::read_to_string(path).map_err(CoreError::Io)?;
                         let version = buf.content_version + 1;
                         buf.mtime = mtime;
                         buf.size = size;
                         buf.content_version = version;
-                        (
-                            Action::Send {
-                                method: "textDocument/didChange",
-                                params: make_did_change(&uri, version, &text),
-                            },
-                            version,
-                        )
+                        let action = Action::Send {
+                            method: "textDocument/didChange",
+                            params: make_did_change(&uri, version, &text),
+                        };
+                        (action, version, lru_evicted)
                     }
                 }
             }
@@ -176,6 +187,14 @@ impl Session {
                 self.notify(method, params).await?;
             }
             Action::None => {}
+        }
+
+        // 修 P1 #1：LRU 淘汰的条目锁外发 didClose（outbound 关 send 失败忽略）。
+        // 注意 LRU 辅助是同步函数，drain 已发生；此处不影响锁纪律。
+        // 走 client().notify（同步）而非 self.notify（async）：避免再走一次 ready
+        // gate 等门——session 此时已 Ready，且 notify 等门是冗余开销。
+        for uri in &lru_evicted {
+            let _ = self.client().notify("textDocument/didClose", make_did_close(uri));
         }
 
         Ok(FileGuard {
@@ -287,4 +306,55 @@ fn make_did_close(uri: &Uri) -> Value {
             "uri": uri.as_str(),
         }
     })
+}
+
+/// LRU 容量闸门（修 P1 #1）：缓冲池达容量上限时，按 `last_released_at` 升序淘汰
+/// 空闲条目，直到池大小 < `capacity`。活跃条目（`ref_count > 0`）一律不动——
+/// 容量压力下也允许短时 overflow（拒绝为容量限制而打断活跃工具调用）。
+///
+/// 调用方：必须在持 `buffers` 锁时调用；返回被淘汰的 URI 列表，调用方**锁外**
+/// 走 didClose 通知（outbound 关 send 失败忽略）。
+///
+/// 复杂度：O(n log n)（按 `last_released_at` 排序），n = 池大小。32 条目下
+/// 微秒级；超 1000 文件 OOM 不会发生（容量闸门本就该在前面）。
+///
+/// `lsp_types::Uri` 含 `UnsafeCell`（内部 path percent-encoding cache），
+/// `clippy::mutable_key_type` 静态告警——但调用方持锁单线程访问，运行时安全。
+#[allow(clippy::mutable_key_type)]
+fn evict_lru_idle_locked(
+    map: &mut std::collections::HashMap<Uri, FileBuffer>,
+    capacity: usize,
+) -> Vec<Uri> {
+    if map.len() < capacity {
+        return Vec::new();
+    }
+    // 收集空闲条目 (uri, last_released_at)；活跃 (ref_count>0) 或未释放
+    // (last_released_at=None) 一律跳过。
+    let mut idle: Vec<(Uri, Instant)> = map
+        .iter()
+        .filter_map(|(uri, buf)| {
+            if buf.ref_count == 0 {
+                buf.last_released_at.map(|t| (uri.clone(), t))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if idle.is_empty() {
+        // 全表皆活跃：允许本轮 overflow，调用方的 ensure_open 不会被阻塞。
+        return Vec::new();
+    }
+    // 按 last_released_at 升序（最久未用在前）。稳定排序 + collect 出 URI。
+    idle.sort_by_key(|(_, t)| *t);
+    // 淘汰直到 len < capacity。
+    let need_evict = map.len().saturating_sub(capacity - 1).max(1);
+    let to_close: Vec<Uri> = idle
+        .into_iter()
+        .take(need_evict)
+        .map(|(uri, _)| uri)
+        .collect();
+    for uri in &to_close {
+        map.remove(uri);
+    }
+    to_close
 }

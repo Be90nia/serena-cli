@@ -715,3 +715,299 @@ async fn ensure_open_same_mtime_different_size_emits_did_change() {
 
     session.shutdown().await;
 }
+
+/// 修 P1 #1（LRU 容量闸门）：打开超过 `FILE_BUFFER_CAPACITY`（32）的文件时，
+/// 池按 `last_released_at` 升序淘汰空闲条目，被淘汰者发 didClose + 移表。
+/// 本测试用 40 文件压 32 容量门，断言最久未用被回收（通过 mock_ls 收到的
+/// didClose 事件顺序验证——LRU 淘汰路径必须发 didClose，最早插入的文件先收）。
+#[tokio::test]
+async fn lru_capacity_evicts_oldest_idle_buffers() {
+    use lsp_core::docsync::FILE_BUFFER_CAPACITY;
+
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+
+    let n_files = FILE_BUFFER_CAPACITY + 8; // 32 + 8 = 40 文件压 32 容量门
+    let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(n_files);
+    for i in 0..n_files {
+        let p = tmp.path().join(format!("f{i:02}.cpp"));
+        tokio::fs::write(&p, format!("// f{i}\n").as_bytes())
+            .await
+            .expect("write fixture");
+        paths.push(p);
+    }
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    // 顺序：每个文件 ensure_open → drop guard（标 last_released_at=now）→ 等 1ms 让时间戳分得开。
+    // 这样后续插入会按 drop 顺序淘汰最早的文件（f00, f01, ...）。
+    let mut guards = Vec::with_capacity(n_files);
+    for p in &paths {
+        let g = session.ensure_open(p).await.expect("ensure_open");
+        guards.push(g);
+        time::sleep(Duration::from_millis(1)).await;
+    }
+    // 全部 drop：ref_count=0，池现在有 40 条空闲条目（暂未触发 LRU，drop 只置 last_released_at）。
+    drop(guards);
+    time::sleep(Duration::from_millis(10)).await;
+
+    // 此时池大小 = 40（> 32）。最后插入的 f08..f31 是最新；最久未用应是 f00..f07（8 个）。
+    // 插入第 41 个文件触发 LRU 容量闸门——
+    // 容量闸门语义：插入后池 41 > 32，需淘汰 `41 - (32-1) = 10` 个 idle 条目。
+    // 即淘汰 f00..f09（最久未用 10 个）。
+    let overflow = tmp.path().join("overflow.cpp");
+    tokio::fs::write(&overflow, b"// overflow\n").await.expect("write overflow");
+    let _g_overflow = session.ensure_open(&overflow).await.expect("overflow open");
+
+    time::sleep(Duration::from_millis(300)).await;
+
+    // 验证 didClose 事件：被淘汰的 f00..f09 必须收到 didClose，f10 必留下。
+    let events = read_track_events(&track_log).await;
+    let closes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didClose"))
+        .collect();
+    let uri_f00 = file_uri(&paths[0]);
+    let uri_f01 = file_uri(&paths[1]);
+    let uri_f09 = file_uri(&paths[9]);
+    let uri_f10 = file_uri(&paths[10]);
+    let uri_overflow_v = file_uri(&overflow);
+
+    let f00_closed = closes
+        .iter()
+        .any(|e| e.get("uri").and_then(Value::as_str) == Some(uri_f00.as_str()));
+    let f01_closed = closes
+        .iter()
+        .any(|e| e.get("uri").and_then(Value::as_str) == Some(uri_f01.as_str()));
+    let f09_closed = closes
+        .iter()
+        .any(|e| e.get("uri").and_then(Value::as_str) == Some(uri_f09.as_str()));
+    let f10_closed = closes
+        .iter()
+        .any(|e| e.get("uri").and_then(Value::as_str) == Some(uri_f10.as_str()));
+    let overflow_in_closes = closes
+        .iter()
+        .any(|e| e.get("uri").and_then(Value::as_str) == Some(uri_overflow_v.as_str()));
+
+    assert!(f00_closed, "f00 是最久未用，必被 LRU 淘汰并发 didClose；events={events:?}");
+    assert!(f01_closed, "f01 是次久未用，必被 LRU 淘汰并发 didClose；events={events:?}");
+    assert!(f09_closed, "f09 在淘汰边界内，必被 LRU 淘汰并发 didClose；events={events:?}");
+    assert!(
+        !f10_closed,
+        "f10 在淘汰边界外，必保留；events={events:?}"
+    );
+    assert!(
+        !overflow_in_closes,
+        "overflow 新插入的必留下，不能有 didClose；events={events:?}"
+    );
+
+    session.shutdown().await;
+}
+
+/// 修 P1 #1（活跃 guard 不被 LRU 淘汰）：所有 ref_count>0 时 LRU 跳过——避免
+/// 容量压力下打断活跃工具调用。验证：32 活跃 + 1 新插入 → 无 didClose（除
+/// shutdown 时 evict_all_buffers 触发），活跃文件全部留下。
+#[tokio::test]
+async fn lru_capacity_skips_active_buffers_under_pressure() {
+    use lsp_core::docsync::FILE_BUFFER_CAPACITY;
+
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+
+    // 32 个文件全持活 guard → ref_count 全部 >0。
+    let n_files = FILE_BUFFER_CAPACITY;
+    let mut paths = Vec::with_capacity(n_files);
+    let mut guards = Vec::with_capacity(n_files);
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    for i in 0..n_files {
+        let p = tmp.path().join(format!("a{i:02}.cpp"));
+        tokio::fs::write(&p, format!("// a{i}\n").as_bytes())
+            .await
+            .expect("write fixture");
+        paths.push(p);
+        let g = session.ensure_open(&paths[i]).await.expect("ensure_open");
+        guards.push(g);
+    }
+
+    // 此时池大小 = 32（正好容量）。再插入一个新文件 → 池 33 > 32 → LRU 应跳过
+    // （全活）→ allow overflow，无 didClose 触发。
+    let overflow = tmp.path().join("overflow2.cpp");
+    tokio::fs::write(&overflow, b"// overflow2\n").await.expect("write overflow");
+    let _g_overflow = session.ensure_open(&overflow).await.expect("overflow open");
+
+    time::sleep(Duration::from_millis(300)).await;
+
+    // 验证：在活跃 guard 还持住期间，无 didClose（mock_ls 不会从非 evict 路径发）。
+    let events_pre = read_track_events(&track_log).await;
+    let closes_pre: Vec<&Value> = events_pre
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didClose"))
+        .collect();
+    assert_eq!(
+        closes_pre.len(),
+        0,
+        "全活状态下 LRU 应跳过，活跃期间不应有 didClose；events={events_pre:?}"
+    );
+
+    drop(guards);
+    time::sleep(Duration::from_millis(50)).await;
+
+    session.shutdown().await;
+}
+
+/// 修 P1 #1（TTL 过期验证）：ref_count=0 超过 TTL 后确保下一次 ensure_open 重新走
+/// didOpen（不是复用）。这是 TTL 与 LRU 的协同——TTL 是窗口复用，LRU 是容量兜底，
+/// TTL 过期后 LRU 仍未动则下次 ensure_open 重新走 didOpen。
+#[tokio::test]
+async fn ttl_expired_ensure_open_re_emits_did_open() {
+    use lsp_core::docsync::FILE_GUARD_TTL;
+
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file = tmp.path().join("t.cpp");
+    tokio::fs::write(&file, b"v1\n").await.expect("write fixture");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    let g1 = session.ensure_open(&file).await.expect("first open");
+    drop(g1);
+
+    // 等超过 FILE_GUARD_TTL 60s？测试不阻塞 60s——直接用 evict_idle_buffers(0)
+    // 把 idle 条目手动驱逐（与 TTL 过期语义等价），再 ensure_open 必重新走 didOpen。
+    let removed = session.evict_idle_buffers(Duration::from_secs(0));
+    assert!(removed >= 1, "TTL 模拟驱逐应回收至少 1 条；removed={removed}");
+
+    let _g2 = session.ensure_open(&file).await.expect("reopen after TTL");
+
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    assert_eq!(
+        opens.len(),
+        2,
+        "TTL 过期 + 显式 evict 后再次 ensure_open 必须重新走 didOpen；events={events:?}"
+    );
+
+    session.shutdown().await;
+    // FILE_GUARD_TTL 仅做编译期断言（确保常量仍存在）。
+    let _ttl = FILE_GUARD_TTL;
+}
+
+/// 修 P1 #1（session shutdown 全关）：Session::shutdown 必须在 pumps kill 前先
+/// evict_all_buffers（清空缓冲池并发 didClose）。这让 LS 在 shutdown+exit 之前
+/// 完成 LSP 协议层的「关闭文档」流程。
+#[tokio::test]
+async fn session_shutdown_evicts_all_buffers() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file_a = tmp.path().join("sa.cpp");
+    let file_b = tmp.path().join("sb.cpp");
+    tokio::fs::write(&file_a, b"a\n").await.expect("write a");
+    tokio::fs::write(&file_b, b"b\n").await.expect("write b");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    let _ga = session.ensure_open(&file_a).await.expect("open a");
+    let _gb = session.ensure_open(&file_b).await.expect("open b");
+    time::sleep(Duration::from_millis(300)).await;
+
+    // shutdown 必须在 evict 后发出 didClose（关文件）→ shutdown 请求 → exit 通知 → 进程退。
+    // 断言：两个文件的 didClose 都在 shutdown 之前发生（顺序：evict_all_buffers 先发
+    // didClose，然后 shutdown_request → exit）。
+    session.shutdown().await;
+
+    let events = read_track_events(&track_log).await;
+    let closes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didClose"))
+        .collect();
+    assert_eq!(
+        closes.len(),
+        2,
+        "shutdown 必须 evict 缓冲池并发 didClose；events={events:?}"
+    );
+    let uri_a = file_uri(&file_a);
+    let uri_b = file_uri(&file_b);
+    let close_a = closes
+        .iter()
+        .any(|e| e.get("uri").and_then(Value::as_str) == Some(uri_a.as_str()));
+    let close_b = closes
+        .iter()
+        .any(|e| e.get("uri").and_then(Value::as_str) == Some(uri_b.as_str()));
+    assert!(close_a && close_b, "两文件都应收到 didClose；events={events:?}");
+}
+
+/// 修 P1 #1（同文件 5 次连续访问 → 缓存命中）：AI 编辑回路的典型场景——
+/// overview / symbol-body / hover / def / refs 连续访问同一文件，TTL 窗口内
+/// 后续 ensure_open 必须**零 didOpen 重发**（mtime/size 未变）。
+#[tokio::test]
+async fn repeated_same_file_access_emits_no_reopen_within_ttl() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file = tmp.path().join("r.cpp");
+    // 50KB 内容（量化场景：典型 .cpp 文件大小）。
+    let body = "// ".to_string() + &"x".repeat(50_000) + "\n";
+    tokio::fs::write(&file, body.as_bytes())
+        .await
+        .expect("write fixture");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    // 5 次连续访问（典型 AI 编辑回路：overview → 定位 → 写 → 诊断 → 再 overview）。
+    let mut durations = Vec::with_capacity(5);
+    for i in 0..5 {
+        let t0 = std::time::Instant::now();
+        let g = session.ensure_open(&file).await.expect("ensure_open");
+        durations.push(t0.elapsed());
+        drop(g);
+        // 极短间隔，远小于 FILE_GUARD_TTL（60s）→ 复用命中。
+        time::sleep(Duration::from_millis(5)).await;
+        // 静音：防 Rust 编译器抱怨 i 未用。
+        let _ = i;
+    }
+
+    time::sleep(Duration::from_millis(300)).await;
+
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    assert_eq!(
+        opens.len(),
+        1,
+        "5 次同文件访问 TTL 内只 1 次 didOpen（其余复用）；events={events:?}"
+    );
+
+    // 前 N 测：第 1 次有 IO（stat + read），后续 4 次纯锁内复用。统计快路径：
+    // 第 1 次稳定后第 5 次应 < 1ms（纯锁内路径）。
+    if durations.len() >= 5 {
+        eprintln!(
+            "5 次 ensure_open 时长 (µs): first={}, last={} (TTL 复用路径)",
+            durations[0].as_micros(),
+            durations[4].as_micros()
+        );
+    }
+
+    session.shutdown().await;
+}

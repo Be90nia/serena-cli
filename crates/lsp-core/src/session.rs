@@ -549,6 +549,13 @@ impl Session {
     /// 持 stdin 等客户端 send —— 必须杀进程才能触发 stdout EOF 与 on_eof。等 EOF 在前
     /// 会把 5s 等满 + 5s 等满 = 10s 总耗时。kill 先发 → stdout EOF ms 级到达。
     pub async fn shutdown(&self) {
+        // 步骤 0（修 P1 #1）：会话关闭前先把 docsync 缓冲池中的活跃文档 didClose——
+        // 让 LS 在 shutdown+exit 之前完成 LSP 协议层的「关闭文档」流程，避免 LS
+        // 退出时残留未关闭文档引用（mock_ls/RA 行为对此无感，但其他 LS 可能持句柄
+        // 不放、文件锁延迟释放等）。必须在 pumps 关闭前发——之后 outbound 关 send
+        // 即失败。`evict_all_buffers` 同步函数纯锁内 drain + 锁外 notify。
+        self.evict_all_buffers();
+
         // 步骤 1：尝试发 shutdown 请求并等回执（mock_ls/真实 LS 都回 null）。
         let _ = time::timeout(SHUTDOWN_REQ_TIMEOUT, async {
             let _r: Result<Value> = self
