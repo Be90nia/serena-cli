@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 use lsp_core::docsync::{path_to_uri, path_to_uri_str};
@@ -204,12 +204,20 @@ fn symbol_cache_put_impl(
     cache.insert(key, hits);
 }
 
-/// root 下（depth ≤3，标准 ignore 过滤）源码文件的最大 mtime —— workspace 级
-/// 缓存的变化信号。只 stat 能被 `resolve_lang_name` 识别的文件（非源码文件变化
-/// 不该失效符号缓存）。删除文件不推进 max —— 残留已知边界，重启 daemon 兜底。
-fn root_source_mtime(root: &Path) -> Option<SystemTime> {
+/// root 下（depth ≤3，标准 ignore 过滤）源码文件的 (max mtime, lang 集合)。
+///
+/// 单次 walk 同时收集 max mtime 与 lang 集合 —— 原实现 `tool_find_symbol` miss
+/// 路径会再走一遍只为收集 lang，重复 stat 风暴。一次 walk 两用。
+///
+/// 只 stat 能被 `resolve_lang_name` 识别的文件（非源码文件变化不该失效符号缓存）。
+/// 删除文件不推进 max —— 残留已知边界，重启 daemon 兜底。
+/// `depth ≤3` 对 `crates/*/src/*.rs` 等深嵌套文件盲（深度 4），P2-4 附注。
+///
+/// ponytail: 同步函数，调用方（`root_signal_cached`）包 `spawn_blocking`。
+fn walk_root_signal(root: &Path) -> (Option<SystemTime>, std::collections::BTreeSet<String>) {
     use ignore::WalkBuilder;
     let mut max: Option<SystemTime> = None;
+    let mut langs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for entry in WalkBuilder::new(root)
         .standard_filters(true)
         .max_depth(Some(3))
@@ -217,7 +225,7 @@ fn root_source_mtime(root: &Path) -> Option<SystemTime> {
         .flatten()
     {
         if entry.file_type().is_some_and(|t| t.is_file())
-            && ls_registry::resolve_lang_name(entry.path()).is_some()
+            && let Some(lang) = ls_registry::resolve_lang_name(entry.path())
             && let Ok(meta) = entry.metadata()
             && let Ok(m) = meta.modified()
         {
@@ -225,9 +233,64 @@ fn root_source_mtime(root: &Path) -> Option<SystemTime> {
                 Some(prev) if prev >= m => prev,
                 _ => m,
             });
+            langs.insert(lang.to_string());
         }
     }
-    max
+    (max, langs)
+}
+
+/// 仅 mtime 信号（保留签名给 `root_source_mtime_change_invalidates_find_symbol_cache`
+/// 测试直接调用，绕开 TTL 缓存保证 mtime 变化立刻可见）。运行时走 `root_signal_cached`。
+#[cfg_attr(not(test), allow(dead_code))]
+fn root_source_mtime(root: &Path) -> Option<SystemTime> {
+    walk_root_signal(root).0
+}
+
+/// root 信号 TTL 缓存（per root）。2s 内复用上次 walk 结果，避免每请求
+/// depth-3 全仓 stat 风暴。外部修改感知延迟 ≤2s，与诊断等待同量级容忍。
+///
+/// 结构：`Mutex<HashMap<PathBuf, (采集时刻, mtime, langs)>`。读路径 fast-path：
+/// 缓存新鲜 → clone 走；miss → `spawn_blocking(walk_root_signal)` 后回填。
+///
+/// ponytail: 全局静态锁 + HashMap；多根项目并行 scan 会争用，但对单一 root 串行
+/// find-symbol 场景（典型）零争用。万级 root 时换 DashMap——本项目禁 dashmap，
+/// 改回 path-hash 分片 Mutex 即可。
+type RootSignalEntry = (std::time::Instant, Option<SystemTime>, std::collections::BTreeSet<String>);
+const ROOT_SIGNAL_TTL: Duration = Duration::from_secs(2);
+
+static ROOT_SIGNAL_CACHE: LazyLock<Mutex<HashMap<PathBuf, RootSignalEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 取缓存的 root 信号（mtime, langs）。2s 内复用；否则 `spawn_blocking` 重 walk。
+///
+/// miss 路径收集的 langs 顺手返回，调用方（`tool_find_symbol`）无需再 walk 第二遍。
+async fn root_signal_cached(
+    root: &Path,
+) -> (Option<SystemTime>, std::collections::BTreeSet<String>) {
+    // Fast-path: 读锁（同步临界区，亚微秒）。
+    if let Some(entry) = ROOT_SIGNAL_CACHE.lock().unwrap().get(root).cloned()
+        && entry.0.elapsed() < ROOT_SIGNAL_TTL
+    {
+        return (entry.1, entry.2);
+    }
+    // Slow-path: spawn_blocking 跑同步 walk，不占 async worker。
+    let root_owned = root.to_path_buf();
+    let (max, langs) =
+        tokio::task::spawn_blocking(move || walk_root_signal(&root_owned))
+            .await
+            .unwrap_or_else(|_| (None, std::collections::BTreeSet::new()));
+    let mut cache = ROOT_SIGNAL_CACHE.lock().unwrap();
+    // 二次检查：期间可能已被并发回填。
+    if let Some(existing) = cache.get(root)
+        && existing.0.elapsed() < ROOT_SIGNAL_TTL
+    {
+        return (existing.1, existing.2.clone());
+    }
+    cache.insert(
+        root.to_path_buf(),
+        (std::time::Instant::now(), max, langs.clone()),
+    );
+    (max, langs)
 }
 
 /// Daemon 工具语义层抽象；实现负责按工具名分派只读请求。
@@ -2021,7 +2084,6 @@ impl Supervisor {
         limit: usize,
         lang_override: Option<&str>,
     ) -> ToolResult<Vec<SymbolHit>> {
-        use ignore::WalkBuilder;
         use std::collections::BTreeSet;
 
         if query.is_empty() {
@@ -2030,32 +2092,24 @@ impl Supervisor {
             });
         }
 
+        // P2-4：root 信号（mtime + langs）走 2s TTL 缓存 + spawn_blocking 同步 walk。
+        // 单次 walk 同时拿 mtime 与 lang 集合：命中路径（root_source_mtime 同等信号）
+        // 与 miss 路径（lang 探测）复用同一份结果，免二次 walk 风暴。
+        let (root_mtime, walked_langs) = root_signal_cached(root).await;
+
         // Phase 3.1 缓存：同 (root, query, root-mtime 信号) 二次调用免全仓
         // workspace/symbol 往返；信号变（任一源码文件被外部改/新增）→ 自然 miss。
-        let cache_key = find_symbol_cache_key(root, query, root_source_mtime(root));
+        let cache_key = find_symbol_cache_key(root, query, root_mtime);
         if let Some(mut cached) = self.symbol_cache_get(&cache_key) {
             cached.truncate(limit);
             return Ok(cached); // cache_hit
         }
 
-        // 决定要查的 lang 集合 (BTreeSet = 字母序, 顺序稳定)。
+        // 决定要查的 lang 集合 (BTreeSet = 字母序, 顺序稳定)。命中缓存时直接复用 walked_langs。
         let langs: BTreeSet<String> = if let Some(l) = lang_override {
             [l.to_ascii_lowercase()].into()
         } else {
-            let mut set: BTreeSet<String> = BTreeSet::new();
-            for entry in WalkBuilder::new(root)
-                .standard_filters(true)
-                .max_depth(Some(3))
-                .build()
-                .flatten()
-            {
-                if entry.file_type().is_some_and(|t| t.is_file())
-                    && let Some(l) = ls_registry::resolve_lang_name(entry.path())
-                {
-                    set.insert(l.to_string());
-                }
-            }
-            set
+            walked_langs
         };
         if langs.is_empty() {
             return Err(ToolError::BadArgs {
@@ -2636,7 +2690,6 @@ impl Supervisor {
         max_results: usize,
         case_sensitive: bool,
     ) -> ToolResult<SearchResponse> {
-        use ignore::WalkBuilder;
         use regex::RegexBuilder;
 
         let regex = RegexBuilder::new(pattern)
@@ -2696,7 +2749,40 @@ impl Supervisor {
         };
 
         let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let mut walker = WalkBuilder::new(&root);
+
+        // 整个扫描体（walk + read + regex）丢 `spawn_blocking`：原同步 IO 内联
+        // 在 async worker 上，单 search 期间 daemon 该 worker 上的其它请求全部排队。
+        // 850 文件冷扫可占 worker 数百 ms-数秒，导致 /status、reaper select、L/batch
+        // 并行的 7 条兄弟请求显著延迟。包 spawn_blocking 后 worker 立刻释放，P2-6。
+        let (hits, truncated, files_scanned) = tokio::task::spawn_blocking(move || {
+            Self::search_sync_scan(&root, &regex, glob_re.as_ref(), max_results)
+        })
+        .await
+        .map_err(|e| ToolError::Core(CoreError::Rpc {
+            code: -1,
+            message: format!("search scan join error: {e}"),
+        }))?;
+
+        Ok(SearchResponse {
+            hits,
+            truncated,
+            files_scanned,
+        })
+    }
+
+    /// 同步执行 search 扫描体（walk + read_to_string + regex），由
+    /// `tool_search_for_pattern` 在 `spawn_blocking` 内调用。
+    /// ponytail: 同步 IO + regex 全跑在 blocking thread pool；
+    /// max_results 截断短路避免无谓读完大文件。
+    fn search_sync_scan(
+        root: &Path,
+        regex: &regex::Regex,
+        glob_re: Option<&regex::Regex>,
+        max_results: usize,
+    ) -> (Vec<SearchHit>, bool, usize) {
+        use ignore::WalkBuilder;
+
+        let mut walker = WalkBuilder::new(root);
         walker
             .standard_filters(true)
             .require_git(false)
@@ -2724,10 +2810,10 @@ impl Supervisor {
                 continue;
             }
             let path = entry.path();
-            let rel = path.strip_prefix(&root).unwrap_or(path);
+            let rel = path.strip_prefix(root).unwrap_or(path);
             let rel_str = rel.to_string_lossy().replace('\\', "/");
 
-            if let Some(g) = &glob_re
+            if let Some(g) = glob_re
                 && !g.is_match(&rel_str)
             {
                 continue;
@@ -2770,12 +2856,9 @@ impl Supervisor {
             }
         }
 
-        Ok(SearchResponse {
-            hits,
-            truncated,
-            files_scanned,
-        })
+        (hits, truncated, files_scanned)
     }
+
     /// `textDocument/rename` 跨文件重命名（Task 22）。
     ///
     /// 设计要点：
@@ -3519,9 +3602,10 @@ fn position_in_range(r: lsp_types::Range, line: u32, col: u32) -> bool {
 
 /// A（ai-token-features §10-A）：给 search 命中增量补 `symbol`/`container`。
 ///
-/// 按 file 分桶，逐桶走 `tool_overview`（Phase 3.1 缓存兜着，同文件仅一次 LS 往返）；
-/// 每条命中按 0-based line/col 找覆盖它的最小符号。单桶 overview 失败（LS 未就绪、
-/// 语言不可解析等）该桶保持 None —— 装饰失败绝不影响 search 主结果。
+/// 按 file 分桶、按语言再分桶（混合目录各走各的 LS，永不串 session），每桶
+/// `overview_via_session` 进 JoinSet 有界并发（Phase 3.1 缓存兜着，同文件仅一次
+/// LS 往返）；每条命中按 0-based line/col 找覆盖它的最小符号。单桶 overview 失败
+/// （LS 未就绪、语言不可解析等）该组保持 None —— 装饰失败绝不影响 search 主结果。
 async fn enrich_search_with_symbols(
     sup: &Supervisor,
     root: &Path,
@@ -3533,16 +3617,71 @@ async fn enrich_search_with_symbols(
     for (idx, hit) in hits.iter().enumerate() {
         per_file.entry(hit.file.clone()).or_default().push(idx);
     }
-    for (file, indices) in per_file {
-        let syms = sup.tool_overview(root, &file, lang).await.ok();
-        let Some(syms) = syms else { continue };
+
+    // 与 tool_symbol_tree 同一扇出原语（修 P1 #3 复用）：按语言分桶 → 每桶一条
+    // session → `overview_via_session` 进 JoinSet 有界并发；语言解析失败 / LS 拉不起
+    // 的文件组跳过 —— 与原串行 `tool_overview(..).ok()` 逐文件语义一致。
+    let mut per_lang: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for file in per_file.keys() {
+        if let Ok(lang_id) = resolve_lang_for_file(file, lang) {
+            per_lang.entry(lang_id).or_default().push(file.clone());
+        }
+    }
+
+    const MAX_INFLIGHT: usize = 4;
+    async fn drain_one(
+        set: &mut tokio::task::JoinSet<(String, ToolResult<Vec<SymbolHit>>)>,
+        out: &mut std::collections::HashMap<String, ToolResult<Vec<SymbolHit>>>,
+    ) {
+        let Some(joined) = set.join_next().await else {
+            return;
+        };
+        if let Ok((file, res)) = joined {
+            out.insert(file, res);
+        }
+    }
+
+    let mut overviews: std::collections::HashMap<String, ToolResult<Vec<SymbolHit>>> =
+        std::collections::HashMap::new();
+    let cache_arc = Arc::clone(&sup.symbol_cache);
+    for (lang_id, files) in per_lang {
+        let Ok(session) = sup.session_for(root, &lang_id).await else {
+            continue; // 单 LS 拉不起 → 该桶全部保持无装饰，不影响 search 主结果
+        };
+        let mut set = tokio::task::JoinSet::new();
+        for file in files {
+            if set.len() >= MAX_INFLIGHT {
+                drain_one(&mut set, &mut overviews).await;
+            }
+            let session = Arc::clone(&session);
+            let cache_arc = Arc::clone(&cache_arc);
+            let root_buf = root.to_path_buf();
+            let lang_owned = lang.map(str::to_string);
+            set.spawn(async move {
+                let res =
+                    overview_via_session(session, cache_arc, root_buf, file.clone(), lang_owned.as_deref())
+                        .await;
+                (file, res)
+            });
+        }
+        while !set.is_empty() {
+            drain_one(&mut set, &mut overviews).await;
+        }
+    }
+
+    // 应用装饰：overview 失败的文件整组跳过（symbol/container 保持 None）。
+    for (file, indices) in &per_file {
+        let Some(Ok(syms)) = overviews.get(file) else {
+            continue;
+        };
         for idx in indices {
             // SearchHit 的 line/col 是 1-based；LSP Range 是 0-based。
-            let line_0 = hits[idx].line.saturating_sub(1);
-            let col_0 = hits[idx].col.saturating_sub(1);
-            if let Some((sym, container)) = find_covering_symbol(&syms, line_0, col_0) {
-                hits[idx].symbol = Some(sym);
-                hits[idx].container = container;
+            let line_0 = hits[*idx].line.saturating_sub(1);
+            let col_0 = hits[*idx].col.saturating_sub(1);
+            if let Some((sym, container)) = find_covering_symbol(syms, line_0, col_0) {
+                hits[*idx].symbol = Some(sym);
+                hits[*idx].container = container;
             }
         }
     }
