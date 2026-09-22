@@ -1,0 +1,877 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "note": "read-time schema; execute_tool args 仍是自由 serde_json::Value",
+  "title": "serena-rust RPC params catalog",
+  "tools": {
+    "call-hierarchy": {
+      "args": {
+        "col": {
+          "description": "required when op=prepare; 0-based",
+          "required": false,
+          "type": "number"
+        },
+        "file": {
+          "description": "required when op=prepare",
+          "required": false,
+          "type": "string"
+        },
+        "item": {
+          "description": "CallHierarchyItem JSON (required when op=incoming|outgoing)",
+          "required": false,
+          "type": "object"
+        },
+        "line": {
+          "description": "required when op=prepare; 0-based",
+          "required": false,
+          "type": "number"
+        },
+        "op": {
+          "description": "prepare | incoming | outgoing",
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "code-action": {
+      "args": {
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "kind": {
+          "description": "CodeActionKind filter",
+          "required": false,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "code-lens": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "completion": {
+      "args": {
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "limit": {
+          "default": 5,
+          "required": false,
+          "type": "number"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        },
+        "trigger": {
+          "description": "trigger character (e.g. '.', ':')",
+          "required": false,
+          "type": "string"
+        }
+      }
+    },
+    "containing-symbol": {
+      "args": {
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "def": {
+      "args": {
+        "_compact": {
+          "default": true,
+          "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "defining-symbol": {
+      "args": {
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "delete-lines": {
+      "args": {
+        "end_line": {
+          "description": "1-based inclusive",
+          "required": true,
+          "type": "number"
+        },
+        "expected_hash": {
+          "required": false,
+          "type": "string"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "start_line": {
+          "description": "1-based inclusive",
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "delete-text-in-symbol": {
+      "args": {
+        "end_line": {
+          "description": "1-based inclusive",
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "start_line": {
+          "description": "1-based inclusive",
+          "required": true,
+          "type": "number"
+        },
+        "symbol": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "diagnostics": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "wait_gen": {
+          "description": "block until generation >= N (5s upper bound)",
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
+    "document-highlight": {
+      "args": {
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "document-link": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "edit-context": {
+      "args": {
+        "description": "B: body + callers + doc + tests in one call",
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "symbol": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "find-file": {
+      "args": {
+        "max_results": {
+          "default": 200,
+          "required": false,
+          "type": "number"
+        },
+        "name_pattern": {
+          "required": true,
+          "type": "string"
+        },
+        "path_glob": {
+          "required": false,
+          "type": "string"
+        }
+      }
+    },
+    "find-implementations": {
+      "args": {
+        "_compact": {
+          "default": true,
+          "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "_delta": {
+          "default": false,
+          "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "find-referencing-code-snippets": {
+      "args": {
+        "_compact": {
+          "default": true,
+          "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "context_lines": {
+          "default": 3,
+          "required": false,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        },
+        "max_results": {
+          "default": 50,
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
+    "find-referencing-symbols": {
+      "args": {
+        "_compact": {
+          "default": true,
+          "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "grouped": {
+          "default": false,
+          "required": false,
+          "type": "bool"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        },
+        "page": {
+          "default": 1,
+          "description": "pagination, used when grouped=true",
+          "required": false,
+          "type": "number"
+        },
+        "page_size": {
+          "default": 20,
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
+    "find-symbol": {
+      "args": {
+        "_compact": {
+          "default": true,
+          "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "_delta": {
+          "default": false,
+          "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "limit": {
+          "default": 50,
+          "required": false,
+          "type": "number"
+        },
+        "query": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "folding-range": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "format": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "insert_spaces": {
+          "required": false,
+          "type": "bool"
+        },
+        "tab_size": {
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
+    "format-range": {
+      "args": {
+        "end_col": {
+          "required": true,
+          "type": "number"
+        },
+        "end_line": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "insert_spaces": {
+          "required": false,
+          "type": "bool"
+        },
+        "start_col": {
+          "required": true,
+          "type": "number"
+        },
+        "start_line": {
+          "description": "0-based",
+          "required": true,
+          "type": "number"
+        },
+        "tab_size": {
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
+    "hover": {
+      "args": {
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "inlay-hint": {
+      "args": {
+        "end_line": {
+          "description": "0-based",
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "start_line": {
+          "description": "0-based",
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "insert-at-line": {
+      "args": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "expected_hash": {
+          "description": "hash for write-conflict guard",
+          "required": false,
+          "type": "string"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "description": "1-based",
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "insert-text-after-symbol": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "symbol": {
+          "required": true,
+          "type": "string"
+        },
+        "text": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "insert-text-before-symbol": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "symbol": {
+          "required": true,
+          "type": "string"
+        },
+        "text": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "list-dir": {
+      "args": {
+        "max_depth": {
+          "required": false,
+          "type": "number"
+        },
+        "max_entries": {
+          "default": 500,
+          "required": false,
+          "type": "number"
+        },
+        "path": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "moniker": {
+      "args": {
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "overview": {
+      "args": {
+        "_compact": {
+          "default": true,
+          "description": "compact envelope (private)",
+          "required": false,
+          "type": "bool"
+        },
+        "_compress": {
+          "description": "strip container/kind (private)",
+          "required": false,
+          "type": "bool"
+        },
+        "_delta": {
+          "default": false,
+          "description": "incremental delta (private)",
+          "required": false,
+          "type": "bool"
+        },
+        "_index_timeout_ms": {
+          "description": "per-call override (private)",
+          "required": false,
+          "type": "number"
+        },
+        "_max_tokens": {
+          "description": "soft budget on items (private)",
+          "required": false,
+          "type": "number"
+        },
+        "_timeout_ms": {
+          "description": "per-call override (private)",
+          "required": false,
+          "type": "number"
+        },
+        "file": {
+          "description": "repo-relative path",
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "read-file": {
+      "args": {
+        "end_line": {
+          "description": "1-based inclusive",
+          "required": false,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "start_line": {
+          "description": "1-based inclusive",
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
+    "refs": {
+      "args": {
+        "_compact": {
+          "default": true,
+          "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "_delta": {
+          "default": false,
+          "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "col": {
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "rename-symbol": {
+      "args": {
+        "col": {
+          "description": "0-based",
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "description": "0-based",
+          "required": true,
+          "type": "number"
+        },
+        "new_name": {
+          "description": "non-empty, no whitespace",
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "replace-body": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "new_body": {
+          "required": true,
+          "type": "string"
+        },
+        "symbol": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "replace-lines": {
+      "args": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "end_line": {
+          "description": "1-based inclusive",
+          "required": true,
+          "type": "number"
+        },
+        "expected_hash": {
+          "required": false,
+          "type": "string"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "start_line": {
+          "description": "1-based inclusive",
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "replace-text-in-symbol": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "new_text": {
+          "required": true,
+          "type": "string"
+        },
+        "old_text": {
+          "required": true,
+          "type": "string"
+        },
+        "symbol": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "repo-map": {
+      "args": {
+        "top_n": {
+          "default": 20,
+          "description": "E: top symbols by ref count",
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
+    "safe-delete-symbol": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "symbol": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "search": {
+      "args": {
+        "case_sensitive": {
+          "default": false,
+          "required": false,
+          "type": "bool"
+        },
+        "comments_only": {
+          "default": false,
+          "description": "I: filter to comment lines only",
+          "required": false,
+          "type": "bool"
+        },
+        "max_results": {
+          "default": 100,
+          "required": false,
+          "type": "number"
+        },
+        "path_glob": {
+          "required": false,
+          "type": "string"
+        },
+        "pattern": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "semantic-tokens": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "signature-help": {
+      "args": {
+        "col": {
+          "description": "0-based (LSP)",
+          "required": true,
+          "type": "number"
+        },
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "line": {
+          "description": "0-based (LSP)",
+          "required": true,
+          "type": "number"
+        }
+      }
+    },
+    "symbol-body": {
+      "args": {
+        "file": {
+          "required": true,
+          "type": "string"
+        },
+        "symbol": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "symbol-tree": {
+      "args": {
+        "dir": {
+          "required": true,
+          "type": "string"
+        },
+        "max_files": {
+          "default": 200,
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
+    "type-hierarchy": {
+      "args": {
+        "col": {
+          "description": "required when op=prepare",
+          "required": false,
+          "type": "number"
+        },
+        "file": {
+          "description": "required when op=prepare",
+          "required": false,
+          "type": "string"
+        },
+        "item": {
+          "description": "TypeHierarchyItem JSON (required when op=supertypes|subtypes)",
+          "required": false,
+          "type": "object"
+        },
+        "line": {
+          "description": "required when op=prepare",
+          "required": false,
+          "type": "number"
+        },
+        "op": {
+          "description": "prepare | supertypes | subtypes",
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "warm": {
+      "args": {
+        "lang": {
+          "description": "M: pre-warm LS for language",
+          "required": true,
+          "type": "string"
+        },
+        "timeout_secs": {
+          "default": 30,
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
+    "workspace-diagnostic": {
+      "args": {}
+    }
+  },
+  "version": 1
+}

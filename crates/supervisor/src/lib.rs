@@ -14,6 +14,9 @@
 //! (clangd)，单 `Mutex<HashMap>` 比 `Arc<Mutex<OnceCell>>` 简单。Task 13 把池换进来时本
 //! 公共 API 不变。
 
+// serde_json::json! 47 个嵌套对象超过默认 128 递归上限；catalog.rs 必需。
+#![recursion_limit = "512"]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -33,6 +36,7 @@ pub mod edit_tools;
 pub mod fs_tools;
 pub mod root_finder;
 
+pub mod catalog;
 pub mod ref_tools;
 pub mod repo_map;
 pub mod warm;
@@ -558,9 +562,16 @@ impl Supervisor {
 
     /// 卸载指定实例：先 shutdown session（5s 超时转 kill），再从池中移除。
     /// 返回 Ok(true) 表示真的卸了；Ok(false) 表示 key 不存在。
+    ///
+    /// P2-0bq: evict 也清理 `load_gates` / `pull_diag_supported` 两张旁表——
+    /// 二者只 insert 不 remove，LRU 反复驱逐同 (root, lang) 会按驱逐次数单调累积。
+    /// `diag_cache` 按 (root, uri) 键与 session 解耦，刻意保留（文件级诊断跨世代
+    /// 仍有效；新一轮 session 第一条 pushDiagnostics 会覆写/清空对应条目）。
     pub async fn evict(&self, key: &Key) -> ToolResult<bool> {
         let session = self.instances.lock().unwrap().remove(key);
         self.last_used.lock().unwrap().remove(key);
+        self.load_gates.lock().unwrap().remove(key);
+        self.pull_diag_supported.lock().unwrap().remove(key);
         match session {
             Some(s) => {
                 s.shutdown().await;
@@ -5959,6 +5970,40 @@ mod reclaim_idle_buffers_tests {
         // 清理：shutdown session + 卸 supervisor 池条目。
         session.shutdown().await;
         let _ = sup.evict(&key).await;
+    }
+
+    /// P2-0bq: evict 必须清理 `load_gates` / `pull_diag_supported` 两张旁表，
+    /// 否则 LRU 反复驱逐同 (root, lang) 按驱逐次数单调累积（gate 是 tokio Mutex，
+    /// pull_diag_supported 是 bool——虽小但每 key 一条，永不回收）。
+    ///
+    /// 这里直接构造一个 key，造表条目，evict，再断言两张表都已清掉。
+    #[tokio::test]
+    async fn evict_removes_load_gates_and_pull_diag_supported() {
+        let sup = Supervisor::direct().await.unwrap();
+        let key = Supervisor::key(Path::new("Z:/no/such/project"), "rust");
+
+        // 插 gate（任意 Arc<Mutex<()>>）+ pull 标记。
+        sup.load_gates
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(())));
+        sup.pull_diag_supported
+            .lock()
+            .unwrap()
+            .insert(key.clone(), true);
+
+        // instances 没有该 key → evict 返 false 但仍清两表。
+        let removed = sup.evict(&key).await.expect("evict");
+        assert!(!removed, "instances 没 key 时 evict 返 false");
+
+        assert!(
+            !sup.load_gates.lock().unwrap().contains_key(&key),
+            "load_gates 必须清掉"
+        );
+        assert!(
+            !sup.pull_diag_supported.lock().unwrap().contains_key(&key),
+            "pull_diag_supported 必须清掉"
+        );
     }
 
     /// 修 P1 #2 节流验证：连续 32 次调用中前 31 次不应扫 sessions（只递增
