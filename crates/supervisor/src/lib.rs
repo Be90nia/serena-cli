@@ -265,6 +265,16 @@ const ROOT_SIGNAL_TTL: Duration = Duration::from_secs(2);
 static ROOT_SIGNAL_CACHE: LazyLock<Mutex<HashMap<PathBuf, RootSignalEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// 写工具收尾的索引缓存失效（bd serena-rust-0em A 层）：写盘已发生，但
+/// `root_signal_cached` 的 2s TTL 窗口内 find_symbol 仍拿旧 mtime → 命中**写前**
+/// 的 find_symbol 缓存（旧行号，观测为"数秒后自愈"）。写后必须主动清：
+/// - ROOT_SIGNAL_CACHE 条目 → 下次强制 walk，新 mtime → 自然 miss；
+/// - 该 root 全部符号缓存（`invalidate_symbol_cache_for_root`，含 find_symbol 的
+///   `ws?` 级条目）→ 防 TTL 窗口内旧 key 命中。
+fn invalidate_write_derived_caches(root: &Path) {
+    ROOT_SIGNAL_CACHE.lock().unwrap().remove(root);
+}
+
 /// 取缓存的 root 信号（mtime, langs）。2s 内复用；否则 `spawn_blocking` 重 walk。
 ///
 /// miss 路径收集的 langs 顺手返回，调用方（`tool_find_symbol`）无需再 walk 第二遍。
@@ -339,6 +349,22 @@ pub struct Supervisor {
     /// `true` = LS 声明支持；`false` = 缺字段/null → 走 push 缓存（与 2.5 之前等价）。
     /// 锁用 std::sync::Mutex —— 写一次读多次、临界区小，不值得换 parking_lot。
     pull_diag_supported: std::sync::Arc<Mutex<HashMap<Key, bool>>>,
+    /// per-(root, uri_lower)：该 uri 是否收到过带 version 的 publishDiagnostics。
+    /// 有 version 纪律的 LS（rust-analyzer）→ 缺 version 的推送（如文件 watcher 通
+    /// 道对旧内容分析的推送）不得凭 generation 达标误确认（bd serena-rust-76d）；
+    /// 从不发 version 的 LS（clangd）→ 保留 generation 判定（旧行为不回退）。
+    version_seen: std::sync::Arc<Mutex<HashMap<(PathBuf, String), bool>>>,
+    /// 写后一致性窗口（bd serena-rust-0em）：写工具收尾标记 (root, file_lowercase)
+    /// → 写入时刻。find_symbol 在 TTL 内对这些文件强制 documentSymbol 对齐 ——
+    /// RA wssym 写后可能**缺条目**（命中集缩水，基线实测），行号比对检不出缺失。
+    recent_writes: Mutex<HashMap<(PathBuf, String), std::time::Instant>>,
+    /// workspace 加载失败记录（bd serena-rust-xzb）：key = `key_root_identity(root)`，
+    /// value = LS 经 `window/showMessage` / `window/logMessage` 报告的原始错误消息。
+    /// cargo metadata 失败（FetchWorkspaceError）等场景语义工具全静默返空，AI 以为
+    /// 项目没符号 —— 记录后经 warning 键透出（`workspace_error_for` / find-symbol /
+    /// hover / def / refs / find-implementations 分支）。LS 重启（session_for 再入）
+    /// 清零重新评估。键用小写归一：Windows 大小写双重身份（历史教训第三次变体）。
+    workspace_errors: std::sync::Arc<Mutex<HashMap<String, String>>>,
     /// Phase 3.1 文档符号缓存：(root, file, mtime) → 平铺 symbol list。
     /// overview / find-symbol / symbol-body 入口前查；命中免 LS 往返。mtime 变 →
     /// key 变 → 自然 miss 重调 LS（旧 entry 残留无害）。std Mutex：临界区仅 HashMap 读写。
@@ -508,6 +534,9 @@ impl Supervisor {
             diag_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             diag_generation: std::sync::Arc::new(AtomicU64::new(0)),
             pull_diag_supported: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            version_seen: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            recent_writes: Mutex::new(HashMap::new()),
+            workspace_errors: std::sync::Arc::new(Mutex::new(HashMap::new())),
             symbol_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             delta_cache: Arc::new(Mutex::new(HashMap::new())),
             idle_buffers_reclaim_counter: AtomicU64::new(0),
@@ -810,6 +839,7 @@ impl Supervisor {
         let cache_root = key.root.clone();
         let cache = std::sync::Arc::clone(&self.diag_cache);
         let generation = std::sync::Arc::clone(&self.diag_generation);
+        let version_seen = std::sync::Arc::clone(&self.version_seen);
         session
             .client()
             .on_notification("textDocument/publishDiagnostics", move |msg| {
@@ -845,6 +875,12 @@ impl Supervisor {
                     .as_ref()
                     .and_then(|p| p.get("version"))
                     .and_then(|v| v.as_i64());
+                if ver.is_some() {
+                    version_seen
+                        .lock()
+                        .unwrap()
+                        .insert((cache_root.clone(), uri.to_lowercase()), true);
+                }
                 let mut cache = cache.lock().unwrap();
                 let key = (cache_root.clone(), uri.to_lowercase());
                 if items.is_empty() {
@@ -854,6 +890,35 @@ impl Supervisor {
                     generation.fetch_add(1, Ordering::Relaxed);
                 }
             });
+        // bd serena-rust-xzb：workspace 加载错误的可见通道除 window 消息外，RA 的
+        // FetchWorkspaceError 只出现在 LS stderr（stderr 泵在 lsp-core，禁区不可改）
+        // —— rust root 由 probe_cargo_workspace_error（下方 insert 前）主动探测。
+        // 这里挂 window/showMessage / window/logMessage 兜底其它 LS 的推送通道。
+        // LS 重启 = 旧结论作废，先清零再挂新 handler 重新评估。
+        let ws_err_root = key_root_identity(&key.root);
+        self.workspace_errors.lock().unwrap().remove(&ws_err_root);
+        for method in ["window/showMessage", "window/logMessage"] {
+            let ws_err_root = ws_err_root.clone();
+            let ws_errors = std::sync::Arc::clone(&self.workspace_errors);
+            session
+                .client()
+                .on_notification(method, move |msg| {
+                    let Some(message) = msg
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("message"))
+                        .and_then(|v| v.as_str())
+                    else {
+                        return;
+                    };
+                    if is_workspace_load_error(message) {
+                        ws_errors
+                            .lock()
+                            .unwrap()
+                            .insert(ws_err_root.clone(), message.to_owned());
+                    }
+                });
+        }
         // ↖ mirror: ls.py@43ae021 on_server_started — 把"等待 LS 索引就绪"
         // 推到 session_for 内，避免用户可见的首请求 = 索引懒加载。探针必须用
         // root 下真实文件（虚拟 URI 不触发项目索引 —— cold-start hang 根因，
@@ -884,6 +949,11 @@ impl Supervisor {
             .insert(key.clone(), supports_pull);
         // 低层会话换代（旧会话已被 evict/懒重启移除）→ 高层符号缓存整体失效。
         self.invalidate_symbol_cache_for_root(&key.root);
+        // bd serena-rust-xzb：rust root 拉起即探测 cargo workspace 健康度（结果缓存，
+        // LS 重启清零重测），失败记录供语义工具 warning 透出。
+        if lang == "rust" {
+            self.probe_cargo_workspace_error(&key.root).await;
+        }
         self.instances
             .lock()
             .unwrap()
@@ -910,6 +980,11 @@ impl Supervisor {
         file: &str,
         lang: Option<&str>,
     ) -> serde_json::Value {
+        // 写盘已发生（bd serena-rust-0em）：先失效写衍生缓存（root 信号 TTL + 该 root
+        // 符号缓存），后续 find-symbol 强制重新 walk → 新 mtime → miss → 重查 LS。
+        invalidate_write_derived_caches(root);
+        self.invalidate_symbol_cache_for_root(root);
+        self.mark_recent_write(root, file);
         // 写入刚发生：记基线，等"下一次"推送（本次 didChange 引发的那代诊断）。
         let before = self.diag_generation.load(Ordering::Relaxed);
         match tokio::time::timeout(
@@ -1000,7 +1075,14 @@ impl Supervisor {
                 let ok = match (ver, doc_cur) {
                     (Some(v), Some(c)) => v >= c,
                     (Some(_), None) => true,
-                    (None, _) => self.diag_generation.load(Ordering::Relaxed) >= target,
+                    // 缺 version 的推送只在「该 uri 从未见 version」的 LS（clangd 等）
+                    // 上信任 generation 达标 —— 有 version 纪律的 LS（RA）其 watcher
+                    // 通道可能推缺 version 的旧内容分析，凭 generation 确认会把旧错误
+                    // 当新鲜（bd serena-rust-76d）。
+                    (None, _) => {
+                        !self.version_seen_uri(&key.root, &uri)
+                            && self.diag_generation.load(Ordering::Relaxed) >= target
+                    }
                 };
                 if ok {
                     confirmed_items = Some(items);
@@ -1015,16 +1097,25 @@ impl Supervisor {
         }
 
         // 窗口尽未达标：LS 没推送当前版本的新鲜诊断（可能分析中、可能 LS 慢）。
-        // pull 兜底拿当前快照，但快照新鲜度不可证 → 一律 pending: true。
-        let mut items = self
+        // bd serena-rust-76d：版本落后（entry_ver < doc_cur）的缓存条目是**上一版
+        // 内容**的分析结果（repair 场景 = 旧错误）—— pending 兜底也不得携带
+        // （验收：pending:true 且不返旧错误）；pull 快照是同类旧版计算结果且无法
+        // 归属版本（裸探针实锤"pull 返回上次计算快照"），版本落后时一并跳过。
+        // LS 不发 version（clangd）→ 无法判定 → 保留旧 items + pull 兜底（旧行为）。
+        let (mut items, entry_ver) = self
             .diag_cache
             .lock()
             .unwrap()
             .get(&(key.root.clone(), uri.to_lowercase()))
-            .map(|(v, _)| v.clone())
+            .cloned()
             .unwrap_or_default();
+        let stale_entry = matches!((entry_ver, doc_cur), (Some(v), Some(c)) if v < c);
+        if stale_entry {
+            items = Vec::new();
+        }
         if items.is_empty()
             && supports_pull
+            && !stale_entry
             && let Ok(value) = session
                 .client()
                 .request::<serde_json::Value>(
@@ -1703,6 +1794,140 @@ impl Supervisor {
         self.symbol_cache.lock().unwrap().len()
     }
 
+    /// 该 uri 是否收到过带 version 的 publishDiagnostics（bd serena-rust-76d）。
+    /// handler 写入；tool_diagnostics 确认分支读。
+    fn version_seen_uri(&self, root: &Path, uri: &str) -> bool {
+        self.version_seen
+            .lock()
+            .unwrap()
+            .get(&(root.to_path_buf(), uri.to_lowercase()))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// 该 root 是否记录过 workspace 加载失败（bd serena-rust-xzb）。
+    /// session_for 的 window 消息 handler 写入；语义工具响应组装时读。
+    fn workspace_error_for(&self, root: &Path) -> Option<String> {
+        self.workspace_errors
+            .lock()
+            .unwrap()
+            .get(&key_root_identity(root))
+            .cloned()
+    }
+
+    /// rust root 的 workspace 加载健康探测（bd serena-rust-xzb）。
+    ///
+    /// RA 的 cargo workspace 加载失败（FetchWorkspaceError，如 fixture 在别的
+    /// workspace 内非成员）只出现在 LS 进程 stderr（裸探针实锤 stdout LSP 通道无
+    /// window/showMessage|logMessage 帧），而 stderr 泵在 lsp-core（禁区）。
+    /// 故 supervisor 用与 RA 同源的 `cargo metadata` 主动探测 —— RA 加载 workspace
+    /// 内部就是跑这条命令，失败与否与 FetchWorkspaceError 同根同源；失败摘要写入
+    /// workspace_errors，语义工具响应经 warning 键透出（不再纯静默空）。
+    /// session 拉起时跑一次（结果缓存至 LS 重启清零）。
+    async fn probe_cargo_workspace_error(&self, root: &Path) {
+        if !root.join("Cargo.toml").is_file() {
+            return; // 非 cargo 项目（纯文件目录 / 其它语言），无从失败
+        }
+        let identity = key_root_identity(root);
+        if self.workspace_errors.lock().unwrap().contains_key(&identity) {
+            return; // 本轮 session 生命周期内已有结论（含其它通道记录）
+        }
+        let manifest = root.join("Cargo.toml");
+        let cwd = root.to_path_buf();
+        let outcome = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("cargo")
+                .args(["metadata", "--format-version", "1", "--manifest-path"])
+                .arg(&manifest)
+                .current_dir(&cwd)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .output()
+        })
+        .await;
+        let Ok(Ok(out)) = outcome else {
+            return; // spawn 失败/异常 = 环境问题，不冤枉 workspace
+        };
+        if out.status.success() {
+            return;
+        }
+        let detail: String = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let detail = if detail.is_empty() {
+            format!("exit code {:?}", out.status.code())
+        } else {
+            detail.chars().take(400).collect()
+        };
+        self.workspace_errors.lock().unwrap().insert(
+            identity,
+            format!("cargo metadata failed: {detail}"),
+        );
+    }
+
+
+    /// workspace 加载错误 warning（bd serena-rust-xzb）：有记录即透出，**不依赖空
+    /// 结果** —— 记录意味着该 root 的 workspace 未加载成功，语义结果整体不可信
+    /// （RA 语法层可能仍有响应，非空结果同样存疑）。
+    fn workspace_error_warnings(&self, root: &Path) -> Vec<String> {
+        match self.workspace_error_for(root) {
+            Some(err) => vec![format!(
+                "workspace error: {err}; semantic results may be empty (workspace failed to load)"
+            )],
+            None => Vec::new(),
+        }
+    }
+
+    /// 语义工具空结果的「可能未就绪」判定（bd serena-rust-we0）：
+    /// documentSymbol 探测 —— 符号索引空（LS 整体未就绪）或位置在符号内
+    /// （类型分析未就绪）→ 就绪提示；位置在符号外 → 空是正常语义，不加。
+    /// 探测自身失败（如 RA 索引刷新期 `-32801 content modified` 竞态）= LS 不稳定
+    /// 窗口，空结果同样可疑 → 一并标记（探测走 tool_overview，Phase 3.1 缓存命中
+    /// 免 LS 往返；未就绪窗口多一次 documentSymbol 往返可接受）。
+    async fn semantic_not_ready_warnings(
+        &self,
+        root: &Path,
+        file: &str,
+        line: u32,
+        col: u32,
+        lang: Option<&str>,
+    ) -> Vec<String> {
+        match self.tool_overview(root, file, lang).await {
+            Err(_) => vec![semantic_not_ready_message()],
+            Ok(hits) if hits.is_empty() || position_in_hits(&hits, line, col) => {
+                vec![semantic_not_ready_message()]
+            }
+            Ok(_) => Vec::new(),
+        }
+    }
+
+
+    /// 写工具收尾标记（bd serena-rust-0em）：file 进入写后一致性窗口。
+    fn mark_recent_write(&self, root: &Path, file: &str) {
+        self.recent_writes
+            .lock()
+            .unwrap()
+            .insert((root.to_path_buf(), file.to_lowercase()), std::time::Instant::now());
+    }
+
+    /// root 下仍在写后一致性窗口内的文件的归一 uri 集合（顺手清理过期条目）。
+    fn recent_written_uris(&self, root: &Path, ttl: Duration) -> Vec<String> {
+        let mut map = self.recent_writes.lock().unwrap();
+        map.retain(|_, t| t.elapsed() < ttl);
+        let mut uris = Vec::new();
+        for ((_r, f), _) in map.iter().filter(|((r, _), _)| *r == root) {
+            let path = root.join(f);
+            if let Ok(uri) = path_to_uri(&path) {
+                uris.push(uri.as_str().to_lowercase());
+            }
+        }
+        uris.sort();
+        uris.dedup();
+        uris
+    }
+
     /// 低层（LS 会话）版本变化 → 该 root 的全部高层符号缓存失效。
     ///
     /// ↖ mirror: ls.py@a5fd4d68 — 高层 document symbol 缓存版本必须纳入 LS-specific
@@ -2262,7 +2487,7 @@ impl Supervisor {
             // langs 非空（空集已在上方返 BadArgs）⇒ failures 非空。
             return Err(combined_all_failed_error(failures));
         }
-        let warnings = failure_warnings(&failures);
+        let mut warnings = failure_warnings(&failures);
         let query = query.to_string();
         let mut tasks = Vec::with_capacity(sessions.len());
         for session in sessions {
@@ -2304,11 +2529,125 @@ impl Supervisor {
         // 部分失败不写缓存：warning 只在本次调用产生（命中路径不过 session_for，
         // 无法重现），缓存部分结果会让重查静默丢失失败信息 —— 宁重查不可错缓存
         // （对齐空集不缓存纪律）。
+        // bd serena-rust-0em（B 层）：写后 RA workspace/symbol 索引刷新无保证时延
+        // （裸探针实测 0.12s~5s+），且写后可能**缺条目**（命中集缩水，基线对照实测）。
+        // 结果先过磁盘一致性校验 + 写后窗口检测，检出 stale/缺失 → documentSymbol
+        // 轮询对齐修正；对不齐 → 透传 + warning 且不写缓存（宁重查不可错缓存）。
+        // 无写后标记且比对全过 → 零额外开销；冷启动首查空的既有语义不变
+        // （bd serena-rust-x67 的 warning 机制不回退）。
+        if let Err(w) = self
+            .realign_stale_hits(root, query.as_str(), &mut merged, lang_override)
+            .await
+        {
+            warnings.push(w);
+        }
         if warnings.is_empty() {
             self.symbol_cache_put(cache_key, merged.clone()); // cache_miss → 写入（截断前全量）
         }
         merged.truncate(limit);
         Ok((merged, warnings))
+    }
+
+    /// workspace/symbol 结果与磁盘的一致性对齐（bd serena-rust-0em B 层）。
+    ///
+    /// 对齐目标 = 磁盘比对检出错位的文件 ∪ 写后一致性窗口内的文件（recent_writes
+    /// —— wssym 写后可能缺条目，行号比对检不出缺失，基线对照实测）。对目标文件
+    /// 轮询 `documentSymbol`（每轮先 `ensure_open`：mtime/size 变则自动重放
+    /// didChange，逼 RA 处理最新内容）直到 docsym 自身与磁盘一致 —— RA 对打开文件
+    /// 的 per-doc 分析远快于全局 index 重建。对齐后目标文件条目以 docsym 扁平表
+    /// **全表替换**（修位 + 补缺失 + 去幽灵一体），其余文件保留 wssym 条目。
+    /// 对不齐 → `Err(warning)`，调用方不写缓存。
+    async fn realign_stale_hits(
+        &self,
+        root: &Path,
+        query: &str,
+        hits: &mut Vec<SymbolHit>,
+        lang_override: Option<&str>,
+    ) -> Result<(), String> {
+        const REALIGN_ROUNDS: usize = 20;
+        const REALIGN_ROUND_MS: u64 = 400;
+        const RECENT_WRITE_TTL: Duration = Duration::from_secs(10);
+        let mut targets = stale_symbol_files(hits);
+        for uri in self.recent_written_uris(root, RECENT_WRITE_TTL) {
+            if !targets.contains(&uri) {
+                targets.push(uri);
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut fresh_tables: HashMap<std::path::PathBuf, Vec<SymbolHit>> = HashMap::new();
+        for n_rounds in 0..REALIGN_ROUNDS {
+            for uri in &targets {
+                // 小写 uri（归一键）反推出的 path 中段大小写可能失真 —— 必须
+                // canonicalize 还原磁盘真实大小写，否则 path_to_uri 生成的 uri 与
+                // RA 记账（canonical）不一致 → RA 拒绝请求（日志实锤）。
+                let Some(path) = uri_to_path(uri).and_then(|p| dunce::canonicalize(p).ok())
+                else {
+                    continue;
+                };
+                if fresh_tables.contains_key(&path) {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let Ok(lang) = resolve_lang_for_file(name, lang_override) else {
+                    continue;
+                };
+                let Ok(session) = self.session_for(root, lang.as_str()).await else {
+                    continue;
+                };
+                let Ok(_guard) = session.ensure_open(&path).await else {
+                    continue;
+                };
+                let Ok(curi) = path_to_uri(&path) else {
+                    continue;
+                };
+                let params = json!({ "textDocument": { "uri": curi.as_str() } });
+                let Ok(resp) = session
+                    .request::<Option<DocumentSymbolResponse>>(
+                        "textDocument/documentSymbol",
+                        params,
+                        INDEX_TIMEOUT,
+                    )
+                    .await
+                else {
+                    tracing::debug!(uri, round = n_rounds, "realign docsym request failed");
+                    continue;
+                };
+                let flat = flatten_symbols(resp, curi.as_str());
+                // docsym 自身也过磁盘校验 —— 旧 parse tree（RA 分析未跟上 didChange）
+                // 同样视为未对齐，等下一轮。（判定用全表，过滤只影响替换内容。）
+                let disk_ok = hits_match_disk_for_file(&path, &flat);
+                // docsym 全表含文件全部符号 —— find-symbol 结果必须维持查询语义，
+                // 按子串匹配过滤后再入替换表（对齐 wssym 的子串查询近似）。
+                let q = query.to_lowercase();
+                let matched: Vec<SymbolHit> = flat
+                    .into_iter()
+                    .filter(|s| s.name.to_lowercase().contains(&q))
+                    .collect();
+                tracing::debug!(
+                    uri,
+                    round = n_rounds,
+                    syms = matched.len(),
+                    ?disk_ok,
+                    "realign docsym poll"
+                );
+                if disk_ok == Some(true) {
+                    fresh_tables.insert(path, matched);
+                }
+            }
+            if fresh_tables.len() == targets.len() {
+                *hits = replace_files_with_tables(std::mem::take(hits), &fresh_tables);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(REALIGN_ROUND_MS)).await;
+        }
+        Err(format!(
+            "symbol index stale for {} file(s) after recent write; results may be misaligned, retry find-symbol shortly",
+            targets.len()
+        ))
     }
     /// `Location[]`，lsp-types 在 capability 上声明多形态——M0 只解 `Option<Location>`）。
     ///
@@ -3435,6 +3774,73 @@ pub(crate) fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(s.replace('\\', "/")))
 }
 
+/// 符号名错位容差窗：`location.range` 是含 attribute/doc 的 full range，起点行
+/// 可能不含符号名（如 `#[derive(..)]` 行）—— 起点行起向后 5 行内 contains(name)
+/// 视为一致。
+const NAME_PROXIMITY_LINES: usize = 5;
+
+/// 单文件符号命中与磁盘行内容的一致性校验（bd serena-rust-0em B 层）。
+///
+/// `Some(false)` = 检出 stale（起点行起容差窗内都不含符号名/越界）；读盘失败
+/// （不存在/非 UTF-8）= `None`（无法判定，调用方按不 stale 处理，维持既有语义）。
+fn hits_match_disk_for_file(path: &Path, hits: &[SymbolHit]) -> Option<bool> {
+    if hits.is_empty() {
+        return Some(true);
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    Some(hits.iter().all(|h| {
+        let start = h.range.start.line as usize;
+        let end = (start + NAME_PROXIMITY_LINES).min(lines.len());
+        lines
+            .get(start..end)
+            .is_some_and(|w| w.iter().any(|l| l.contains(&h.name)))
+    }))
+}
+
+/// workspace/symbol 结果里 stale 的文件集合（每文件首个 hit 判定；uri 归一小写，
+/// 与 diag_cache 同一归一纪律 —— RA 推送/返回的 uri 盘符小写）。
+fn stale_symbol_files(hits: &[SymbolHit]) -> Vec<String> {
+    let mut stale = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for h in hits {
+        let uri = h.uri.to_lowercase();
+        if seen.insert(uri.clone())
+            && let Some(p) = uri_to_path(&h.uri)
+            && hits_match_disk_for_file(&p, std::slice::from_ref(h)) == Some(false)
+        {
+            stale.push(uri);
+        }
+    }
+    stale
+}
+
+/// 目标文件的条目以 docsym 扁平表（已按查询过滤）**全表替换**（修位 + 补缺失 +
+/// 去幽灵一体）；非目标文件的条目原样保留。匹配键用 canonical path —— wssym 返回
+/// 的 uri 形态不一（盘符小写/`%3A` percent-encode，实测混现），字符串键会漏配。
+fn replace_files_with_tables(
+    hits: Vec<SymbolHit>,
+    tables: &HashMap<std::path::PathBuf, Vec<SymbolHit>>,
+) -> Vec<SymbolHit> {
+    let mut out: Vec<SymbolHit> = hits
+        .into_iter()
+        .filter(|h| match uri_to_path(&h.uri).and_then(|p| dunce::canonicalize(p).ok()) {
+            Some(p) => !tables.contains_key(&p),
+            // 无法归一 → 保留（不误删他人条目）。
+            None => true,
+        })
+        .collect();
+    for (path, table) in tables {
+        let uri = path_to_uri_str(path).to_lowercase();
+        for s in table {
+            let mut s = s.clone();
+            s.uri = uri.clone();
+            out.push(s);
+        }
+    }
+    out
+}
+
 /// percent-decode `%XX` 序列（非法 / 截断序列原样保留）。
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -3945,6 +4351,59 @@ fn symbol_hits_envelope(hits: &[SymbolHit], compact: bool) -> serde_json::Value 
     }
 }
 
+/// completion envelope（bd serena-rust-5st）：compact 时逐 item 裁掉零信息字段
+/// （`insert` 恒等于 label 的兜底副本、200 字符 `doc`、`deprecated:false`、空
+/// `additional_text_edits`——原嵌套 LSP range 结构压成 `["L{行}:{列}", 新文本]` 对）。
+/// `_compact=false`（CLI `--json`）走原 `CompletionResponse` 序列化，wire 零变化。
+fn completion_envelope(resp: &CompletionResponse) -> serde_json::Value {
+    let items: Vec<serde_json::Value> =
+        resp.items.iter().map(compact_completion_item).collect();
+    let mut env = serde_json::json!({
+        "compact": true,
+        "items": items,
+        "raw_count": resp.items.len(),
+    });
+    if let Some(t) = &resp.truncated {
+        env["truncated"] = serde_json::json!(t);
+    }
+    env
+}
+
+/// 单个 completion item 的紧凑形态：label/kind/detail 恒在（签名是 AI 选候选的
+/// 主依据），其余字段仅在偏离默认时有信息量才出现。
+fn compact_completion_item(it: &CompletionItemLite) -> serde_json::Value {
+    let mut o = serde_json::Map::new();
+    o.insert("label".into(), serde_json::json!(it.label));
+    o.insert("kind".into(), serde_json::json!(it.kind));
+    if let Some(d) = &it.detail {
+        o.insert("detail".into(), serde_json::json!(d));
+    }
+    // parse_completion_item 兜底 insert=label；与 label 相同即零信息，省略。
+    if it.insert.as_deref().is_some_and(|i| i != it.label) {
+        o.insert("insert".into(), serde_json::json!(it.insert));
+    }
+    if it.deprecated {
+        o.insert("deprecated".into(), serde_json::json!(true));
+    }
+    if !it.additional_text_edits.is_empty() {
+        let edits: Vec<[String; 2]> = it
+            .additional_text_edits
+            .iter()
+            .map(|e| {
+                // 与 compact_loc 同基线：LSP 0-based → 人类 1-based。
+                let at = format!(
+                    "L{}:{}",
+                    e.range.start.line + 1,
+                    e.range.start.character + 1
+                );
+                [at, e.new_text.clone()]
+            })
+            .collect();
+        o.insert("edits".into(), serde_json::json!(edits));
+    }
+    serde_json::Value::Object(o)
+}
+
 // ==== find-symbol LS 缺失可见性（bd serena-rust-x67）====
 
 /// find-symbol 全失败收口：所有 lang 的 `session_for` 都失败时的错误决策。
@@ -3991,7 +4450,9 @@ fn failure_warnings(failures: &[(String, ToolError)]) -> Vec<String> {
 /// compact envelope 本是对象 → 直接加键；非 compact 裸数组无法带键 → 仅当有
 /// warning 时升级为 `{compact:false, items, warning}` 对象（无 warning 维持裸数组
 /// 既有 wire 不变）。`_delta=true` 的增量形态 `{delta,added,removed}` 本就有损，不带 warning。
-fn attach_warning(value: &mut serde_json::Value, warnings: &[String]) {
+///
+/// pub 供 daemon http 层复用（bd serena-rust-h4i：跨 project 切换 warning 走同一通道）。
+pub fn attach_warning(value: &mut serde_json::Value, warnings: &[String]) {
     if warnings.is_empty() {
         return;
     }
@@ -3999,10 +4460,72 @@ fn attach_warning(value: &mut serde_json::Value, warnings: &[String]) {
     if value.is_array() {
         let items = std::mem::take(value);
         *value = serde_json::json!({ "compact": false, "items": items, "warning": w });
-    } else if let Some(obj) = value.as_object_mut() {
-        obj.insert("warning".to_string(), w);
+    } else if value.is_object() {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("warning".to_string(), w);
+        }
+    } else {
+        // 裸 null / 标量（string/number/bool）无法携带键 → 升级为对象形态
+        // （对齐裸数组升级模式；无 warning 时调用方不会进来，既有 wire 不变）。
+        let items = std::mem::take(value);
+        *value = serde_json::json!({ "items": items, "warning": w });
     }
 }
+
+/// LS 报告的 window 消息是否为 workspace 加载失败（bd serena-rust-xzb）。
+/// 特征词取自 cargo/RA 的真实错误文本：
+/// - RA load_workspace 失败经 window/showMessage 转发的 `FetchWorkspaceError(...)`；
+/// - cargo metadata 对"目录在别的 workspace 内但非成员"的原话
+///   `current package believes it's in a workspace when it's not`。
+///
+/// 窄匹配少误报：普通编译诊断不进 workspace_errors。
+fn is_workspace_load_error(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("fetchworkspaceerror") || m.contains("believes it's in a workspace")
+}
+
+/// 0-based LSP Position 是否落在任一符号的 range 内（bd serena-rust-we0 判据）。
+/// hover/def 空结果 + 位置在语法层符号内 = 「类型分析未就绪」而非「无符号」；
+/// 位置在符号外 = 空是正常语义（不标记）。
+fn position_in_hits(hits: &[SymbolHit], line: u32, col: u32) -> bool {
+    hits.iter().any(|h| {
+        let (sl, sc) = (h.range.start.line, h.range.start.character);
+        let (el, ec) = (h.range.end.line, h.range.end.character);
+        (sl < line || (sl == line && sc <= col))
+            && (line < el || (line == el && col <= ec))
+    })
+}
+
+/// 语义工具空结果的「可能未就绪」warning 文案（bd serena-rust-we0）。
+/// documentSymbol/workspaceSymbol 先就绪、类型分析（def/refs/hover）晚 30-60s；
+/// warm 以 find-symbol 非空为判据覆盖不到类型分析窗口 —— 空结果必须自带线索
+/// 让 AI 区分「没符号」与「没就绪」（与诊断 pending 同构）。
+fn semantic_not_ready_message() -> String {
+    "semantic layer returned empty; the language server's type analysis may not be ready yet \
+     (typically ready 30-60s after symbol index on a fresh workspace; a non-empty symbol index \
+     does not imply type analysis is ready)"
+        .to_string()
+}
+
+/// hover 空结果判定（bd serena-rust-we0）：`null`（部分 LS 未就绪返 null）或
+/// contents 无内容 —— 实测 RA 未就绪窗口两种形态都出现（空 contents 对象 ≠
+/// Some(Hover) 的有效语义，直接 `is_null()` 判会漏）。
+fn hover_is_empty(value: &serde_json::Value) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    match value.get("contents") {
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        Some(c) => c
+            .get("value")
+            .and_then(|v| v.as_str())
+            .map(str::is_empty)
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
 
 /// RefSymbolHit[] envelope：compact 时合并 `symbol` + `refs[]` 嵌套紧凑（按容器聚类）。
 fn ref_symbol_hits_envelope(
@@ -4462,6 +4985,17 @@ impl SupervisorTrait for Supervisor {
         // ponytail: 阈值 32 对应稳态 5~10 s 节流；测试直接调 reclaim_idle_buffers_once
         // 绕过阈值验证语义。
         let _reclaimed = self.reclaim_idle_buffers_once();
+        // bd serena-rust-84n：不存在文件 = 确定性参数错（wire §6.3 BAD_ARGS），
+        // 统一在入口拦截 —— 否则 ensure_open 的 io NotFound 经 Core 冒成 INTERNAL，
+        // AI 无法据错误码免重试。args 带 file 字段的工具（读/写/位置类）目标文件
+        // 全部要求已存在（本项目无「file = 新建目标」语义的工具）。
+        if let Some(f) = args.get("file").and_then(|v| v.as_str())
+            && !root.join(f).is_file()
+        {
+            return Err(ToolError::BadArgs {
+                detail: format!("file not found: {f}"),
+            });
+        }
         let mut value: serde_json::Value = match tool {
             "overview" => {
                 let file = required_file(&args)?;
@@ -4489,7 +5023,14 @@ impl SupervisorTrait for Supervisor {
                     }
                 })?;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-                let (raw, warnings) = self.tool_find_symbol(root, query, limit, lang).await?;
+                let (raw, mut warnings) = self.tool_find_symbol(root, query, limit, lang).await?;
+                // bd serena-rust-xzb：workspace 加载失败时 wssym 全空且无任何线索 ——
+                // 有记录即透出（不依赖空结果，xzb 场景下结果恒空）。
+                if let Some(err) = self.workspace_error_for(root) {
+                    warnings.push(format!(
+                        "workspace error: {err}; semantic results may be empty (workspace failed to load)"
+                    ));
+                }
                 let mut value = symbol_hits_envelope(&raw, compact);
                 attach_warning(&mut value, &warnings);
                 let root_key = format!("{}|{}|{}", root.display(), query, limit);
@@ -4720,8 +5261,20 @@ impl SupervisorTrait for Supervisor {
             .map_err(|e| ToolError::Serialize(e.into())),
             "hover" => {
                 let (file, line, col) = required_position(&args)?;
-                serde_json::to_value(self.tool_hover(root, &file, line, col, lang).await?)
-                    .map_err(|e| ToolError::Serialize(e.into()))
+                let resp = self.tool_hover(root, &file, line, col, lang).await?;
+                let mut value =
+                    serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))?;
+                // bd serena-rust-we0：空 hover 可能是「类型分析未就绪」而非「无悬停」；
+                // bd serena-rust-xzb：workspace 加载错误无条件透出（结果不可信）。
+                let mut ws = self.workspace_error_warnings(root);
+                if hover_is_empty(&value) {
+                    ws.extend(
+                        self.semantic_not_ready_warnings(root, &file, line, col, lang)
+                            .await,
+                    );
+                }
+                attach_warning(&mut value, &ws);
+                Ok(value)
             }
             "diagnostics" => {
                 let file = required_file(&args)?;
@@ -4735,7 +5288,19 @@ impl SupervisorTrait for Supervisor {
                 // `def` 单 Location → 退化为单元素 envelope（AI 期望 `items[]` 统一）。
                 // None 是合法语义（位置无定义），保留为 `items: []` + `compact: true|false`。
                 let locs = raw.into_iter().collect::<Vec<_>>();
-                Ok(locations_envelope(&locs, compact))
+                let empty = locs.is_empty();
+                let mut value = locations_envelope(&locs, compact);
+                // bd serena-rust-we0：空 def 可能是「类型分析未就绪」而非「无定义」；
+                // bd serena-rust-xzb：workspace 加载错误无条件透出。
+                let mut ws = self.workspace_error_warnings(root);
+                if empty {
+                    ws.extend(
+                        self.semantic_not_ready_warnings(root, &file, line, col, lang)
+                            .await,
+                    );
+                }
+                attach_warning(&mut value, &ws);
+                Ok(value)
             }
 
             "containing-symbol" => {
@@ -4758,7 +5323,18 @@ impl SupervisorTrait for Supervisor {
             "refs" => {
                 let (file, line, col) = required_position(&args)?;
                 let raw = self.tool_refs(root, &file, line, col, lang).await?;
-                let value = locations_envelope(&raw, compact);
+                let empty = raw.is_empty();
+                let mut value = locations_envelope(&raw, compact);
+                // bd serena-rust-we0：空 refs 可能是「类型分析未就绪」而非「无引用」；
+                // bd serena-rust-xzb：workspace 加载错误无条件透出。
+                let mut ws = self.workspace_error_warnings(root);
+                if empty {
+                    ws.extend(
+                        self.semantic_not_ready_warnings(root, &file, line, col, lang)
+                            .await,
+                    );
+                }
+                attach_warning(&mut value, &ws);
                 let root_key = format!("{}|{}|{}|{}", root.display(), file, line, col);
                 Ok(self.maybe_delta("refs", &root_key, value, delta).await)
             }
@@ -4769,14 +5345,31 @@ impl SupervisorTrait for Supervisor {
                 let resp = self
                     .tool_completion(root, &file, line, col, limit, trigger, lang)
                     .await?;
-                serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
+                // bd serena-rust-5st：默认紧凑 envelope（与 def/refs 同套 `_compact`
+                // 约定）；`--json`（_compact=false）走原 CompletionResponse wire。
+                if compact {
+                    Ok(completion_envelope(&resp))
+                } else {
+                    serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
+                }
             }
             "find-implementations" => {
                 let (file, line, col) = required_position(&args)?;
                 let raw = self
                     .tool_find_implementations(root, &file, line, col, lang)
                     .await?;
-                let value = locations_envelope(&raw, compact);
+                let empty = raw.is_empty();
+                let mut value = locations_envelope(&raw, compact);
+                // bd serena-rust-we0：空 impls 可能是「类型分析未就绪」而非「无实现」；
+                // bd serena-rust-xzb：workspace 加载错误无条件透出。
+                let mut ws = self.workspace_error_warnings(root);
+                if empty {
+                    ws.extend(
+                        self.semantic_not_ready_warnings(root, &file, line, col, lang)
+                            .await,
+                    );
+                }
+                attach_warning(&mut value, &ws);
                 let root_key = format!("{}|{}|{}|{}", root.display(), file, line, col);
                 Ok(self.maybe_delta("find-implementations", &root_key, value, delta).await)
             }
@@ -6397,6 +6990,161 @@ mod reclaim_idle_buffers_tests {
 }
 
 #[cfg(test)]
+mod write_consistency_tests {
+    //! bd serena-rust-0em / 76d：写后索引一致性。纪律：不拉 LS —— 磁盘比对与
+    //! zip 修正是纯逻辑可直接断言；`realign_stale_hits` 的 LS 轮询链路与
+    //! `post_diag_for_write` 的失效接线由 CLI e2e 锁（fixtures + rust-analyzer）。
+    use super::*;
+
+    fn hit_at(name: &str, uri: &str, line: u32) -> SymbolHit {
+        SymbolHit {
+            name: name.to_string(),
+            kind: SymbolKindTag::Function,
+            uri: uri.into(),
+            range: lsp_types::Range {
+                start: Position::new(line, 0),
+                end: Position::new(line, 8),
+            },
+            container: None,
+        }
+    }
+
+    #[test]
+    fn hits_match_disk_fresh_attr_window_stale_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.rs");
+        std::fs::write(&p, "fn foo() {}\nfn bar() {}\n").unwrap();
+
+        // 对齐：起点行含名字。
+        assert_eq!(
+            hits_match_disk_for_file(&p, &[hit_at("foo", "file:///x/a.rs", 0)]),
+            Some(true)
+        );
+        // 容差窗：起点行是 attribute，名字在下 1 行 —— full range 起点 ≠ 名字行。
+        let q = dir.path().join("attr.rs");
+        std::fs::write(&q, "#[derive(Debug)]\nstruct S;\n").unwrap();
+        assert_eq!(
+            hits_match_disk_for_file(&q, &[hit_at("S", "file:///x/attr.rs", 0)]),
+            Some(true)
+        );
+        // stale：越界行。
+        assert_eq!(
+            hits_match_disk_for_file(&p, &[hit_at("foo", "file:///x/a.rs", 9)]),
+            Some(false)
+        );
+        // stale：行内容不含符号名（错位到别的行）。
+        assert_eq!(
+            hits_match_disk_for_file(&p, &[hit_at("qux", "file:///x/a.rs", 0)]),
+            Some(false)
+        );
+        // 读盘失败 = 无法判定。
+        assert_eq!(
+            hits_match_disk_for_file(&dir.path().join("nope.rs"), &[hit_at("x", "", 0)]),
+            None
+        );
+        // 空集 = 一致（冷启动空语义不受影响）。
+        assert_eq!(hits_match_disk_for_file(&p, &[]), Some(true));
+    }
+
+    #[test]
+    fn stale_symbol_files_collects_only_mismatched_and_normalizes_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_string_lossy().replace('\\', "/");
+        let mk_uri = |f: &str, lower: bool| {
+            let u = format!("file:///{base}/{f}");
+            if lower {
+                // 小写盘符变体（RA 实测返回形态），判 stale 走归一后的真实路径。
+                u.replacen("file:///C:/", "file:///c:/", 1)
+            } else {
+                u
+            }
+        };
+        std::fs::write(dir.path().join("fresh.rs"), "fn alpha() {}\n").unwrap();
+        // 位移超出容差窗（>5 行）：hit@0 的窗内不含 beta → 检出 stale。
+        std::fs::write(
+            dir.path().join("moved.rs"),
+            "// shifted far\n\n\n\n\n\n\nfn beta() {}\n",
+        )
+        .unwrap();
+        let hits = vec![
+            hit_at("alpha", &mk_uri("fresh.rs", false), 0),
+            // 行号 0 指向注释行，不含 beta → stale；且 uri 用小写盘符变体。
+            hit_at("beta", &mk_uri("moved.rs", true), 0),
+        ];
+        let stale = stale_symbol_files(&hits);
+        // 返回值与 diag_cache 同纪律：uri 全小写归一。
+        assert_eq!(stale, vec![mk_uri("moved.rs", true).to_lowercase()]);
+    }
+
+    #[test]
+    fn replace_tables_swaps_target_files_keeps_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_string_lossy().replace('\\', "/");
+        let mk_uri = |f: &str| format!("file:///{base}/{f}");
+        let mk_uri_pct = |f: &str| format!("file:///{base}/{f}").replacen("file:///C:/", "file:///C%3A/", 1);
+        std::fs::write(dir.path().join("moved.rs"), "fn stale_line() {}\nfn added() {}\n").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "fn keep() {}\n").unwrap();
+        let hits = vec![
+            hit_at("stale_line", &mk_uri_pct("moved.rs"), 7), // percent-encode 盘符形态
+            hit_at("ghost", &mk_uri("moved.rs"), 30),         // 目标文件整体替换：幽灵自动消失
+            hit_at("keep", &mk_uri("other.rs"), 5),           // 非目标文件
+        ];
+        let moved_path = dunce::canonicalize(dir.path().join("moved.rs")).unwrap();
+        let mut tables = HashMap::new();
+        // docsym 新鲜表（已按 query 过滤）：stale_line 行号新 + added（wssym 缺失形态补全）。
+        tables.insert(
+            moved_path,
+            vec![hit_at("stale_line", "", 0), hit_at("added", "", 1)],
+        );
+        let out = replace_files_with_tables(hits, &tables);
+        assert_eq!(out.len(), 3, "2 from docsym table + 1 kept from other file");
+        let moved = out.iter().find(|h| h.name == "stale_line").unwrap();
+        assert_eq!(moved.range.start.line, 0, "行号来自 docsym（新鲜）");
+        assert!(
+            moved.uri.ends_with("/moved.rs"),
+            "uri 归一为 path_to_uri_str 小写: {}",
+            moved.uri
+        );
+        assert!(out.iter().any(|h| h.name == "added"), "缺失条目补全");
+        assert!(
+            !out.iter().any(|h| h.name == "ghost"),
+            "docsym 查无的幽灵自动消失（全表替换）"
+        );
+        let kept = out.iter().find(|h| h.name == "keep").unwrap();
+        assert_eq!(kept.range.start.line, 5, "非目标文件原样保留");
+    }
+
+    #[tokio::test]
+    async fn recent_write_marks_and_expires_by_ttl() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/write-proj");
+        assert!(sup.recent_written_uris(root, Duration::from_secs(10)).is_empty());
+        sup.mark_recent_write(root, "lib.rs");
+        let uris = sup.recent_written_uris(root, Duration::from_secs(10));
+        assert_eq!(uris.len(), 1, "窗口内标记必须可见");
+        assert!(uris[0].ends_with("/lib.rs"), "归一 uri: {}", uris[0]);
+        // TTL = 0 → 立即过期并清理。
+        assert!(sup.recent_written_uris(root, Duration::ZERO).is_empty());
+        assert!(sup.recent_written_uris(root, Duration::from_secs(10)).is_empty());
+    }
+
+    #[test]
+    fn invalidate_write_derived_caches_clears_root_signal_entry() {
+        let root = Path::new("Z:/no/such/write-proj");
+        ROOT_SIGNAL_CACHE.lock().unwrap().insert(
+            root.to_path_buf(),
+            (std::time::Instant::now(), None, Default::default()),
+        );
+        assert!(ROOT_SIGNAL_CACHE.lock().unwrap().contains_key(root));
+        invalidate_write_derived_caches(root);
+        assert!(
+            !ROOT_SIGNAL_CACHE.lock().unwrap().contains_key(root),
+            "写后必须清 root 信号 TTL 条目，否则 find_symbol 在 2s 窗口内命中写前缓存"
+        );
+    }
+}
+
+#[cfg(test)]
 mod symbol_cache_tests {
     //! 纪律：不拉 LS —— 命中路径在 session_for 之前返回，可对空 supervisor 做工具级
     //! 断言；miss→写→hit 全链路由 CLI smoke（fixtures/rust_demo + rust-analyzer）覆盖。
@@ -7770,6 +8518,72 @@ mod compact_locations_tests {
         assert!(items[0]["range"]["start"]["line"].is_u64());
     }
 
+    /// completion 紧凑 envelope（bd serena-rust-5st）：默认形态 item 只留有信息
+    /// 字段——insert==label 兜底副本、doc、deprecated:false、空 edits 全部省略。
+    #[test]
+    fn completion_envelope_compact_drops_zero_info_fields() {
+        let resp = CompletionResponse {
+            truncated: Some("1 of 23".into()),
+            items: vec![CompletionItemLite {
+                label: "add".into(),
+                kind: "function".into(),
+                detail: Some("fn add(a: i32, b: i32) -> i32".into()),
+                insert: Some("add".into()),
+                doc: Some("adds two numbers".into()),
+                deprecated: false,
+                additional_text_edits: Vec::new(),
+            }],
+        };
+        let v = completion_envelope(&resp);
+        assert_eq!(v["compact"], serde_json::Value::Bool(true));
+        assert_eq!(v["raw_count"], serde_json::json!(1));
+        assert_eq!(v["truncated"], serde_json::json!("1 of 23"));
+        let item = &v["items"][0];
+        assert_eq!(item["label"], serde_json::json!("add"));
+        assert_eq!(item["kind"], serde_json::json!("function"));
+        assert_eq!(item["detail"], serde_json::json!("fn add(a: i32, b: i32) -> i32"));
+        assert!(item.get("insert").is_none(), "insert==label 兜底副本应省略");
+        assert!(item.get("doc").is_none(), "compact 下 doc 应省略（--json 可取全）");
+        assert!(item.get("deprecated").is_none(), "deprecated:false 应省略");
+        assert!(item.get("edits").is_none(), "空 additional_text_edits 应省略");
+    }
+
+    /// 偏离默认的字段必须出现：insert!=label、deprecated:true、非空 edits 扁平为
+    /// `["L{行}:{列}", 新文本]` 对（与 compact_loc 同为 1-based）。
+    #[test]
+    fn completion_envelope_compact_keeps_non_default_fields_flattened() {
+        let resp = CompletionResponse {
+            truncated: None,
+            items: vec![CompletionItemLite {
+                label: "HashMap".into(),
+                kind: "class".into(),
+                detail: None,
+                insert: Some("std::collections::HashMap".into()),
+                doc: Some("docs".into()),
+                deprecated: true,
+                additional_text_edits: vec![lsp_types::TextEdit {
+                    range: lsp_types::Range {
+                        start: lsp_types::Position::new(1, 0),
+                        end: lsp_types::Position::new(1, 0),
+                    },
+                    new_text: "use std::collections::HashMap;\n".into(),
+                }],
+            }],
+        };
+        let v = completion_envelope(&resp);
+        let item = &v["items"][0];
+        assert_eq!(
+            item["insert"],
+            serde_json::json!("std::collections::HashMap"),
+            "insert!=label 必须保留"
+        );
+        assert_eq!(item["deprecated"], serde_json::Value::Bool(true));
+        assert_eq!(v.get("truncated"), None, "未截断不增 truncated 键");
+        let edits = item["edits"].as_array().unwrap();
+        assert_eq!(edits[0][0], serde_json::json!("L2:1"), "0-based → 1-based");
+        assert_eq!(edits[0][1], serde_json::json!("use std::collections::HashMap;\n"));
+    }
+
     /// symbol_hits_envelope compact 形态：`[name, "file:line:col"]` 二元组。
     #[test]
     fn symbol_hits_envelope_compact_true_pairs_name_with_loc() {
@@ -8301,5 +9115,216 @@ mod find_symbol_ls_error_tests {
             .expect("rust-only query on warm session");
         assert!(!hits.is_empty(), "rust-only query must still hit");
         assert!(warnings.is_empty(), "all-success must carry no warnings");
+    }
+}
+
+#[cfg(test)]
+mod semantic_readiness_and_args_tests {
+    //! bd serena-rust-we0 / xzb / 84n：
+    //! - we0：语义空结果的「未就绪 vs 无符号」判据（position_in_hits 纯逻辑 + 文案）。
+    //! - xzb：workspace 加载错误的特征词判定（window 消息 → workspace_errors）。
+    //! - 84n：不存在文件入口统一 BadArgs（校验在 session_for 之前，不拉 LS）。
+    use super::*;
+
+    // ---- we0：位置命中判据 ----
+
+    fn hit(range_sl: u32, range_sc: u32, range_el: u32, range_ec: u32) -> SymbolHit {
+        SymbolHit {
+            name: "f".into(),
+            kind: SymbolKindTag::Function,
+            uri: "file:///t/f.rs".into(),
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: range_sl,
+                    character: range_sc,
+                },
+                end: lsp_types::Position {
+                    line: range_el,
+                    character: range_ec,
+                },
+            },
+            container: None,
+        }
+    }
+
+    #[test]
+    fn position_in_hits_matches_point_inside_symbol_range() {
+        let hits = vec![hit(2, 4, 2, 20)];
+        assert!(position_in_hits(&hits, 2, 4), "range start 含端点");
+        assert!(position_in_hits(&hits, 2, 20), "range end 含端点");
+        assert!(position_in_hits(&hits, 2, 10), "range 中段");
+    }
+
+    #[test]
+    fn position_in_hits_rejects_point_outside_all_symbols() {
+        let hits = vec![hit(2, 4, 2, 20)];
+        assert!(!position_in_hits(&hits, 5, 0), "范围后");
+        assert!(!position_in_hits(&hits, 1, 0), "范围前");
+        assert!(!position_in_hits(&hits, 2, 3), "同行但列在范围前");
+    }
+
+    #[test]
+    fn position_in_hits_empty_hits_is_false() {
+        assert!(!position_in_hits(&[], 0, 0));
+    }
+
+    // ---- we0：未就绪文案 AI 可判读 ----
+
+    #[test]
+    fn not_ready_message_names_type_analysis_and_window() {
+        let m = semantic_not_ready_message();
+        assert!(m.contains("type analysis"), "AI 可判读关键词: {m}");
+        assert!(m.contains("not be ready"), "就绪性而非无符号: {m}");
+        assert!(m.contains("30-60s"), "预期窗口: {m}");
+    }
+
+    /// hover 空结果判定：null / 无 contents / 空串 / 空数组 / 空 MarkupValue 都算空；
+    /// 有内容的对象与数组不算。
+    #[test]
+    fn hover_is_empty_covers_null_and_blank_contents_forms() {
+        assert!(hover_is_empty(&serde_json::Value::Null));
+        assert!(hover_is_empty(&serde_json::json!({})));
+        assert!(hover_is_empty(&serde_json::json!({"contents": ""})));
+        assert!(hover_is_empty(&serde_json::json!({"contents": []})));
+        assert!(hover_is_empty(&serde_json::json!({"contents": {"value": ""}})));
+        assert!(!hover_is_empty(&serde_json::json!({"contents": {"value": "fn hello"}})));
+        assert!(!hover_is_empty(&serde_json::json!({"contents": [{"value": "x"}]})));
+    }
+
+    /// hover 等返 Option 的工具空结果 = 裸 null：带 warning 时升级为对象形态；
+    /// 无 warning 时保持 null（wire 既有形态不变）。
+    #[test]
+    fn attach_warning_upgrades_bare_null_only_when_warning_present() {
+        let mut v = serde_json::Value::Null;
+        attach_warning(&mut v, &[]);
+        assert!(v.is_null(), "无 warning 的 null 保持既有 wire 形态");
+
+        let mut v = serde_json::Value::Null;
+        attach_warning(&mut v, &["not ready".to_string()]);
+        assert_eq!(v["items"], serde_json::Value::Null);
+        assert!(v["warning"].as_str().unwrap().contains("not ready"));
+    }
+
+    /// 标量响应（string/number/bool）同裸 null：带 warning 时升级对象形态不丢内容。
+    #[test]
+    fn attach_warning_upgrades_scalar_without_dropping_value() {
+        let mut v = serde_json::json!("symbol body text");
+        attach_warning(&mut v, &["project switched: A -> B".to_string()]);
+        assert_eq!(v["items"], serde_json::json!("symbol body text"));
+        assert!(v["warning"].as_str().unwrap().contains("project switched"));
+    }
+
+    // ---- xzb：workspace 加载错误特征词 ----
+
+    #[test]
+    fn workspace_error_matches_fetch_workspace_error_and_cargo_wording() {
+        assert!(is_workspace_load_error(
+            "rust-analyzer failed to load workspace: FetchWorkspaceError(LoadFailed { stdout: \"\" })"
+        ));
+        assert!(is_workspace_load_error(
+            "error: current package believes it's in a workspace when it's not"
+        ));
+    }
+
+    #[test]
+    fn workspace_error_ignores_ordinary_messages() {
+        assert!(!is_workspace_load_error(
+            "unused variable: `x` in function main"
+        ));
+        assert!(!is_workspace_load_error("cargo build finished"));
+        assert!(!is_workspace_load_error(""));
+    }
+
+    // ---- 84n：不存在文件入口统一 BadArgs（校验先于 session_for，无 LS 依赖）----
+
+    #[tokio::test]
+    async fn overview_missing_file_returns_bad_args_not_internal() {
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = sup
+            .execute_tool(
+                "overview",
+                dir.path().to_str().unwrap(),
+                serde_json::json!({"file": "nope.rs"}),
+                Some("rust"),
+            )
+            .await
+            .expect_err("missing file must BadArgs (wire §6.3), not INTERNAL");
+        match err {
+            ToolError::BadArgs { detail } => {
+                assert!(detail.contains("not found"), "detail={detail}");
+                assert!(detail.contains("nope.rs"), "detail={detail}");
+            }
+            other => panic!("expected BadArgs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_and_read_file_missing_file_return_bad_args() {
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_str().unwrap();
+        for tool in ["diagnostics", "read-file"] {
+            let err = sup
+                .execute_tool(
+                    tool,
+                    root,
+                    serde_json::json!({"file": "nope.rs"}),
+                    Some("rust"),
+                )
+                .await
+                .expect_err("missing file must BadArgs");
+            assert!(
+                matches!(err, ToolError::BadArgs { .. }),
+                "tool={tool} got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cargo_probe_flags_non_member_and_clears_valid_workspace() {
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        // 合法独立 workspace → 不记录
+        let ok_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            ok_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"okws\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::create_dir_all(ok_dir.path().join("src")).expect("mkdir src");
+        std::fs::write(ok_dir.path().join("src/main.rs"), "fn main() {}\n").expect("write");
+        sup.probe_cargo_workspace_error(ok_dir.path()).await;
+        assert!(
+            sup.workspace_error_for(ok_dir.path()).is_none(),
+            "valid workspace must not be flagged"
+        );
+
+        // 父 [workspace] 空表 + 子 package 非成员 → cargo metadata 失败（xzb 同构最小复刻）
+        let outer = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outer.path().join("Cargo.toml"), "[workspace]\n").expect("write");
+        let child = outer.path().join("child");
+        std::fs::create_dir_all(child.join("src")).expect("mkdir child/src");
+        std::fs::write(
+            child.join("Cargo.toml"),
+            "[package]\nname = \"child\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write child Cargo.toml");
+        std::fs::write(child.join("src/main.rs"), "fn main() {}\n").expect("write");
+        sup.probe_cargo_workspace_error(&child).await;
+        let err = sup
+            .workspace_error_for(&child)
+            .expect("non-member child must be flagged");
+        assert!(err.contains("cargo metadata failed"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn cargo_probe_skips_non_cargo_root() {
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let dir = tempfile::tempdir().expect("tempdir");
+        sup.probe_cargo_workspace_error(dir.path()).await;
+        assert!(
+            sup.workspace_error_for(dir.path()).is_none(),
+            "no Cargo.toml → nothing to probe, no record"
+        );
     }
 }

@@ -150,7 +150,14 @@ async fn tools_post(
         .unwrap_or_else(new_invocation_id);
 
     // 记录最近请求的 project_root（供 /status 观察；不区分成败，只要请求到达）。
-    *state.active_project.lock().unwrap() = Some(req.project_root.clone());
+    // bd serena-rust-h4i：daemon 全局单 project 语义——跨 project 调用会隐式切换
+    // active_project（session 池 per (root, lang)，LRU 复用）。切换发生时在响应
+    // data 顶层附 warning，让 AI 感知 project 已变；同 project 连续调用零噪音。
+    let prev_project = state
+        .active_project
+        .lock()
+        .unwrap()
+        .replace(req.project_root.clone());
 
     let started = std::time::Instant::now();
     let resp = match state
@@ -158,7 +165,16 @@ async fn tools_post(
         .execute_tool(&name, &req.project_root, req.args, req.lang.as_deref())
         .await
     {
-        Ok(data) => {
+        Ok(mut data) => {
+            if let Some(prev) = prev_project.filter(|p| *p != req.project_root) {
+                let switch = format!("project switched: {prev} -> {}", req.project_root);
+                // 工具自身的 warning（如 we0/xzb 就绪标记）不覆盖，拼接保序。
+                let combined = match data.get("warning").and_then(|w| w.as_str()) {
+                    Some(existing) => format!("{existing}; {switch}"),
+                    None => switch,
+                };
+                supervisor::attach_warning(&mut data, &[combined]);
+            }
             log_invocation(
                 &state.invocation_log_path,
                 &invocation_id,
@@ -268,8 +284,9 @@ fn log_invocation(
     }
 }
 
+/// `GET /status`：纯诊断查询。不刷 activity 时钟——idle 监控脚本轮询 status
+/// 不能让 15min idle 自杀永不触发（bd b40）；真正的负载信号是 in_flight 计数。
 async fn status_get(State(state): State<AppState>) -> Response {
-    crate::reaper::note_activity();
     let loaded = state
         .supervisor
         .loaded_entries()
@@ -697,6 +714,44 @@ mod tests {
         assert_eq!(body["data"], json!([{"name": "main"}]));
     }
 
+    /// bd serena-rust-h4i：跨 project 调用 → 响应附 `project switched` warning；
+    /// 首调（active_project 尚为 None）与同 project 连续调用零噪音。
+    #[tokio::test]
+    async fn cross_project_call_attaches_switch_warning_once() {
+        let st = state("secret", MockSupervisor::echo_by_tool());
+        let router = router(st);
+        let call = |root: &str| {
+            req_post(
+                "/tools/overview",
+                Some("secret"),
+                json!({ "project_root": root, "args": {} }),
+            )
+        };
+        // 首调：无 warning（echo 标量响应原样透传，不升级）。
+        let (_, body) = oneshot_json(router.clone(), call("D:/proj-a")).await;
+        let body = body.expect("json body");
+        assert_eq!(body["data"], json!("overview"), "无 warning 时 wire 零变化");
+
+        // 跨 project：data 升级携带 warning（标量响应走 attach_warning 升级通道）。
+        let (_, body) = oneshot_json(router.clone(), call("D:/proj-b")).await;
+        let body = body.expect("json body");
+        assert_eq!(body["ok"], true);
+        let w = body["data"]["warning"].as_str().expect("warning 键必须存在");
+        assert!(w.contains("project switched"), "{w}");
+        assert!(w.contains("D:/proj-a"), "{w}");
+        assert!(w.contains("D:/proj-b"), "{w}");
+        assert_eq!(
+            body["data"]["items"],
+            json!("overview"),
+            "升级形态不丢原响应内容"
+        );
+
+        // 同 project 连续调用：无 warning。
+        let (_, body) = oneshot_json(router, call("D:/proj-b")).await;
+        let body = body.expect("json body");
+        assert_eq!(body["data"], json!("overview"), "同 project 无 warning");
+    }
+
     // ── d3a：编排 envelope + invocation 重放日志 ──
 
     /// UUID v4 形状：8-4-4-4-12，版本位 4，变体位 [89ab]。
@@ -867,6 +922,23 @@ mod tests {
         assert!(body["uptime_secs"].is_u64());
         assert_eq!(body["loaded_ls"], json!(["rust"]));
         assert_eq!(body["draining"], false);
+    }
+
+    /// b40：status 是纯诊断，不得刷新全局 activity 时钟——否则 idle 监控
+    /// 脚本轮询 /status 即可让 15min idle 自杀永不触发。
+    /// （并行测试可能刷新全局时钟，见 reaper tests 同类注释；偶发失败重跑，
+    /// 持续复现才是真回归。）
+    #[tokio::test]
+    async fn status_get_does_not_refresh_activity() {
+        let st = state("secret", MockSupervisor::ok(json!(null)));
+        let before = crate::reaper::last_activity();
+        let (status, _) = oneshot_json(router(st), req_get("/status", Some("secret"))).await;
+        assert_eq!(status, AxStatus::OK);
+        let after = crate::reaper::last_activity();
+        assert_eq!(
+            before, after,
+            "status_get 不得刷新全局 activity 时钟（bd b40）"
+        );
     }
 
     #[tokio::test]

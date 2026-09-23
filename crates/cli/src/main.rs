@@ -29,6 +29,11 @@ const MGMT_TIMEOUT: Duration = Duration::from_secs(3);
 /// lazy-spawn 后等 daemon 就绪的总窗口。
 const SPAWN_WAIT: Duration = Duration::from_secs(10);
 
+/// bd de4：负载波峰下 loopback connect 瞬断实测 5-10%（daemon accept 处理不过来）。
+/// 客户端 4 次指数退避（50/100/200/400ms）实测 12 线程并发 0% 错误（T2 验证；
+/// 2 次退避仍 3.4%）。
+const CONNECT_BACKOFF_MS: [u64; 4] = [50, 100, 200, 400];
+
 /// CLI 侧共享 HTTP client：本机回环，建连 2s 封顶（管理面失败即报，daemon 侧自愈）。
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -421,8 +426,17 @@ enum Cmd {
         all: bool,
     },
     /// 长连接 shell（stdin/stdout JSONL）。Task 18。
+    ///
+    /// 每行 stdin 一个 JSON 请求，响应逐行写 stdout。协议形状：
+    ///   {"id":1,"cmd":"find-symbol","args":{"name_path":"foo","project_root":"D:/proj"}}
+    ///   {"id":2,"cmd":"status"}
+    ///   {"id":3,"cmd":"exit"}
+    /// 响应：{"id":<n>,"ok":true,"data":...} 或 {"id":<n>,"ok":false,"error":"..."}。
+    /// 单 daemon 顺序多 project：跨 project 调用会隐式切换 active_project（LS
+    /// session 按 project 复用池），响应带 `project switched: A -> B` warning。
+    /// EOF 或 exit 请求后退出 0。
     Shell,
-    /// 环境体检（5 类：运行时 / PATH / 本机 LS / daemon / 网络）。
+    /// 环境体检（6 类：运行时 / PATH / 本机 LS / daemon / 网络 / workspace cargo metadata）。
     Doctor {
         /// JSON 输出（默认人类可读）。
         #[arg(long)]
@@ -551,7 +565,8 @@ async fn cli_main() -> ExitCode {
                 .unwrap_or(ExitCode::from(3));
         }
         Some(Cmd::Doctor { json, fix }) => {
-            return cmd_doctor(*json, *fix, &lock_path).await;
+            let project_root = resolve_project_root(cli.project.clone());
+            return cmd_doctor(*json, *fix, &lock_path, &project_root).await;
         }
         Some(Cmd::Shell) => {}
         _ => {}
@@ -998,13 +1013,41 @@ fn spawn_daemon_child() -> Result<u16, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        cmd.creation_flags(daemon_creation_flags());
         // ponytail: DETACHED_PROCESS 让父进程退出不影响子进程 —— 缺这个 daemon 退随父 CLI。
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        // bd vjm：stdio→NULL 只换掉子进程的 std 槽位，管不住 bInheritHandles=TRUE 的
+        // 父进程全句柄表继承——subprocess capture 场景下 python 管道写端（本进程的
+        // std out/err）被 daemon 继承，CLI 退出后管道不 EOF，父端 read()/communicate()
+        // 死等且 python timeout kill 掉 CLI 后仍死等（timeout 失效）。spawn 前清掉
+        // stdio 句柄的继承位，继承表里不再出现这些句柄；本进程自己读写不受影响。
+        detach_stdio_inheritance();
     }
     cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
     Ok(7860) // M1 固定端口；M2 起 OS 分配 + lock 回填
+}
+
+/// lazy-spawn daemon 的进程创建 flags（独立成纯函数便于单测断言配置）。
+#[cfg(windows)]
+fn daemon_creation_flags() -> u32 {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+}
+
+/// 清当前进程 stdio 句柄的继承位：只影响此后 spawn 的子进程能否继承，本进程读写不受影响。
+/// 句柄无效（无控制台场景）时静默跳过——此时本就无可泄漏的管道。
+#[cfg(windows)]
+fn detach_stdio_inheritance() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for slot in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let h = unsafe { GetStdHandle(slot) };
+        if !h.is_null() && h != INVALID_HANDLE_VALUE {
+            unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
 }
 
 /// TCP 探活。
@@ -1043,6 +1086,33 @@ async fn wait_ready(port: u16, timeout: Duration) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(format!("daemon on :{port} not ready within {timeout:?}"))
+}
+
+/// connect 类瞬断退避重试：首发起发 + `CONNECT_BACKOFF_MS` 各一轮，共 5 发。
+/// 仅对 `transient(e)` 为真的错误重试——连接未建立 = 请求未出网，重发无重复执行风险；
+/// HTTP 4xx/5xx、daemon 工具错误（有响应即语义结果）一律不重试。超时/解码错误
+/// 不在 `transient` 判定内（请求可能已到达 daemon，重发写类工具 = 重复执行）。
+async fn send_with_connect_retry<T, E, F, Fut>(mut send: F, transient: fn(&E) -> bool) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    match send().await {
+        Ok(v) => return Ok(v),
+        Err(e) if !transient(&e) => return Err(e),
+        Err(_) => {}
+    }
+    let last = CONNECT_BACKOFF_MS.len() - 1;
+    for (i, ms) in CONNECT_BACKOFF_MS.iter().enumerate() {
+        tokio::time::sleep(Duration::from_millis(*ms)).await;
+        match send().await {
+            Ok(v) => return Ok(v),
+            // 末轮失败不再续期，如实上报。
+            Err(e) if transient(&e) && i < last => {}
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("last backoff round returns in-loop")
 }
 
 /// 按子命令转发 HTTP。
@@ -1451,18 +1521,13 @@ async fn forward(
             .timeout(FORWARD_TIMEOUT)
             .send()
     };
-    let mut resp = match send_once(&token.clone()).await {
-        Ok(r) => r,
-        // 压测观察（2026-09-23）：负载波峰下 loopback connect 偶发瞬断（daemon 侧
-        // 无任何日志，TCP connect 即失败），立即重试必成 —— 重试一次再放弃。
-        Err(e) if e.is_connect() || e.is_request() => {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            send_once(&token.clone())
-                .await
-                .map_err(|e| format!("forward {tool}: {e}"))?
-        }
-        Err(e) => return Err(format!("forward {tool}: {e}")),
-    };
+    let mut resp = send_with_connect_retry(
+        || send_once(&token.clone()),
+        // 与压测观察一致：error sending request 覆盖 connect 与 request 两类瞬断形态。
+        |e: &reqwest::Error| e.is_connect() || e.is_request(),
+    )
+    .await
+    .map_err(|e| format!("forward {tool}: {e}"))?;
     if resp.status() == reqwest::StatusCode::FORBIDDEN
         && let Some(fresh) = refresh_token_if_stale(lock_path, token).await
     {
@@ -1562,9 +1627,59 @@ fn cmd_install_all() -> ExitCode {
     }
 }
 
-/// `doctor` 子命令：5 类体检 + 可选 --fix 自动装 MISS 的 LS。
-async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path) -> ExitCode {
-    let report = supervisor::doctor::run_all(lock_path);
+/// cargo metadata 健康检查（bd xzb-doctor 的 doctor 侧）：项目目录落在别的
+/// workspace 内时 `cargo metadata` 失败（"current package believes it's in a
+/// workspace"），RA FetchWorkspaceError 令 def/refs/hover 等语义工具静默返空
+/// ——在此提前暴露根因。检查目标 = `--project` 或 cwd。
+fn check_cargo_metadata(project_root: &Path) -> supervisor::doctor::Check {
+    let mk = |status: supervisor::doctor::Status, detail: String, hint: Option<String>| {
+        supervisor::doctor::Check {
+            category: "workspace",
+            id: "cargo_metadata",
+            label: "cargo metadata",
+            status,
+            detail,
+            hint,
+        }
+    };
+    // ponytail: 无超时——std Command 无内建超时；--no-deps 冷缓存秒级，与网络探活同级可接受。
+    match std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(project_root)
+        .output()
+    {
+        Ok(o) if o.status.success() => mk(
+            supervisor::doctor::Status::Ok,
+            format!("manifest 解析正常（{}）", project_root.display()),
+            None,
+        ),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let first = stderr.lines().next().unwrap_or_default().to_string();
+            mk(
+                supervisor::doctor::Status::Miss,
+                if first.is_empty() { "exit != 0".into() } else { first },
+                Some(
+                    "workspace 归属冲突会使 LSP 语义工具静默返空：把项目移出外部 \
+                     workspace 目录，或在其 Cargo.toml 追加空 [workspace] 表"
+                        .into(),
+                ),
+            )
+        }
+        Err(e) => mk(
+            supervisor::doctor::Status::Warn,
+            format!("cargo 不可执行: {e}"),
+            Some("非 Rust 项目可忽略此项；Rust 项目请确认 cargo 在 PATH".into()),
+        ),
+    }
+}
+
+/// `doctor` 子命令：6 类体检 + 可选 --fix 自动装 MISS 的 LS。
+async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path, project_root: &Path) -> ExitCode {
+    let mut report = supervisor::doctor::run_all(lock_path);
+    // workspace 类在 CLI 侧追加：检查目标（--project/cwd）是 CLI 会话概念，
+    // supervisor::doctor 不感知（分层：doctor 库只做环境探测，ARCH §1）。
+    report.checks.push(check_cargo_metadata(project_root));
     // 可选：--fix 尝试装 MISS 的 server 类别条目
     if fix {
         for c in &report.checks {
@@ -1595,6 +1710,23 @@ async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path) -> ExitCode {
     ExitCode::from(report.exit_code())
 }
 
+/// bd serena-rust-abi：loaded_ls 同 lang 多 session 折叠计数（`["rust","rust","rust"]`
+/// → `["rust x3"]`）。session 池按 (project_root, lang) 键控，daemon 生命周期内
+/// 服务过的多 project 各占一条；仅显示层消歧义，status wire 不动。
+fn dedup_loaded_ls(body: &mut serde_json::Value) {
+    let Some(arr) = body.get_mut("loaded_ls").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let mut counts = std::collections::BTreeMap::new();
+    for lang in arr.iter().filter_map(|v| v.as_str()) {
+        *counts.entry(lang.to_owned()).or_insert(0usize) += 1;
+    }
+    *arr = counts
+        .into_iter()
+        .map(|(lang, n)| if n > 1 { json!(format!("{lang} x{n}")) } else { json!(lang) })
+        .collect();
+}
+
 /// `status` 子命令。
 async fn cmd_status(lock_path: &Path) -> ExitCode {
     let entry = match daemon::lockfile::read(lock_path) {
@@ -1613,7 +1745,8 @@ async fn cmd_status(lock_path: &Path) -> ExitCode {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+            let mut body: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+            dedup_loaded_ls(&mut body);
             print_json(&body).expect("print status");
             ExitCode::SUCCESS
         }
@@ -1695,6 +1828,11 @@ async fn cmd_shell(cli: &Cli) -> ExitCode {
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim();
         if line.is_empty() {
+            // 空输入回 usage 提示（bd djo）：协议通道内只出合法 JSON 帧。
+            println!(
+                "{}",
+                json!({"id": null, "ok": false, "error": "empty input; usage: {\"id\":<n>,\"cmd\":\"<tool|status|exit>\",\"args\":{...}}; see: serena-cli shell --help"})
+            );
             continue;
         }
 
@@ -1775,10 +1913,11 @@ async fn dispatch_shell_cmd(
             .await
             .map_err(|e| format!("status: {e}"))?;
         let status = resp.status();
-        let data: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+        let mut data: serde_json::Value = resp.json().await.unwrap_or(json!(null));
         if !status.is_success() {
             return Err(format!("daemon transport {status}: {data}"));
         }
+        dedup_loaded_ls(&mut data);
         return Ok(data);
     }
 
@@ -1841,9 +1980,13 @@ async fn dispatch_shell_cmd(
             .timeout(FORWARD_TIMEOUT)
             .send()
     };
-    let mut resp = send_tool(&base_token.1)
-        .await
-        .map_err(|e| format!("forward {tool}: {e}"))?;
+    let mut resp = send_with_connect_retry(
+        || send_tool(&base_token.1.clone()),
+        // 与压测观察一致：error sending request 覆盖 connect 与 request 两类瞬断形态。
+        |e: &reqwest::Error| e.is_connect() || e.is_request(),
+    )
+    .await
+    .map_err(|e| format!("forward {tool}: {e}"))?;
     if resp.status() == reqwest::StatusCode::FORBIDDEN
         && let Some(fresh) = refresh_token_if_stale(lock_path, &base_token.1).await
     {
@@ -2073,6 +2216,27 @@ mod tests {
         assert_eq!(args, json!({"file": "a.rs"}));
     }
 
+    /// bd serena-rust-abi：loaded_ls 同 lang 折叠计数；单实例与跨 lang 保持原样。
+    #[test]
+    fn dedup_loaded_ls_folds_repeated_langs_with_count() {
+        let mut body = json!({"loaded_ls": ["rust", "rust", "rust"], "pid": 1});
+        dedup_loaded_ls(&mut body);
+        assert_eq!(body["loaded_ls"], json!(["rust x3"]));
+        assert_eq!(body["pid"], 1, "status 其余字段不动");
+
+        let mut body = json!({"loaded_ls": ["rust", "clangd"]});
+        dedup_loaded_ls(&mut body);
+        assert_eq!(
+            body["loaded_ls"],
+            json!(["clangd", "rust"]),
+            "单实例不加计数；输出按字典序（确定性）"
+        );
+
+        let mut body = json!({"uptime_secs": 5});
+        dedup_loaded_ls(&mut body);
+        assert_eq!(body, json!({"uptime_secs": 5}), "无 loaded_ls 键静默跳过");
+    }
+
     // ---- 行号契约（bd serena-rust-7xv）----
 
     #[test]
@@ -2243,5 +2407,116 @@ mod tests {
             panic!("variant changed")
         };
         assert_eq!((*line, *col), (Some(0), Some(0)));
+    }
+}
+
+#[cfg(test)]
+mod net_retry_tests {
+    use super::*;
+
+    // 假错误类型：reqwest::Error 无公开构造器，transient 判定以 fn 注入即可测重试编排。
+    #[derive(Debug, PartialEq)]
+    enum FakeErr {
+        Transient,
+        Fatal,
+    }
+
+    fn transient(e: &FakeErr) -> bool {
+        matches!(e, FakeErr::Transient)
+    }
+
+    #[tokio::test]
+    async fn retries_transient_until_success() {
+        let calls = std::cell::Cell::new(0usize);
+        let r = send_with_connect_retry(
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                async move {
+                    if n < 3 {
+                        Err(FakeErr::Transient)
+                    } else {
+                        Ok::<_, FakeErr>(n)
+                    }
+                }
+            },
+            transient,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, 3);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn non_transient_fails_without_retry() {
+        let calls = std::cell::Cell::new(0usize);
+        let r: Result<(), FakeErr> = send_with_connect_retry(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err(FakeErr::Fatal) }
+            },
+            transient,
+        )
+        .await;
+        assert_eq!(r, Err(FakeErr::Fatal));
+        assert_eq!(calls.get(), 1, "语义错误绝不重试");
+    }
+
+    #[tokio::test]
+    async fn exhausted_transient_returns_last_err() {
+        let calls = std::cell::Cell::new(0usize);
+        let r: Result<(), FakeErr> = send_with_connect_retry(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err(FakeErr::Transient) }
+            },
+            transient,
+        )
+        .await;
+        assert_eq!(r, Err(FakeErr::Transient));
+        assert_eq!(
+            calls.get(),
+            1 + CONNECT_BACKOFF_MS.len(),
+            "首发起发 + 每档退避各一发"
+        );
+    }
+
+    /// 真连接失败走 reqwest::Error 判定：bind 后立即 drop listener → connect refused
+    /// 应被判为可重试并退避耗尽（总耗时 ≥ 各档退避之和）。
+    #[tokio::test]
+    async fn real_connect_refused_is_transient_and_backs_off() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let client = http_client();
+        let t0 = Instant::now();
+        let r: Result<reqwest::Response, _> = send_with_connect_retry(
+            || {
+                let url = format!("http://127.0.0.1:{port}/");
+                let c = client.clone();
+                async move { c.get(&url).send().await }
+            },
+            |e: &reqwest::Error| e.is_connect() || e.is_request(),
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(
+            t0.elapsed() >= Duration::from_millis(700),
+            "4 档退避之和 750ms，实测 {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// lazy-spawn 进程配置：DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP 必须都在
+    /// （父退不带走 daemon；ctrl+C 不打穿 daemon）。行为层由 vjm e2e 锁。
+    #[cfg(windows)]
+    #[test]
+    fn daemon_creation_flags_detached_and_new_group() {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let f = super::daemon_creation_flags();
+        assert_ne!(f & DETACHED_PROCESS, 0);
+        assert_ne!(f & CREATE_NEW_PROCESS_GROUP, 0);
     }
 }

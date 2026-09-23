@@ -51,6 +51,11 @@ pub fn note_activity() {
     *GLOBAL_LAST_ACTIVITY.lock().unwrap() = Instant::now();
 }
 
+/// 读全局活跃时钟（测试锁用：断言某路径未刷新时钟）。
+pub fn last_activity() -> Instant {
+    *GLOBAL_LAST_ACTIVITY.lock().unwrap()
+}
+
 /// 启动 reaper 常驻 task。返回 JoinHandle 供测试/停机取消。
 ///
 /// `lock` = (lock 路径, 自己的 boot_ms 归属戳)，用于 shutdown 收尾的
