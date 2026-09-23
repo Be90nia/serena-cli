@@ -21,6 +21,8 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use supervisor::{Supervisor, ToolError};
 
+mod lint_shell;
+
 /// 转发超时（工具请求 300s；管理命令 3s，daemon 卡死时 stop-all 快速失败）。
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(300);
 const MGMT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -104,9 +106,9 @@ enum Cmd {
         #[arg(long, value_name = "N", default_value_t = 200)]
         max_files: usize,
     },
-    /// 跳转到符号定义（textDocument/definition）。line/col 为 0-based。
+    /// 跳转到符号定义（textDocument/definition）。line/col 为 1-based。
     Def { file: String, line: u32, col: u32 },
-    /// 列出引用（textDocument/references）。line/col 0-based。
+    /// 列出引用（textDocument/references）。line/col 1-based。
     Refs {
         file: String,
         line: u32,
@@ -115,7 +117,7 @@ enum Cmd {
         #[arg(long)]
         delta: bool,
     },
-    /// 鼠标位置符号的 type / doc（textDocument/hover）。line/col 为 0-based。
+    /// 鼠标位置符号的 type / doc（textDocument/hover）。line/col 为 1-based。
     Hover { file: String, line: u32, col: u32 },
     Diagnostics {
         file: String,
@@ -134,7 +136,7 @@ enum Cmd {
         #[arg(long)]
         delta: bool,
     },
-    /// 符号的所有实现位置（textDocument/implementation）。line/col 为 0-based。
+    /// 符号的所有实现位置（textDocument/implementation）。line/col 为 1-based。
     FindImplementations {
         file: String,
         line: u32,
@@ -143,7 +145,7 @@ enum Cmd {
         #[arg(long)]
         delta: bool,
     },
-    /// 跨文件 rename（textDocument/rename）。line/col 为 0-based。
+    /// 跨文件 rename（textDocument/rename）。line/col 为 1-based。
     RenameSymbol {
         file: String,
         line: u32,
@@ -185,7 +187,7 @@ enum Cmd {
         /// glob 模式（如 main.cpp）。
         name_pattern: String,
     },
-    /// 所有引用 + 每个 ref 落在哪个外层符号里。line/col 为 0-based。
+    /// 所有引用 + 每个 ref 落在哪个外层符号里。line/col 为 1-based。
     FindReferencingSymbols {
         file: String,
         line: u32,
@@ -198,7 +200,7 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         page_size: usize,
     },
-    /// 所有引用 + 每个 ref 前后 N 行。line/col 为 0-based。
+    /// 所有引用 + 每个 ref 前后 N 行。line/col 为 1-based。
     FindReferencingCodeSnippets {
         file: String,
         line: u32,
@@ -301,7 +303,7 @@ enum Cmd {
         expected_hash: Option<String>,
     },
     /// 代码补全（textDocument/completion）—— AI-friendly 字段裁剪 + 自动推断 trigger。
-    /// line/col 为 0-based（与 def/refs 同基线，均直传 LSP Position）。
+    /// line/col 为 1-based（与 def/refs 同基线；CLI 层统一转 LSP 0-based）。
     Completion {
         file: String,
         line: u32,
@@ -314,18 +316,18 @@ enum Cmd {
         trigger: Option<String>,
     },
     /// 按位置反查最深层包含符号（documentSymbol walk）。无命中返空数组（合法）。
-    /// line/col 为 0-based。
+    /// line/col 为 1-based。
     ContainingSymbol { file: String, line: u32, col: u32 },
     /// 跳到定义并取完整符号信息（def + documentSymbol walk + body 切片）。
     /// def 返空 → null；定义无符号覆盖 → 空数组；C++ 重载等多定义 → 多元素。
-    /// line/col 为 0-based。
+    /// line/col 为 1-based。
     DefiningSymbol { file: String, line: u32, col: u32 },
 
     /// 函数调用位置的参数签名提示（textDocument/signatureHelp）。无调用位置返 null。
-    /// line/col 为 0-based。
+    /// line/col 为 1-based。
     SignatureHelp { file: String, line: u32, col: u32 },
     /// 列出可用 codeAction（textDocument/codeAction）。可选 `--kind` 过滤（如 quickfix / refactor）。
-    /// line/col 为 0-based。
+    /// line/col 为 1-based。
     CodeAction {
         file: String,
         line: u32,
@@ -341,7 +343,7 @@ enum Cmd {
         #[arg(long)]
         insert_spaces: Option<bool>,
     },
-    /// range 内格式化（textDocument/rangeFormatting）。返 edits[]。行/列为 0-based。
+    /// range 内格式化（textDocument/rangeFormatting）。返 edits[]。行/列为 1-based。
     FormatRange {
         file: String,
         start_line: u32,
@@ -353,13 +355,13 @@ enum Cmd {
         #[arg(long)]
         insert_spaces: Option<bool>,
     },
-    /// 行范围内类型提示（textDocument/inlayHint）。行号为 0-based。
+    /// 行范围内类型提示（textDocument/inlayHint）。行号为 1-based。
     InlayHint {
         file: String,
         start_line: u32,
         end_line: u32,
     },
-    /// 光标位置的同符号高亮（textDocument/documentHighlight）。line/col 为 0-based。
+    /// 光标位置的同符号高亮（textDocument/documentHighlight）。line/col 为 1-based。
     DocumentHighlight {
         file: String,
         line: u32,
@@ -374,7 +376,7 @@ enum Cmd {
     /// 文档链接（textDocument/documentLink）。
     DocumentLink { file: String },
     /// 调用层级：prepare / incoming / outgoing 三件套（callHierarchy/*）。
-    /// prepare 的 line/col 为 0-based。
+    /// prepare 的 line/col 为 1-based。
     CallHierarchy {
         /// "prepare" 用 file/line/col；"incoming"/"outgoing" 用 --item。
         op: String,
@@ -386,7 +388,7 @@ enum Cmd {
         item: Option<String>,
     },
     /// 类型层级：prepare / supertypes / subtypes 三件套（typeHierarchy/*）。
-    /// prepare 的 line/col 为 0-based。
+    /// prepare 的 line/col 为 1-based。
     TypeHierarchy {
         op: String,
         file: Option<String>,
@@ -395,7 +397,7 @@ enum Cmd {
         #[arg(long)]
         item: Option<String>,
     },
-    /// 全局符号标识（textDocument/moniker）。line/col 为 0-based。
+    /// 全局符号标识（textDocument/moniker）。line/col 为 1-based。
     Moniker {
         file: String,
         line: u32,
@@ -429,6 +431,22 @@ enum Cmd {
         #[arg(long)]
         fix: bool,
     },
+    /// 静态自审即将在 shell 执行的命令串（bd serena-rust-8ot）。默认 warn-only
+    /// （有 finding 也 exit 0）；`--strict` 下存在 error 级 finding → exit 2。
+    LintShell {
+        /// 待检查的命令串（与 --cmd-stdin 二选一）。
+        #[arg(long, required_unless_present = "cmd_stdin", conflicts_with = "cmd_stdin")]
+        cmd: Option<String>,
+        /// 从 stdin 读命令串。
+        #[arg(long)]
+        cmd_stdin: bool,
+        /// JSON 输出（findings + summary）。
+        #[arg(long)]
+        json: bool,
+        /// 存在 error 级 finding 时 exit 2（默认恒 0）。
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -459,7 +477,18 @@ async fn cli_main() -> ExitCode {
         }
     }
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // 行号契约统一（bd serena-rust-7xv）：position 型子命令的 line/col 以 1-based
+    // 收入，此处一次性就地转 LSP 0-based —— `--direct` 进程内直调与 HTTP 转发两条
+    // 路径共用转换结果，supervisor / lsp-core 不感知。0 = 用法错（BAD_ARGS，exit 2）。
+    if let Some(sub) = cli.cmd.as_mut()
+        && let Err(detail) = normalize_positions(sub)
+    {
+        eprintln!("BAD_ARGS: {detail}");
+        return ExitCode::from(2);
+    }
+
     let lock_path = daemon::serve::default_lock_path();
 
     // ---- daemon 模式：本进程做 daemon，阻塞至 shutdown ----
@@ -490,6 +519,21 @@ async fn cli_main() -> ExitCode {
     match &cli.cmd {
         Some(Cmd::Status) => return cmd_status(&lock_path).await,
         Some(Cmd::StopAll) => return cmd_stop_all(&lock_path).await,
+        // lint-shell：纯本地静态分析，不碰 daemon/lock。
+        Some(Cmd::LintShell { cmd, cmd_stdin, json, strict }) => {
+            let text = if *cmd_stdin {
+                match std::io::read_to_string(std::io::stdin()) {
+                    Ok(buf) => buf,
+                    Err(_) => {
+                        eprintln!("lint-shell: failed to read command from stdin");
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                cmd.clone().unwrap_or_default()
+            };
+            return ExitCode::from(lint_shell::run(&text, *json, *strict));
+        }
         // install 内部自建 blocking runtime（下载），必须在阻塞线程跑。
         Some(Cmd::Install { lang, all }) => {
             if *all {
@@ -1343,6 +1387,7 @@ async fn forward(
         | Some(Cmd::Install { .. })
         | Some(Cmd::Shell)
         | Some(Cmd::Doctor { .. })
+        | Some(Cmd::LintShell { .. })
         | None => {
             unreachable!("handled earlier")
         }
@@ -1872,6 +1917,100 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+// ============== 行号契约（bd serena-rust-7xv）==============
+//
+// CLI 的 position 型参数契约统一为 1-based（AI 用户与编辑器行号习惯）；LSP
+// Position 为 0-based。转换只发生在 CLI 层：`cli_main` 解析后经
+// `normalize_positions` 一次性就地 -1，`--direct` 直调与 HTTP 转发两条路径共用
+// 转换结果，supervisor / lsp-core 不感知。行级编辑工具（read-file /
+// insert-at-line / replace-lines / delete-lines / delete-text-in-symbol）的行
+// 参数本来就是 1-based 且不映射 LSP Position，不在转换之列。shell JSONL 的
+// args 透传模式不在本契约内（另行约定）。
+
+/// 1-based (line, col) → LSP 0-based Position；0 为用法错误。
+fn to_lsp_pos(line: u32, col: u32) -> Result<(u32, u32), String> {
+    if line == 0 {
+        return Err(format!("line is 1-based (got line={line})"));
+    }
+    if col == 0 {
+        return Err(format!("col is 1-based (got col={col})"));
+    }
+    Ok((line - 1, col - 1))
+}
+
+/// 1-based line（无 col 的行参数，如 inlay-hint 的 Range 行）→ 0-based。
+fn to_lsp_line(line: u32) -> Result<u32, String> {
+    if line == 0 {
+        return Err(format!("line is 1-based (got line={line})"));
+    }
+    Ok(line - 1)
+}
+
+/// 解析后统一转换：把 position 型子命令的 line/col 就地 -1 成 LSP 0-based。
+/// 新增 position 型子命令时必须在此登记——漏登记 = 该命令 raw 透传（即 bd 7xv
+/// 的原始 bug 形态）；行级工具误登记 = 双重 -1（单测锁定）。
+fn normalize_positions(cmd: &mut Cmd) -> Result<(), String> {
+    match cmd {
+        Cmd::Def { line, col, .. }
+        | Cmd::Refs { line, col, .. }
+        | Cmd::Hover { line, col, .. }
+        | Cmd::FindImplementations { line, col, .. }
+        | Cmd::RenameSymbol { line, col, .. }
+        | Cmd::FindReferencingSymbols { line, col, .. }
+        | Cmd::FindReferencingCodeSnippets { line, col, .. }
+        | Cmd::Completion { line, col, .. }
+        | Cmd::ContainingSymbol { line, col, .. }
+        | Cmd::DefiningSymbol { line, col, .. }
+        | Cmd::SignatureHelp { line, col, .. }
+        | Cmd::CodeAction { line, col, .. }
+        | Cmd::DocumentHighlight { line, col, .. }
+        | Cmd::Moniker { line, col, .. } => {
+            let (l, c) = to_lsp_pos(*line, *col)?;
+            *line = l;
+            *col = c;
+            Ok(())
+        }
+        Cmd::FormatRange {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            ..
+        } => {
+            let (sl, sc) = to_lsp_pos(*start_line, *start_col)?;
+            let (el, ec) = to_lsp_pos(*end_line, *end_col)?;
+            *start_line = sl;
+            *start_col = sc;
+            *end_line = el;
+            *end_col = ec;
+            Ok(())
+        }
+        Cmd::InlayHint {
+            start_line,
+            end_line,
+            ..
+        } => {
+            *start_line = to_lsp_line(*start_line)?;
+            *end_line = to_lsp_line(*end_line)?;
+            Ok(())
+        }
+        // 仅 prepare 消费 file/line/col；incoming/outgoing 的 line/col 不使用、不动。
+        Cmd::CallHierarchy { op, line, col, .. }
+        | Cmd::TypeHierarchy { op, line, col, .. }
+            if op == "prepare" =>
+        {
+            if let (Some(l), Some(c)) = (line, col) {
+                let (l2, c2) = to_lsp_pos(*l, *c)?;
+                *l = l2;
+                *c = c2;
+            }
+            Ok(())
+        }
+        // 行级工具（已 1-based）/ 管理命令 / shell / daemon：无 position 参数。
+        _ => Ok(()),
+    }
+}
+
 /// J（§11-J）：4 个集合型位置工具是否带 `--delta`（其余子命令无该 flag）。
 fn cmd_requests_delta(cmd: &Option<Cmd>) -> bool {
     matches!(
@@ -1932,5 +2071,177 @@ mod tests {
         inject_compact_arg(&mut args, false);
         assert!(args.get("_compact").is_none());
         assert_eq!(args, json!({"file": "a.rs"}));
+    }
+
+    // ---- 行号契约（bd serena-rust-7xv）----
+
+    #[test]
+    fn to_lsp_pos_converts_1based_to_0based() {
+        assert_eq!(to_lsp_pos(1, 1), Ok((0, 0)));
+        assert_eq!(to_lsp_pos(2, 8), Ok((1, 7)));
+        assert_eq!(to_lsp_pos(u32::MAX, 1), Ok((u32::MAX - 1, 0)));
+    }
+
+    #[test]
+    fn to_lsp_pos_rejects_zero() {
+        assert!(to_lsp_pos(0, 7).is_err());
+        assert!(to_lsp_pos(1, 0).is_err());
+        assert!(to_lsp_pos(0, 0).is_err());
+    }
+
+    #[test]
+    fn to_lsp_line_converts_and_rejects_zero() {
+        assert_eq!(to_lsp_line(3), Ok(2));
+        assert!(to_lsp_line(0).is_err());
+    }
+
+    #[test]
+    fn normalize_converts_position_subcommands() {
+        let mut cmd = Cmd::RenameSymbol {
+            file: "lib.rs".into(),
+            line: 1,
+            col: 8,
+            new_name: "X".into(),
+        };
+        normalize_positions(&mut cmd).unwrap();
+        let Cmd::RenameSymbol { line, col, .. } = &cmd else {
+            panic!("variant changed")
+        };
+        assert_eq!((*line, *col), (0, 7));
+
+        let mut cmd = Cmd::Hover {
+            file: "lib.rs".into(),
+            line: 2,
+            col: 8,
+        };
+        normalize_positions(&mut cmd).unwrap();
+        let Cmd::Hover { line, col, .. } = &cmd else {
+            panic!("variant changed")
+        };
+        assert_eq!((*line, *col), (1, 7));
+    }
+
+    #[test]
+    fn normalize_rejects_zero_line_and_col() {
+        let mut cmd = Cmd::RenameSymbol {
+            file: "lib.rs".into(),
+            line: 0,
+            col: 7,
+            new_name: "X".into(),
+        };
+        assert!(normalize_positions(&mut cmd).is_err());
+
+        let mut cmd = Cmd::Def {
+            file: "lib.rs".into(),
+            line: 1,
+            col: 0,
+        };
+        assert!(normalize_positions(&mut cmd).is_err());
+    }
+
+    #[test]
+    fn normalize_skips_line_based_tools() {
+        // 行级工具的行参数本来就是 1-based，normalize 不得触碰（防双重 -1）。
+        let mut cmd = Cmd::InsertAtLine {
+            file: "lib.rs".into(),
+            line: 1,
+            text: "// foo".into(),
+            expected_hash: None,
+        };
+        normalize_positions(&mut cmd).unwrap();
+        let Cmd::InsertAtLine { line, .. } = &cmd else {
+            panic!("variant changed")
+        };
+        assert_eq!(*line, 1);
+
+        let mut cmd = Cmd::ReadFile {
+            file: "lib.rs".into(),
+            start_line: Some(1),
+            end_line: Some(2),
+        };
+        normalize_positions(&mut cmd).unwrap();
+        let Cmd::ReadFile {
+            start_line,
+            end_line,
+            ..
+        } = &cmd
+        else {
+            panic!("variant changed")
+        };
+        assert_eq!((*start_line, *end_line), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn normalize_converts_range_subcommands() {
+        let mut cmd = Cmd::FormatRange {
+            file: "f.rs".into(),
+            start_line: 1,
+            start_col: 1,
+            end_line: 2,
+            end_col: 5,
+            tab_size: None,
+            insert_spaces: None,
+        };
+        normalize_positions(&mut cmd).unwrap();
+        let Cmd::FormatRange {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            ..
+        } = &cmd
+        else {
+            panic!("variant changed")
+        };
+        assert_eq!(
+            (*start_line, *start_col, *end_line, *end_col),
+            (0, 0, 1, 4)
+        );
+
+        let mut cmd = Cmd::InlayHint {
+            file: "f.rs".into(),
+            start_line: 1,
+            end_line: 3,
+        };
+        normalize_positions(&mut cmd).unwrap();
+        let Cmd::InlayHint {
+            start_line,
+            end_line,
+            ..
+        } = &cmd
+        else {
+            panic!("variant changed")
+        };
+        assert_eq!((*start_line, *end_line), (0, 2));
+    }
+
+    #[test]
+    fn normalize_converts_hierarchy_prepare_only() {
+        let mut cmd = Cmd::CallHierarchy {
+            op: "prepare".into(),
+            file: Some("f.rs".into()),
+            line: Some(2),
+            col: Some(8),
+            item: None,
+        };
+        normalize_positions(&mut cmd).unwrap();
+        let Cmd::CallHierarchy { line, col, .. } = &cmd else {
+            panic!("variant changed")
+        };
+        assert_eq!((*line, *col), (Some(1), Some(7)));
+
+        // incoming/outgoing 不消费 line/col：不转换也不报错。
+        let mut cmd = Cmd::TypeHierarchy {
+            op: "subtypes".into(),
+            file: None,
+            line: Some(0),
+            col: Some(0),
+            item: Some("{}".into()),
+        };
+        normalize_positions(&mut cmd).unwrap();
+        let Cmd::TypeHierarchy { line, col, .. } = &cmd else {
+            panic!("variant changed")
+        };
+        assert_eq!((*line, *col), (Some(0), Some(0)));
     }
 }

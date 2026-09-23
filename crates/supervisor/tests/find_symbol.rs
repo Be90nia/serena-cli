@@ -77,10 +77,11 @@ async fn workspace_symbol_finds_known_functions() {
         .await
         .expect("overview");
 
-    let hits = sup
+    let (hits, warnings) = sup
         .tool_find_symbol(&root, "alpha_func", 50, None)
         .await
         .expect("find_symbol");
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 
     assert!(
         !hits.is_empty(),
@@ -125,7 +126,7 @@ async fn limit_caps_results() {
 
     // alpha / beta / gamma 都含 `_helper` / `_func` / `_method`？没有共同子串。
     // 用空 pattern 之前的 nil；改用一个只匹配一个的 query：alpha_func。
-    let hits = sup
+    let (hits, _warnings) = sup
         .tool_find_symbol(&root, "alpha_func", 1, None)
         .await
         .expect("find_symbol");
@@ -155,10 +156,11 @@ async fn lang_override_skips_root_probe() {
         .expect("overview");
 
     // 指定 lang=cpp → 只查 clangd。
-    let hits = sup
+    let (hits, warnings) = sup
         .tool_find_symbol(&root, "alpha_func", 50, Some("cpp"))
         .await
         .expect("find_symbol with lang=cpp");
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     assert!(
         !hits.is_empty(),
         "lang=cpp should find alpha_func via clangd, got 0 hits"

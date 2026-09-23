@@ -2198,6 +2198,11 @@ impl Supervisor {
     /// - 指定 `lang_override`：仅查该 LS（不依赖 root 文件探测）。
     /// - 不指定：扫 root 找所有 lang, 每个 lang 各起 LS 并行查 + merge (去重已排序后截断)。
     ///
+    /// 返回 `(hits, warnings)`：LS 拉起失败不再静默吞（bd serena-rust-x67）——
+    /// 全部 lang 失败 → `Err`（全 NotInstalled 合并为一个；混入其它错误原样上抛，
+    /// 见 `combined_all_failed_error`）；部分成功 → hits 只含成功 lang，
+    /// warnings 逐条描述失败 lang（execute_tool 落到结果顶层 `warning` 键）。
+    ///
     /// 索引可能慢（>10s），用 `INDEX_TIMEOUT` 而不是 `TOOL_TIMEOUT`。
     pub async fn tool_find_symbol(
         &self,
@@ -2205,7 +2210,7 @@ impl Supervisor {
         query: &str,
         limit: usize,
         lang_override: Option<&str>,
-    ) -> ToolResult<Vec<SymbolHit>> {
+    ) -> ToolResult<(Vec<SymbolHit>, Vec<String>)> {
         use std::collections::BTreeSet;
 
         if query.is_empty() {
@@ -2224,7 +2229,9 @@ impl Supervisor {
         let cache_key = find_symbol_cache_key(root, query, root_mtime);
         if let Some(mut cached) = self.symbol_cache_get(&cache_key) {
             cached.truncate(limit);
-            return Ok(cached); // cache_hit
+            // 命中路径不过 session_for；带 warning 的结果本就不写缓存（见下），
+            // 命中即全成功快照 → warnings 恒空。
+            return Ok((cached, Vec::new())); // cache_hit
         }
 
         // 决定要查的 lang 集合 (BTreeSet = 字母序, 顺序稳定)。命中缓存时直接复用 walked_langs。
@@ -2241,12 +2248,21 @@ impl Supervisor {
 
         // ponytail: 串行拿 session (load_gate_for 防双 spawn), 然后并行 fan-out 请求。
         let mut sessions = Vec::with_capacity(langs.len());
+        let mut failures: Vec<(String, ToolError)> = Vec::with_capacity(langs.len());
         for lang in &langs {
             match self.session_for(root, lang).await {
                 Ok(s) => sessions.push(s),
-                Err(_) => continue, // 单 LS 拉起失败不阻塞其它
+                // 单 LS 拉起失败不阻塞其它 lang，但必须可见 —— 静默 continue 会让
+                // 「全失败」伪装成「无符号」（bd serena-rust-x67）。
+                Err(e) => failures.push((lang.clone(), e)),
             }
         }
+        if sessions.is_empty() {
+            // 全失败：可见性与 hover/def 一致（错误上抛），不再静默返空。
+            // langs 非空（空集已在上方返 BadArgs）⇒ failures 非空。
+            return Err(combined_all_failed_error(failures));
+        }
+        let warnings = failure_warnings(&failures);
         let query = query.to_string();
         let mut tasks = Vec::with_capacity(sessions.len());
         for session in sessions {
@@ -2285,9 +2301,14 @@ impl Supervisor {
                 merged.extend(v);
             }
         }
-        self.symbol_cache_put(cache_key, merged.clone()); // cache_miss → 写入（截断前全量）
+        // 部分失败不写缓存：warning 只在本次调用产生（命中路径不过 session_for，
+        // 无法重现），缓存部分结果会让重查静默丢失失败信息 —— 宁重查不可错缓存
+        // （对齐空集不缓存纪律）。
+        if warnings.is_empty() {
+            self.symbol_cache_put(cache_key, merged.clone()); // cache_miss → 写入（截断前全量）
+        }
         merged.truncate(limit);
-        Ok(merged)
+        Ok((merged, warnings))
     }
     /// `Location[]`，lsp-types 在 capability 上声明多形态——M0 只解 `Option<Location>`）。
     ///
@@ -3924,6 +3945,65 @@ fn symbol_hits_envelope(hits: &[SymbolHit], compact: bool) -> serde_json::Value 
     }
 }
 
+// ==== find-symbol LS 缺失可见性（bd serena-rust-x67）====
+
+/// find-symbol 全失败收口：所有 lang 的 `session_for` 都失败时的错误决策。
+/// 任一失败为非 NotInstalled（unknown lang / spawn crash）→ 原样上抛首个此类错误
+/// （不把崩溃谎报成 LS_NOT_INSTALLED，否则 agent 会去重装而不是看真错误）；
+/// 全为 NotInstalled → 合并 language/hint 为单个 NotInstalled（wire=LS_NOT_INSTALLED，
+/// 与 hover/def 单 lang 路径同形）。
+fn combined_all_failed_error(failures: Vec<(String, ToolError)>) -> ToolError {
+    let mut langs = Vec::with_capacity(failures.len());
+    let mut hints = Vec::with_capacity(failures.len());
+    let mut other: Option<ToolError> = None;
+    for (lang, e) in failures {
+        match e {
+            ToolError::NotInstalled { hint, .. } => {
+                langs.push(lang);
+                hints.push(hint);
+            }
+            _ => {
+                if other.is_none() {
+                    other = Some(e);
+                }
+            }
+        }
+    }
+    if let Some(e) = other {
+        return e;
+    }
+    ToolError::NotInstalled {
+        language: langs.join(", "),
+        hint: hints.join("; "),
+    }
+}
+
+/// find-symbol 部分失败场景的 warning 文案：lang 前缀保证多失败可归属，
+/// 复用 ToolError Display（NotInstalled 自带安装 hint）。
+fn failure_warnings(failures: &[(String, ToolError)]) -> Vec<String> {
+    failures
+        .iter()
+        .map(|(lang, e)| format!("{lang}: {e}"))
+        .collect()
+}
+
+/// 结果 JSON 顶层 `warning` 键（wire 无既有 warning 通道，PM 拍板放结果顶层）。
+/// compact envelope 本是对象 → 直接加键；非 compact 裸数组无法带键 → 仅当有
+/// warning 时升级为 `{compact:false, items, warning}` 对象（无 warning 维持裸数组
+/// 既有 wire 不变）。`_delta=true` 的增量形态 `{delta,added,removed}` 本就有损，不带 warning。
+fn attach_warning(value: &mut serde_json::Value, warnings: &[String]) {
+    if warnings.is_empty() {
+        return;
+    }
+    let w = serde_json::Value::String(warnings.join("; "));
+    if value.is_array() {
+        let items = std::mem::take(value);
+        *value = serde_json::json!({ "compact": false, "items": items, "warning": w });
+    } else if let Some(obj) = value.as_object_mut() {
+        obj.insert("warning".to_string(), w);
+    }
+}
+
 /// RefSymbolHit[] envelope：compact 时合并 `symbol` + `refs[]` 嵌套紧凑（按容器聚类）。
 fn ref_symbol_hits_envelope(
     hits: &[ref_tools::RefSymbolHit],
@@ -4409,8 +4489,9 @@ impl SupervisorTrait for Supervisor {
                     }
                 })?;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-                let raw = self.tool_find_symbol(root, query, limit, lang).await?;
-                let value = symbol_hits_envelope(&raw, compact);
+                let (raw, warnings) = self.tool_find_symbol(root, query, limit, lang).await?;
+                let mut value = symbol_hits_envelope(&raw, compact);
+                attach_warning(&mut value, &warnings);
                 let root_key = format!("{}|{}|{}", root.display(), query, limit);
                 Ok(self.maybe_delta("find-symbol", &root_key, value, delta).await)
             }
@@ -6504,11 +6585,12 @@ mod symbol_cache_tests {
         );
 
         let t0 = Instant::now();
-        let out = sup
+        let (out, warnings) = sup
             .tool_find_symbol(root, "parse", 2, Some("rust"))
             .await
             .unwrap();
         let elapsed = t0.elapsed();
+        assert!(warnings.is_empty(), "cache hit must not fabricate warnings");
         // 50ms：仍远低于 LS 往返（60ms+），防「命中路径意外走了慢路径」；
         // 10ms 在 86 测试并行满载下会被 tempdir+walk 抖破（实测 16ms）。
         assert!(
@@ -8020,5 +8102,204 @@ mod search_symbol_tests {
         assert_eq!(items[1]["file"], "b.rs");
         assert!(v["meta"].get("kind").is_none(), "递归删非 items 层的同名字段");
         assert_eq!(v["meta"]["file"], "c.rs", "非目标字段不动");
+    }
+}
+
+#[cfg(test)]
+mod find_symbol_ls_error_tests {
+    //! bd serena-rust-x67：find-symbol 不再静默吞 NotInstalled。
+    //! - 纯逻辑：全失败合并 / warning 文案 / wire 顶层 warning 键（不拉 LS）。
+    //! - 集成：全失败走 python fixture（pyright 本机故意不装——环境不变量）；
+    //!   部分成功 + 全成功走 rust+py 混合 fixture（真拉 rust-analyzer，秒级冷启动；
+    //!   独立成 mod 以不污染 symbol_cache_tests 的「不拉 LS」纪律）。
+    use super::*;
+
+    /// 分支 1 纯逻辑：全失败且全为 NotInstalled → 合并 language/hint 为单错误。
+    #[test]
+    fn all_failed_not_installed_merges_languages_and_hints() {
+        let failures = vec![
+            (
+                "python".to_string(),
+                ToolError::NotInstalled {
+                    language: "python".to_string(),
+                    hint: "pip install pyright".to_string(),
+                },
+            ),
+            (
+                "go".to_string(),
+                ToolError::NotInstalled {
+                    language: "go".to_string(),
+                    hint: "install gopls".to_string(),
+                },
+            ),
+        ];
+        match combined_all_failed_error(failures) {
+            ToolError::NotInstalled { language, hint } => {
+                assert_eq!(language, "python, go");
+                assert_eq!(hint, "pip install pyright; install gopls");
+            }
+            other => panic!("expected combined NotInstalled, got {other:?}"),
+        }
+    }
+
+    /// 分支 1 变体：混入非 NotInstalled（crash）→ 原样上抛真错误，不谎报未安装
+    /// （否则 agent 会去重装 LS 而不是看崩溃原因）。
+    #[test]
+    fn all_failed_mixed_errors_prefer_real_error_over_not_installed() {
+        let failures = vec![
+            (
+                "python".to_string(),
+                ToolError::NotInstalled {
+                    language: "python".to_string(),
+                    hint: "h".to_string(),
+                },
+            ),
+            (
+                "rust".to_string(),
+                ToolError::Launch(anyhow::anyhow!("spawn boom")),
+            ),
+        ];
+        let err = combined_all_failed_error(failures);
+        assert!(
+            matches!(&err, ToolError::Launch(e) if format!("{e:#}").contains("spawn boom")),
+            "got {err:?}"
+        );
+    }
+
+    /// 分支 2 文案：lang 前缀 + 复用 Display（NotInstalled 自带安装 hint）。
+    #[test]
+    fn failure_warnings_carry_lang_prefix_and_display() {
+        let failures = vec![(
+            "python".to_string(),
+            ToolError::NotInstalled {
+                language: "python".to_string(),
+                hint: "pip install pyright".to_string(),
+            },
+        )];
+        let w = failure_warnings(&failures);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].starts_with("python: "), "w[0]={}", w[0]);
+        assert!(w[0].contains("not installed"));
+        assert!(w[0].contains("pip install pyright"));
+    }
+
+    /// 分支 3 wire 三形态：无 warning 不加键；compact 对象直接加键；裸数组升级对象。
+    #[test]
+    fn attach_warning_shapes_per_envelope_form() {
+        let mut v = serde_json::json!({"compact": true, "items": [], "raw_count": 0});
+        attach_warning(&mut v, &[]);
+        assert!(v.get("warning").is_none(), "无失败不得加 warning 键");
+
+        let mut v = serde_json::json!({
+            "compact": true,
+            "items": [["foo", "a.rs:1:1"]],
+            "raw_count": 1,
+        });
+        attach_warning(
+            &mut v,
+            &["python: language server for `python` not installed: x".to_string()],
+        );
+        assert_eq!(v["compact"], serde_json::Value::Bool(true), "compact 键保留");
+        assert_eq!(v["raw_count"], 1);
+        assert!(v["warning"].as_str().unwrap().contains("python"));
+
+        let mut v = serde_json::json!([{"name": "foo"}]);
+        attach_warning(&mut v, &["rust: boom".to_string()]);
+        assert_eq!(v["compact"], serde_json::Value::Bool(false));
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert!(v["warning"].as_str().unwrap().contains("boom"));
+    }
+
+    /// 分支 1 集成：py fixture（walked_langs={python}，pyright 缺失）→
+    /// Err NotInstalled 含 lang 与安装 hint，不再 rc=0 静默空。
+    /// 环境不变量：pyright 故意不装（find_symbol.rs::has_clangd 同款守卫——
+    /// pyright 已装的环境本测试前提失效，跳过不计失败）。
+    fn has_pyright() -> bool {
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let names: &[&str] = if cfg!(windows) {
+                    &["pyright.exe", "pyright.cmd", "pyright.bat"]
+                } else {
+                    &["pyright"]
+                };
+                if names.iter().any(|n| dir.join(n).is_file()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn find_symbol_all_ls_missing_returns_not_installed() {
+        if has_pyright() {
+            println!("skipped: pyright installed — all-missing env invariant broken");
+            return;
+        }
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("mod.py"), "def py_foo():\n    pass\n").expect("write .py");
+        let err = sup
+            .tool_find_symbol(dir.path(), "py_foo", 10, None)
+            .await
+            .expect_err("all-LS-missing must Err, not silent empty");
+        match err {
+            ToolError::NotInstalled { language, hint } => {
+                assert!(language.contains("python"), "language={language}");
+                assert!(!hint.is_empty(), "hint must carry install guidance");
+            }
+            other => panic!("expected NotInstalled, got {other:?}"),
+        }
+    }
+
+    /// 分支 2 集成（部分成功）：rust+py 混合目录（RA 在 PATH、pyright 缺失）→
+    /// Ok 且 hits 来自 rust、warning 归属 python；随后同 root 仅查 rust（warm session）
+    /// → 分支 3 全成功无 warning。真拉 rust-analyzer —— RA 符号索引双阶段就绪
+    /// （session ready ≠ workspace/symbol 可见，首查可能静默空），轮询非空。
+    #[tokio::test]
+    async fn find_symbol_partial_ls_failure_keeps_hits_and_warns() {
+        use std::time::{Duration, Instant};
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x67fix\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::write(
+            src.join("main.rs"),
+            "fn alpha_main() {}\nfn main() { alpha_main(); }\n",
+        )
+        .expect("write main.rs");
+        std::fs::write(dir.path().join("mod.py"), "def py_foo():\n    pass\n").expect("write .py");
+
+        // RA 符号索引就绪窗口内 workspace/symbol 可能静默空 → 轮询非空（60s 上限）。
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (hits, warnings) = loop {
+            let (h, w) = sup
+                .tool_find_symbol(dir.path(), "alpha_main", 50, None)
+                .await
+                .expect("partial LS failure must not fail the call");
+            if !h.is_empty() || Instant::now() >= deadline {
+                break (h, w);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        assert!(
+            hits.iter().any(|h| h.name == "alpha_main"),
+            "rust hits must survive python LS failure; hits={hits:?} warnings={warnings:?}"
+        );
+        assert_eq!(warnings.len(), 1, "warnings={warnings:?}");
+        assert!(warnings[0].starts_with("python: "), "warnings={warnings:?}");
+
+        // 分支 3：同 root 仅查 rust（session 已 warm、索引已就绪）→ 全成功无 warning。
+        let (hits, warnings) = sup
+            .tool_find_symbol(dir.path(), "alpha_main", 50, Some("rust"))
+            .await
+            .expect("rust-only query on warm session");
+        assert!(!hits.is_empty(), "rust-only query must still hit");
+        assert!(warnings.is_empty(), "all-success must carry no warnings");
     }
 }

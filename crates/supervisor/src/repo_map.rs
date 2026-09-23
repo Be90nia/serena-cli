@@ -140,7 +140,8 @@ async fn count_refs(
     lang: Option<&str>,
 ) -> usize {
     let hits = match sup.tool_find_symbol(root, name, 50, lang).await {
-        Ok(h) => h,
+        // warnings（失败 lang）在 repo_map 计数场景无挂载点，忽略 —— 计数尽力而为。
+        Ok((h, _)) => h,
         Err(_) => return 0,
     };
     // 在 hits 里挑 file 路径一致的第一个（uri → file_path 同款 URI 解码逻辑
