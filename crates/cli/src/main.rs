@@ -447,7 +447,9 @@ fn main() -> ExitCode {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+// worker_threads=4（2026-09-23 压测实锤）：2 worker 下 RA 冷启动+分析会把 runtime
+// 吃满，HTTP/轮询 task 饿死（post_diag 循环错过推送窗口 → pending 误报）。
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_main() -> ExitCode {
     #[cfg(windows)]
     unsafe {
@@ -462,6 +464,15 @@ async fn cli_main() -> ExitCode {
 
     // ---- daemon 模式：本进程做 daemon，阻塞至 shutdown ----
     if cli.daemon {
+        // 全库 tracing::warn!/info! 的唯一出口：不 init 则全部静默丢弃（排障全盲）。
+        // RUST_LOG 控制，默认 info；stderr —— daemon 由 lazy-spawn 时 stdout 已重定向。
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_writer(std::io::stderr)
+            .try_init();
         let cfg = daemon::serve::ServeConfig {
             lock_path,
             ..Default::default()
@@ -1386,27 +1397,33 @@ async fn forward(
     });
 
     let url = format!("{base}/tools/{tool}");
-    let mut resp = client
-        .post(&url)
-        .header("X-Serena-Token", &*token)
-        .header("X-Invocation-Id", &invocation_id)
-        .json(&body)
-        .timeout(FORWARD_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| format!("forward {tool}: {e}"))?;
+    let send_once = |token: &String| {
+        client
+            .post(&url)
+            .header("X-Serena-Token", token)
+            .header("X-Invocation-Id", &invocation_id)
+            .json(&body)
+            .timeout(FORWARD_TIMEOUT)
+            .send()
+    };
+    let mut resp = match send_once(&token.clone()).await {
+        Ok(r) => r,
+        // 压测观察（2026-09-23）：负载波峰下 loopback connect 偶发瞬断（daemon 侧
+        // 无任何日志，TCP connect 即失败），立即重试必成 —— 重试一次再放弃。
+        Err(e) if e.is_connect() || e.is_request() => {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            send_once(&token.clone())
+                .await
+                .map_err(|e| format!("forward {tool}: {e}"))?
+        }
+        Err(e) => return Err(format!("forward {tool}: {e}")),
+    };
     if resp.status() == reqwest::StatusCode::FORBIDDEN
         && let Some(fresh) = refresh_token_if_stale(lock_path, token).await
     {
         // daemon 换代后缓存 token 过期：已刷新，用新 token 重发一次。
         *token = fresh;
-        resp = client
-            .post(&url)
-            .header("X-Serena-Token", &*token)
-            .header("X-Invocation-Id", &invocation_id)
-            .json(&body)
-            .timeout(FORWARD_TIMEOUT)
-            .send()
+        resp = send_once(token)
             .await
             .map_err(|e| format!("forward {tool}: {e}"))?;
     }

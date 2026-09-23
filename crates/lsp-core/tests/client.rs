@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ls_runtime::process::{Child, LaunchInfo, TransportKind};
-use lsp_core::client::{Client, Id};
+use lsp_core::client::{Client, Id, OutboundItem};
 use lsp_core::error::CoreError;
 use lsp_core::framing::JsonRpc;
-use lsp_core::transport::stdio::{Pumps, pump};
+use lsp_core::transport::stdio::{Pumps, pump_with_priority};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -47,7 +47,7 @@ async fn boot(envs: &[(&str, &str)]) -> Rig {
     })
     .unwrap();
 
-    let (tx, rx) = mpsc::channel::<JsonRpc>(64);
+    let (tx, rx) = mpsc::channel::<OutboundItem>(64);
     let (reply_tx, reply_rx) = mpsc::channel::<JsonRpc>(8);
 
     let client = Client::with_name("mock_ls".into(), tx);
@@ -60,7 +60,7 @@ async fn boot(envs: &[(&str, &str)]) -> Rig {
         let c = client_for_pump.clone();
         Arc::new(move || c.abort_all())
     };
-    let pumps = pump(child, rx, reply_rx, reply_tx, on_msg, on_eof);
+    let pumps = pump_with_priority(child, rx, reply_rx, reply_tx, on_msg, on_eof);
 
     Rig {
         client,
@@ -145,7 +145,7 @@ async fn eof_drains_pending_with_terminated() {
 
 #[tokio::test]
 async fn server_to_client_request_gets_default_null_reply() {
-    let (out_tx, _out_rx) = mpsc::channel::<JsonRpc>(8);
+    let (out_tx, _out_rx) = mpsc::channel::<OutboundItem>(8);
     let client = Client::with_name("mock_ls".into(), out_tx);
     let srv_req = JsonRpc {
         jsonrpc: "2.0".into(),
@@ -185,7 +185,7 @@ async fn server_to_client_request_e2e_with_mock_ls() {
     })
     .unwrap();
 
-    let (out_tx, out_rx) = mpsc::channel::<JsonRpc>(64);
+    let (out_tx, out_rx) = mpsc::channel::<OutboundItem>(64);
     let (reply_tx, reply_rx) = mpsc::channel::<JsonRpc>(8);
     let client = Client::with_name("mock_ls".into(), out_tx.clone());
     let capture_tx_clone = capture_tx.clone();
@@ -202,7 +202,7 @@ async fn server_to_client_request_e2e_with_mock_ls() {
         })
     };
     let on_eof: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-    let mut pumps = pump(child, out_rx, reply_rx, reply_tx, on_msg, on_eof);
+    let mut pumps = pump_with_priority(child, out_rx, reply_rx, reply_tx, on_msg, on_eof);
 
     // 先发 initialize 触发 mock_ls 完成握手 + 触发它发 server→client request。
     let init_resp: Value = client

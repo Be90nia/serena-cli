@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -30,6 +30,129 @@ use tokio::time;
 
 use crate::error::{CoreError, Result};
 use crate::framing::{JsonRpc, RpcError};
+
+/// P0B：出站帧分类优先级。三级队列：High 永不排队等 Normal，Normal 累积 50ms
+/// 降级 Background，Background 走 TokenBucket 限流（30/s、burst 2s）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// 用户面向 LSP 请求（textDocument/*、workspace/executeCommand 等）。直插队首，
+    /// 不被任何 Normal/Background 帧阻塞。
+    ///
+    /// 审计 F6 更正（2026-09-23）：协议顺序敏感帧 `initialized` 与
+    /// didOpen/didChange/didClose 也归 High（见 classify_method 文档）——
+    /// 本 variant 的"中性通知"示例已过时，以 classify_method 实现为准。
+    High,
+    /// RA 自发通知中无顺序约束的（workspace/didChangeWatchedFiles、$/progress、
+    /// exit 等）。默认 priority。
+    Normal,
+    /// 索引/监听/扫描类（$/workspace/_ping、workspace/symbol 走后台、crate 重解析）。
+    Background,
+}
+
+/// 携带优先级标记的出站帧。`Client` 唯一发送形态，writer 三 channel 入口。
+#[derive(Debug)]
+pub struct OutboundItem {
+    pub msg: JsonRpc,
+    pub priority: Priority,
+}
+
+/// 按 method 归类出站优先级。命名规则：textDocument/* → High；workspace/... 但非
+/// `_ping` → Normal；workspace/_ping、workspace/symbol（目录扫描）等后台 → Background；
+/// $/progress、$/workspace/_ping 等 RA 私域 → Background。**规则保守优先：High 仅限
+/// 用户面向，**索引/扫描类**一律 Background，绝不抢占用户请求**。
+///
+/// P0B race 修（2026-09-22）：`initialized` / didOpen / didChange / didClose 必须与
+/// 其后续 textDocument 请求保持协议顺序 —— 它们若留在 Normal 会被 50ms demote 到
+/// Background，让 High 请求插队到 `initialized` 之前（rust-analyzer 严格校验顺序，
+/// 收到未握手请求直接退出 → 管道断 → channel closed），或插到 didChange 之前
+/// （RA 读到旧内容 → 符号体错位 → 写坏代码）。升 High 后与请求同队列 FIFO，
+/// 到达序即协议序，demote 永不触及。
+pub fn classify_method(method: &str) -> Priority {
+    // 协议顺序敏感：握手 + 文档同步必须先于依赖它们的请求写出。
+    if method == "initialized"
+        || method == "textDocument/didOpen"
+        || method == "textDocument/didChange"
+        || method == "textDocument/didClose"
+    {
+        return Priority::High;
+    }
+    // 后台探测/保活（rust-analyzer `$/workspace/_ping` 等）—— 优先 Background。
+    if method.starts_with("$/workspace/_ping") || method == "workspace/_ping" {
+        return Priority::Background;
+    }
+    // RA workspace/symbol 在大型 workspace 是重量级索引后端 → Background
+    // （supervisor 端用户主动 search 用 High 重写方法名时再走 High）。
+    if method == "workspace/symbol" {
+        return Priority::Background;
+    }
+    // 用户面向的 LSP 文本请求：textDocument/*（documentSymbol/hover/references 等）。
+    if method.starts_with("textDocument/")
+        || method == "workspace/executeCommand"
+        || method == "workspace/workspaceFolders"
+        || method == "workspace/configuration"
+        || method == "window/workDoneProgress/create"
+    {
+        return Priority::High;
+    }
+    // RA 自发 / 中性通知（didChangeWatchedFiles、$/progress、exit、shutdown 等）
+    // 走 Normal。注意 initialized / didOpen / didChange / didClose 已在上面升 High
+    // （协议顺序敏感，审计 F6：勿按旧行为"修正"回 Normal —— 会复现 RA 未握手退出）。
+    Priority::Normal
+}
+
+/// 简易令牌桶：限 Background 帧速率。`per_sec` 长期速率上限；`burst` 允许瞬时积攒
+/// 的令牌数上限（等价于 2s 抑制窗）。线程安全（内部 `Mutex<State>`，临界区仅几条
+/// 整数 + Instant 比较，无 await）。
+///
+/// 用法：每次准备发 Background 帧前 `try_acquire(now)` → true 才放行，false 则 sleep。
+pub struct TokenBucket {
+    per_sec: u32,
+    burst: u32,
+    state: Mutex<TokenState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenState {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    /// 构造。`per_sec` ≤ 0 等价 30/s；`burst` ≤ 0 等价 2s 抑制窗。
+    pub fn new(per_sec: u32, burst: u32) -> Self {
+        let per_sec = if per_sec == 0 { 30 } else { per_sec };
+        let burst = if burst == 0 { per_sec.saturating_mul(2).max(1) } else { burst };
+        Self {
+            per_sec,
+            burst,
+            state: Mutex::new(TokenState {
+                tokens: burst as f64,
+                last_refill: Instant::now(),
+            }),
+        }
+    }
+
+    /// 尝试取一个令牌。返回 true 表示放行（已扣 1）；false 表示节流（调用方应 sleep）。
+    pub fn try_acquire(&self, now: Instant) -> bool {
+        let mut s = self.state.lock().unwrap();
+        // 按 elapsed 补满令牌（连续积攒上限 = burst）。
+        let elapsed = now.saturating_duration_since(s.last_refill);
+        let refill = (elapsed.as_secs_f64()) * (self.per_sec as f64);
+        s.tokens = (s.tokens + refill).min(self.burst as f64);
+        s.last_refill = now;
+        if s.tokens >= 1.0 {
+            s.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 距下次放行的最短等待。测试断言常量。
+    pub fn per_sec(&self) -> u32 {
+        self.per_sec
+    }
+}
 
 /// 归一化 id：服务器既可能回 `id:1` 也可能回 `id:"1"`（quirk, `response_id.isdigit()`）。
 /// pending 表的 key 类型，查找时先按 `Num` 后按 `Str` 试。
@@ -82,8 +205,9 @@ pub type ServerRequestHandler = Arc<dyn Fn(JsonRpc) -> Option<Value> + Send + Sy
 struct ClientInner {
     /// 服务器标识，组装 Terminated 错误用。
     ls_name: String,
-    /// 出站 channel：所有写帧走它，由 transport writer task 独占消费。
-    outbound: mpsc::Sender<JsonRpc>,
+    /// 出站 channel：所有写帧（带 priority 标记）走它，由 transport writer task
+    /// 通过 priority-aware router 独占消费。
+    outbound: mpsc::Sender<OutboundItem>,
     /// pending 表（id → oneshot 完结）。临界区微秒无 await（§3.4）。
     pending: Mutex<HashMap<Id, oneshot::Sender<Result<JsonRpc>>>>,
     /// id 分配计数器。无锁（§3.4）。
@@ -106,13 +230,14 @@ pub struct Client {
 }
 
 impl Client {
-    /// 构造。`ls_name` 仅用于 Terminated 错误的展示字段；`outbound` 由 transport 提供。
-    pub fn new(outbound: mpsc::Sender<JsonRpc>) -> Self {
+    /// 构造。`ls_name` 仅用于 Terminated 错误的展示字段；`outbound` 由 transport
+    /// 提供。`Sender<OutboundItem>` 携带优先级，由 writer 端按 priority 路由。
+    pub fn new(outbound: mpsc::Sender<OutboundItem>) -> Self {
         Self::with_name("ls".into(), outbound)
     }
 
-    /// 显式指定服务器名（用于 Terminated 错误呈现）。
-    pub fn with_name(ls_name: String, outbound: mpsc::Sender<JsonRpc>) -> Self {
+    /// 显式指定服务器名（用于 Terminated 错误呈现）。见 [`Client::new`]。
+    pub fn with_name(ls_name: String, outbound: mpsc::Sender<OutboundItem>) -> Self {
         Self {
             inner: Arc::new(ClientInner {
                 ls_name,
@@ -164,24 +289,73 @@ impl Client {
         guard.insert(method.into(), Arc::new(f));
     }
 
-    /// 发送通知（无 id、不期待响应）。
+    /// 发送通知（无 id、不期待响应）。按 method 自动归类 priority（P0B）。
+    /// textDocument/* 等用户面向请求由调用方走 [`Client::notify_at`] 显式 High；
+    /// 本方法默认按 `classify_method` 推断（didOpen/didChange/didClose 等 Normal）。
     pub fn notify(&self, method: impl AsRef<str>, params: Value) -> Result<()> {
+        let method_ref = method.as_ref();
+        let msg = JsonRpc::notification(method_ref, params);
+        let priority = classify_method(method_ref);
+        self.inner
+            .outbound
+            .try_send(OutboundItem { msg, priority })
+            .map_err(|e| match e {
+                // writer 死亡 → channel 关闭：必须映射 Terminated，让 supervisor 的
+                // with_session_retry 自愈门触发 evict + 换新 session（审计 F1——
+                // 映射成 Io 会让死 session 以 Ready 缓存持续失败）。
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => CoreError::Terminated {
+                    ls: self.inner.ls_name.clone(),
+                    cause: "outbound channel closed (writer dead)".into(),
+                },
+                other => CoreError::Io(std::io::Error::other(format!("outbound: {other}"))),
+            })
+    }
+
+    /// 按指定优先级发通知。`High` 用于 supervisor 显式标记的关键路径。
+    pub fn notify_at(
+        &self,
+        method: impl AsRef<str>,
+        params: Value,
+        priority: Priority,
+    ) -> Result<()> {
         let msg = JsonRpc::notification(method.as_ref(), params);
         self.inner
             .outbound
-            .try_send(msg)
-            .map_err(|e| CoreError::Io(std::io::Error::other(format!("outbound closed: {e}"))))
+            .try_send(OutboundItem { msg, priority })
+            .map_err(|e| match e {
+                // 同 notify（审计 F1）：Closed 必须 → Terminated 才能触发自愈重试。
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => CoreError::Terminated {
+                    ls: self.inner.ls_name.clone(),
+                    cause: "outbound channel closed (writer dead)".into(),
+                },
+                other => CoreError::Io(std::io::Error::other(format!("outbound: {other}"))),
+            })
     }
 
-    /// 同步等待请求结果。`timeout` 到期 → `CoreError::Timeout{method, secs}`。
-    ///
-    /// 若响应 `error.code == -32801` 且方法在重试白名单内：内部按 `3 × 200ms` 重试；
-    /// 超限仍 -32801 或非白名单 → 返回 `CoreError::Rpc{code, message}`。
+    /// 同步等待请求结果（按 method 自动分类 priority）。`timeout` 到期 →
+    /// `CoreError::Timeout{method, secs}`。
     pub async fn request<R>(
         &self,
         method: impl AsRef<str>,
         params: Value,
         timeout: Duration,
+    ) -> Result<R>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        let priority = classify_method(method.as_ref());
+        self.request_at(method, params, timeout, priority).await
+    }
+
+    /// 显式 priority 版的 [`Client::request`]。supervisor 调 `textDocument/*`
+    /// 之类用户面向方法可走 High 抢占队列；走 Background 等后台探测可避免
+    /// 抢占用户请求。
+    pub async fn request_at<R>(
+        &self,
+        method: impl AsRef<str>,
+        params: Value,
+        timeout: Duration,
+        priority: Priority,
     ) -> Result<R>
     where
         R: serde::de::DeserializeOwned,
@@ -196,7 +370,9 @@ impl Client {
 
         let mut attempt: u32 = 0;
         loop {
-            let reply = self.send_once(&method, params.clone(), timeout).await?;
+            let reply = self
+                .send_once_at(&method, params.clone(), timeout, priority)
+                .await?;
             match &reply.error {
                 Some(RpcError { code, .. }) if *code == CONTENT_MODIFIED && in_retry_list => {
                     attempt += 1;
@@ -219,8 +395,14 @@ impl Client {
         }
     }
 
-    /// 单次请求：分配 id、插 pending、发帧、等 oneshot。`Timeout` 在此产生。
-    async fn send_once(&self, method: &str, params: Value, timeout: Duration) -> Result<JsonRpc> {
+    /// 显式 priority 版的 [`Client::send_once`]。
+    async fn send_once_at(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        priority: Priority,
+    ) -> Result<JsonRpc> {
         let id_num = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let id = Id::Num(id_num);
 
@@ -231,7 +413,12 @@ impl Client {
         }
 
         let msg = JsonRpc::request(id_num, method, params);
-        if let Err(e) = self.inner.outbound.send(msg).await {
+        if let Err(e) = self
+            .inner
+            .outbound
+            .send(OutboundItem { msg, priority })
+            .await
+        {
             // outbound 关 → pending 也要清，否则 zombie oneshot
             let mut pending = self.inner.pending.lock().unwrap();
             pending.remove(&id);

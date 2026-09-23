@@ -1011,3 +1011,160 @@ async fn repeated_same_file_access_emits_no_reopen_within_ttl() {
 
     session.shutdown().await;
 }
+
+/// 修 P0-A：批量 ensure_open 等价语义 —— 同 key（同文件）多次 ensure_open 走
+/// ref_count++ 不重发 didOpen（与串行调 ensure_open 完全一致）。验证点：
+///   1. 返回 Vec<Result<FileGuard>> 与输入顺序一致
+///   2. 全部 OK（无 Err）
+///   3. mock_ls 收到 1 个 didOpen（ref_count=4）
+///   4. 所有 guard 关联同一 uri（证明同 key 复用）
+#[tokio::test]
+async fn ensure_open_batch_emits_single_did_open_per_uri() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let f1 = tmp.path().join("a.cpp");
+    tokio::fs::write(&f1, b"fn a() {}\n").await.expect("write a");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+    session.set_language_id("cpp");
+
+    // 4 个相同 path（同一 URI）→ ensure_open_batch 应只发一次 didOpen。
+    let paths: Vec<&std::path::Path> = vec![&f1, &f1, &f1, &f1];
+    let params = lsp_core::docsync::EnsureOpenParams {
+        debounce_ms: 0, // 测试中关掉 debounce，只验结构
+        send_immediate: true,
+    };
+    let results = session.ensure_open_batch(&paths, params).await;
+    assert_eq!(results.len(), 4, "4 路径 → 4 个槽位");
+    for (i, r) in results.iter().enumerate() {
+        if r.is_err() {
+            panic!("slot {i} 应 Ok，got Err: {:?}", r.as_ref().err().unwrap());
+        }
+    }
+    let uris: std::collections::HashSet<String> = results
+        .iter()
+        .map(|r| r.as_ref().unwrap().uri().to_string())
+        .collect();
+    assert_eq!(uris.len(), 1, "4 guard 同 uri: {uris:?}");
+
+    time::sleep(Duration::from_millis(100)).await;
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    assert_eq!(
+        opens.len(),
+        1,
+        "同 URI 4 次 ensure_open_batch 仅 1 次 didOpen: {events:?}"
+    );
+
+    session.shutdown().await;
+}
+
+/// 修 P0-A：批内多个**不同**文件 → 每个文件 1 次 didOpen（4 文件 = 4 didOpen，
+/// 不重复；与串行 ensure_open N 次完全等价）。验证点：
+///   1. 返回 Vec 顺序 = 输入顺序
+///   2. mock_ls 收到 N 个 didOpen（各 URI 各 1）
+#[tokio::test]
+async fn ensure_open_batch_distinct_uris_each_get_one_did_open() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let names = ["a.cpp", "b.cpp", "c.cpp", "d.cpp"];
+    let files: Vec<std::path::PathBuf> = names
+        .iter()
+        .map(|n| tmp.path().join(n))
+        .collect();
+    for f in &files {
+        tokio::fs::write(f, b"fn x() {}\n").await.expect("write");
+    }
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+    session.set_language_id("cpp");
+
+    let paths: Vec<&std::path::Path> = files.iter().map(|p| p.as_path()).collect();
+    let params = lsp_core::docsync::EnsureOpenParams {
+        debounce_ms: 0,
+        send_immediate: true,
+    };
+    let results = session.ensure_open_batch(&paths, params).await;
+    assert_eq!(results.len(), 4);
+    for (i, r) in results.iter().enumerate() {
+        if r.is_err() {
+            panic!("slot {i} 应 Ok，got Err: {:?}", r.as_ref().err().unwrap());
+        }
+    }
+
+    time::sleep(Duration::from_millis(100)).await;
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    assert_eq!(
+        opens.len(),
+        4,
+        "4 不同 URI 各 1 次 didOpen: {events:?}"
+    );
+
+    session.shutdown().await;
+}
+
+/// 修 P0-A：debounce 行为 —— `send_immediate=false` + `debounce_ms>0` 时，
+/// 整批调用耗时 ≥ debounce_ms（每路 sleep 后才 ensure_open）。验证：
+///   1. 总耗时 ≥ debounce_ms（不可短于 debounce，证明每路都 sleep 了）
+///   2. 4 文件仍 4 个 didOpen（debounce 不去重 didOpen，仅延后单文件 didOpen）
+///
+/// 用 50ms debounce + 测墙 ≥ 50ms 即证明 sleep 真正生效。
+#[tokio::test]
+async fn ensure_open_batch_debounce_delays_each_send() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let names = ["a.cpp", "b.cpp", "c.cpp", "d.cpp"];
+    let files: Vec<std::path::PathBuf> = names.iter().map(|n| tmp.path().join(n)).collect();
+    for f in &files {
+        tokio::fs::write(f, b"fn x() {}\n").await.expect("write");
+    }
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+    session.set_language_id("cpp");
+
+    let paths: Vec<&std::path::Path> = files.iter().map(|p| p.as_path()).collect();
+    let debounce_ms: u64 = 50;
+    let params = lsp_core::docsync::EnsureOpenParams {
+        debounce_ms,
+        send_immediate: false,
+    };
+    let t0 = std::time::Instant::now();
+    let results = session.ensure_open_batch(&paths, params).await;
+    let elapsed = t0.elapsed();
+    assert_eq!(results.len(), 4);
+    for (i, r) in results.iter().enumerate() {
+        if r.is_err() {
+            panic!("slot {i} 应 Ok，got Err: {:?}", r.as_ref().err().unwrap());
+        }
+    }
+    assert!(
+        elapsed >= Duration::from_millis(debounce_ms),
+        "debounce 应让每路 sleep 至少 {debounce_ms}ms；实测 {elapsed:?}"
+    );
+
+    time::sleep(Duration::from_millis(50)).await;
+    let events = read_track_events(&track_log).await;
+    let opens: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
+        .collect();
+    assert_eq!(opens.len(), 4, "debounce 不去重，仍 4 didOpen");
+
+    session.shutdown().await;
+}

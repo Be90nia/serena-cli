@@ -2,8 +2,9 @@
 //! 写 stdin，响应帧到达 on_msg 回调。
 
 use ls_runtime::process::{Child, LaunchInfo, TransportKind};
+use lsp_core::client::{OutboundItem, Priority};
 use lsp_core::framing::JsonRpc;
-use lsp_core::transport::stdio::pump;
+use lsp_core::transport::stdio::pump_with_priority;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -20,7 +21,7 @@ async fn pumps_roundtrip_requests() {
     })
     .unwrap();
 
-    let (tx, rx) = mpsc::channel::<JsonRpc>(64);
+    let (tx, rx) = mpsc::channel::<OutboundItem>(64);
     let (reply_tx, reply_rx) = mpsc::channel::<JsonRpc>(8);
     let (resp_tx, mut resp_rx) = mpsc::channel::<JsonRpc>(8);
     let on_msg: Arc<dyn Fn(JsonRpc) -> Option<JsonRpc> + Send + Sync> = Arc::new(move |msg| {
@@ -31,14 +32,13 @@ async fn pumps_roundtrip_requests() {
     });
     let on_eof: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
 
-    let mut pumps = pump(child, rx, reply_rx, reply_tx, on_msg, on_eof);
+    let mut pumps = pump_with_priority(child, rx, reply_rx, reply_tx, on_msg, on_eof);
 
     // ① initialize 往返：mock 回 capabilities
-    tx.send(JsonRpc::request(
-        1,
-        "initialize",
-        json!({"capabilities": {}}),
-    ))
+    tx.send(OutboundItem {
+        msg: JsonRpc::request(1, "initialize", json!({"capabilities": {}})),
+        priority: Priority::Normal,
+    })
     .await
     .unwrap();
     let resp = tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx.recv())
@@ -52,11 +52,14 @@ async fn pumps_roundtrip_requests() {
     );
 
     // ② documentSymbol 往返：mock 回固定数组
-    tx.send(JsonRpc::request(
-        2,
-        "textDocument/documentSymbol",
-        json!({"textDocument": {"uri": "file:///mock/main.cpp"}}),
-    ))
+    tx.send(OutboundItem {
+        msg: JsonRpc::request(
+            2,
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": "file:///mock/main.cpp"}}),
+        ),
+        priority: Priority::High,
+    })
     .await
     .unwrap();
     let resp = tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx.recv())

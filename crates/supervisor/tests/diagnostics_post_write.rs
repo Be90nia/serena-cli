@@ -63,13 +63,20 @@ async fn post_write_diagnostics_appears_in_tool_result() {
 
     let diags = result
         .get("post_write_diagnostics")
-        .expect("post_write_diagnostics 必须存在")
-        .as_array()
-        .expect("必须是数组");
+        .expect("post_write_diagnostics 必须存在");
+    let items = diags
+        .get("items")
+        .and_then(|v| v.as_array())
+        .expect("必须是 {items, pending} 快照");
 
     assert!(
-        !diags.is_empty(),
+        !items.is_empty(),
         "clangd 真触发错误，必须有非空 diagnostics；got: {result}"
+    );
+    assert_eq!(
+        diags.get("pending").and_then(|v| v.as_bool()),
+        Some(false),
+        "clangd 已推送错误（非空 items）→ pending 必为 false；got: {result}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

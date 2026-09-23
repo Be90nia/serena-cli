@@ -28,11 +28,13 @@ use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
-use crate::client::Client;
+use crate::client::{Client, OutboundItem};
 use crate::error::{CoreError, Result};
 use crate::framing::JsonRpc;
 use crate::recording::Recorder;
-use crate::transport::stdio::{OnEof, OnMsg, Pumps, pump, record_pump, replay_pump};
+use crate::transport::stdio::{
+    OnEof, OnMsg, Pumps, pump_with_priority, record_pump_with_priority, replay_pump_with_priority,
+};
 
 /// 握手超时上限（10s）。真实 clangd 多在 1s 内回 initialize；mock_ls 同样。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -125,13 +127,14 @@ pub struct Session {
     pub(crate) initialized_notify: Notify,
     /// JSON-RPC 客户端（共享 Arc，可 Clone）。
     pub(crate) client: Client,
-    /// 出站 mpsc 的发送端。`Client` 也持一份；channel 在 `Arc<Session>` 全部 drop 时
-    /// 关闭 → writer task EOF。本字段保留仅为「Session 独占一份 sender」的契约表达。
+    /// 出站 mpsc（带 priority 的 `OutboundItem`）的发送端。`Client` 也持一份；
+    /// channel 在 `Arc<Session>` 全部 drop 时关闭 → writer task EOF。本字段保留
+    /// 仅为「Session 独占一份 sender」的契约表达。
     ///
     /// ponytail: 不为「显式关 stdin」独立设计 Take-out —— Job Object 兜底保证进程退场；
     /// LS 自然走 shutdown+exit+EOF 关闭 stdin 是 nice-to-have 不是必须。
     #[allow(dead_code)]
-    outbound_tx: mpsc::Sender<JsonRpc>,
+    outbound_tx: mpsc::Sender<OutboundItem>,
     /// 泵句柄集合。`shutdown` 终态 drop → Job 句柄关闭 → KILL_ON_JOB_CLOSE 灭树兜底。
     pumps: Mutex<Option<Pumps>>,
     /// stdout EOF 通知：stdout 泵读到 EOF 时 `notify_waiters()`；`shutdown` 等此门确认进程退。
@@ -206,7 +209,9 @@ impl Session {
     /// 不重试：失败语义由 supervisor 决策（PLAN Global Constraints）。
     pub async fn start(child: Option<ChildHandle>, params: InitializeParams) -> Result<Arc<Self>> {
         // 拆 child + 起 3 泵（架构要求 writer 独占 stdin、stdout 泵内联分发、stderr 泵日志）。
-        let (out_tx, out_rx) = mpsc::channel::<JsonRpc>(64);
+        // P0B：outbound channel 改 `OutboundItem`（带 priority），writer 走 priority-aware
+        // 三路路由 + TokenBucket；详见 `transport::stdio::pump_with_priority`。
+        let (out_tx, out_rx) = mpsc::channel::<OutboundItem>(64);
         let (reply_tx, reply_rx) = mpsc::channel::<JsonRpc>(8);
 
         let client = Client::with_name("ls".into(), out_tx.clone());
@@ -229,12 +234,12 @@ impl Session {
         let recorder = recorder_from_env();
         let pumps = match (child, &recorder) {
             (Some(c), r) if !r.is_passthrough() && !r.is_replay() => {
-                record_pump(c, out_rx, reply_rx, reply_tx, on_msg, on_eof, recorder)
+                record_pump_with_priority(c, out_rx, reply_rx, reply_tx, on_msg, on_eof, recorder)
             }
             (None, r) if r.is_replay() => {
-                replay_pump(out_rx, reply_rx, reply_tx, on_msg, on_eof, recorder)
+                replay_pump_with_priority(out_rx, reply_rx, reply_tx, on_msg, on_eof, recorder)
             }
-            (Some(c), _) => pump(c, out_rx, reply_rx, reply_tx, on_msg, on_eof),
+            (Some(c), _) => pump_with_priority(c, out_rx, reply_rx, reply_tx, on_msg, on_eof),
             (None, _) => {
                 return Err(CoreError::Io(std::io::Error::other(
                     "Session::start: no child and no SERENA_REPLAY env",
@@ -482,6 +487,14 @@ impl Session {
         &self.buffers
     }
 
+    /// 当前文件的 docsync `content_version`（tool_diagnostics 的推送 version 比对用）。
+    /// 文件未打开（无 buffer）→ None。key 用 docsync 同款 path_to_uri 保证一致。
+    pub fn content_version_of(&self, path: &std::path::Path) -> Option<i64> {
+        let uri = crate::docsync::path_to_uri(path).ok()?;
+        let map = self.buffers.lock().unwrap();
+        map.get(&uri).map(|b| b.content_version)
+    }
+
     /// initialize 响应的 `capabilities` 子对象克隆。握手成功后才有值；之前返 None。
     /// 仅 supervisor 用 — 在 `session_for` 末尾探测 pull diagnostics 等支持能力。
     pub fn server_capabilities(&self) -> Option<serde_json::Value> {
@@ -520,6 +533,47 @@ impl Session {
         let snap = self.state.lock().unwrap().clone();
         match snap {
             SessionState::Ready => self.client.request(method, params, timeout).await,
+            SessionState::Failed(cause) => Err(CoreError::Terminated {
+                ls: "ls".into(),
+                cause: format!("session failed: {cause}"),
+            }),
+            SessionState::Uninitialized | SessionState::Initializing => Err(CoreError::Io(
+                std::io::Error::other("session not ready after notify"),
+            )),
+        }
+    }
+
+    /// 显式 priority 版的 [`Session::request`]（审计 P1-2：用户主动触发的
+    /// Background 类方法如 workspace/symbol 需要覆盖默认分类）。
+    pub async fn request_at<R>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        priority: crate::client::Priority,
+    ) -> Result<R>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        if matches!(*self.state.lock().unwrap(), SessionState::Ready) {
+            return self.client.request_at(method, params, timeout, priority).await;
+        }
+        if matches!(*self.state.lock().unwrap(), SessionState::Failed(_)) {
+            return Err(CoreError::Terminated {
+                ls: "ls".into(),
+                cause: "session failed before request".into(),
+            });
+        }
+
+        let notified = self.initialized_notify.notified();
+        if matches!(*self.state.lock().unwrap(), SessionState::Ready) {
+            return self.client.request_at(method, params, timeout, priority).await;
+        }
+        notified.await;
+
+        let snap = self.state.lock().unwrap().clone();
+        match snap {
+            SessionState::Ready => self.client.request_at(method, params, timeout, priority).await,
             SessionState::Failed(cause) => Err(CoreError::Terminated {
                 ls: "ls".into(),
                 cause: format!("session failed: {cause}"),

@@ -34,6 +34,7 @@ use std::time::{Instant, SystemTime};
 
 use lsp_types::Uri;
 use serde_json::{Value, json};
+use tokio::time::sleep;
 
 use crate::error::{CoreError, Result};
 use crate::session::Session;
@@ -62,6 +63,28 @@ pub const FILE_GUARD_TTL: std::time::Duration = std::time::Duration::from_secs(6
 /// 修 P1 #1：原实现无容量闸门，长驻 daemon 累计几千文件会让 RA 报 OOM。容量限制
 /// + LRU 兜底 —— 复用窗口（60s TTL）内同文件访问不丢；窗口外冷文件被强制回收。
 pub const FILE_BUFFER_CAPACITY: usize = 32;
+
+/// didChange 去抖窗口（修 P0-A 50 文件挂死）：批工具（如 `tool_symbol_tree`）扇出
+/// N 路 `ensure_open` 时，每路先 sleep `debounce_ms` 让前一波 `didOpen` 流到 LS，
+/// 然后本批整体走 `didChange` —— 缓解 LS 内部队列拥塞导致 channel 关闭。
+///
+/// 200ms：覆盖 rust-analyzer 单文件 index 单次往返 P99；同 key 多次 didChange
+/// 在 LS 进程内合并为一次全量（LS 自身行为）。`send_immediate=true` 跳过 debounce，
+/// 给单文件路径用 —— 行为与原 `ensure_open` 完全等价。
+#[derive(Debug, Clone, Copy)]
+pub struct EnsureOpenParams {
+    pub debounce_ms: u64,
+    pub send_immediate: bool,
+}
+
+impl Default for EnsureOpenParams {
+    fn default() -> Self {
+        Self {
+            debounce_ms: 200,
+            send_immediate: false,
+        }
+    }
+}
 
 /// 单文件状态：uri + 上次记账 mtime/size + 当前 LSP 版本 + 引用计数。
 #[derive(Debug)]
@@ -184,7 +207,29 @@ impl Session {
 
         match to_send {
             Action::Send { method, params } => {
-                self.notify(method, params).await?;
+                if let Err(e) = self.notify(method, params).await {
+                    // 审计 F1 次生：notify 失败（典型=writer 死亡 channel 关）时回滚
+                    // 记账，否则新插条目变孤儿（ref_count=1 无人 drop）且 mtime 记账
+                    // 让后续 ensure_open 走复用分支永不补发 didOpen——该文件语义
+                    // 请求全部拿空/旧结果。复用/didChange 路径同理回滚 ref_count。
+                    let mut map = self.buffers.lock().expect("docsync buffers mutex poisoned");
+                    match map.get_mut(&uri) {
+                        // ref_count==1：唯一持有者就是本次失败的调用方，条目记账
+                        // （mtime/version）已不可信，直接移表让下次冷启动重新 didOpen。
+                        Some(buf) if buf.ref_count == 1 => {
+                            map.remove(&uri);
+                        }
+                        // 并发 ensure_open 抢先 +1 过：只回滚本次计数。
+                        Some(buf) => {
+                            buf.ref_count = buf.ref_count.saturating_sub(1);
+                            if buf.ref_count == 0 {
+                                buf.last_released_at = Some(Instant::now());
+                            }
+                        }
+                        None => {}
+                    }
+                    return Err(e);
+                }
             }
             Action::None => {}
         }
@@ -203,9 +248,9 @@ impl Session {
         })
     }
 
-    /// 强制回收所有缓冲：发 didClose + 移表。仅当调用方确认要立即关闭所有文档
+/// 强制回收所有缓冲：发 didClose + 移表。仅当调用方确认要立即关闭所有文档
     /// 时使用（daemon shutdown / 测试清理 / LS 内存压力回收）。
-    /// 锁内 drain 取待发列表，锁外发通知（outbound 关 send 会失败，吞错兜底）。
+    /// 锁内 drain 取待发列表，锁外发通知（outbound 关 send 失败忽略）。
     pub fn evict_all_buffers(&self) {
         let to_close: Vec<Uri> = {
             let mut map = self
@@ -221,6 +266,53 @@ impl Session {
                 .client()
                 .notify("textDocument/didClose", make_did_close(uri));
         }
+    }
+
+    /// 批量 `ensure_open`（修 P0-A 50 文件挂死）：对 N 个文件并行调用 `ensure_open`，
+    /// 每路先 `sleep(params.debounce_ms)` 让前一波流到 LS —— 把扇出产生的
+    /// `didOpen/didChange` 洪泛合并成 N 个时间上错开的脉冲，缓解 LS 内部队列拥塞。
+    ///
+    /// `send_immediate=true`：跳过 debounce，等价于对每个 path 串行/并发调 `ensure_open`，
+    /// 行为与逐文件调完全一致。
+    ///
+    /// 实现：JoinSet 有界并发（MAX_INFLIGHT=4）—— 与 `tool_symbol_tree` 同形态；
+    /// 单文件失败 → 收集到 `errors`，不阻断其他文件（与 overview 路径容错一致）。
+    /// 返回：`Vec<Result<FileGuard>>` 与输入 `paths` 同序 —— 调用方按索引对齐原数据。
+    pub async fn ensure_open_batch(
+        self: &Arc<Self>,
+        paths: &[&Path],
+        params: EnsureOpenParams,
+    ) -> Vec<Result<FileGuard>> {
+        let mut results: Vec<Option<Result<FileGuard>>> = (0..paths.len()).map(|_| None).collect();
+        let mut set = tokio::task::JoinSet::new();
+        let max_inflight = 4usize;
+
+        for (idx, path) in paths.iter().enumerate() {
+            // 槽位耗尽 → 等一个完成再放新的
+            while set.len() >= max_inflight {
+                if let Some(Ok((i, r))) = set.join_next().await {
+                    results[i] = Some(r);
+                }
+            }
+            let session = Arc::clone(self);
+            let path = path.to_path_buf();
+            set.spawn(async move {
+                if !params.send_immediate && params.debounce_ms > 0 {
+                    sleep(std::time::Duration::from_millis(params.debounce_ms)).await;
+                }
+                let r = session.ensure_open(&path).await;
+                (idx, r)
+            });
+        }
+        // drain 剩余
+        while let Some(Ok((i, r))) = set.join_next().await {
+            results[i] = Some(r);
+        }
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(i, opt)| opt.unwrap_or_else(|| Err(CoreError::Io(std::io::Error::other(format!("ensure_open_batch slot {i} dropped"))))))
+            .collect()
     }
 
 /// 回收超过 TTL 的空闲缓冲：ref_count=0 且 last_released_at + ttl < now。

@@ -144,8 +144,12 @@ pub enum ToolError {
 }
 
 /// supervisor 公共结果类型（库层 Result 别名）。
-/// diagnostics 缓存条目类型：uri -> items。
-pub type DiagCache = std::sync::Arc<Mutex<HashMap<(PathBuf, String), Vec<serde_json::Value>>>>;
+/// diagnostics 缓存条目：uri -> (items, 推送的 document version)。
+/// version 来自 publishDiagnostics.params.version（LS 可缺省）—— tool_diagnostics
+/// 用它比对 docsync 当前 content_version 判定"诊断对应哪一版内容"（RA didChange
+/// 后会先重推旧快照再推新分析，无 version 比对则新旧不可分）。
+pub type DiagCache =
+    std::sync::Arc<Mutex<HashMap<(PathBuf, String), (Vec<serde_json::Value>, Option<i64>)>>>;
 pub type ToolResult<T> = std::result::Result<T, ToolError>;
 /// 文档符号缓存 key（Phase 3.1）：(root, file, (mtime, size))。
 /// find-symbol（workspace 级）无单文件锚点：file 位放 `ws?{query}`、信号位放 root 信号。
@@ -826,19 +830,28 @@ impl Supervisor {
                 else {
                     return;
                 };
-                // 每次 publishDiagnostics 都 ++ generation（含空 items 的"无错"推送），
-                // 客户端 wait_gen >= N 才能精确等新一代，而非盲等 5s。
-                generation.fetch_add(1, Ordering::Relaxed);
+                // generation 只计**非空**推送（2026-09-23 语义修正）：RA 的空推送是
+                // 分析中间态快照（didOpen 后 ~2.5s 才推完整错误版），若空推送也 ++，
+                // wait_gen 会在中间态就 confirmed → 误判"确认无错"。空推送仍清缓存
+                // （修 P1 #1：改完错误后 RA 推空，仅 !is_empty 写入会让陈旧错误永存），
+                // 但只表示"上一版错误已失效"，不代表新分析完成。
+                // cache key 归一化：RA 推送 uri 盘符小写（file:///d:/...），而
+                // path_to_uri 生成大写（file:///D:/...）—— 不归一则 cache 永远 miss
+                // （2026-09-23 debug 日志实锤）。Windows 路径大小写不敏感，统一小写。
+                // 空推送也入 cache（带 version）—— "version N 的 items 为空" =
+                // 该版内容确认无错（gen 不 ++，generation 只计含错误推送）。
+                let ver = msg
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("version"))
+                    .and_then(|v| v.as_i64());
                 let mut cache = cache.lock().unwrap();
-                let key = (cache_root.clone(), uri.to_string());
+                let key = (cache_root.clone(), uri.to_lowercase());
                 if items.is_empty() {
-                    // 空推送必须清缓存（修 P1 #1）：push-only LS（如 rust-analyzer）在用户
-                    // 把错误改完后会推空 items 数组 —— 仅当 !is_empty 时写入会让陈旧
-                    // 错误项永存；删除条目后 tool_diagnostics 默认返空（unwrap_or_default）。
-                    // generation++ 已在外完成，wait_gen 读侧无需变更。
-                    cache.remove(&key);
+                    cache.insert(key, (Vec::new(), ver));
                 } else {
-                    cache.insert(key, items);
+                    cache.insert(key, (items, ver));
+                    generation.fetch_add(1, Ordering::Relaxed);
                 }
             });
         // ↖ mirror: ls.py@43ae021 on_server_started — 把"等待 LS 索引就绪"
@@ -879,37 +892,40 @@ impl Supervisor {
         Ok(session)
     }
 
-    /// 写工具收尾：拉一次 file-level 诊断快照；失败/超时/未就绪一律降级为 `[]`。
+    /// 写工具收尾：拉一次 file-level 诊断快照；挂进写工具响应 `post_write_diagnostics`。
     ///
     /// F2 设计：写完后 AI 最常见的下一步是 `diagnostics <file>` 验证；本 helper 把这步
-    /// 折叠进写工具返回值（`post_write_diagnostics` 字段）。不阻塞主结果。
+    /// 折叠进写工具返回值。不阻塞主结果（写仍正常返回 applied=true）。
     ///
-    /// 锁纪律：与 tool_diagnostics 同样走 push 缓存 + 2s 兜底超时；不进诊断时不阻塞。
-    /// ponytail: 不为失败建新错误路径 —— 任何 err 都 `tracing::debug!` + 返 []。
+    /// pending 语义（2026-09-23 裸 RA 探针实锤）：rust-analyzer 语义诊断（didChange →
+    /// publishDiagnostics 推送）延迟 ~2.5s，pull（textDocument/diagnostic）更滞后。
+    /// `pending: true` = 等待窗口内 LS 没推新一代诊断，items 为空**不代表无错**——
+    /// AI 应回头显式查 `diagnostics` 复核；`pending: false` 且 items 空 = LS 确认无错。
+    ///
+    /// 锁纪律：与 tool_diagnostics 同样走 push 缓存 + 3s 兜底超时；不进诊断时不阻塞。
+    /// ponytail: 不为失败建新错误路径 —— 任何 err 都 `tracing::debug!` + pending 假快照。
     async fn post_diag_for_write(
         &self,
         root: &Path,
         file: &str,
         lang: Option<&str>,
-    ) -> Vec<serde_json::Value> {
+    ) -> serde_json::Value {
+        // 写入刚发生：记基线，等"下一次"推送（本次 didChange 引发的那代诊断）。
+        let before = self.diag_generation.load(Ordering::Relaxed);
         match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.tool_diagnostics(root, file, lang, None),
+            std::time::Duration::from_secs(3),
+            self.tool_diagnostics(root, file, lang, Some(before + 1)),
         )
         .await
         {
-            Ok(Ok(value)) => value
-                .get("items")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default(),
+            Ok(Ok(value)) => value,
             Ok(Err(e)) => {
                 tracing::debug!(error = %e, file, "F2 post-write diag failed; degrading");
-                Vec::new()
+                serde_json::json!({ "items": [], "pending": true })
             }
             Err(_elapsed) => {
-                tracing::debug!(file, "F2 post-write diag timeout 2s; degrading");
-                Vec::new()
+                tracing::debug!(file, "F2 post-write diag timeout 3s; degrading");
+                serde_json::json!({ "items": [], "pending": true })
             }
         }
     }
@@ -923,9 +939,18 @@ impl Supervisor {
     ///   透明 fallback 到 `publishDiagnostics` push 缓存（与 2.4 之前完全等价）。
     ///
     /// `wait_gen`：
-    /// - `None`：盲轮询 5s（同现状，向后兼容）。
-    /// - `Some(0)`：立即返回当前 generation 的诊断（不等）。
-    /// - `Some(N>0)`：等 generation >= N，仍受 5s 上限；超时返 `{ items: [] }`。
+    /// - `None`：自动基线（函数入口 generation +1），等下一次推送。
+    /// - `Some(N>0)`：等 generation >= N，仍受 5s 上限；超时返 `{ items: [], pending: true }`。
+    ///
+    /// pending 语义（2026-09-23 裸 RA 探针 + live 复现实锤）：rust-analyzer 的 pull
+    /// （textDocument/diagnostic）返回的是"上次计算的快照"——didChange 后异步重算
+    /// 完成前，pull 会返回**陈旧错误**（REPAIR 场景实测拿到上一版 7 条 syntax errors
+    /// 且无任何版本标记）。因此 **pull 快照无法归属 didChange 之后的版本，永不可信**。
+    ///
+    /// 主路径 = **push 等待**：generation 只计非空推送（见 handler），gen 越基线 =
+    /// didOpen/didChange 之后的新一代推送到达（cache 即新鲜 items）。窗口尽未达标
+    /// → pull 做兜底但**一律标 pending: true**（快照可能陈旧）；items 空**不代表
+    /// 无错**，AI 应回头复核。
     pub async fn tool_diagnostics(
         &self,
         root: &Path,
@@ -945,7 +970,7 @@ impl Supervisor {
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
         let key = Self::key(root, lang.as_str());
 
-        // 探测结果查表。缺 key 视为"未探测过" → 走 push（防御：未来多写漏写）。
+        // 探测结果查表。缺 key 视为"未探测过" → 视为不支持 pull（防御：未来多写漏写）。
         let supports_pull = self
             .pull_diag_supported
             .lock()
@@ -954,66 +979,65 @@ impl Supervisor {
             .copied()
             .unwrap_or(false);
 
-        // 主路径选择。`supports_pull=false` 直接走 push（任务 #1/#2 覆盖）。
-        // `supports_pull=true` 走 textDocument/diagnostic；纯函数 `extract_pull_items`
-        // 统一处理 LSP 3.17 报告 + 错误 → None 触发 push fallback（任务 #4）。
-        let pull_items: Option<Vec<serde_json::Value>> = if supports_pull {
-            let params = json!({ "textDocument": { "uri": uri.clone() } });
-            let resp: Result<serde_json::Value, CoreError> = session
-                .client()
-                .request("textDocument/diagnostic", params, TOOL_TIMEOUT)
-                .await;
-            match resp {
-                Ok(value) => Self::extract_pull_items(&value),
-                Err(_) => None, // fallback push（-32601 / timeout / 任意 RPC 错）。
-            }
-        } else {
-            None
-        };
-        if let Some(items) = pull_items {
-            // pull full 命中：++ generation 保持与 publishDiagnostics 一致（任务要求）；
-            // 不与 push cache 拼接避免重复。
-            self.diag_generation.fetch_add(1, Ordering::Relaxed);
-            return Ok(json!({ "items": items }));
-        }
-        // 推送路径（push-only LS，或 pull fallback）：等 generation/cache 后取 push cache。
-        match wait_gen {
-            None => {
-                // 默认盲轮询：等 cache 命中或上限 50 × 100ms = 5s。
-                // 空 cache（无错）也只等 5s 返空数组（向后兼容）。
-                for i in 0..50 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    if i >= 4 {
-                        let present = self
-                            .diag_cache
-                            .lock()
-                            .unwrap()
-                            .contains_key(&(key.root.clone(), uri.clone()));
-                        if present {
-                            break;
-                        }
-                    }
+        // push 等待：**version 精确比对** —— RA didChange 后会先重推旧快照再推新
+        // 分析（2026-09-23 实锤），generation 无法区分新旧；推送 version == 当前
+        // docsync content_version 才是新内容的分析结果（items 空 = 该版确认无错）。
+        // LS 不发 version（如 clangd）→ 回退 generation 达标判定（旧行为）。
+        // 窗口 5s（50 × 100ms）。Some(N) 语义保留：gen 兜底路径下 N <= 当前 gen
+        // → 立即返回（旧契约，测试锁定）。
+        let before_gen = self.diag_generation.load(Ordering::Relaxed);
+        let target = wait_gen.unwrap_or(before_gen + 1);
+        let doc_cur = session.content_version_of(&path);
+        let mut confirmed_items: Option<Vec<serde_json::Value>> = None;
+        for _ in 0..50 {
+            let hit = self
+                .diag_cache
+                .lock()
+                .unwrap()
+                .get(&(key.root.clone(), uri.to_lowercase()))
+                .cloned();
+            if let Some((items, ver)) = hit {
+                let ok = match (ver, doc_cur) {
+                    (Some(v), Some(c)) => v >= c,
+                    (Some(_), None) => true,
+                    (None, _) => self.diag_generation.load(Ordering::Relaxed) >= target,
+                };
+                if ok {
+                    confirmed_items = Some(items);
+                    break;
                 }
             }
-            Some(target) => {
-                // generation 等待：每 100ms 探一次，5s 上限。Some(0) 等价"立即返回"。
-                for _ in 0..50 {
-                    let cur = self.diag_generation.load(Ordering::Relaxed);
-                    if cur >= target {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let items = self
+        if let Some(items) = confirmed_items {
+            tracing::debug!(uri = %uri, "tool_diagnostics confirmed: {} items", items.len());
+            return Ok(json!({ "items": compact_diags(&items), "pending": false }));
+        }
+
+        // 窗口尽未达标：LS 没推送当前版本的新鲜诊断（可能分析中、可能 LS 慢）。
+        // pull 兜底拿当前快照，但快照新鲜度不可证 → 一律 pending: true。
+        let mut items = self
             .diag_cache
             .lock()
             .unwrap()
-            .get(&(key.root.clone(), uri.clone()))
-            .cloned()
+            .get(&(key.root.clone(), uri.to_lowercase()))
+            .map(|(v, _)| v.clone())
             .unwrap_or_default();
-        Ok(json!({ "items": items }))
+        if items.is_empty()
+            && supports_pull
+            && let Ok(value) = session
+                .client()
+                .request::<serde_json::Value>(
+                    "textDocument/diagnostic",
+                    json!({ "textDocument": { "uri": uri.clone() } }),
+                    TOOL_TIMEOUT,
+                )
+                .await
+            && let Some(pull) = Self::extract_pull_items(&value)
+        {
+            items = pull;
+        }
+        Ok(json!({ "items": compact_diags(&items), "pending": true }))
     }
 
     /// 从 LSP 3.17 `textDocument/diagnostic` 响应提取权威 items。
@@ -1035,6 +1059,67 @@ impl Supervisor {
                 .unwrap_or_default(),
         )
     }
+}
+
+/// LSP Diagnostic JSON → AI-friendly 单行紧凑文本（省 token：一条 ~15 行 JSON 折成
+/// 一行 ~80 字符）。格式：`[error] L12:5-12:20 E0308: message`；行列为 1-based
+/// （与 read-file / 行级编辑基线一致）。message 内换行折叠为空格。
+fn compact_diags(items: &[serde_json::Value]) -> Vec<String> {
+    items.iter().map(compact_one_diag).collect()
+}
+
+fn compact_one_diag(d: &serde_json::Value) -> String {
+    let sev = match d.get("severity").and_then(|v| v.as_u64()) {
+        Some(1) => "error",
+        Some(2) => "warn",
+        Some(3) => "info",
+        Some(4) => "hint",
+        _ => "diag",
+    };
+    let (sl, sc) = d["range"]["start"]
+        .as_object()
+        .map(|p| {
+            (
+                p.get("line").and_then(|v| v.as_u64()).unwrap_or(0) + 1,
+                p.get("character").and_then(|v| v.as_u64()).unwrap_or(0) + 1,
+            )
+        })
+        .unwrap_or((0, 0));
+    let (el, ec) = d["range"]["end"]
+        .as_object()
+        .map(|p| {
+            (
+                p.get("line").and_then(|v| v.as_u64()).unwrap_or(0) + 1,
+                p.get("character").and_then(|v| v.as_u64()).unwrap_or(0) + 1,
+            )
+        })
+        .unwrap_or((sl, sc));
+    let code = d
+        .get("code")
+        .map(|c| match c {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => String::new(),
+        })
+        .filter(|s| !s.is_empty() && s != "syntax-error");
+    let msg = d
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .replace('\n', " ");
+    let mut out = format!("[{sev}] L{sl}:{sc}");
+    if (el, ec) != (sl, sc) {
+        out.push_str(&format!("-L{el}:{ec}"));
+    }
+    if let Some(code) = code {
+        out.push_str(&format!(" {code}:"));
+    }
+    out.push(' ');
+    out.push_str(&msg);
+    out
+}
+
+impl Supervisor {
     pub fn diag_generation(&self) -> u64 {
         self.diag_generation.load(Ordering::Relaxed)
     }
@@ -1712,7 +1797,29 @@ impl Supervisor {
         // ensure_open 按 mtime/size 差异自动重放）。
         self.reconcile_symbol_cache_for_file(root, file);
         let lang_str = resolve_lang_for_file(file, lang_override)?;
-        let session = self.session_for(root, &lang_str).await?;
+        let file_owned = file.to_string();
+        let lang_owned = lang_str.clone();
+        // P0B race 修：overview 曾不走 self-heal —— cold-start LS_TIMEOUT 后 writer
+        // 静默死亡（channel closed），session 仍以 Ready 缓存，后续调用立刻
+        // Terminated 且永不恢复。走 with_session_retry 后 Terminated 触发 evict +
+        // 换新 session 重试一次（同 def/refs/replace-body 等 tool 的既有通道）。
+        Self::with_session_retry(self, root, lang_str.as_str(), move |session| {
+            let file = file_owned.clone();
+            let lang_str = lang_owned.clone();
+            async move { Self::tool_overview_inner(session, root, &file, &lang_str).await }
+        })
+        .await
+        .inspect(|out| self.symbol_cache_put(cache_key, out.clone())) // cache_miss → 写入
+    }
+
+    /// tool_overview 的实际实现 —— 拆出便于 `with_session_retry` 在闭包里重放
+    /// 整条链路（含 ensure_open 重取）。
+    async fn tool_overview_inner(
+        session: std::sync::Arc<lsp_core::session::Session>,
+        root: &Path,
+        file: &str,
+        lang_str: &str,
+    ) -> ToolResult<Vec<SymbolHit>> {
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
@@ -1723,20 +1830,15 @@ impl Supervisor {
         // `args._timeout_ms` 提取后塞进 per-call override；当前 tool_overview 拿不到
         // args，故先固定传 `lang` 让 servers.toml 的 per-LS timeout 生效。其它
         // tool_* 后续按相同 pattern 替换。
-        let timeout = ls_registry::config::effective_timeout_ms(
-            &lang_str,
-            None,
-        )
-        .map(|ms| Duration::from_millis(ms as u64))
-        .unwrap_or(TOOL_TIMEOUT);
+        let timeout = ls_registry::config::effective_timeout_ms(lang_str, None)
+            .map(|ms| Duration::from_millis(ms as u64))
+            .unwrap_or(TOOL_TIMEOUT);
         // Option 宽容：RA 等对未就绪文档返 null（untagged enum 不匹配 null → 硬错）。
         let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, timeout)
             .await?;
 
-        let out = flatten_symbols(resp, &uri);
-        self.symbol_cache_put(cache_key, out.clone()); // cache_miss → 写入
-        Ok(out)
+        Ok(flatten_symbols(resp, &uri))
     }
 
     /// 跨文件符号树（PLAN Phase 2.5 / 7.2）：聚合 `dir` 下源码文件的 documentSymbol。
@@ -1854,7 +1956,14 @@ impl Supervisor {
 
             // 对每桶：先把缓存命中按 idx 压 entries，再把 miss 索引推到该桶的并发池；
             // 桶之间可并行（不同 LS 进程），但同桶内受 MAX_INFLIGHT 限制。
+            //
+            // 修 P0-A 50 文件挂死：扇出前先 sleep 100ms 让前一波 didOpen 流到 LS；
+            // files 总数 > 30（实测拐点）时整桶改成串行（in-flight=1），避免 didChange
+            // 洪泛把 RA 内部队列压垮 → channel 关闭 → daemon hang。
+            // 审计 P2-2：sleep 挪到确认存在 miss 之后 —— 纯缓存命中路径不该白付 100ms。
             const MAX_INFLIGHT: usize = 4;
+            let serial_mode = files.len() > 30;
+            let mut throttled = false;
             for (lang_id, bucket_indices) in per_lang_buckets {
                 // 单桶内的 miss 索引 + 缓存分流
                 let mut miss_indices: Vec<usize> = Vec::new();
@@ -1882,10 +1991,23 @@ impl Supervisor {
                 // 单桶：拉一次 session（按本桶 lang）。session_for 在该 lang 已有
                 // 实例时直返（per-key 加载门），不会重复冷启动。
                 let session = self.session_for(root, &lang_id).await?;
+                if !serial_mode && !throttled {
+                    // 让 outbox mpsc 把已排队的 didOpen 流过去再放 documentSymbol 风暴
+                    throttled = true;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
                 let mut set = tokio::task::JoinSet::new();
                 for idx in miss_indices {
-                    while set.len() >= MAX_INFLIGHT {
-                        drain_one(&mut set, &mut entries, &mut errors).await;
+                    if !serial_mode {
+                        while set.len() >= MAX_INFLIGHT {
+                            drain_one(&mut set, &mut entries, &mut errors).await;
+                        }
+                    } else {
+                        // >30 文件：先 drain 上一轮再启下一个，串行推进；
+                        // 并行度退化到 1 = 单文件 didOpen 间歇 > 单 documentSymbol。
+                        while !set.is_empty() {
+                            drain_one(&mut set, &mut entries, &mut errors).await;
+                        }
                     }
                     let file = files[idx].clone();
                     let file_for_res = file.clone();
@@ -2131,8 +2253,16 @@ impl Supervisor {
             let q = query.clone();
             tasks.push(tokio::spawn(async move {
                 let params = json!({ "query": q });
+                // 审计 P1-2：workspace/symbol 在 classify_method 归 Background
+                // （重量级索引），但本工具是用户主动搜索 —— 必须显式 High，
+                // 否则落在 TokenBucket 限流 + BG 路径，与设计注释承诺相悖。
                 let resp: Vec<lsp_types::SymbolInformation> = match session
-                    .request("workspace/symbol", params, INDEX_TIMEOUT)
+                    .request_at(
+                        "workspace/symbol",
+                        params,
+                        INDEX_TIMEOUT,
+                        lsp_core::client::Priority::High,
+                    )
                     .await
                 {
                     Ok(r) => r,
@@ -5942,24 +6072,29 @@ mod pull_diagnostics_tests {
     /// 写工具返回值挂诊断快照是设计目标，但降级路径才是契约核心 —— 任何失败
     /// 都不能影响主结果（写工具仍正常返回 applied=true）。三种路径：
     /// - 场景 A：session_for 抛 NotInstalled/NotFound（root 不存在 / 文件无
-    ///   LanguageServer 可拉）→ tool_diagnostics 返 Err → helper 降级 []。
+    ///   LanguageServer 可拉）→ tool_diagnostics 返 Err → helper 降级 pending 快照。
     /// - 场景 B：根路径不存在 / 完全无法解析 → resolve_lang_for_file / 早期错误
-    ///   路径 → helper 降级 []。
-    /// - 场景 C：合法且无错误 → 无 items → helper 返回 []（is_empty）。
+    ///   路径 → helper 降级 pending 快照。
+    /// - 场景 C：合法且无错误 → 无 items → helper 返回空 items（is_empty）。
     #[tokio::test]
     async fn post_diag_for_write_degrades_on_each_failure_mode() {
         let sup = Supervisor::direct().await.expect("supervisor");
 
         // 场景 A：根路径不存在 → session_for 失败（要么 resolve_lang 失败，
-        // 要么 launch 抛 ToolError::NotInstalled）。helper 必须降级 []。
+        // 要么 launch 抛 ToolError::NotInstalled）。helper 必须降级 pending 快照。
         let bad_root = std::path::PathBuf::from("Z:/nonexistent_for_test_xyz_42");
         let a = sup
             .post_diag_for_write(&bad_root, "x.rs", Some("rust"))
             .await;
-        assert!(a.is_empty(), "root 不存在 → 必须降级为空数组");
+        assert_eq!(
+            a["items"],
+            serde_json::json!([]),
+            "root 不存在 → 必须降级为空数组"
+        );
+        assert_eq!(a["pending"], serde_json::json!(true), "失败降级必带 pending");
 
         // 场景 B：root 存在但 lang 完全无法解析（未装 LS + 无 override 路径探测
-        // 也未命中）→ tool_diagnostics 返 Err → helper 降级 []。
+        // 也未命中）→ tool_diagnostics 返 Err → helper 降级 pending 快照。
         let tmp = tempfile::tempdir().expect("tempdir");
         let b = sup
             .post_diag_for_write(
@@ -5968,14 +6103,22 @@ mod pull_diagnostics_tests {
                 Some("__definitely_not_a_real_lang__"),
             )
             .await;
-        assert!(b.is_empty(), "lang 无法解析 → 必须降级为空数组");
+        assert_eq!(
+            b["items"],
+            serde_json::json!([]),
+            "lang 无法解析 → 必须降级为空数组"
+        );
 
         // 场景 C：合法 + 文件不存在 → 走 session_for + ensure_open 路径。
-        // 写工具超时/失败兜底 helper 验证降级；LS 未拉起场景下 helper 也必须返 []。
+        // 写工具超时/失败兜底 helper 验证降级；LS 未拉起场景下 helper 也必须返空。
         let c = sup
             .post_diag_for_write(tmp.path(), "does_not_exist_xyz_42.rs", Some("rust"))
             .await;
-        assert!(c.is_empty(), "文件不存在 → 必须降级为空数组");
+        assert_eq!(
+            c["items"],
+            serde_json::json!([]),
+            "文件不存在 → 必须降级为空数组"
+        );
     }
 }
 // ============================================================================
@@ -6475,6 +6618,62 @@ mod symbol_cache_tests {
         let entries = tree["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 6, "全部缓存命中 → 6 个 entries: {tree}");
         // errors 必须空：缓存命中分支不构造 error。
+        let errors = tree["errors"].as_array().unwrap();
+        assert!(errors.is_empty(), "缓存命中不应有 errors: {tree}");
+    }
+
+    /// 修 P0-A：>30 文件走串行路径（修 50 文件挂死）。缓存命中场景下，serial_mode
+    /// 分支也正确返回 35 个 entries，errors 空，结构与原 fan-out 测试一致。
+    /// 用 cache-primed 而非真 LS：避免 mock_ls 不支持 Rust 拉不起——测的是
+    /// `files.len() > 30` 控制流入口分支的正确性。
+    #[tokio::test]
+    async fn symbol_tree_serial_mode_handles_above_threshold() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // 35 文件 > 30 拐点 → 触发 serial_mode = true 分支。
+        let names: Vec<String> = (0..35).map(|i| format!("f{i}.rs")).collect();
+        for n in &names {
+            std::fs::write(dir.path().join(n), "fn x() {}\n").unwrap();
+        }
+        let root = dir.path();
+        for n in &names {
+            sup.symbol_cache_put(doc_symbol_cache_key(root, n), vec![hit("x")]);
+        }
+
+        let tree = sup
+            .tool_symbol_tree(root, ".", Some("rust"), 200)
+            .await
+            .unwrap();
+        assert_eq!(tree["files_scanned"], 35, "35 文件扫描: {tree}");
+        let entries = tree["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 35, "全部缓存命中 → 35 个 entries: {tree}");
+        let errors = tree["errors"].as_array().unwrap();
+        assert!(errors.is_empty(), "缓存命中不应有 errors: {tree}");
+    }
+
+    /// 修 P0-A：≤30 文件走并发（in-flight=4）原路径不变 —— 回归保护。25 文件
+    /// 全部缓存命中时验证 entries 数 + errors 空。
+    #[tokio::test]
+    async fn symbol_tree_concurrent_mode_handles_below_threshold() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // 25 文件 ≤ 30 → 走 serial_mode = false 分支 + sleep 100ms 入口。
+        let names: Vec<String> = (0..25).map(|i| format!("f{i}.rs")).collect();
+        for n in &names {
+            std::fs::write(dir.path().join(n), "fn x() {}\n").unwrap();
+        }
+        let root = dir.path();
+        for n in &names {
+            sup.symbol_cache_put(doc_symbol_cache_key(root, n), vec![hit("x")]);
+        }
+
+        let tree = sup
+            .tool_symbol_tree(root, ".", Some("rust"), 200)
+            .await
+            .unwrap();
+        assert_eq!(tree["files_scanned"], 25, "25 文件扫描: {tree}");
+        let entries = tree["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 25, "全部缓存命中 → 25 个 entries: {tree}");
         let errors = tree["errors"].as_array().unwrap();
         assert!(errors.is_empty(), "缓存命中不应有 errors: {tree}");
     }

@@ -48,11 +48,14 @@ async fn diagnostics_returns_error_on_bad_code() {
         !items.is_empty(),
         "expected at least 1 diagnostic, got: {diag}"
     );
-    let msg = items[0]
-        .get("message")
-        .and_then(|m| m.as_str())
-        .unwrap_or("");
+    // 紧凑格式（2026-09-23）：items 是单行字符串（`[error] L1:14 type mismatch: ...`），
+    // 非 LSP 原始 JSON 对象。
+    let msg = items[0].as_str().unwrap_or("");
     assert!(!msg.is_empty(), "expected non-empty message, got: {msg}");
+    assert!(
+        msg.starts_with('[') && msg.contains('L'),
+        "compact format expected `[sev] L..:.. message`, got: {msg}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
