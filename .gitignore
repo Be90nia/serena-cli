@@ -9,4 +9,9 @@ fixtures/typescript_demo/node_modules/
 .dolt/
 *.db
 .beads-credential-key
+.beads/
 .beads/proxieddb/
+
+# 本地工作材料(验收脚本/报告/日志/探针——不进 git)
+local/
+

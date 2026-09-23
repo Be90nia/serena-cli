@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "serena_rust",
-  "project_id": "69282c7e-abf5-40b7-8f66-28aa2b19e5c4"
-}

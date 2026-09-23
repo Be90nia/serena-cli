@@ -1,7 +1,0 @@
-{
-  "content": "// typescript-language-server fixture (M3 verify).\nexport function add(a: number, b: number): number {\n    if (!Number.isFinite(a) || !Number.isFinite(b)) {\n        throw new Error(\"add: arguments must be finite numbers\");\n    }\n    return a + b;\n}\n\nexport function main(): void {\n    const s = add(1, 2);\n    console.log(s);\n}",
-  "end_line": 12,
-  "hash": "da1177e935e34136",
-  "start_line": 1,
-  "total_lines": 12
-}
