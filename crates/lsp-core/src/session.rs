@@ -215,6 +215,10 @@ impl Session {
         let (reply_tx, reply_rx) = mpsc::channel::<JsonRpc>(8);
 
         let client = Client::with_name("ls".into(), out_tx.clone());
+        // bd serena-rust-s3u：位置类方法的 -32801 ContentModified 必须在 client 层内部
+        // 重试消化（3 次 × 200ms），否则并发首击 RA 类型分析重算窗口时硬错误外泄 wire。
+        // 白名单与 init_params::RETRY_ON_CONTENT_MODIFIED 同源。
+        client.set_content_modified_retry(crate::init_params::RETRY_ON_CONTENT_MODIFIED);
         let client_for_pump = client.clone();
         let on_msg: OnMsg = {
             let c = client_for_pump.clone();

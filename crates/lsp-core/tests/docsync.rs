@@ -8,6 +8,7 @@
 //! mock_ls 通过 `MOCK_LS_TRACK_FILE_EVENTS=<path>` 追加写日志，测试读完即断言事件序列。
 
 use std::ffi::OsString;
+use std::str::FromStr;
 use std::time::Duration;
 
 use ls_runtime::process::{Child, LaunchInfo, TransportKind};
@@ -1167,4 +1168,48 @@ async fn ensure_open_batch_debounce_delays_each_send() {
     assert_eq!(opens.len(), 4, "debounce 不去重，仍 4 didOpen");
 
     session.shutdown().await;
+}
+
+/// bd serena-rust-cbd：非 ASCII 路径（中文/emoji）必须 percent-encode 成全 ASCII
+/// 合法 URI —— 回归形态是 rust `Uri` 拒绝非 ASCII → `CoreError::Io` → wire INTERNAL。
+#[test]
+fn path_to_uri_str_percent_encodes_non_ascii_and_roundtrips() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let zh_dir = tmp.path().join("目录");
+    std::fs::create_dir_all(&zh_dir).expect("create 中文目录");
+    let emoji_file = zh_dir.join("😀.rs");
+
+    for path in [zh_dir.as_path(), emoji_file.as_path()] {
+        let raw = lsp_core::docsync::path_to_uri_str(path);
+        assert!(raw.bytes().all(|b| b.is_ascii()), "URI 必须全 ASCII: {raw}");
+        lsp_types::Uri::from_str(&raw)
+            .unwrap_or_else(|e| panic!("percent-encoded URI 应可解析: {raw} ({e})"));
+        assert!(
+            lsp_core::docsync::path_to_uri(path).is_ok(),
+            "path_to_uri 对非 ASCII 路径应 Ok: {}",
+            path.display()
+        );
+        // roundtrip：URI path 段解码 == 原路径（`\`→`/` 归一；非 `/` 开头路径
+        // 在 URI path 里带前导 `/`，如 file:///C:/... 的 path 是 /C:/...）。
+        let body = raw.strip_prefix("file://").expect("file scheme 前缀");
+        let decoded = percent_encoding::percent_decode_str(body)
+            .decode_utf8()
+            .expect("解码必须是合法 UTF-8");
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        let expected_body = if normalized.starts_with('/') {
+            normalized
+        } else {
+            format!("/{normalized}")
+        };
+        assert_eq!(decoded, expected_body, "roundtrip 不等: {raw}");
+    }
+}
+
+/// 纯 ASCII 路径保持原样；URL 结构字符（空格/`#`/`?`/`%`）编码，`:` `/` 保留。
+#[test]
+fn path_to_uri_str_encodes_url_unsafe_ascii_only() {
+    let raw = lsp_core::docsync::path_to_uri_str(std::path::Path::new("/tmp/a b#c?d%e.rs"));
+    assert_eq!(raw, "file:///tmp/a%20b%23c%3Fd%25e.rs");
+    let plain = lsp_core::docsync::path_to_uri_str(std::path::Path::new("/tmp/plain_v1.2.rs"));
+    assert_eq!(plain, "file:///tmp/plain_v1.2.rs");
 }

@@ -28,6 +28,7 @@ ignore = "0.4"
 regex = "1"
 win32job = "2"
 dunce = "1"
+percent-encoding = "2"
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 bytes = "1"
 

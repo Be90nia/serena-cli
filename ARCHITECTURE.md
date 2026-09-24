@@ -504,7 +504,7 @@ stateDiagram-v2
 | supervisor | `ToolError::{BadArgs{detail}, NotInstalled{language, hint}, Core(CoreError), WriteConflict{path, reason}, Launch(anyhow::Error), Serialize(anyhow::Error), Protocol{tool, reason}}`（thiserror，供 wire 映射；`Launch` 内嵌 anyhow 收口适配器错误；`Serialize`/`Protocol` 为 `Δ` 新增——确定性失败与协议语义错从 Launch 兜底拆出，避免被误标 retryable） | — |
 | daemon/cli | `anyhow`（顶层装配与兜底；CLI 把 `ToolError` 渲染为 exit code） | — |
 
-**边界规则**：库 crate（ls-runtime / lsp-core / supervisor）一律 thiserror 具名类型，**禁止 anyhow 越界进入 lsp-core**（调用方需要按变体分类重试/上报）；anyhow 只存在于 ls-adapters 内部与 daemon/cli 顶层（supervisor 仅以 `ToolError::Launch/Serialize` 内嵌 anyhow 收口适配器错误，不外泄 anyhow 类型）。`ContentModified(-32801)` 不设独立变体 —— 它是 `Rpc{code:-32801}` 的判定值，重试逻辑在 `client.rs` 内部消化（opt-in 方法表 + 3 次 + 200ms，`↖ mirror: ls_process.py@43ae021 send_request + set_content_modified_retry_methods`）。
+**边界规则**：库 crate（ls-runtime / lsp-core / supervisor）一律 thiserror 具名类型，**禁止 anyhow 越界进入 lsp-core**（调用方需要按变体分类重试/上报）；anyhow 只存在于 ls-adapters 内部与 daemon/cli 顶层（supervisor 仅以 `ToolError::Launch/Serialize` 内嵌 anyhow 收口适配器错误，不外泄 anyhow 类型）。`ContentModified(-32801)` 不设独立变体 —— 它是 `Rpc{code:-32801}` 的判定值，重试逻辑在 `client.rs` 内部消化（opt-in 方法表 + 3 次 + 200ms；`Session::start` 默认注册位置类方法白名单，与 `init_params::RETRY_ON_CONTENT_MODIFIED` 同源，bd serena-rust-s3u，`↖ mirror: ls_process.py@43ae021 send_request + set_content_modified_retry_methods`）。
 
 ### 6.2 传播路径
 

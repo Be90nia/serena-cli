@@ -22,6 +22,23 @@ use lsp_types::{
 const CLIENT_NAME: &str = "serena-rust";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 位置类方法的 ContentModified(-32801) 内部重试白名单 —— 两处共用的事实源：
+/// - `Session::start` 注册到 `Client::set_content_modified_retry`（client 层自动重试），
+/// - `base_initialize_params` 的 `stale_request_support.retry_on_content_modified` 声明
+///   （告知 LS 这些方法可放心回 -32801）。
+///
+/// `workspace/symbol` 只进声明、不进 client 重试白名单（workspace 级方法，结果过期
+/// 语义由调用方决定，不在位置类工具的热路径上）。
+pub const RETRY_ON_CONTENT_MODIFIED: [&str; 7] = [
+    "textDocument/hover",
+    "textDocument/definition",
+    "textDocument/references",
+    "textDocument/documentSymbol",
+    "textDocument/completion",
+    "textDocument/implementation",
+    "textDocument/typeDefinition",
+];
+
 /// 构造 base `InitializeParams`：填写 processId、capabilities、client_info，
 /// rootUri/rootPath/workspaceFolders 由调用方（supervisor）按项目补齐。
 ///
@@ -42,12 +59,13 @@ pub fn base_initialize_params() -> InitializeParams {
         general: Some(GeneralClientCapabilities {
             stale_request_support: Some(StaleRequestSupportClientCapabilities {
                 cancel: true,
-                // ARCHITECTURE §3.2：与 client.rs 的 ContentModified 重试白名单对齐。
-                // Task 6 阶段只声明最常用的两类；adapter patch（Task 8）按需扩展。
-                retry_on_content_modified: vec![
-                    "textDocument/documentSymbol".into(),
-                    "workspace/symbol".into(),
-                ],
+                // ARCHITECTURE §3.2：与 client.rs 的 ContentModified 重试白名单对齐
+                //（同源 RETRY_ON_CONTENT_MODIFIED + workspace/symbol）。
+                retry_on_content_modified: RETRY_ON_CONTENT_MODIFIED
+                    .into_iter()
+                    .chain(["workspace/symbol"])
+                    .map(Into::into)
+                    .collect(),
             }),
             // 优先 utf-16（clangd 默认协商值；mock_ls capabilities 写死 utf-16，对齐便于测试）。
             position_encodings: Some(vec![

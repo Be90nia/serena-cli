@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use lsp_types::Uri;
+use percent_encoding::{CONTROLS, utf8_percent_encode};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
@@ -41,6 +42,16 @@ use crate::session::Session;
 
 /// LSP `didOpen` 起始版本号（LSP spec §3.1.1：每次变更递增，初始为 1）。
 const INITIAL_VERSION: i64 = 1;
+
+/// 路径 → URI 时需百分号编码的 ASCII 集合：控制字符 + 空格 + `#` + `?` + `%`。
+/// `/` `:` 字母数字和 `-_~.` 是 RFC 3986 path 合法字符，保持原样；非 ASCII 字节
+/// （中文/emoji 等 UTF-8 序列）percent-encoding 无条件编码（bd serena-rust-cbd：
+/// rust `Uri` 拒绝非 ASCII，原样拼接会导致 ensure_open 链路误报 INTERNAL）。
+const PATH_UNSAFE: &percent_encoding::AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'#')
+    .add(b'?')
+    .add(b'%');
 
 /// FileGuard TTL 窗口：归零到显式 evict 之间的"复用宽限"。串行工具调用场景下
 /// 几乎都覆盖；后台并发/批处理场景下 `evict_all_buffers()` 提供强制回收出口。
@@ -350,13 +361,15 @@ impl Session {
     }
 }
 
-/// 把绝对路径转成 `file://` URL 字符串。`dunce` 去 UNC 前缀，`\` → `/`。
+/// 把绝对路径转成 `file://` URL 字符串。`dunce` 去 UNC 前缀，`\` → `/`，
+/// URI 不安全字符（非 ASCII/空格/`#`/`?`/`%`）按 UTF-8 百分号编码。
 pub fn path_to_uri_str(path: &Path) -> String {
-    let s = path.to_string_lossy().replace('\\', "/");
-    if s.starts_with('/') {
-        format!("file://{}", s)
+    let lossy = path.to_string_lossy().replace('\\', "/");
+    let encoded = utf8_percent_encode(&lossy, PATH_UNSAFE).collect::<String>();
+    if lossy.starts_with('/') {
+        format!("file://{encoded}")
     } else {
-        format!("file:///{}", s)
+        format!("file:///{encoded}")
     }
 }
 

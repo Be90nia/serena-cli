@@ -27,6 +27,45 @@ fn launch_mock_ls() -> LaunchInfo {
     }
 }
 
+/// bd serena-rust-s3u：Session::start 必须注册位置类方法 ContentModified(-32801)
+/// 内部重试白名单。mock_ls 对 hover 头 2 次回 -32801；白名单生效时 client 层重试后
+/// 成功返回，回归（白名单未注册）时首次 -32801 直接外泄为 CoreError::Rpc → 本用例失败。
+#[tokio::test]
+async fn session_registers_content_modified_retry_whitelist() {
+    let exe: std::path::PathBuf = env!("CARGO_BIN_EXE_mock_ls").into();
+    let child = Child::spawn(LaunchInfo {
+        cmd: vec![OsString::from(exe)],
+        cwd: std::env::temp_dir(),
+        env: vec![
+            (
+                "MOCK_LS_CONTENTMODIFIED_METHODS".into(),
+                "textDocument/hover".into(),
+            ),
+            ("MOCK_LS_CONTENTMODIFIED_FAILS".into(), "2".into()),
+        ],
+        transport: TransportKind::Stdio,
+    })
+    .unwrap();
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start 应成功");
+
+    let hover: Value = session
+        .request(
+            "textDocument/hover",
+            json!({
+                "textDocument": {"uri": "file:///mock/main.cpp"},
+                "position": {"line": 0, "character": 0}
+            }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("hover 的 -32801 应被白名单内部重试消化，而非外泄");
+    assert_eq!(hover, Value::Null, "mock_ls 对非 documentSymbol 回 null 结果");
+
+    session.shutdown().await;
+}
+
 fn dummy_init_params() -> InitializeParams {
     // 不填 rootUri/rootPath —— Task 6 仅验证握手通路；workspace caps 由 init_params.rs 提供。
     InitializeParams::default()

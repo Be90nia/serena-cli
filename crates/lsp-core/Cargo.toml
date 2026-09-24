@@ -13,9 +13,11 @@ tracing.workspace = true
 ls-runtime = { path = "../ls-runtime" }
 win32job.workspace = true
 dunce.workspace = true
- [dev-dependencies]
+percent-encoding.workspace = true
+[dev-dependencies]
 tempfile.workspace = true
 dunce.workspace = true
+percent-encoding.workspace = true
 
 [[bin]]
 name = "mock_ls"

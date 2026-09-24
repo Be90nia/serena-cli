@@ -893,6 +893,7 @@ dependencies = [
  "dunce",
  "ls-runtime",
  "lsp-types",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tempfile",
