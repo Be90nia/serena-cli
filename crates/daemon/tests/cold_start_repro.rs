@@ -65,6 +65,7 @@ async fn cold_start_overview_via_daemon_http() {
         // 空路径 = 不写 envelope 日志（压测探活不需要 d3a 重放索引）。
         invocation_log_path: std::path::PathBuf::new(),
         drain_window: std::time::Duration::from_secs(2),
+        no_token_estimate: false,
     };
     let app = daemon::http::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -48,6 +48,9 @@ pub struct AppState {
     /// 工具调用重放日志（d3a，JSONL 索引按 invocation_id）。空路径 = 不写
     /// （不关心日志的测试用；生产由 serve 注入 default_invocation_log_path()）。
     pub invocation_log_path: std::path::PathBuf,
+    /// 7rh：SERENA_NO_TOKEN_ESTIMATE=1 时工具成功响应不附 `~tokens` 估算。
+    /// daemon 启动读一次（serve），测试直接注入 bool 保持隔离。
+    pub no_token_estimate: bool,
 }
 
 impl AppState {
@@ -184,10 +187,30 @@ async fn tools_post(
                 None,
                 started.elapsed(),
             );
+            // 7rh：token 估算 = 响应序列化字节 / 4（无 tokenizer 依赖）。tokens
+            // 依赖最终字节数，只能先计量再发送（两遍 serialize，Value 零 clone：
+            // take 出去计量再还回）。SERENA_NO_TOKEN_ESTIMATE=1 时跳过，保持单遍。
+            let approx_tokens = if state.no_token_estimate {
+                None
+            } else {
+                let probe = ToolResponse::Ok {
+                    ok: true,
+                    data: std::mem::take(&mut data),
+                    format: None,
+                    approx_tokens: None,
+                };
+                let n = serde_json::to_vec(&probe).ok().map(|b| (b.len() / 4) as u64);
+                // 计量后把 data 还回（probe 按构造恒为 Ok 变体）。
+                if let ToolResponse::Ok { data: measured, .. } = probe {
+                    data = measured;
+                }
+                n
+            };
             let resp = ToolResponse::Ok {
                 ok: true,
                 data,
                 format: None,
+                approx_tokens,
             };
             // Direct Serialize (no intermediate Value clone). For large responses
             // (search 200+ hits, refs, repo-map) saves ~500µs / 84% vs the prior
@@ -608,6 +631,8 @@ mod tests {
             in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drain_window: std::time::Duration::from_millis(100),
             invocation_log_path,
+            // 7rh：默认开估算；关闭开关的测试显式置 true。
+            no_token_estimate: false,
         }
     }
 
@@ -913,6 +938,74 @@ mod tests {
         assert_eq!(body["error"]["retryable"], false);
     }
 
+    /// 7rh：成功响应附 `~tokens` 整数估算，且 >0（字节/4）。
+    #[tokio::test]
+    async fn tool_success_carries_token_estimate() {
+        let st = state("secret", MockSupervisor::ok(json!({"n": 1})));
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post(
+                "/tools/overview",
+                Some("secret"),
+                json!({"project_root": "D:/x", "args": {}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK);
+        let body = body.expect("json body");
+        assert_eq!(body["ok"], true);
+        let tokens = body
+            .get("~tokens")
+            .and_then(|v| v.as_u64())
+            .expect("~tokens 必须是非负整数");
+        assert!(tokens > 0, "估算必须 >0，got {tokens}");
+    }
+
+    /// 7rh：no_token_estimate（SERENA_NO_TOKEN_ESTIMATE=1）时字段不上 wire。
+    #[tokio::test]
+    async fn token_estimate_opt_out_strips_field() {
+        let mut st = state("secret", MockSupervisor::ok(json!({"n": 1})));
+        st.no_token_estimate = true;
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post(
+                "/tools/overview",
+                Some("secret"),
+                json!({"project_root": "D:/x", "args": {}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK);
+        let body = body.expect("json body");
+        assert_eq!(body["ok"], true);
+        assert!(body.get("~tokens").is_none(), "开关打开时不得附 ~tokens");
+    }
+
+    /// 7rh：错误响应（9 码 wire）不带 ~tokens——错误结构零变动。
+    #[tokio::test]
+    async fn error_response_has_no_token_estimate() {
+        let st = state(
+            "secret",
+            MockSupervisor::err(supervisor::ToolError::BadArgs {
+                detail: "missing x".into(),
+            }),
+        );
+        let (status, body) = oneshot_json(
+            router(st),
+            req_post(
+                "/tools/overview",
+                Some("secret"),
+                json!({"project_root": "D:/x", "args": {}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK, "工具级失败走 200");
+        let body = body.expect("json body");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "BAD_ARGS");
+        assert!(body.get("~tokens").is_none(), "错误响应不得附 ~tokens");
+    }
+
     #[tokio::test]
     async fn status_returns_uptime_and_loaded_ls() {
         let st = state("secret", MockSupervisor::ok(json!(null)));
@@ -926,19 +1019,28 @@ mod tests {
 
     /// b40：status 是纯诊断，不得刷新全局 activity 时钟——否则 idle 监控
     /// 脚本轮询 /status 即可让 15min idle 自杀永不触发。
-    /// （并行测试可能刷新全局时钟，见 reaper tests 同类注释；偶发失败重跑，
-    /// 持续复现才是真回归。）
+    /// 全局时钟是进程级单例：并行的 tools/batch 类测试 note_activity 会打穿
+    /// before/after 单次取样（与是否回归无关）。轮询到并行噪音静止后再断言——
+    /// status_get 若真刷钟则 before==after 永不成立，deadline 处必失败。
     #[tokio::test]
     async fn status_get_does_not_refresh_activity() {
         let st = state("secret", MockSupervisor::ok(json!(null)));
-        let before = crate::reaper::last_activity();
-        let (status, _) = oneshot_json(router(st), req_get("/status", Some("secret"))).await;
-        assert_eq!(status, AxStatus::OK);
-        let after = crate::reaper::last_activity();
-        assert_eq!(
-            before, after,
-            "status_get 不得刷新全局 activity 时钟（bd b40）"
-        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let before = crate::reaper::last_activity();
+            let (status, _) =
+                oneshot_json(router(st.clone()), req_get("/status", Some("secret"))).await;
+            assert_eq!(status, AxStatus::OK);
+            let after = crate::reaper::last_activity();
+            if before == after {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "status_get 不得刷新全局 activity 时钟（bd b40）"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

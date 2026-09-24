@@ -108,7 +108,7 @@ serena-rust/
 │   │       ├── dto.rs          # wire DTO：ToolRequest/ToolResponse + 9 错误码映射（wire_error_from_tool_error）
 │   │       ├── serve.rs        # serve()：lock 父目录 → bind → try_become_daemon → reaper → axum::serve
 │   │       ├── lockfile.rs     # daemon 探测/lazy-spawn 协议（§2 分支 B）
-│   │       └── reaper.rs       # 全局空闲自杀（默认 15min）；Δ 每 LS 实例空闲卸载在 supervisor（默认 10min）
+│   │       └── reaper.rs       # 全局空闲自杀（默认 15min，阈值可配 §6.4）；Δ 每 LS 实例空闲卸载在 supervisor（默认 10min）
 │   └── cli/                    # 唯一 bin：serena-cli
 │       └── src/main.rs         # clap 解析（47 子命令 = 42 工具 + status/stop-all/install/shell/doctor）→
 │                               #   探测 daemon → 转发/拉起；--daemon 进 daemon 模式；--direct 开发模式；
@@ -525,10 +525,11 @@ flowchart LR
 // POST /tools/{name} 请求体
 { "project_root": "D:/proj", "args": { "pattern": "Foo" } }
 
-// 成功（HTTP 200）
-{ "ok": true, "data": "main.rs:42  fn Foo\n…", "format": "text" }
+// 成功（HTTP 200）；`~tokens` = 响应字节/4 的 token 估算（bd serena-rust-7rh，
+// 仅 tools_post 成功响应附带；SERENA_NO_TOKEN_ESTIMATE=1 时省略）
+{ "ok": true, "data": "main.rs:42  fn Foo\n…", "format": "text", "~tokens": 17 }
 
-// 失败（HTTP 200 携带业务失败，传输层错误才用 4xx/5xx）
+// 失败（HTTP 200 携带业务失败，传输层错误才用 4xx/5xx；结构零变动）
 { "ok": false,
   "error": {
     "code": "WRITE_CONFLICT",          // 见下表枚举
@@ -551,6 +552,16 @@ flowchart LR
 | `INTERNAL` | daemon 内部 bug（anyhow 兜底，含 chain 摘要） | false | 3 |
 
 HTTP 层错误保留给传输语义：`404` 未知工具名、`503` daemon 关停中。**工具级失败走 200 + `{ok:false}`**，让 CLI 的分支只看 JSON，不看状态码二次判错。CLI exit：0 成功 / 1 工具失败 / 2 用法错误 / 3 daemon 或传输故障（含 daemon 拉起失败）/ 4 `wait-ready` 超时（bd serena-rust-55m）。转发路径对 `503 DAEMON_DRAINING`（stop-all 后 reaper 收尾窗口）做客户端侧自愈：≤5s 窗口内每 300ms 重试一次完整链路（重新探活 + lazy-spawn），超窗仍 draining 则原样报错 rc=3（bd serena-rust-g0m）。
+
+### 6.4 daemon 环境变量（bd serena-rust-j8b / 7rh）
+
+daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认，配置错误不致命。缺省行为与历史版本一致。
+
+| 变量 | 默认 | 语义 |
+|---|---|---|
+| `SERENA_IDLE_TIMEOUT_SECS` | `900` | 全局 idle 自杀阈值；`0` = 永不自杀（AI 批量任务保活） |
+| `SERENA_LS_IDLE_EVICTION_SECS` | `600` | 单 LS 空闲驱逐阈值；`0` = 永不驱逐（避免 90min 批量中反复冷启动） |
+| `SERENA_NO_TOKEN_ESTIMATE` | 未设 | 设 `1` 时工具成功响应不附 `~tokens` 估算字段 |
 
 ---
 

@@ -56,6 +56,10 @@ pub enum ToolResponse {
         data: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<String>,
+        /// 7rh：响应体 token 估算（序列化字节/4，无 tokenizer 依赖）。None =
+        /// 不附字段（错误响应、/batch、SERENA_NO_TOKEN_ESTIMATE=1 时）。
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "~tokens")]
+        approx_tokens: Option<u64>,
     },
     Err {
         ok: bool, // false
@@ -239,10 +243,41 @@ mod tests {
             ok: true,
             data: serde_json::json!([1, 2, 3]),
             format: None,
+            approx_tokens: None,
         };
         let j = serde_json::to_string(&resp).unwrap();
         assert!(j.contains("\"ok\":true"));
         assert!(j.contains("\"data\":[1,2,3]"));
+    }
+
+    /// 7rh：approx_tokens wire 键名 `~tokens`；None 时字段缺席（向后兼容）；
+    /// 旧 daemon 响应（无该字段）反序列化 → None。
+    #[test]
+    fn approx_tokens_wire_shape() {
+        let with = ToolResponse::Ok {
+            ok: true,
+            data: serde_json::json!({"n": 1}),
+            format: None,
+            approx_tokens: Some(7),
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["~tokens"], 7);
+
+        let without = ToolResponse::Ok {
+            ok: true,
+            data: serde_json::json!({"n": 1}),
+            format: None,
+            approx_tokens: None,
+        };
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(v.get("~tokens").is_none(), "None 时字段不得上 wire");
+
+        let legacy: ToolResponse =
+            serde_json::from_value(serde_json::json!({"ok": true, "data": {}})).unwrap();
+        match legacy {
+            ToolResponse::Ok { approx_tokens, .. } => assert_eq!(approx_tokens, None),
+            ToolResponse::Err { .. } => panic!("应匹配 Ok 变体"),
+        }
     }
 
     #[test]

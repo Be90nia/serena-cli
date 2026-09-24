@@ -29,7 +29,9 @@ impl Default for ServeConfig {
         Self {
             port: 7860,
             lock_path: default_lock_path(),
-            intervals: ReaperIntervals::default(),
+            // bd j8b：idle 阈值环境变量可配（SERENA_IDLE_TIMEOUT_SECS /
+            // SERENA_LS_IDLE_EVICTION_SECS），缺省与 ReaperIntervals::default 一致。
+            intervals: crate::reaper::intervals_from_env(),
         }
     }
 }
@@ -98,6 +100,8 @@ let sup = Arc::new(Supervisor::direct().await?);
         // 并发的残余请求流 ~10-12s，10s 上限时窗口外仍有 ~17% refused；
         // 15s 把 stop-all 触发后仍在途的请求基本都覆盖成 503 DAEMON_DRAINING。
         drain_window: std::time::Duration::from_secs(15),
+        // 7rh：SERENA_NO_TOKEN_ESTIMATE=1 → 工具成功响应不附 ~tokens 估算。
+        no_token_estimate: std::env::var("SERENA_NO_TOKEN_ESTIMATE").ok().as_deref() == Some("1"),
     };
 
     // reaper 常驻：draining → 删 lock → 卸 LS。lock 归属戳 (path, boot_ms)

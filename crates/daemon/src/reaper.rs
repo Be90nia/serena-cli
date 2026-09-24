@@ -6,6 +6,9 @@
 //! - 全局 15min 空闲 → ShutdownDraining：503 + Retry-After（http 层）→
 //!   删 lock → exit 0（排空窗口由 http 层 wait_drain 承担，此处不重复等）
 //!
+//! bd j8b：两个 idle 阈值环境变量可配（`intervals_from_env`），0 = 永不
+//! （自杀/驱逐）；缺省与 Default 一致，默认行为不变。
+//!
 //! ponytail: 全部状态复用 supervisor.last_used + daemon AppState.draining，
 //! 不另建 reaper 私有状态表。
 
@@ -39,6 +42,41 @@ impl Default for ReaperIntervals {
             global_idle: Duration::from_secs(15 * 60),
             max_loaded_ls: 3,
         }
+    }
+}
+
+/// 环境变量秒数解析（bd j8b）：缺失 → 默认；负数/非数字/空串 → warn 后用默认
+/// （配置错误不致命）；`0` 合法 = 永不（自杀/驱逐，由 reaper_loop 的 is_zero guard 实现）。
+fn parse_secs(raw: Option<&str>, var: &str, default: u64) -> u64 {
+    match raw {
+        None => default,
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(env = var, value = s, default, "invalid value; using default");
+                default
+            }
+        },
+    }
+}
+
+/// 生产 intervals：idle 阈值环境变量可配（bd j8b）。
+/// - `SERENA_IDLE_TIMEOUT_SECS`：全局 idle 自杀阈值（缺省 = Default 的 900；0 = 永不自杀）
+/// - `SERENA_LS_IDLE_EVICTION_SECS`：单 LS 空闲驱逐阈值（缺省 = Default 的 600；0 = 永不驱逐）
+pub fn intervals_from_env() -> ReaperIntervals {
+    let base = ReaperIntervals::default();
+    ReaperIntervals {
+        global_idle: Duration::from_secs(parse_secs(
+            std::env::var("SERENA_IDLE_TIMEOUT_SECS").ok().as_deref(),
+            "SERENA_IDLE_TIMEOUT_SECS",
+            base.global_idle.as_secs(),
+        )),
+        ls_idle: Duration::from_secs(parse_secs(
+            std::env::var("SERENA_LS_IDLE_EVICTION_SECS").ok().as_deref(),
+            "SERENA_LS_IDLE_EVICTION_SECS",
+            base.ls_idle.as_secs(),
+        )),
+        ..base
     }
 }
 
@@ -101,22 +139,24 @@ async fn reaper_loop(
         let now = Instant::now();
         let entries = sup.loaded_entries();
 
-        // 1) 全局空闲判定：最新活动（LS 或全局时钟）距今超阈值。
+        // 1) 全局空闲判定：最新活动（LS 或全局时钟）距今超阈值；0 = 永不自杀（bd j8b）。
         let newest = entries
             .iter()
             .map(|(_, t)| *t)
             .max()
             .unwrap_or(*GLOBAL_LAST_ACTIVITY.lock().unwrap());
-        if now.duration_since(newest) >= iv.global_idle {
+        let global_expired =
+            !iv.global_idle.is_zero() && now.duration_since(newest) >= iv.global_idle;
+        if global_expired {
             tracing::info!("global idle reached; entering ShutdownDraining");
             state.draining.store(true, Ordering::Release);
             finish_shutdown(&state, &lock).await;
             return;
         }
 
-        // 2) 单 LS 空闲卸载。
+        // 2) 单 LS 空闲卸载；0 = 永不驱逐（bd j8b）。
         for (key, last) in &entries {
-            if now.duration_since(*last) >= iv.ls_idle {
+            if !iv.ls_idle.is_zero() && now.duration_since(*last) >= iv.ls_idle {
                 tracing::info!(root = %key.root.display(), lang = %key.lang, "evict idle LS");
                 let _ = sup.evict(key).await;
             }
@@ -217,6 +257,8 @@ mod tests {
             invocation_log_path: std::path::PathBuf::new(),
             // 短窗口：reaper 收尾测试不必等满生产 2s。
             drain_window: Duration::from_millis(100),
+            // 7rh：reaper 测试不关心 token 估算。
+            no_token_estimate: false,
         }
     }
 
@@ -257,6 +299,38 @@ mod tests {
         assert_eq!(iv.ls_idle, Duration::from_secs(600));
         assert_eq!(iv.global_idle, Duration::from_secs(900));
         assert_eq!(iv.max_loaded_ls, 3);
+    }
+
+    /// bd j8b：env 秒数解析——缺失/非法（负数、非数字、空串）回默认，0 合法。
+    /// （不直接测 intervals_from_env 读真 env：进程全局状态会被并行测试污染。）
+    #[test]
+    fn parse_secs_defaults_on_missing_or_invalid() {
+        assert_eq!(parse_secs(None, "X", 900), 900);
+        assert_eq!(parse_secs(Some("0"), "X", 900), 0, "0 = 永不，是合法值");
+        assert_eq!(parse_secs(Some("120"), "X", 900), 120);
+        assert_eq!(parse_secs(Some(" 300 "), "X", 900), 300);
+        assert_eq!(parse_secs(Some("-1"), "X", 900), 900, "负数非法 → 默认");
+        assert_eq!(parse_secs(Some("abc"), "X", 900), 900);
+        assert_eq!(parse_secs(Some(""), "X", 900), 900);
+    }
+
+    /// bd j8b：global_idle=0 → 永不自杀（覆盖原 400ms 触发窗后仍不 draining）。
+    #[tokio::test]
+    async fn zero_global_idle_never_drains() {
+        let sup = Arc::new(Supervisor::direct().await.unwrap());
+        let state = test_state();
+        let iv = ReaperIntervals {
+            global_idle: Duration::ZERO,
+            ..fast_intervals()
+        };
+        let handle = spawn_reaper(sup, state.clone(), iv, None);
+        // fast_intervals 的 global_idle=400ms；等 700ms 覆盖原触发窗 + 两个 tick。
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !state.draining.load(Ordering::Acquire),
+            "global_idle=0 不得触发自杀"
+        );
+        handle.abort();
     }
 
     #[tokio::test]

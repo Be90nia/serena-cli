@@ -9,6 +9,8 @@ All notable changes to `serena-rust` are recorded here, ordered by phase. Anchor
 | (uncommitted) | daemon orphan race fix (bd y2y): lock ownership-checked removal (`remove_owned` pid+boot_ms), stale-grace probing (3×300ms) before takeover, bind-before-lock arbitration, CLI 403 token self-heal (`refresh_token_if_stale`) | stop-all × lazy-spawn cross: 403 = 0 (was 400/400 calls), orphan daemons = 0, lock↔listener consistency held across daemon generations |
 | (uncommitted) | `wait-ready` subcommand (bd serena-rust-55m): blocks until type analysis truly usable (overview first-symbol → hover non-empty we0-verdict), 500ms→2s backoff, stderr progress; timeout exit 4 | AI/e2e scripts drop ~20 lines of hand-rolled polling each |
 | (uncommitted) | DAEMON_DRAINING client-side self-heal (bd serena-rust-g0m): forward classifies 503 + wire code, ≤5s window × 300ms retries full chain incl. lazy-spawn re-probe; beyond window original rc=3 error preserved | stop-all → immediate tool call succeeds instead of hard rc=3 |
+| (uncommitted) | configurable idle policy (bd serena-rust-j8b): `SERENA_IDLE_TIMEOUT_SECS` (global self-kill, default 900) + `SERENA_LS_IDLE_EVICTION_SECS` (LS eviction, default 600), `0` = never; invalid values warn+default; default behavior unchanged | AI batch jobs (90min) stop paying 30-90s cold restarts per idle eviction |
+| (uncommitted) | response token estimate (bd serena-rust-7rh): tools_post success envelope gains `"~tokens": N` (serialized bytes / 4, no tokenizer dep); `SERENA_NO_TOKEN_ESTIMATE=1` opts out; error responses / /batch unchanged | AI agents get a cost feedback signal on every tool response |
 
 ## Phase 0 · Stability foundations (P0)
 
