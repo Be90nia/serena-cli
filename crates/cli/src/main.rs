@@ -11,7 +11,8 @@
 //! Windows 启动即 `SetConsoleOutputCP(65001)` —— 中文 Windows conhost 默认 GBK 码页。
 //!
 //! Exit code 协议（ARCH §6.3）：
-//! 0 成功 / 1 工具失败（含 LS 未装）/ 2 用法错 / 3 daemon 或传输故障。
+//! 0 成功 / 1 工具失败（含 LS 未装）/ 2 用法错 / 3 daemon 或传输故障 /
+//! 4 wait-ready 超时（bd serena-rust-55m）。
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -240,6 +241,18 @@ enum Cmd {
         /// 就绪等待上限（秒）。
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
+    },
+    /// 阻塞到类型分析真正可用（bd serena-rust-55m）：循环探测——overview 首符号
+    /// 非空（符号索引起）→ hover 该位置 contents 非空（类型分析起；未就绪响应带
+    /// we0 warning，解析即判据）。就绪 exit 0；超时 exit 4。探测间隔 500ms 起
+    /// 指数退避到 2s 封顶，进度单行打 stderr。
+    WaitReady {
+        /// 探测目标文件（默认项目内首个源文件，路径相对项目根或绝对）。
+        #[arg(long, value_name = "FILE")]
+        file: Option<String>,
+        /// 就绪等待上限（秒）。
+        #[arg(long, value_name = "N", default_value_t = 120)]
+        timeout: u64,
     },
     /// 替换符号体（写门 + hash 对账 + 原子写）。
     ReplaceBody {
@@ -568,6 +581,10 @@ async fn cli_main() -> ExitCode {
             let project_root = resolve_project_root(cli.project.clone());
             return cmd_doctor(*json, *fix, &lock_path, &project_root).await;
         }
+        // wait-ready（bd serena-rust-55m）：阻塞到类型分析真正可用，exit 0/4。
+        Some(Cmd::WaitReady { file, timeout }) => {
+            return cmd_wait_ready(&cli, file.as_deref(), *timeout, &lock_path).await;
+        }
         Some(Cmd::Shell) => {}
         _ => {}
     }
@@ -581,8 +598,8 @@ async fn cli_main() -> ExitCode {
     if matches!(&cli.cmd, Some(Cmd::Shell)) {
         return cmd_shell(&cli).await;
     }
-    // ---- 默认：转发模式（lazy-spawn）----
-    match forward_or_spawn(&cli, &lock_path).await {
+    // ---- 默认：转发模式（lazy-spawn；draining 窗口自愈 g0m）----
+    match forward_with_draining_retry(&cli, &lock_path).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
@@ -885,10 +902,275 @@ async fn handle_type_hierarchy(
     }
 }
 
-/// 转发模式：探活 → 转发；死 lock → lazy-spawn --daemon → 轮询就绪 → 转发。
-async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<(), String> {
-    let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
+// ==== bd serena-rust-g0m：DAEMON_DRAINING 自愈（纯客户端，与 send_with_connect_retry 正交：
+// 那是连接层瞬断重试，这里是 503 语义层识别 + 退避后重试完整链路含 lazy-spawn 重新探活）====
 
+/// stop-all 后 reaper 收尾窗口（数秒）内新请求会打到 draining daemon（503
+/// DAEMON_DRAINING）。客户端退避重试总窗：覆盖收尾期，超窗原样报错不无限等。
+const DRAINING_RETRY_WINDOW: Duration = Duration::from_secs(5);
+const DRAINING_RETRY_BACKOFF: Duration = Duration::from_millis(300);
+
+/// forward 链路失败分类（g0m）：draining 值得等，其余原样上报。
+enum ForwardFailure {
+    /// 连接失败 / 解码失败 / 非 DRAINING 503 等，重试无意义，消息原样给调用方。
+    Fatal(String),
+    /// 503 + body error.code=DAEMON_DRAINING：daemon 正在收尾，退避后重试完整链路。
+    Draining {
+        status: reqwest::StatusCode,
+        payload: serde_json::Value,
+    },
+}
+
+impl From<String> for ForwardFailure {
+    fn from(m: String) -> Self {
+        Self::Fatal(m)
+    }
+}
+
+/// 503 + wire 错误码 DAEMON_DRAINING 才触发自愈（区别于其他 503）。
+fn is_daemon_draining(status: reqwest::StatusCode, payload: &serde_json::Value) -> bool {
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && payload.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str())
+            == Some("DAEMON_DRAINING")
+}
+
+/// draining 重试循环（泛型化便于 mock 单测）：窗口内每 backoff 轮重试一次完整
+/// 链路（重新探活；旧 daemon 退净 lock 释放即正常 lazy-spawn 新 daemon），
+/// 超窗仍 draining 则还原既有错误文本 rc=3。
+async fn retry_on_draining<F, Fut, T>(
+    mut op: F,
+    window: Duration,
+    backoff: Duration,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ForwardFailure>>,
+{
+    let deadline = Instant::now() + window;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(ForwardFailure::Fatal(m)) => return Err(m),
+            Err(ForwardFailure::Draining { status, payload }) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("daemon transport error {status}: {payload}"));
+                }
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+}
+
+/// forward_or_spawn + draining 自愈包装（g0m）。转发模式的实际入口。
+async fn forward_with_draining_retry(cli: &Cli, lock_path: &Path) -> Result<(), String> {
+    retry_on_draining(
+        || forward_or_spawn(cli, lock_path),
+        DRAINING_RETRY_WINDOW,
+        DRAINING_RETRY_BACKOFF,
+    )
+    .await
+}
+
+// ==== bd serena-rust-55m：wait-ready ====
+
+/// 探测退避：500ms 起步指数退避，2s 封顶（避免打爆 daemon）。
+fn wait_ready_backoff(round: usize) -> Duration {
+    Duration::from_millis(500u64 << round.min(2) as u32)
+}
+
+/// hover 响应就绪判定（we0 语义的 CLI 侧镜像，`hover_is_empty` + warning 判据）：
+/// 带 "may not be ready" warning → 未就绪；空悬停（null / contents 空）→ 未就绪；
+/// contents 有内容 → 就绪。
+fn hover_ready(data: &serde_json::Value) -> bool {
+    let not_ready = data
+        .get("warning")
+        .and_then(|w| w.as_str())
+        .is_some_and(|w| w.contains("may not be ready"));
+    if not_ready {
+        return false;
+    }
+    match data.get("contents") {
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(c) => c
+            .get("value")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty()),
+        None => false,
+    }
+}
+
+/// 默认探测目标：项目内首个源文件（扩展名经 ls-registry 识别即算）。
+/// 浅深度优先（深度 ≤4），跳过 VCS/构建/依赖目录；找不到返回 None。
+fn find_first_source_file(root: &Path) -> Option<PathBuf> {
+    const SKIP: [&str; 10] = [
+        ".git", "target", "node_modules", ".venv", "venv", "dist", "build", "__pycache__",
+        ".idea", ".vscode",
+    ];
+    fn walk(dir: &Path, depth: u8) -> Option<PathBuf> {
+        if depth > 4 {
+            return None;
+        }
+        let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.filter_map(Result::ok).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if !SKIP.contains(&name.as_str())
+                    && let Some(hit) = walk(&p, depth + 1)
+                {
+                    return Some(hit);
+                }
+            } else if ls_registry::file_detect::detect_language(&p).is_some() {
+                return Some(p);
+            }
+        }
+        None
+    }
+    walk(root, 0)
+}
+
+/// wait-ready 单次探测工具调用：POST /tools/{tool}，返回 wire data。
+async fn probe_tool_call(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    root: &Path,
+    tool: &str,
+    args: serde_json::Value,
+    lang: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let body = json!({
+        "project_root": root.to_string_lossy(),
+        "args": args,
+        "lang": lang,
+    });
+    let resp = client
+        .post(format!("{base}/tools/{tool}"))
+        .header("X-Serena-Token", token)
+        .json(&body)
+        .timeout(FORWARD_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("{tool}: {e}"))?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("transport {status}: {payload}"));
+    }
+    match payload.get("ok").and_then(|v| v.as_bool()) {
+        Some(true) => Ok(payload.get("data").cloned().unwrap_or(serde_json::Value::Null)),
+        _ => Err(payload.get("error").cloned().unwrap_or(payload).to_string()),
+    }
+}
+
+/// `wait-ready` 子命令（bd serena-rust-55m）：阻塞到类型分析真正可用。
+/// 两段探测：overview 首符号非空（符号索引起）→ hover 该位置 contents 非空
+/// （类型分析起；未就绪响应带 we0 warning，`hover_ready` 解析即判据）。
+/// 就绪 exit 0（stderr 'ready in NNs'）；超时 exit 4。
+async fn cmd_wait_ready(
+    cli: &Cli,
+    file: Option<&str>,
+    timeout_secs: u64,
+    lock_path: &Path,
+) -> ExitCode {
+    let root = resolve_project_root(cli.project.clone());
+    let probe_path = match file {
+        Some(f) => PathBuf::from(f),
+        None => match find_first_source_file(&root) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "wait-ready: no source file under {}; pass --file <FILE>",
+                    root.display()
+                );
+                return ExitCode::from(2);
+            }
+        },
+    };
+    // 工具 contract 与其他子命令一致：相对项目根的路径。
+    let rel = probe_path
+        .strip_prefix(&root)
+        .unwrap_or(&probe_path)
+        .to_string_lossy()
+        .to_string();
+    let lang = cli.lang.clone().or_else(|| {
+        ls_registry::file_detect::detect_language(&probe_path).map(|l| l.as_str().to_string())
+    });
+
+    // daemon 未起时先 lazy-spawn（与转发模式同一条就绪链路）。
+    let (base, token) = match ensure_daemon(lock_path).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wait-ready: {e}");
+            return ExitCode::from(3);
+        }
+    };
+    let client = http_client();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(timeout_secs);
+    let mut round = 0usize;
+    loop {
+        // 段 1：符号索引——overview 首符号位置（LSP 0-based，wire 契约直接透传）。
+        let hit_pos = probe_tool_call(
+            &client,
+            &base,
+            &token,
+            &root,
+            "overview",
+            json!({"file": rel}),
+            lang.as_deref(),
+        )
+        .await
+        .ok()
+        .and_then(|data| {
+            data.get(0)
+                .and_then(|h| h.get("range"))
+                .and_then(|r| r.get("start"))
+                .and_then(|s| {
+                    Some((
+                        s.get("line")?.as_u64()? as u32,
+                        s.get("character")?.as_u64()? as u32,
+                    ))
+                })
+        });
+        if let Some((line, col)) = hit_pos {
+            // 段 2：类型分析——hover 首符号位置（we0 warning = 未就绪标记）。
+            // 探测期瞬态（RA -32801 content modified / 连接抖动）≠ 确认就绪，
+            // 一律退避续等到 deadline——等待语义不做硬失败。
+            match probe_tool_call(
+                &client,
+                &base,
+                &token,
+                &root,
+                "hover",
+                json!({"file": rel, "line": line, "col": col}),
+                lang.as_deref(),
+            )
+            .await
+            {
+                Ok(data) if hover_ready(&data) => {
+                    eprintln!("ready in {}s", started.elapsed().as_secs());
+                    return ExitCode::SUCCESS;
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("probe error (keep waiting): {e}"),
+            }
+        }
+        if Instant::now() >= deadline {
+            eprintln!("wait-ready: not ready within {timeout_secs}s");
+            return ExitCode::from(4);
+        }
+        eprintln!("waiting... {}s", started.elapsed().as_secs());
+        tokio::time::sleep(wait_ready_backoff(round)).await;
+        round += 1;
+    }
+}
+
+/// 转发模式：探活 → 转发；死 lock → lazy-spawn --daemon → 轮询就绪 → 转发。
+async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<(), ForwardFailure> {
+    let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
     let base = match entry {
         Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
             format!("http://127.0.0.1:{}", e.port)
@@ -1122,7 +1404,7 @@ async fn forward(
     token: &mut String,
     lock_path: &Path,
     lang: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), ForwardFailure> {
     let client = http_client();
     // 工具名与 args 组装。
     let (tool, args): (&str, serde_json::Value) = match &cli.cmd {
@@ -1458,6 +1740,7 @@ async fn forward(
         | Some(Cmd::Shell)
         | Some(Cmd::Doctor { .. })
         | Some(Cmd::LintShell { .. })
+        | Some(Cmd::WaitReady { .. })
         | None => {
             unreachable!("handled earlier")
         }
@@ -1542,8 +1825,11 @@ async fn forward(
     let payload: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
 
     if !status.is_success() {
-        // 403/503 等传输层错。
-        return Err(format!("daemon transport error {status}: {payload}"));
+        // 403/503 等传输层错；503 DAEMON_DRAINING 单独分类供上层自愈重试（g0m）。
+        if is_daemon_draining(status, &payload) {
+            return Err(ForwardFailure::Draining { status, payload });
+        }
+        return Err(format!("daemon transport error {status}: {payload}").into());
     }
     match payload.get("ok").and_then(|v| v.as_bool()) {
         Some(true) => {
@@ -2518,5 +2804,130 @@ mod net_retry_tests {
         let f = super::daemon_creation_flags();
         assert_ne!(f & DETACHED_PROCESS, 0);
         assert_ne!(f & CREATE_NEW_PROCESS_GROUP, 0);
+    }
+
+    // ---- bd serena-rust-g0m：DAEMON_DRAINING 自愈 ----
+
+    #[test]
+    fn is_daemon_draining_matches_only_503_with_wire_code() {
+        let draining = json!({"ok": false, "error": {"code": "DAEMON_DRAINING", "message": "x"}});
+        let other_code = json!({"ok": false, "error": {"code": "INTERNAL", "message": "x"}});
+        assert!(is_daemon_draining(reqwest::StatusCode::SERVICE_UNAVAILABLE, &draining));
+        assert!(
+            !is_daemon_draining(reqwest::StatusCode::SERVICE_UNAVAILABLE, &other_code),
+            "非 DRAINING 503 不触发自愈"
+        );
+        assert!(
+            !is_daemon_draining(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &draining),
+            "非 503 不触发"
+        );
+        assert!(!is_daemon_draining(reqwest::StatusCode::SERVICE_UNAVAILABLE, &json!("boom")));
+    }
+
+    #[tokio::test]
+    async fn draining_is_retried_until_success() {
+        let calls = std::cell::Cell::new(0usize);
+        let payload = json!({"error": {"code": "DAEMON_DRAINING"}});
+        let r = retry_on_draining(
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                let payload = payload.clone();
+                async move {
+                    if n < 3 {
+                        Err(ForwardFailure::Draining {
+                            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                            payload,
+                        })
+                    } else {
+                        Ok::<_, ForwardFailure>(())
+                    }
+                }
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(calls.get(), 3, "窗口内退避重试到成功");
+    }
+
+    #[tokio::test]
+    async fn draining_beyond_window_returns_original_error() {
+        let calls = std::cell::Cell::new(0usize);
+        let r: Result<(), String> = retry_on_draining(
+            || {
+                calls.set(calls.get() + 1);
+                async {
+                    Err(ForwardFailure::Draining {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        payload: json!({"error": {"code": "DAEMON_DRAINING"}}),
+                    })
+                }
+            },
+            Duration::from_millis(150),
+            Duration::from_millis(50),
+        )
+        .await;
+        let msg = r.unwrap_err();
+        assert!(msg.contains("daemon transport error"), "还原既有错误文本: {msg}");
+        assert!(msg.contains("DAEMON_DRAINING"), "错误体保留 wire 码: {msg}");
+        assert!(calls.get() >= 2, "窗口内至少重试过一轮: {}", calls.get());
+    }
+
+    #[tokio::test]
+    async fn fatal_forward_failure_is_not_retried() {
+        let calls = std::cell::Cell::new(0usize);
+        let r: Result<(), String> = retry_on_draining(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err(ForwardFailure::Fatal("boom".into())) }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(r.unwrap_err(), "boom");
+        assert_eq!(calls.get(), 1, "非 draining 失败绝不重试");
+    }
+
+    // ---- bd serena-rust-55m：wait-ready ----
+
+    #[test]
+    fn hover_ready_rejects_we0_warning_and_empty_forms() {
+        assert!(!hover_ready(&json!(
+            {"items": [], "warning": "semantic layer returned empty; ... may not be ready yet"}
+        )));
+        assert!(!hover_ready(&serde_json::Value::Null));
+        assert!(!hover_ready(&json!({"contents": ""})));
+        assert!(!hover_ready(&json!({"contents": []})));
+        assert!(!hover_ready(&json!({"contents": {"value": ""}})));
+        assert!(!hover_ready(&json!({})));
+    }
+
+    #[test]
+    fn hover_ready_accepts_nonempty_contents_forms() {
+        assert!(hover_ready(&json!({"contents": {"value": "fn hello"}})));
+        assert!(hover_ready(&json!({"contents": [{"value": "x"}]})));
+        assert!(hover_ready(&json!({"contents": "plain text"})));
+    }
+
+    #[test]
+    fn wait_ready_backoff_caps_at_2s() {
+        assert_eq!(wait_ready_backoff(0), Duration::from_millis(500));
+        assert_eq!(wait_ready_backoff(1), Duration::from_millis(1000));
+        assert_eq!(wait_ready_backoff(2), Duration::from_millis(2000));
+        assert_eq!(wait_ready_backoff(10), Duration::from_millis(2000), "封顶");
+    }
+
+    #[test]
+    fn find_first_source_file_skips_build_dirs_and_detects_by_ext() {
+        let tmp = std::env::temp_dir().join(format!("serena-waitready-test-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("target")).unwrap();
+        std::fs::write(tmp.join("target").join("aaa.rs"), "fn junk() {}").unwrap();
+        std::fs::write(tmp.join("zmain.py"), "def main():\n    pass\n").unwrap();
+        let hit = find_first_source_file(&tmp).unwrap();
+        assert_eq!(hit, tmp.join("zmain.py"), "target/ 被跳过");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

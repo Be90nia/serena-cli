@@ -7,6 +7,8 @@ All notable changes to `serena-rust` are recorded here, ordered by phase. Anchor
 | commit | summary | key metric |
 |---|---|---|
 | (uncommitted) | daemon orphan race fix (bd y2y): lock ownership-checked removal (`remove_owned` pid+boot_ms), stale-grace probing (3×300ms) before takeover, bind-before-lock arbitration, CLI 403 token self-heal (`refresh_token_if_stale`) | stop-all × lazy-spawn cross: 403 = 0 (was 400/400 calls), orphan daemons = 0, lock↔listener consistency held across daemon generations |
+| (uncommitted) | `wait-ready` subcommand (bd serena-rust-55m): blocks until type analysis truly usable (overview first-symbol → hover non-empty we0-verdict), 500ms→2s backoff, stderr progress; timeout exit 4 | AI/e2e scripts drop ~20 lines of hand-rolled polling each |
+| (uncommitted) | DAEMON_DRAINING client-side self-heal (bd serena-rust-g0m): forward classifies 503 + wire code, ≤5s window × 300ms retries full chain incl. lazy-spawn re-probe; beyond window original rc=3 error preserved | stop-all → immediate tool call succeeds instead of hard rc=3 |
 
 ## Phase 0 · Stability foundations (P0)
 

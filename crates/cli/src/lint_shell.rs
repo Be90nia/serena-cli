@@ -111,6 +111,7 @@ const TOOL_NAMES: &[&str] = &[
     "shell",
     "doctor",
     "lint-shell",
+    "wait-ready",
 ];
 
 /// position 型子命令的行号形状。手工同步自 main.rs `normalize_positions`
