@@ -158,6 +158,9 @@ pub type ToolResult<T> = std::result::Result<T, ToolError>;
 /// 会漏检同粒度改写，命中旧 SymbolHit → replace-body 切片错位）。
 type SymbolCacheKey = (PathBuf, String, Option<(SystemTime, u64)>);
 
+/// O3 解析候选：(file 相对路径, 符号 range)。
+type SymbolCandidates = Vec<(String, lsp_types::Range)>;
+
 /// overview / symbol-body 的缓存 key；文件不可 stat（不存在/失败）→ None（确定性 key）。
 fn doc_symbol_cache_key(root: &Path, file: &str) -> SymbolCacheKey {
     (
@@ -382,6 +385,27 @@ pub struct Supervisor {
     /// 修 P1 #2 测试专用：覆盖默认 TTL 让单测可控；生产 build 不持此字段。
     #[cfg(test)]
     _idle_ttl_override: std::sync::Arc<Mutex<Option<Duration>>>,
+    /// LS 启动暖机窗口（bd serena-rust-bxd O2/O4）：root → 记录。LS 会话新建
+    /// （session_for spawn 点）即记账并重置；首个语义工具（hover/def/refs/
+    /// find-implementations）非空成功即关闭。窗口内 find-symbol 结果可能随
+    /// 索引爬升波动（实测 9→4→6+），经既有 warning 通道透出 partial 信号。
+    /// 键用 key_root_identity 归一（Windows 大小写双重身份惯例）。
+    ls_warmup: Mutex<HashMap<String, LsWarmup>>,
+}
+
+/// 单 root 的 LS 暖机记账。
+struct LsWarmup {
+    started: std::time::Instant,
+    semantic_ok: bool,
+}
+
+/// 暖机窗口长度：LS 启动后 10s 内符号索引仍在爬升（P2-4 root 信号 2s TTL 覆盖
+/// 的是文件变更，这里是 LS 冷启动全局索引，窗长放宽到 10s）；首个语义成功提前关闭。
+const LS_WARMUP_WINDOW: Duration = Duration::from_secs(10);
+
+/// O4：暖机窗口内 find-symbol 附带的 partial 提示文案。
+fn index_warming_message() -> String {
+    "index warming: results may be partial".to_string()
 }
 /// 实例池身份键。`root` 保存 canonical **真实大小写**——rust-analyzer 按 URI 精确
 /// 字符串匹配挂载文件，小写化 root 会让 didOpen/def 的原始大小写 URI 脱挂所有
@@ -540,6 +564,7 @@ impl Supervisor {
             symbol_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             delta_cache: Arc::new(Mutex::new(HashMap::new())),
             idle_buffers_reclaim_counter: AtomicU64::new(0),
+            ls_warmup: Mutex::new(HashMap::new()),
             #[cfg(test)]
             _idle_ttl_override: std::sync::Arc::new(Mutex::new(None)),
         })
@@ -958,6 +983,8 @@ impl Supervisor {
             .lock()
             .unwrap()
             .insert(key.clone(), session.clone());
+        // bd serena-rust-bxd O2/O4：LS 冷启动/重启 → 开（或重开）暖机窗口。
+        self.mark_ls_started(&key.root);
         self.touch(&key);
         Ok(session)
     }
@@ -1904,6 +1931,43 @@ impl Supervisor {
     }
 
 
+    /// LS 会话新建（session_for spawn 点）记账：开窗 + 清语义就绪标记。
+    /// LS 重启（evict/懒重启）即重新冷启动，窗口必须重开。
+    fn mark_ls_started(&self, root: &Path) {
+        self.ls_warmup.lock().unwrap().insert(
+            key_root_identity(root),
+            LsWarmup {
+                started: std::time::Instant::now(),
+                semantic_ok: false,
+            },
+        );
+    }
+
+    /// 首个语义工具（hover/def/refs/find-implementations）非空成功 → 关窗。
+    fn mark_semantic_ready(&self, root: &Path) {
+        if let Some(w) = self.ls_warmup.lock().unwrap().get_mut(&key_root_identity(root)) {
+            w.semantic_ok = true;
+        }
+    }
+
+    /// 暖机窗口判定：LS 已启动 && 10s 内 && 首语义成功未到 → partial 提示。
+    /// 无记账（root 从未拉起 LS）→ 不提示（无可言的窗口）。
+    fn index_warming_warnings(&self, root: &Path) -> Vec<String> {
+        let active = self
+            .ls_warmup
+            .lock()
+            .unwrap()
+            .get(&key_root_identity(root))
+            .is_some_and(|w| {
+                !w.semantic_ok && w.started.elapsed() < LS_WARMUP_WINDOW
+            });
+        if active {
+            vec![index_warming_message()]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// 写工具收尾标记（bd serena-rust-0em）：file 进入写后一致性窗口。
     fn mark_recent_write(&self, root: &Path, file: &str) {
         self.recent_writes
@@ -2541,7 +2605,9 @@ impl Supervisor {
         {
             warnings.push(w);
         }
-        if warnings.is_empty() {
+        // 暖机窗口内的空结果是「假空」（wssym 未爬完，打回实锤 1 分钟后同查询
+        // 命中数十处）——不得入缓存，否则 500ms 重试与就绪后重查都命中缓存恒空。
+        if warnings.is_empty() && self.index_warming_warnings(root).is_empty() {
             self.symbol_cache_put(cache_key, merged.clone()); // cache_miss → 写入（截断前全量）
         }
         merged.truncate(limit);
@@ -2876,6 +2942,129 @@ impl Supervisor {
                 message: format!("find_referencing_code_snippets: {e}"),
             })
         })
+    }
+
+    /// O3（bd serena-rust-bxd）：`--symbol` 直查的符号名解析。
+    ///
+    /// 解析顺序：documentSymbol 缓存（overview/symbol-body 等已铺平的 per-file
+    /// 表）精确名优先、其次前缀，确定性按 (file, line, col) 排序取首命中；缓存
+    /// 零命中时回退 workspace/symbol（= 两步法的第一步内部化，覆盖冷 daemon 时
+    /// documentSymbol 缓存为空的窗口）。命中多个 → 返回提示串（调用方附 warning
+    /// → CLI stderr 可见用了哪个）；零命中 → BadArgs rc=2。
+    ///
+    /// 返回的 line/col 为 LSP 0-based，与位置参数路径（CLI 已 -1）同基线。
+    async fn resolve_symbol_position(
+        &self,
+        root: &Path,
+        name: &str,
+        lang: Option<&str>,
+    ) -> ToolResult<(String, u32, u32, Option<String>)> {
+        // (file, range) 候选；精确名优先于前缀，同级确定性排序。
+        let pick = |hits: &[SymbolHit]| -> (SymbolCandidates, SymbolCandidates) {
+            let mut exact: Vec<(String, lsp_types::Range)> = Vec::new();
+            let mut prefix: Vec<(String, lsp_types::Range)> = Vec::new();
+            for h in hits {
+                if h.name == name {
+                    exact.push((h.name.clone(), h.range));
+                } else if h.name.starts_with(name) {
+                    prefix.push((h.name.clone(), h.range));
+                }
+            }
+            (exact, prefix)
+        };
+        let mut exact: Vec<(String, lsp_types::Range)> = Vec::new();
+        let mut prefix: Vec<(String, lsp_types::Range)> = Vec::new();
+
+        // 1) documentSymbol 缓存扫描。key.1 即构造时的 file 相对路径，直接可复用。
+        let root_id = key_root_identity(root);
+        let cached_files: Vec<(String, Vec<SymbolHit>)> = self
+            .symbol_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| key_root_identity(&k.0) == root_id)
+            .map(|(k, v)| (k.1.clone(), v.clone()))
+            .collect();
+        for (file, hits) in &cached_files {
+            let (e, p) = pick(hits);
+            exact.extend(e.into_iter().map(|(_, r)| (file.clone(), r)));
+            prefix.extend(p.into_iter().map(|(_, r)| (file.clone(), r)));
+        }
+
+        // 2) 缓存零命中 → workspace/symbol 兜底（冷 daemon 窗口）。暖机窗口内
+        // wssym 首查常为「假空」（bd serena-rust-bxd 打回：1 分钟后同命令命中
+        // 数十处）——窗口仍 active 时追加 1 次 500ms 重试再判空。注意 warming
+        // 判定必须在 fallback 之后：首查经 session_for spawn LS 才开窗。
+        if exact.is_empty() && prefix.is_empty() {
+            for attempt in 0..2 {
+                match self.tool_find_symbol(root, name, 50, lang).await {
+                    Ok((hits, _)) => {
+                        for h in &hits {
+                            let Some(path) = uri_to_path(&h.uri) else {
+                                continue;
+                            };
+                            let rel = path
+                                .strip_prefix(root)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .to_string();
+                            if h.name == name {
+                                exact.push((rel, h.range));
+                            } else if h.name.starts_with(name) {
+                                prefix.push((rel, h.range));
+                            }
+                        }
+                    }
+                    // 暖机窗口内兜底查询自身失败（LS 未起/无可查 lang）不淹没
+                    // hint；非窗口如实上抛。
+                    Err(_) if !self.index_warming_warnings(root).is_empty() => {}
+                    Err(e) => return Err(e),
+                }
+                if !exact.is_empty() || !prefix.is_empty() {
+                    break;
+                }
+                if attempt == 0 && !self.index_warming_warnings(root).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                } else {
+                    break;
+                }
+            }
+        }
+        let warming = !self.index_warming_warnings(root).is_empty();
+
+        let by_pos = |a: &(String, lsp_types::Range), b: &(String, lsp_types::Range)| {
+            a.0.cmp(&b.0)
+                .then(a.1.start.line.cmp(&b.1.start.line))
+                .then(a.1.start.character.cmp(&b.1.start.character))
+        };
+        exact.sort_by(by_pos);
+        prefix.sort_by(by_pos);
+        // 歧义只在所选层级内计：有精确命中时前缀候选全部落选，不算「多命中」。
+        let (chosen, total) = if !exact.is_empty() {
+            (&exact, exact.len())
+        } else {
+            (&prefix, prefix.len())
+        };
+        let Some((file, range)) = chosen.first().cloned() else {
+            // 打回修复（bd serena-rust-bxd）：暖机窗口内零命中 ≠ 符号不存在——
+            // wssym 可能仍未爬完，错误必须带 hint 防 AI 误判（对齐 find-symbol
+            // 的 partial warning，不能比它更误导）。
+            let mut detail =
+                format!("symbol `{name}` not found (documentSymbol cache and workspace index empty)");
+            if warming {
+                detail.push_str(
+                    "; index may still be warming (cold start), retry shortly or use find-symbol",
+                );
+            }
+            return Err(ToolError::BadArgs { detail });
+        };
+        let note = (total > 1).then(|| {
+            format!(
+                "resolved --symbol {name} -> {file}:{} ({total} matches; using first, 1-based line)",
+                range.start.line + 1
+            )
+        });
+        Ok((file, range.start.line, range.start.character, note))
     }
 
     /// `replace_text_in_symbol`：在 symbol 体内替换 old→new（Task 25）。
@@ -5031,6 +5220,10 @@ impl SupervisorTrait for Supervisor {
                         "workspace error: {err}; semantic results may be empty (workspace failed to load)"
                     ));
                 }
+                // bd serena-rust-bxd O4：LS 暖机窗口内符号索引仍在爬升（结果数实测
+                // 波动 9→4→6+），成功响应同样附 partial 提示，AI 不会把中间态当
+                // 全量；窗口关闭（10s 或首语义成功）后自动消失，wire 零新字段。
+                warnings.extend(self.index_warming_warnings(root));
                 let mut value = symbol_hits_envelope(&raw, compact);
                 attach_warning(&mut value, &warnings);
                 let root_key = format!("{}|{}|{}", root.display(), query, limit);
@@ -5272,6 +5465,9 @@ impl SupervisorTrait for Supervisor {
                         self.semantic_not_ready_warnings(root, &file, line, col, lang)
                             .await,
                     );
+                } else {
+                    // bd serena-rust-bxd O2/O4：首个语义成功 → 关暖机窗口。
+                    self.mark_semantic_ready(root);
                 }
                 attach_warning(&mut value, &ws);
                 Ok(value)
@@ -5298,6 +5494,8 @@ impl SupervisorTrait for Supervisor {
                         self.semantic_not_ready_warnings(root, &file, line, col, lang)
                             .await,
                     );
+                } else {
+                    self.mark_semantic_ready(root);
                 }
                 attach_warning(&mut value, &ws);
                 Ok(value)
@@ -5333,6 +5531,8 @@ impl SupervisorTrait for Supervisor {
                         self.semantic_not_ready_warnings(root, &file, line, col, lang)
                             .await,
                     );
+                } else {
+                    self.mark_semantic_ready(root);
                 }
                 attach_warning(&mut value, &ws);
                 let root_key = format!("{}|{}|{}|{}", root.display(), file, line, col);
@@ -5368,6 +5568,8 @@ impl SupervisorTrait for Supervisor {
                         self.semantic_not_ready_warnings(root, &file, line, col, lang)
                             .await,
                     );
+                } else {
+                    self.mark_semantic_ready(root);
                 }
                 attach_warning(&mut value, &ws);
                 let root_key = format!("{}|{}|{}|{}", root.display(), file, line, col);
@@ -5538,7 +5740,16 @@ impl SupervisorTrait for Supervisor {
                 }
             }
             "find-referencing-code-snippets" => {
-                let (file, line, col) = required_position(&args)?;
+                // O3：`symbol` 直查 —— 符号名解析为 (file, line, col)（LSP 0-based），
+                // 与位置参数路径同基线；命中多个时附 warning 提示用了哪个。
+                let (file, line, col, resolution_note) =
+                    match args.get("symbol").and_then(|v| v.as_str()) {
+                        Some(name) => self.resolve_symbol_position(root, name, lang).await?,
+                        None => {
+                            let (f, l, c) = required_position(&args)?;
+                            (f, l, c, None)
+                        }
+                    };
                 let context_lines = args
                     .get("context_lines")
                     .and_then(|v| v.as_u64())
@@ -5558,7 +5769,11 @@ impl SupervisorTrait for Supervisor {
                         lang,
                     )
                     .await?;
-                Ok(ref_snippet_hits_envelope(&hits, compact))
+                let mut value = ref_snippet_hits_envelope(&hits, compact);
+                if let Some(note) = resolution_note {
+                    attach_warning(&mut value, &[note]);
+                }
+                Ok(value)
             }
             "replace-text-in-symbol" => {
                 let file = required_file(&args)?;
@@ -7162,6 +7377,113 @@ mod symbol_cache_tests {
             },
             container: None,
         }
+    }
+
+    /// bd serena-rust-bxd O2/O4：暖机窗口开/关/过期三态。
+    #[tokio::test]
+    async fn index_warming_window_opens_closes_and_expires() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/warmup-proj");
+
+        // 无记账（从未拉起 LS）→ 不提示。
+        assert!(sup.index_warming_warnings(root).is_empty());
+
+        // LS 启动 → 窗口开（10s 内 + 未语义成功）→ partial 提示。
+        sup.mark_ls_started(root);
+        let ws = sup.index_warming_warnings(root);
+        assert_eq!(ws, vec![index_warming_message()]);
+
+        // 首个语义成功 → 窗口提前关闭。
+        sup.mark_semantic_ready(root);
+        assert!(sup.index_warming_warnings(root).is_empty());
+
+        // 过期路径：手工回拨 started 越过 10s 窗 → 不提示。
+        let stale_root = Path::new("Z:/no/such/warmup-stale");
+        sup.ls_warmup.lock().unwrap().insert(
+            key_root_identity(stale_root),
+            LsWarmup {
+                started: std::time::Instant::now() - LS_WARMUP_WINDOW - Duration::from_secs(1),
+                semantic_ok: false,
+            },
+        );
+        assert!(sup.index_warming_warnings(stale_root).is_empty());
+    }
+
+    /// bd serena-rust-bxd O3：--symbol 直查解析（documentSymbol 缓存路径）。
+    #[tokio::test]
+    async fn resolve_symbol_position_prefers_exact_and_reports_multi() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/o3-proj");
+        let mk = |name: &str, uri: &str, sl: u32, sc: u32| SymbolHit {
+            name: name.to_string(),
+            kind: SymbolKindTag::Function,
+            uri: uri.to_string(),
+            range: lsp_types::Range {
+                start: Position::new(sl, sc),
+                end: Position::new(sl, sc + 5),
+            },
+            container: None,
+        };
+        // 前缀命中在 a.rs（字母序在前），精确命中在 b.rs —— 精确必须赢。
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "a.rs"),
+            vec![mk("ensure_open_impl", "file:///x/a.rs", 0, 0)],
+        );
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "b.rs"),
+            vec![mk("ensure_open", "file:///x/b.rs", 4, 2)],
+        );
+        let (file, line, col, note) =
+            sup.resolve_symbol_position(root, "ensure_open", None).await.unwrap();
+        assert_eq!((file.as_str(), line, col), ("b.rs", 4, 2));
+        assert!(note.is_none(), "单命中不提示");
+
+        // 多命中：同名精确 ×2（前缀 ×1 落选不计）→ 取 (file, line, col) 序首者 + note 报总数。
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "c.rs"),
+            vec![mk("ensure_open", "file:///x/c.rs", 1, 0)],
+        );
+        let (file, _l, _c, note) =
+            sup.resolve_symbol_position(root, "ensure_open", None).await.unwrap();
+        assert_eq!(file, "b.rs", "同级按 (file, line, col) 排序取首");
+        let note = note.unwrap();
+        assert!(note.contains("2 matches"), "note 应报所选层级总数: {note}");
+        assert!(note.contains("b.rs:5"), "note 含 1-based 位置: {note}");
+
+        // 零命中：缓存无匹配 + fake root 的 wssym 兜底必败 → BadArgs rc=2。
+        let err = sup
+            .resolve_symbol_position(root, "zzz_absent", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::BadArgs { .. }),
+            "零命中必须 BadArgs rc=2: {err:?}"
+        );
+
+        // 打回修复：暖机窗口内零命中的错误必须带 warming hint（不得裸 not found
+        // 让 AI 误判「符号不存在」）；非窗口错误不带 hint。
+        sup.mark_ls_started(root);
+        let err = sup
+            .resolve_symbol_position(root, "zzz_absent_warm", None)
+            .await
+            .unwrap_err();
+        let ToolError::BadArgs { detail } = &err else {
+            panic!("expected BadArgs: {err:?}")
+        };
+        assert!(
+            detail.contains("index may still be warming (cold start), retry shortly or use find-symbol"),
+            "暖机窗口零命中必须带 hint: {detail}"
+        );
+        // 对照：非窗口 root（从未开窗）零命中 → 错误不带 warming hint。
+        let cold_root = Path::new("Z:/no/such/o3-proj-cold");
+        let err = sup
+            .resolve_symbol_position(cold_root, "zzz_absent", None)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("index may still be warming"),
+            "非窗口零命中不得带 hint: {err}"
+        );
     }
 
     /// ↖ mirror: ls.py@a5fd4d68 — 低层（LS 会话）版本变化后高层缓存不得再命中：

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use supervisor::{Supervisor, ToolError};
 
@@ -207,10 +207,16 @@ enum Cmd {
         page_size: usize,
     },
     /// 所有引用 + 每个 ref 前后 N 行。line/col 为 1-based。
+    /// `--symbol <NAME>` 直查（bd serena-rust-bxd）：免两步 find-symbol 拿坐标；
+    /// 给了 --symbol 则 FILE/LINE/COL 可省（内部解析首命中，命中多个时 warning
+    /// 提示用了哪个，零命中 rc=2）。
     FindReferencingCodeSnippets {
-        file: String,
-        line: u32,
-        col: u32,
+        file: Option<String>,
+        line: Option<u32>,
+        col: Option<u32>,
+        /// 符号名直查：documentSymbol 缓存精确名优先、其次前缀，转 line/col。
+        #[arg(long, value_name = "NAME")]
+        symbol: Option<String>,
         /// 每个 ref 上下文行数（前后对称）。
         #[arg(long, default_value_t = 3)]
         context_lines: u32,
@@ -242,17 +248,22 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
-    /// 阻塞到类型分析真正可用（bd serena-rust-55m）：循环探测——overview 首符号
-    /// 非空（符号索引起）→ hover 该位置 contents 非空（类型分析起；未就绪响应带
-    /// we0 warning，解析即判据）。就绪 exit 0；超时 exit 4。探测间隔 500ms 起
-    /// 指数退避到 2s 封顶，进度单行打 stderr。
+    /// 阻塞到就绪（bd serena-rust-55m / bxd）：循环探测。`--stage symbol` =
+    /// overview 首符号非空即就绪（符号索引层，秒级）；`--stage semantic`（默认，
+    /// 保持现行为）= hover contents 非空（类型分析层；未就绪响应带 we0 warning，
+    /// 解析即判据）。就绪 exit 0；超时 exit 4。探测间隔 500ms 起指数退避到 2s
+    /// 封顶，进度（含阶段）单行打 stderr。
     WaitReady {
         /// 探测目标文件（默认项目内首个源文件，路径相对项目根或绝对）。
         #[arg(long, value_name = "FILE")]
         file: Option<String>,
-        /// 就绪等待上限（秒）。
-        #[arg(long, value_name = "N", default_value_t = 120)]
-        timeout: u64,
+        /// 就绪等待上限（秒）。可用环境变量 SERENA_WAIT_READY_TIMEOUT_SECS
+        /// 覆盖默认 120s（显式 --timeout 优先；非法值 warn + 用默认，对齐 j8b）。
+        #[arg(long, value_name = "N")]
+        timeout: Option<u64>,
+        /// 就绪档位：symbol = 符号索引可用；semantic = 类型分析可用。
+        #[arg(long, value_enum, default_value_t = WaitStage::Semantic)]
+        stage: WaitStage,
     },
     /// 替换符号体（写门 + hash 对账 + 原子写）。
     ReplaceBody {
@@ -581,10 +592,12 @@ async fn cli_main() -> ExitCode {
             let project_root = resolve_project_root(cli.project.clone());
             return cmd_doctor(*json, *fix, &lock_path, &project_root).await;
         }
-        // wait-ready（bd serena-rust-55m）：阻塞到类型分析真正可用，exit 0/4。
-        Some(Cmd::WaitReady { file, timeout }) => {
-            return cmd_wait_ready(&cli, file.as_deref(), *timeout, &lock_path).await;
-        }
+        // wait-ready（bd serena-rust-55m）：阻塞到就绪（symbol/semantic 档），exit 0/4。
+        Some(Cmd::WaitReady {
+            file,
+            timeout,
+            stage,
+        }) => return cmd_wait_ready(&cli, file.as_deref(), *timeout, *stage, &lock_path).await,
         Some(Cmd::Shell) => {}
         _ => {}
     }
@@ -973,6 +986,36 @@ async fn forward_with_draining_retry(cli: &Cli, lock_path: &Path) -> Result<(), 
 
 // ==== bd serena-rust-55m：wait-ready ====
 
+/// wait-ready 就绪档位（bd serena-rust-bxd）：symbol = 符号索引可用（秒级）；
+/// semantic = 类型分析可用（大 workspace 可达 120s+，历史默认判据）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum WaitStage {
+    Symbol,
+    Semantic,
+}
+
+/// wait-ready 超时上限（秒），默认 120s。
+const WAIT_READY_DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+/// 解析 wait-ready 超时：显式 --timeout 优先；否则 SERENA_WAIT_READY_TIMEOUT_SECS
+/// （非法值 warn + 用默认，对齐 j8b 的 parse_secs 惯例）；都没有 → 默认。
+fn wait_ready_timeout_secs(explicit: Option<u64>, env_raw: Option<&str>) -> u64 {
+    if let Some(t) = explicit {
+        return t;
+    }
+    match env_raw.map(str::trim).map(|s| s.parse::<u64>()) {
+        Some(Ok(t)) => t,
+        None => WAIT_READY_DEFAULT_TIMEOUT_SECS,
+        Some(Err(_)) => {
+            eprintln!(
+                "wait-ready: invalid SERENA_WAIT_READY_TIMEOUT_SECS={env_raw:?}; \
+                 using default {WAIT_READY_DEFAULT_TIMEOUT_SECS}s"
+            );
+            WAIT_READY_DEFAULT_TIMEOUT_SECS
+        }
+    }
+}
+
 /// 探测退避：500ms 起步指数退避，2s 封顶（避免打爆 daemon）。
 fn wait_ready_backoff(round: usize) -> Duration {
     Duration::from_millis(500u64 << round.min(2) as u32)
@@ -1065,16 +1108,22 @@ async fn probe_tool_call(
     }
 }
 
-/// `wait-ready` 子命令（bd serena-rust-55m）：阻塞到类型分析真正可用。
-/// 两段探测：overview 首符号非空（符号索引起）→ hover 该位置 contents 非空
-/// （类型分析起；未就绪响应带 we0 warning，`hover_ready` 解析即判据）。
-/// 就绪 exit 0（stderr 'ready in NNs'）；超时 exit 4。
+/// `wait-ready` 子命令（bd serena-rust-55m / bxd）：阻塞到所选档位就绪。
+/// 两段探测：overview 首符号非空（符号索引起）→ semantic 档再 hover 该位置
+/// contents 非空（类型分析起；未就绪响应带 we0 warning，`hover_ready` 解析即判据）。
+/// 就绪 exit 0（stderr 'ready in NNs'）；超时 exit 4。进度行带阶段
+/// （`probe #N symbol-pending` / `probe #N symbol-ok hover-pending`）。
 async fn cmd_wait_ready(
     cli: &Cli,
     file: Option<&str>,
-    timeout_secs: u64,
+    timeout: Option<u64>,
+    stage: WaitStage,
     lock_path: &Path,
 ) -> ExitCode {
+    let timeout_secs = wait_ready_timeout_secs(
+        timeout,
+        std::env::var("SERENA_WAIT_READY_TIMEOUT_SECS").ok().as_deref(),
+    );
     let root = resolve_project_root(cli.project.clone());
     let probe_path = match file {
         Some(f) => PathBuf::from(f),
@@ -1136,6 +1185,10 @@ async fn cmd_wait_ready(
                 })
         });
         if let Some((line, col)) = hit_pos {
+            if stage == WaitStage::Symbol {
+                eprintln!("ready (symbol) in {}s", started.elapsed().as_secs());
+                return ExitCode::SUCCESS;
+            }
             // 段 2：类型分析——hover 首符号位置（we0 warning = 未就绪标记）。
             // 探测期瞬态（RA -32801 content modified / 连接抖动）≠ 确认就绪，
             // 一律退避续等到 deadline——等待语义不做硬失败。
@@ -1162,7 +1215,12 @@ async fn cmd_wait_ready(
             eprintln!("wait-ready: not ready within {timeout_secs}s");
             return ExitCode::from(4);
         }
-        eprintln!("waiting... {}s", started.elapsed().as_secs());
+        let progress = if hit_pos.is_some() {
+            "symbol-ok hover-pending"
+        } else {
+            "symbol-pending"
+        };
+        eprintln!("wait-ready: probe #{round} {progress}");
         tokio::time::sleep(wait_ready_backoff(round)).await;
         round += 1;
     }
@@ -1242,7 +1300,7 @@ fn autodetect_lang(cli: &Cli) -> Option<String> {
         Some(Cmd::FindImplementations { file, .. }) => Some(file),
         Some(Cmd::RenameSymbol { file, .. }) => Some(file),
         Some(Cmd::FindReferencingSymbols { file, .. }) => Some(file),
-        Some(Cmd::FindReferencingCodeSnippets { file, .. }) => Some(file),
+        Some(Cmd::FindReferencingCodeSnippets { file, .. }) => file.as_deref(),
         Some(Cmd::SymbolBody { file, .. }) => Some(file),
         Some(Cmd::EditContext { file, .. }) => Some(file),
         Some(Cmd::Completion { file, .. }) => Some(file),
@@ -1496,18 +1554,29 @@ async fn forward(
             file,
             line,
             col,
+            symbol,
             context_lines,
             max_results,
-        }) => (
-            "find-referencing-code-snippets",
-            json!({
-                "file": file,
-                "line": line,
-                "col": col,
+        }) => {
+            // --symbol 直查：位置可省，supervisor 端解析符号名转坐标（O3）。
+            let mut a = json!({
                 "context_lines": context_lines,
                 "max_results": max_results,
-            }),
-        ),
+            });
+            if let Some(name) = symbol {
+                a["symbol"] = json!(name);
+            }
+            if let Some(f) = file {
+                a["file"] = json!(f);
+            }
+            if let Some(l) = line {
+                a["line"] = json!(l);
+            }
+            if let Some(c) = col {
+                a["col"] = json!(c);
+            }
+            ("find-referencing-code-snippets", a)
+        }
         Some(Cmd::SymbolBody { file, symbol }) => {
             ("symbol-body", json!({"file": file, "symbol": symbol}))
         }
@@ -1833,8 +1902,20 @@ async fn forward(
     }
     match payload.get("ok").and_then(|v| v.as_bool()) {
         Some(true) => {
-            print_json(payload.get("data").unwrap_or(&serde_json::Value::Null))
-                .map_err(|e| e.to_string())?;
+            let data = payload.get("data").unwrap_or(&serde_json::Value::Null);
+            // bd serena-rust-bxd O2：人类可读模式不再吞 supervisor warning ——
+            // 统一打 stderr（--json 模式 warning 字段本就随 data 透传，不动）。
+            if let Some(w) = data.get("warning").and_then(|v| v.as_str()) {
+                eprintln!("[warn] {w}");
+            }
+            // 空结果 + warning = 「没符号」可能是「没就绪」（we0/暖机窗口）→
+            // 误导性最强的形态，额外给固定 hint；正常空（无 warning）不打，不误报。
+            if payload_is_empty(data) && data.get("warning").is_some() {
+                eprintln!(
+                    "[hint] index warming: semantic layer not ready, empty result may be false negative (rerun or use wait-ready)"
+                );
+            }
+            print_json(data).map_err(|e| e.to_string())?;
             Ok(())
         }
         _ => {
@@ -2071,6 +2152,15 @@ async fn cmd_stop_all(lock_path: &Path) -> ExitCode {
             eprintln!("shutdown probe failed: {other:?}; lock left for lazy-spawn arbitration");
             ExitCode::from(3)
         }
+    }
+}
+
+/// wire 成功 data 是否为空结果：`items:[]` envelope 或裸 `[]`。
+/// 无 items 且非数组的形态（hover 对象等）视为非空——O2 hint 只管集合型工具。
+fn payload_is_empty(v: &serde_json::Value) -> bool {
+    match v.get("items") {
+        Some(items) => items.as_array().is_some_and(|a| a.is_empty()),
+        None => v.as_array().is_some_and(|a| a.is_empty()),
     }
 }
 
@@ -2380,13 +2470,25 @@ fn to_lsp_line(line: u32) -> Result<u32, String> {
 /// 的原始 bug 形态）；行级工具误登记 = 双重 -1（单测锁定）。
 fn normalize_positions(cmd: &mut Cmd) -> Result<(), String> {
     match cmd {
+        // O3：--symbol 直查时位置可省；给了位置才做 1-based → 0-based 归一，
+        // 缺位置交由 supervisor required_position 报 BAD_ARGS rc=2。
+        Cmd::FindReferencingCodeSnippets {
+            line: Some(l),
+            col: Some(c),
+            symbol,
+            ..
+        } if symbol.is_none() => {
+            let (nl, nc) = to_lsp_pos(*l, *c)?;
+            *l = nl;
+            *c = nc;
+            Ok(())
+        }
         Cmd::Def { line, col, .. }
         | Cmd::Refs { line, col, .. }
         | Cmd::Hover { line, col, .. }
         | Cmd::FindImplementations { line, col, .. }
         | Cmd::RenameSymbol { line, col, .. }
         | Cmd::FindReferencingSymbols { line, col, .. }
-        | Cmd::FindReferencingCodeSnippets { line, col, .. }
         | Cmd::Completion { line, col, .. }
         | Cmd::ContainingSymbol { line, col, .. }
         | Cmd::DefiningSymbol { line, col, .. }
@@ -2918,6 +3020,62 @@ mod net_retry_tests {
         assert_eq!(wait_ready_backoff(1), Duration::from_millis(1000));
         assert_eq!(wait_ready_backoff(2), Duration::from_millis(2000));
         assert_eq!(wait_ready_backoff(10), Duration::from_millis(2000), "封顶");
+    }
+
+    #[test]
+    fn wait_ready_timeout_explicit_beats_env_and_invalid_env_falls_back() {
+        // 显式 --timeout 永远优先。
+        assert_eq!(wait_ready_timeout_secs(Some(5), Some("999")), 5);
+        // 合法 env 覆盖默认。
+        assert_eq!(wait_ready_timeout_secs(None, Some("300")), 300);
+        // 非法 env（非数字 / 空白含非数字）→ warn + 默认。
+        assert_eq!(
+            wait_ready_timeout_secs(None, Some("abc")),
+            WAIT_READY_DEFAULT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            wait_ready_timeout_secs(None, Some("")),
+            WAIT_READY_DEFAULT_TIMEOUT_SECS
+        );
+        // 都没有 → 默认。
+        assert_eq!(
+            wait_ready_timeout_secs(None, None),
+            WAIT_READY_DEFAULT_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn wait_ready_stage_defaults_to_semantic_and_parses_symbol() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["serena-cli", "--project", ".", "wait-ready"]).unwrap();
+        let Some(Cmd::WaitReady { stage, timeout, .. }) = cli.cmd else {
+            panic!("expected wait-ready");
+        };
+        assert_eq!(stage, WaitStage::Semantic, "默认保持现行为 semantic");
+        assert_eq!(timeout, None);
+        let cli = Cli::try_parse_from([
+            "serena-cli",
+            "--project",
+            ".",
+            "wait-ready",
+            "--stage",
+            "symbol",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::WaitReady { stage: WaitStage::Symbol, .. })
+        ));
+    }
+
+    #[test]
+    fn payload_is_empty_covers_envelope_and_bare_array_but_not_hover_objects() {
+        assert!(payload_is_empty(&json!({ "items": [], "warning": "w" })));
+        assert!(payload_is_empty(&json!([])));
+        assert!(!payload_is_empty(&json!({ "items": [1] })));
+        assert!(!payload_is_empty(&json!({ "compact": true, "items": ["a", "f:1:1"] })));
+        // hover 等无 items 的对象形态不算「空集合」——O2 hint 只管集合型工具。
+        assert!(!payload_is_empty(&json!({ "contents": "" })));
     }
 
     #[test]
