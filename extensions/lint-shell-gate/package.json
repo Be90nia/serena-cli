@@ -1,0 +1,13 @@
+{
+  "name": "lint-shell-gate",
+  "version": "0.1.0",
+  "description": "omp extension — runs `serena-cli lint-shell --cmd <bash command>` after every bash tool_result and injects an error-only reminder into the conversation history (warn-only, fail-open).",
+  "private": true,
+  "main": "index.ts",
+  "engines": {
+    "omp": ">=18.3.0"
+  },
+  "scripts": {
+    "test": "bun test index.test.ts"
+  }
+}
