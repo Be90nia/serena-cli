@@ -19,6 +19,9 @@ use lsp_core::types::SymbolKindTag;
 use supervisor::Supervisor;
 
 fn has_clangd() -> bool {
+    if std::env::var_os("SERENA_SKIP_LS_E2E").is_some() {
+        return false; // CI: skip real-LS e2e (3rd-party LS version drift; covered locally/nightly)
+    }
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             for ext in if cfg!(windows) {

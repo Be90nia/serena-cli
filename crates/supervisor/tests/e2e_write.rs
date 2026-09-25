@@ -28,6 +28,9 @@ fn fixtures_root() -> PathBuf {
 
 /// 与 e2e_direct.rs 同款 PATH + LLVM 标准路径探测。
 fn has_clangd() -> bool {
+    if std::env::var_os("SERENA_SKIP_LS_E2E").is_some() {
+        return false; // CI: skip real-LS e2e (3rd-party LS version drift; covered locally/nightly)
+    }
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd", ".bat"]
     } else {

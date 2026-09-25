@@ -113,6 +113,9 @@ async fn m0_overview_def_refs_over_real_clangd() {
 /// Mimic `ls_adapters::which_no_unc` exactly so the skip policy matches the
 /// production code path. Duplicating 15 lines avoids lifting the helper.
 fn has_clangd() -> bool {
+    if std::env::var_os("SERENA_SKIP_LS_E2E").is_some() {
+        return false; // CI: skip real-LS e2e (3rd-party LS version drift; covered locally/nightly)
+    }
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd", ".bat"]
     } else {
