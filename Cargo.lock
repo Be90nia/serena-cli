@@ -259,26 +259,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "daemon",
- "dunce",
- "ls-registry",
- "lsp-core",
- "reqwest",
- "serde",
- "serde_json",
- "supervisor",
- "tokio",
- "tracing-subscriber",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1344,6 +1324,26 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serena-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "daemon",
+ "dunce",
+ "ls-registry",
+ "lsp-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "supervisor",
+ "tokio",
+ "tracing-subscriber",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

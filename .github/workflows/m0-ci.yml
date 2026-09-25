@@ -31,4 +31,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: serena-cli-m0-${{ github.sha }}
-          path: target/release/cli.exe
+          path: target/release/serena-cli.exe

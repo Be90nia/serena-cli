@@ -1,10 +1,10 @@
 [package]
-name = "cli"
+name = "serena-cli"
 edition.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "cli"
+name = "serena-cli"
 path = "src/main.rs"
 
 [dependencies]

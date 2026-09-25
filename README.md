@@ -58,8 +58,8 @@ All 7 end-to-end smoke verified on real language servers (rust, typescript, c/cp
 
 ```bash
 # From source (single binary, no runtime deps beyond `rustup` itself)
-git clone https://github.com/<you>/serena-rust.git
-cd serena-rust
+git clone https://github.com/Be90nia/serena-cli.git
+cd serena-cli
 cargo install --path crates/cli --locked
 
 # Verify

@@ -60,8 +60,8 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 ```bash
 # 从源码安装（单二进制，除 rustup 本身外无运行时依赖）
-git clone https://github.com/<you>/serena-rust.git
-cd serena-rust
+git clone https://github.com/Be90nia/serena-cli.git
+cd serena-cli
 cargo install --path crates/cli --locked
 
 # 验证

@@ -1,11 +1,11 @@
 //! lint-shell 子命令端到端测试（bd serena-rust-8ot 验收 2-6）。
 //!
-//! 走真实二进制（CARGO_BIN_EXE_cli），覆盖 exit code 协议与输出格式。
+//! 走真实二进制（CARGO_BIN_EXE_serena-cli），覆盖 exit code 协议与输出格式。
 
 use std::process::Command;
 
 fn lint_cmd(cmd: &str, extra: &[&str]) -> (i32, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_cli"))
+    let out = Command::new(env!("CARGO_BIN_EXE_serena-cli"))
         .args(["lint-shell", "--cmd", cmd])
         .args(extra)
         .output()
@@ -69,7 +69,7 @@ fn json_output_is_valid() {
 #[test]
 fn cmd_stdin_equivalent() {
     use std::io::Write;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_serena-cli"))
         .args(["lint-shell", "--cmd-stdin", "--strict"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
