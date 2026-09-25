@@ -11,6 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # locate_finds_functional_rust_analyzer 探测真 rust-analyzer（rustup which
+          # → --version 校验）；minimal profile 不含该组件，rustup proxy 会因组件
+          # 缺失 --version 失败 → locate 链全落空。
+          components: rust-analyzer
       - name: Cache cargo
         uses: actions/cache@v4
         with:

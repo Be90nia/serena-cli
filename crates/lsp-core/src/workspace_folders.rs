@@ -46,6 +46,11 @@ use tracing::trace;
 /// 探测 root 下的 monorepo modules，返回**除 root 自身外**的额外 WorkspaceFolder。
 /// root 自身由 supervisor 加到结果首部——本函数只看 modules。
 pub fn discover_additional_workspace_folders(root: &Path) -> Vec<WorkspaceFolder> {
+    // root 可能是非 canonical 形态（8.3 短名 `RUNNER~1` / 大小写漂移）：module_folder
+    // 把 module canonical 化后按组件比对 root，raw root 会把全部模块误过滤
+    // （M0 CI windows runner 的 TEMP 即 `C:\Users\RUNNER~1\...`，实测回归）。
+    // root 一并 canonical 化，保证与 module 同一身份。
+    let root = &dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut folders = Vec::new();
 
     // Cargo workspace（[workspace] members）
@@ -458,6 +463,27 @@ mod tests {
             folders.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains("mod-a"));
         assert!(names.contains("mod-b"));
+    }
+
+    /// root 以非 canonical 形态传入（8.3 短名 `RUNNER~1` / 大小写漂移）时模块探测
+    /// 不得清零 —— M0 CI windows runner 的 TEMP 即 `C:\Users\RUNNER~1\...` 形态，
+    /// raw root vs canonical module 前缀失配曾把全部 module 过滤掉（实测回归）。
+    #[test]
+    fn discover_survives_non_canonical_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_go_work(tmp.path(), &["mod-a", "mod-b"]);
+        // Windows：整路径小写化制造 canonical（真实大小写）与 raw 的组件失配；
+        // 非 Windows 文件系统大小写敏感，保持原路径（退化为普通 sanity 检查）。
+        #[cfg(windows)]
+        let root = std::path::PathBuf::from(tmp.path().to_str().unwrap().to_lowercase());
+        #[cfg(not(windows))]
+        let root = tmp.path().to_path_buf();
+        let folders = discover_additional_workspace_folders(&root);
+        assert_eq!(
+            folders.len(),
+            2,
+            "非 canonical root 不得过滤掉 go.work 模块: {folders:?}"
+        );
     }
 
     #[test]
