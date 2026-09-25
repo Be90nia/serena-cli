@@ -25,16 +25,20 @@ use async_trait::async_trait;
 use lsp_types::InitializeParams;
 
 pub mod basedpyright_server;
+pub mod bash;
 pub mod clangd;
 pub mod csharp_ls;
 pub mod gopls;
 pub mod jdtls;
 pub mod jedi_server;
+pub mod json;
+pub mod powershell;
 pub mod pyre_server;
 pub mod pyright;
 pub mod rust_analyzer;
 pub mod ty_server;
 pub mod typescript;
+pub mod vue;
 
 /// 语言标识：与 `servers.toml` `languages` 字段、claude 端 ProjectCtx.language 一一对应。
 ///
@@ -51,6 +55,10 @@ pub enum LanguageId {
     Java,
     /// T0 配置驱动（servers.toml，Task 19）：无手写 T2 适配器的语言从 here 起。
     Markdown,
+    Bash,
+    Json,
+    PowerShell,
+    Vue,
 }
 
 impl LanguageId {
@@ -64,6 +72,10 @@ impl LanguageId {
             Self::CSharp => "csharp",
             Self::Java => "java",
             Self::Markdown => "markdown",
+            Self::Bash => "bash",
+            Self::Json => "json",
+            Self::PowerShell => "powershell",
+            Self::Vue => "vue",
         }
     }
     /// 反向：lang 字符串 → LanguageId。未知返 None。
@@ -77,6 +89,10 @@ impl LanguageId {
             "csharp" => Some(Self::CSharp),
             "java" => Some(Self::Java),
             "markdown" => Some(Self::Markdown),
+            "bash" => Some(Self::Bash),
+            "json" => Some(Self::Json),
+            "powershell" | "pwsh" => Some(Self::PowerShell),
+            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -94,6 +110,10 @@ impl LanguageId {
             "cs" => Some(Self::CSharp),
             "java" => Some(Self::Java),
             "md" | "markdown" => Some(Self::Markdown),
+            "sh" | "bash" => Some(Self::Bash),
+            "json" | "jsonc" => Some(Self::Json),
+            "ps1" | "psm1" | "psd1" => Some(Self::PowerShell),
+            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -158,6 +178,10 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::TypeScript => &["ts", "tsx", "js", "jsx"],
         // T0 注册语言，无 T2 适配器/LS 就绪门语义；探针走工程标记名单。
         LanguageId::Markdown => &[],
+        LanguageId::Bash => &["sh", "bash"],
+        LanguageId::Json => &["json"],
+        LanguageId::PowerShell => &["ps1", "psm1", "psd1"],
+        LanguageId::Vue => &["vue"],
     }
 }
 
@@ -272,6 +296,26 @@ pub trait LanguageServerAdapter: Send + Sync {
         Ok(())
     }
 
+    /// [`Self::on_server_ready`] 的 `Arc` 变体：编排型 adapter（vue hybrid 的伴生
+    /// 生命周期绑定需要 `Weak<Session>`）覆写本方法而非 trait 全员改签名；默认转发。
+    /// supervisor 统一调本方法。
+    async fn on_session_ready(
+        &self,
+        session: &std::sync::Arc<lsp_core::session::Session>,
+    ) -> anyhow::Result<()> {
+        Self::on_server_ready(self, session).await
+    }
+
+    /// hybrid 语言的语义会话：`.vue` 的 script 类型语义（hover/诊断等）由伴生
+    /// TypeScript LS（tsserver + `@vue/typescript-plugin`）承载，主 Vue LS 只承载
+    /// SFC 结构与模板语义（↖ mirror 上游双 server 分工：Vue LS 处理 .vue 结构、
+    /// TypeScript LS 处理 TS 语义）。返回 `Some` 时 supervisor 把 hover /
+    /// signature-help 等位置类语义请求路由到该会话，并把伴生 publishDiagnostics
+    /// 并入同一诊断缓存。未拉起 / 已退场 → `None`（调用方回退主会话）。
+    fn semantic_session(&self, _root: &Path) -> Option<std::sync::Arc<lsp_core::session::Session>> {
+        None
+    }
+
     /// 写类工具（rename / replace-body）入口的索引等待（PLAN Phase 3.2）。
     ///
     /// 默认实现：对被操作文件 `file` 反复发 `textDocument/documentSymbol` 探针，直到
@@ -334,8 +378,11 @@ pub trait LanguageServerAdapter: Send + Sync {
 ///
 /// dunce 在 Windows 下把 `\\?\C:\...` 退化为 `C:\...`，避免污染 LSP URI。
 pub(crate) fn which_no_unc(name: &str) -> Option<PathBuf> {
+    // Windows 不含无扩展名候选：PATH 上的同名裸文件是 npm/sh shim（sh 脚本，
+    // CreateProcess 无法执行），先命中会令下游 spawn 失败 —— doctor 报 npm MISS
+    // 而 `where.exe npm` 命中的根因。.exe/.cmd/.bat 才是 Windows 可执行形态。
     let exts: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".cmd", ".bat"]
+        &[".exe", ".cmd", ".bat"]
     } else {
         &[""]
     };

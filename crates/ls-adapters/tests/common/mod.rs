@@ -196,3 +196,34 @@ pub fn assert_basic_metadata<A: LanguageServerAdapter>(
     let h = adapter.request_hooks();
     let _ = h; // default 即可；具体语义由各 adapter 内部 test 覆盖
 }
+
+/// PATH 前置 `dir` 后调 `which_path(name)`（which 探测共用 PATH 串行锁）。
+pub async fn which_with_dir_on_path(
+    dir: &std::path::Path,
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    let dir_path = dir.to_path_buf();
+    let name = name.to_string();
+    let holder: std::sync::Arc<std::sync::Mutex<Option<Option<std::path::PathBuf>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let holder_c = holder.clone();
+    with_path_lock(move || {
+        let holder_c = holder_c.clone();
+        let dir_path = dir_path.clone();
+        async move {
+            let original = std::env::var_os("PATH").unwrap_or_default();
+            let mut new_path = dir_path.as_os_str().to_os_string();
+            if !original.is_empty() {
+                new_path.push(if cfg!(windows) { ";" } else { ":" });
+                new_path.push(original.clone());
+            }
+            // SAFETY: 持 PATH_LOCK。
+            unsafe { std::env::set_var("PATH", &new_path) };
+            let found = ls_adapters::which_path(&name);
+            unsafe { std::env::set_var("PATH", original) };
+            *holder_c.lock().unwrap() = Some(found);
+        }
+    })
+    .await;
+    holder.lock().unwrap().take().unwrap()
+}
