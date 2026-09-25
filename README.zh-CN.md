@@ -53,7 +53,7 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 | Go | gopls | ready（adapter 壳） | `go.work` / 多模块目录检测为 stub |
 | C# | csharp-ls | ready（adapter 壳） | 决策记录：`local/csharp-ls-decision.md`（上游已迁移至 roslyn LS） |
 | Java | jdtls | ready（自动下载） | 约 100MB 下载，JVM 参数模板见 `crates/ls-runtime/src/install.rs` |
-| Bash | bash-language-server | ready（npm） | tree-sitter 语法诊断；ShellCheck 集成未捆绑 |
+| Bash | bash-language-server | ready（npm） | tree-sitter 语法诊断；hover 依赖 Unix `man` 页（Windows 上为空）；ShellCheck 集成未捆绑 |
 | JSON | vscode-json-languageserver | ready（npm） | schema 驱动的 hover/诊断 |
 | PowerShell | PowerShellEditorServices | ready（下载） | 需要 `pwsh` 7+；内置 PSScriptAnalyzer 诊断 |
 | Vue | @vue/language-server | ready（npm，hybrid） | 伴生 typescript-language-server 挂 `@vue/typescript-plugin`；语义 hover/路由已通，诊断走 tsserver 桥待接 |

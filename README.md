@@ -51,7 +51,7 @@ vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent
 | Go | gopls | ready (adapter shell) | `go.work` / multi-module dir detection stubbed |
 | C# | csharp-ls | ready (adapter shell) | decision log: `local/csharp-ls-decision.md` (upstream migrated to roslyn LS) |
 | Java | jdtls | ready (auto-download) | ~100MB download, JVM arg templates from `crates/ls-runtime/src/install.rs` |
-| Bash | bash-language-server | ready (npm) | tree-sitter syntax diagnostics; ShellCheck integration not bundled |
+| Bash | bash-language-server | ready (npm) | tree-sitter syntax diagnostics; hover needs Unix `man` pages (empty on Windows); ShellCheck integration not bundled |
 | JSON | vscode-json-languageserver | ready (npm) | schema-driven hover/diagnostics |
 | PowerShell | PowerShellEditorServices | ready (download) | requires `pwsh` 7+; bundled PSScriptAnalyzer diagnostics |
 | Vue | @vue/language-server | ready (npm, hybrid) | companion typescript-language-server with `@vue/typescript-plugin`; semantic hover/routing live, diagnostics via tsserver bridge pending |
