@@ -869,56 +869,10 @@ impl Supervisor {
         let cache = std::sync::Arc::clone(&self.diag_cache);
         let generation = std::sync::Arc::clone(&self.diag_generation);
         let version_seen = std::sync::Arc::clone(&self.version_seen);
-        session
-            .client()
-            .on_notification("textDocument/publishDiagnostics", move |msg| {
-                let Some(uri) = msg
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("uri"))
-                    .and_then(|u| u.as_str())
-                else {
-                    return;
-                };
-                let Some(items) = msg
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("diagnostics"))
-                    .and_then(|d| d.as_array())
-                    .cloned()
-                else {
-                    return;
-                };
-                // generation 只计**非空**推送（2026-09-23 语义修正）：RA 的空推送是
-                // 分析中间态快照（didOpen 后 ~2.5s 才推完整错误版），若空推送也 ++，
-                // wait_gen 会在中间态就 confirmed → 误判"确认无错"。空推送仍清缓存
-                // （修 P1 #1：改完错误后 RA 推空，仅 !is_empty 写入会让陈旧错误永存），
-                // 但只表示"上一版错误已失效"，不代表新分析完成。
-                // cache key 归一化：RA 推送 uri 盘符小写（file:///d:/...），而
-                // path_to_uri 生成大写（file:///D:/...）—— 不归一则 cache 永远 miss
-                // （2026-09-23 debug 日志实锤）。Windows 路径大小写不敏感，统一小写。
-                // 空推送也入 cache（带 version）—— "version N 的 items 为空" =
-                // 该版内容确认无错（gen 不 ++，generation 只计含错误推送）。
-                let ver = msg
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("version"))
-                    .and_then(|v| v.as_i64());
-                if ver.is_some() {
-                    version_seen
-                        .lock()
-                        .unwrap()
-                        .insert((cache_root.clone(), diag_uri_key(uri)), true);
-                }
-                let mut cache = cache.lock().unwrap();
-                let key = (cache_root.clone(), diag_uri_key(uri));
-                if items.is_empty() {
-                    cache.insert(key, (Vec::new(), ver));
-                } else {
-                    cache.insert(key, (items, ver));
-                    generation.fetch_add(1, Ordering::Relaxed);
-                }
-            });
+        session.client().on_notification(
+            "textDocument/publishDiagnostics",
+            make_diag_handler(cache_root, cache, generation, version_seen),
+        );
         // bd serena-rust-xzb：workspace 加载错误的可见通道除 window 消息外，RA 的
         // FetchWorkspaceError 只出现在 LS stderr（stderr 泵在 lsp-core，禁区不可改）
         // —— rust root 由 probe_cargo_workspace_error（下方 insert 前）主动探测。
@@ -955,11 +909,26 @@ impl Supervisor {
         if let Some(adapter) = &t2 {
             adapter.set_project_root(&key.root);
             if let Err(e) =
-                tokio::time::timeout(Duration::from_secs(30), adapter.on_server_ready(&session))
+                tokio::time::timeout(Duration::from_secs(30), adapter.on_session_ready(&session))
                     .await
             {
                 tracing::warn!(adapter = adapter.id(), error = %e, "on_server_ready probe failed/timed out; continuing");
             }
+        }
+        // hybrid 语言（vue）：伴生 TS LS 的类型诊断并入同一 diag_cache，agent 的
+        // diagnostics 工具同时看到模板错（主 LS）与类型错（tsserver）。handler 与
+        // 主会话同源（make_diag_handler），缓存键按 uri 归一互不冲突。
+        if let Some(adapter) = &t2
+            && let Some(companion) = adapter.semantic_session(&key.root)
+        {
+            let cache_root = key.root.clone();
+            let cache = std::sync::Arc::clone(&self.diag_cache);
+            let generation = std::sync::Arc::clone(&self.diag_generation);
+            let version_seen = std::sync::Arc::clone(&self.version_seen);
+            companion.client().on_notification(
+                "textDocument/publishDiagnostics",
+                make_diag_handler(cache_root, cache, generation, version_seen),
+            );
         }
 
         // 写一次、读多次；错就当不支持（fallback push 与 2.4 之前等价）。
@@ -1068,18 +1037,63 @@ impl Supervisor {
             })?
             .as_str()
             .to_string();
-        let session = self.session_for(root, lang.as_str()).await?;
+        let session = self.semantic_session_or_main(root, lang.as_str()).await?;
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
         let key = Self::key(root, lang.as_str());
 
-        // 探测结果查表。缺 key 视为"未探测过" → 视为不支持 pull（防御：未来多写漏写）。
-        let supports_pull = self
-            .pull_diag_supported
-            .lock()
-            .unwrap()
-            .get(&key)
-            .copied()
-            .unwrap_or(false);
+        // hybrid 语言（vue）路由到伴生 TS LS 时伴生不在 pull_diag_supported 表
+        // （session_for 只探测主会话）→ 从所选会话的 serverCapabilities 现查；
+        // TLS 支持 LSP 3.17 pull（.vue 的 tsserver 类型诊断即经此取出）。
+        let hybrid_companion = ls_registry::adapter_for(lang.as_str()).is_some_and(|a| {
+            a.semantic_session(root)
+                .is_some_and(|s| Arc::ptr_eq(&s, &session))
+        });
+        let supports_pull = if hybrid_companion {
+            session
+                .server_capabilities()
+                .as_ref()
+                .map(supports_pull_diagnostics)
+                .unwrap_or(false)
+        } else {
+            self.pull_diag_supported
+                .lock()
+                .unwrap()
+                .get(&key)
+                .copied()
+                .unwrap_or(false)
+        };
+
+        // hybrid 伴生路径：类型诊断权威源 = 伴生 pull。**必须绕过 push 缓存** ——
+        // 主 Vue LS 会推空 items（模板层无错）且版本匹配，命中后短路会把
+        // tsserver 侧的类型错永久遮蔽。didOpen 后 tsserver 分析有窗口期（早期
+        // pull 快照为空），10s 内轮询直到出现错误级诊断或窗口满（满 = 信任
+        // LS 的 full 报告为"确认无错"，同 push 缓存的确认语义）。
+        if hybrid_companion {
+            if supports_pull {
+                for _ in 0..40 {
+                    let pulled = session
+                        .client()
+                        .request::<serde_json::Value>(
+                            "textDocument/diagnostic",
+                            json!({ "textDocument": { "uri": uri.clone() } }),
+                            TOOL_TIMEOUT,
+                        )
+                        .await
+                        .ok()
+                        .and_then(|v| Self::extract_pull_items(&v));
+                    if let Some(items) = pulled {
+                        let has_error = items
+                            .iter()
+                            .any(|d| d.get("severity").and_then(|s| s.as_i64()) == Some(1));
+                        if has_error {
+                            return Ok(json!({ "items": compact_diags(&items), "pending": false }));
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            return Ok(json!({ "items": [], "pending": true }));
+        }
 
         // push 等待：**version 精确比对** —— RA didChange 后会先重推旧快照再推新
         // 分析（2026-09-23 实锤），generation 无法区分新旧；推送 version == 当前
@@ -1242,6 +1256,19 @@ impl Supervisor {
         self.diag_generation.load(Ordering::Relaxed)
     }
 
+    /// hybrid 语言语义路由：adapter 提供语义会话（vue 的伴生 TS LS）时优先，否则
+    /// 主会话（session_for 兼带首次拉起 —— 冷启动首个请求必经此处拉起主 + 伴生）。
+    /// 仅位置类语义请求（hover / signature-help）经此；结构类（documentSymbol）
+    /// 与写类仍走主会话。
+    async fn semantic_session_or_main(&self, root: &Path, lang: &str) -> ToolResult<Arc<Session>> {
+        if let Some(adapter) = ls_registry::adapter_for(lang)
+            && let Some(s) = adapter.semantic_session(root)
+        {
+            return Ok(s);
+        }
+        self.session_for(root, lang).await
+    }
+
     pub async fn tool_hover(
         &self,
         root: &Path,
@@ -1251,7 +1278,7 @@ impl Supervisor {
         lang_override: Option<&str>,
     ) -> ToolResult<Option<lsp_types::Hover>> {
         let lang = resolve_lang_for_file(file, lang_override)?;
-        let session = self.session_for(root, lang.as_str()).await?;
+        let session = self.semantic_session_or_main(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
@@ -1280,7 +1307,7 @@ impl Supervisor {
         lang_override: Option<&str>,
     ) -> ToolResult<Option<lsp_types::SignatureHelp>> {
         let lang = resolve_lang_for_file(file, lang_override)?;
-        let session = self.session_for(root, lang.as_str()).await?;
+        let session = self.semantic_session_or_main(root, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
@@ -4026,6 +4053,65 @@ fn replace_files_with_tables(
 /// 不归一则 push 缓存永不命中（2026-09-25 pyright 诊断恒空根因）。
 fn diag_uri_key(uri: &str) -> String {
     percent_decode(uri).to_lowercase()
+}
+
+/// publishDiagnostics → diag_cache 统一 handler 工厂。主/伴生会话共用同一缓存：
+/// vue hybrid 的类型诊断来自伴生 TS LS、模板诊断来自主 Vue LS，agent 的
+/// diagnostics 工具（读 diag_cache）天然同时可见两者。
+fn make_diag_handler(
+    cache_root: PathBuf,
+    cache: DiagCache,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    version_seen: std::sync::Arc<Mutex<HashMap<(PathBuf, String), bool>>>,
+) -> impl Fn(lsp_core::framing::JsonRpc) + Send + Sync + 'static {
+    move |msg| {
+        let Some(uri) = msg
+            .params
+            .as_ref()
+            .and_then(|p| p.get("uri"))
+            .and_then(|u| u.as_str())
+        else {
+            return;
+        };
+        let Some(items) = msg
+            .params
+            .as_ref()
+            .and_then(|p| p.get("diagnostics"))
+            .and_then(|d| d.as_array())
+            .cloned()
+        else {
+            return;
+        };
+        // generation 只计**非空**推送（2026-09-23 语义修正）：RA 的空推送是
+        // 分析中间态快照（didOpen 后 ~2.5s 才推完整错误版），若空推送也 ++，
+        // wait_gen 会在中间态就 confirmed → 误判"确认无错"。空推送仍清缓存
+        // （修 P1 #1：改完错误后 RA 推空，仅 !is_empty 写入会让陈旧错误永存），
+        // 但只表示"上一版错误已失效"，不代表新分析完成。
+        // cache key 归一化：RA 推送 uri 盘符小写（file:///d:/...），而
+        // path_to_uri 生成大写（file:///D:/...）—— 不归一则 cache 永远 miss
+        // （2026-09-23 debug 日志实锤）。Windows 路径大小写不敏感，统一小写。
+        // 空推送也入 cache（带 version）—— "version N 的 items 为空" =
+        // 该版内容确认无错（gen 不 ++，generation 只计含错误推送）。
+        let ver = msg
+            .params
+            .as_ref()
+            .and_then(|p| p.get("version"))
+            .and_then(|v| v.as_i64());
+        if ver.is_some() {
+            version_seen
+                .lock()
+                .unwrap()
+                .insert((cache_root.clone(), diag_uri_key(uri)), true);
+        }
+        let mut cache = cache.lock().unwrap();
+        let key = (cache_root.clone(), diag_uri_key(uri));
+        if items.is_empty() {
+            cache.insert(key, (Vec::new(), ver));
+        } else {
+            cache.insert(key, (items, ver));
+            generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// percent-decode `%XX` 序列（非法 / 截断序列原样保留）。

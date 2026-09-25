@@ -65,12 +65,21 @@ pub struct ChildHandle {
     pub job: Option<win32job::Job>,
     /// 直接子进程 pid（测试断言进程回收用；spawn 后理论上不为 None）。
     pub pid: Option<u32>,
+    /// 保留的进程本体：调用方需要 `wait()/try_wait()` 监视伴生进程时，在把 handle
+    /// 交给 `Session::start` 前用 `take_child` 取走（stdio 已拆出，wait 只等进程退，
+    /// 不碰管道——安全）。不取则随 handle drop（脱离，job 兜底灭树）。
+    pub child: Option<tokio::process::Child>,
 }
 
 impl ChildHandle {
     /// 显式终止进程树：丢掉 Job → 句柄关闭 → 内核按 KILL_ON_JOB_CLOSE 清场。
     pub fn kill(&mut self) {
         self.job.take();
+    }
+
+    /// 取走进程本体供调用方监视（伴生进程编排：vue adapter 监听伴生 TS LS 退出）。
+    pub fn take_child(&mut self) -> Option<tokio::process::Child> {
+        self.child.take()
     }
 }
 
@@ -146,6 +155,7 @@ impl Child {
             stderr: child.stderr.take().expect("stderr piped above"),
             job,
             pid: child.id(),
+            child: Some(child),
         })
     }
 }

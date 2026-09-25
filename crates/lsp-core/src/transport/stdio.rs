@@ -68,6 +68,7 @@ pub fn pump(
         stderr,
         job,
         pid: _,
+        ..
     } = child;
 
     let reply_tx_for_dispatch = reply_tx.clone();
@@ -201,6 +202,7 @@ pub fn record_pump(
         stderr,
         job,
         pid: _,
+        ..
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
     let rec_w = recorder.clone();
@@ -370,6 +372,7 @@ pub fn pump_with_priority(
         stderr,
         job,
         pid: _,
+        ..
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
     let rec_w = Recorder::passthrough();
@@ -451,6 +454,7 @@ pub fn record_pump_with_priority(
         stderr,
         job,
         pid: _,
+        ..
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
     let rec_w = recorder.clone();
