@@ -215,7 +215,7 @@ fn check_local_ls() -> Vec<Check> {
         (
             "jdtls",
             "jdtls (Java LS)",
-            "run `serena-cli install jdtls` (downloads Eclipse JDT LS launcher)",
+            "no manual install needed — first launch auto-downloads Eclipse JDT LS to the local cache; requires `java` (JRE 25+) on PATH",
         ),
         (
             "csharp-ls",
@@ -225,23 +225,48 @@ fn check_local_ls() -> Vec<Check> {
     ];
     ls_specs
         .iter()
-        .map(|(name, label, hint)| match which_path(name) {
-            Some(p) => Check {
-                category: "ls",
-                id: name,
-                label,
-                status: Status::Ok,
-                detail: format!("PATH={}", p.display()),
-                hint: None,
-            },
-            None => Check {
-                category: "ls",
-                id: name,
-                label,
-                status: Status::Miss,
-                detail: format!("`{name}` not on PATH"),
-                hint: Some((*hint).to_string()),
-            },
+        .map(|(name, label, hint)| {
+            // jdtls 特判：PATH 无 `jdtls` 不再等于未安装——launch_info 首启自动下载
+            // 到本地缓存；缓存已装（含手工 ~/.local/share/jdtls 之外的产物目录）也如实报 OK。
+            if *name == "jdtls" {
+                let cached = ls_cache_root().join("jdtls/latest/bin/jdtls");
+                if cached.is_file() {
+                    return Check {
+                        category: "ls",
+                        id: name,
+                        label,
+                        status: Status::Ok,
+                        detail: format!("cache={}", cached.display()),
+                        hint: None,
+                    };
+                }
+                return Check {
+                    category: "ls",
+                    id: name,
+                    label,
+                    status: Status::Miss,
+                    detail: "not on PATH; will auto-download on first launch".to_string(),
+                    hint: Some((*hint).to_string()),
+                };
+            }
+            match which_path(name) {
+                Some(p) => Check {
+                    category: "ls",
+                    id: name,
+                    label,
+                    status: Status::Ok,
+                    detail: format!("PATH={}", p.display()),
+                    hint: None,
+                },
+                None => Check {
+                    category: "ls",
+                    id: name,
+                    label,
+                    status: Status::Miss,
+                    detail: format!("`{name}` not on PATH"),
+                    hint: Some((*hint).to_string()),
+                },
+            }
         })
         .collect()
 }

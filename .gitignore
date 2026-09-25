@@ -15,3 +15,6 @@ fixtures/typescript_demo/node_modules/
 # 本地工作材料(验收脚本/报告/日志/探针——不进 git)
 local/
 
+# jdtls per-project workspace data (auto-created at project root)
+.jdtls_workspace/
+

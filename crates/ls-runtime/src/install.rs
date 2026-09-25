@@ -326,6 +326,23 @@ fn host_allowed(host: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|a| a.to_ascii_lowercase() == host)
 }
 
+/// 默认安装缓存根（design §5 cache_root）：Windows `%LOCALAPPDATA%\serena\ls`，
+/// Unix `~/.local/share/serena/ls`。
+///
+/// 单一事实源：`ls-registry::config::dirs_cache_root` 委托本函数——依赖方向为
+/// ls-registry → ls-adapters，adapter（jdtls auto-install）取缓存根必须走共用底层。
+pub fn default_cache_root() -> PathBuf {
+    if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|a| PathBuf::from(a).join("serena/ls"))
+            .unwrap_or_else(|| PathBuf::from(".serena-ls"))
+    } else {
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(".local/share/serena/ls"))
+            .unwrap_or_else(|| PathBuf::from(".serena-ls"))
+    }
+}
+
 /// 构造带 §5.1 重定向逐跳校验的 blocking client。
 pub fn build_download_client(
     allowed_hosts: &[String],

@@ -628,16 +628,9 @@ pub fn ensure_launch(
 }
 
 /// 安装缓存根（design §5 cache_root；v1：%LOCALAPPDATA%\serena\ls / ~/.local/share/serena/ls）。
+/// 实现锚在 `ls_runtime::install::default_cache_root`（adapter 需要同款缓存根，事实源下沉）。
 pub fn dirs_cache_root() -> PathBuf {
-    if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|a| PathBuf::from(a).join("serena/ls"))
-            .unwrap_or_else(|| PathBuf::from(".serena-ls"))
-    } else {
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".local/share/serena/ls"))
-            .unwrap_or_else(|| PathBuf::from(".serena-ls"))
-    }
+    ls_runtime::install::default_cache_root()
 }
 
 #[cfg(test)]

@@ -2,9 +2,10 @@
 //!
 //! ↖ mirror: oraios/serena@43ae021 `language_servers/eclipse_jdtls_language_server.py`
 //!
-//! jdtls 是 Java 生态最权威的 LSP server；它需要 **JRE 21+ + 单独下载 jdtls 发行包**
-//! （https://download.eclipse.org/jdtls/snapshots/），启动慢（~5-10s 加载 JDT workspace）
-//! + 索引慢（首次 indexing 按项目大小 30s-几分钟）。这是最复杂的 adapter。
+//! jdtls 是 Java 生态最权威的 LSP server；它需要 **JRE 25+ + jdtls 发行包**
+//! （https://download.eclipse.org/jdtls/snapshots/，首启自动下载到本地缓存），
+//! 启动慢（~5-10s 加载 JDT workspace）+ 索引慢（首次 indexing 按项目大小 30s-几分钟）。
+//! 这是最复杂的 adapter。
 //!
 //! ## 启动 quirk（最复杂）
 //!
@@ -14,17 +15,23 @@
 //! 3. on_server_ready 不能用 documentSymbol 探测 —— jdtls 首次 documentSymbol 阻塞
 //!    在 workspace 初始化完成事件；改为等待 `language/status`（jdtls 特有）广播。
 //!
-//! ## 深度（M2 落地：全自动 jdtls 安装）
+//! ## 安装（launch_info 已接线：首启自动下载）
 //!
-//! 不再要求用户自装 jdtls + 配 PATH。`launch_info` 检测到 PATH 无 `jdtls` 时：
-//! 1. 走 `ls_runtime::install::DownloadInstaller` 自动下载
-//!    `https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz`
-//    到 `{cache_root}/jdtls/<version>/`；
-//! 2. 解压后 layout = `jdt-language-server-latest/{bin,config_linux,config_mac,config_win}/`；
-//! 3. 启动命令模板 = `java -jar {plugins}/org.eclipse.equinox.launcher_<ver>.jar
+//! PATH 无 `jdtls` 且无预装目录时，`launch_info` 走 `ls_runtime::install::DownloadInstaller`：
+//! 1. 下载 `https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz`
+//!    到 `{cache_root}/jdtls/latest/`（Windows %LOCALAPPDATA%\serena\ls，Unix
+//!    ~/.local/share/serena/ls）；已装缓存秒回短路（幂等）。
+//! 2. snapshot tar **顶层即包体**（`{bin,config_*,features,plugins}/` 直接在顶，
+//!    无 `jdt-language-server-latest/` 包装层）→ `strip_components: 0`。
+//! 3. sha256 特例：`latest` 是滚动软链且 Eclipse 不发布伴随 hash 文件
+//!    （`.sha256`/`.sha512` 实测 404），无法钉 hash —— 信任锚 = HTTPS +
+//!    `allowed_hosts` 白名单（download.eclipse.org），跳过 §2.9 sha 门。
+//! 4. 启动命令模板 = `java -jar {plugins}/org.eclipse.equinox.launcher_<ver>.jar
 //!    -configuration {install}/config_{plat} -data {project_root}/.jdtls_workspace`。
 //!
-//! JRE 探测：仍要求用户预装 JRE 21+（PATH 有 `java`）。jdtls 不含 JRE。
+//! JRE 探测：仍要求用户预装 JRE 25+（PATH 有 `java`）。jdtls 不含 JRE。
+//! 已知漂移：`latest` snapshot 滚动使 JDK 下限漂浮（当前构建要求 JavaSE 25，
+//! JDK21 启动秒死）；钉版本属后续版本管理范畴，不在本接线范围。
 //!
 //! ponytail: jdtls project import（maven/gradle 项目解析）走 jdtls 自身流程；不预解析。
 //!
@@ -39,7 +46,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ls_runtime::deps::{Arch, Os};
 use ls_runtime::install::{
-    ArchiveKind, DownloadInstaller, InstallCtx, InstallKind, InstallOutcome, InstallSpec,
+    default_cache_root, ArchiveKind, DownloadInstaller, InstallCtx, InstallKind, InstallOutcome,
+    InstallSpec,
 };
 use ls_runtime::process::{LaunchInfo, TransportKind};
 use lsp_types::InitializeParams;
@@ -51,15 +59,13 @@ use crate::{
 /// jdtls 启动 + 首次索引合并超时。jdtls 是最慢的 LS —— 给 90s 保守值。
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// jdtls 最新稳定 snapshot 版本（写死。snapshot 自身滚动；M2 不做 update 流程）。
+/// jdtls 最新稳定 snapshot 版本（写死。snapshot 自身滚动；不做 update 流程）。
 ///
 /// 锚：https://download.eclipse.org/jdtls/snapshots/ —— jdtls 用 Maven snapshot 模式分发，
 /// URL `jdt-language-server-latest.tar.gz` 是软链，指向最新构建。
-#[allow(dead_code)]
 const JDTLS_VERSION: &str = "latest";
 
 /// jdtls 安装 cache key（不含版本，URL 含 `latest`）。
-#[allow(dead_code)] // M2 stub 占位接口，wire 到 launch_info 时再消
 const JDTLS_CACHE_ID: &str = "jdtls";
 
 /// jdtls equinox launcher JAR 相对路径模板（解压后）。
@@ -135,27 +141,26 @@ pub(crate) fn jdtls_launch_args(
 ///
 /// ponytail: 不抽 URL 矩阵 helper —— jdtls URL 唯一（snapshot 软链），元组 < (os, arch),
 /// JDT-LS 是 platform-neutral Java 包（解包后无 platform 二进制）。
-#[allow(dead_code)] // M2 stub 占位接口，wire 到 launch_info 时再消
-pub(crate) fn jdtls_install_spec(cache_root: &Path) -> InstallSpec {
-    let _install_dir = cache_root.join(JDTLS_CACHE_ID).join(JDTLS_VERSION);
+pub(crate) fn jdtls_install_spec() -> InstallSpec {
     InstallSpec {
         id: JDTLS_CACHE_ID.to_string(),
         kind: InstallKind::Download {
             version: JDTLS_VERSION.to_string(),
             url: "https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz"
                 .to_string(),
-            // sha256 未知 → 拒绝 auto-install（auto-install-design §2.9 门）。用户需
-            // 走 `--allow-unsigned-sha` 越狱（人类显式）或预装 jdtls。
+            // sha256 特例留空：latest 滚动软链 + Eclipse 无伴随 hash 文件（404 实测），
+            // 无法钉 hash —— `ensure_jdtls_installed` 以 allow_unsigned_sha 跳过 §2.9 门
+            // （信任锚 = HTTPS + allowed_hosts 域白名单）。
             sha256: String::new(),
             archive: ArchiveKind::TarGz,
-            // jdtls tar 包顶层 = `jdt-language-server-latest/`。strip=1 让
-            // bin/config_*/plugins 直接落在 install_dir 下。
-            strip_components: 1,
-            // bin_path 仅作"装好"短路探测：jdtls 没单一 bin（要走 java -jar），
-            // 用 equinox launcher JAR 路径作存在性探针。
-            bin_path: "plugins/org.eclipse.equinox.launcher_1.6.500.v20230731-1003.jar"
-                .to_string(),
-            // Eclipse Foundation 官方域 + 镜像。
+            // snapshot tar 顶层即包体（bin/config_*/plugins 直接在顶，无包装层）——
+            // strip >0 会把包体拍平。
+            strip_components: 0,
+            // "装好"短路探针：equinox launcher JAR 文件名带滚动版本号（不可写死），
+            // 用全平台都存在的 `bin/jdtls`（POSIX 启动脚本，与 bin_path 探测解耦——
+            // 启动仍走 `jdtls_launch_args` 的 launcher 通配探测）。
+            bin_path: "bin/jdtls".to_string(),
+            // Eclipse Foundation 官方域。
             allowed_hosts: vec![
                 "download.eclipse.org".to_string(),
                 "eclipse.org".to_string(),
@@ -167,45 +172,49 @@ pub(crate) fn jdtls_install_spec(cache_root: &Path) -> InstallSpec {
     }
 }
 
-/// 触发 jdtls auto-install（用户授权 + URL 已知 + sha 已知时）。返回装好后的 install_dir。
+/// 触发 jdtls auto-install。返回装好后的 install_dir（`{cache_root}/jdtls/{JDTLS_VERSION}/`）。
 ///
-/// 当前 sha 未知 → 走 `UnsignedRefused` 分支（wire 映射 = LS_NOT_INSTALLED + hint）。
-/// 用户可越狱：环境变量 `SERENA_ALLOW_UNSIGNED_SHA=1` 强行装；或预装 jdtls。
+/// 已装缓存短路在 `DownloadInstaller` 内（`bin/jdtls` 存在即秒回，不触网）。
 ///
-/// 同步阻塞 IO（HTTP 下载 + 解压分钟级）—— `launch_info` 是 async 上下文，调用方
-/// 应 `tokio::task::spawn_blocking` 包裹；M2 实际未 wire 进 `launch_info`（path 1+2
-/// 优先 auto-install 流程 M3+ 接 ls-registry Task 21），故本函数暂仅 expose 给
-/// supervisor / 测试。
-#[allow(dead_code)] // M2 stub 占位接口，wire 到 launch_info 时再消
-pub(crate) fn ensure_jdtls_installed(
-    cache_root: &Path,
-    allow_unsigned_sha: bool,
-) -> Result<PathBuf, anyhow::Error> {
-    let spec = jdtls_install_spec(cache_root);
+/// sha 门特例：`latest` snapshot 滚动 + Eclipse 无伴随 hash 文件 → 无法钉 sha256，
+/// 信任锚 = HTTPS + `allowed_hosts`（download.eclipse.org 白名单）→ 跳过 §2.9 门。
+///
+/// 同步阻塞 IO（HTTP ~51MB + 解压，分钟级；client 自带 connect 30s / 总 600s 超时）——
+/// async 调用方（`launch_info`）以 `spawn_blocking` 包裹。失败（URL 不可达等）→
+/// Err，调用方 wrap 成 `not_installed_error` 形态 → wire 归类 LS_NOT_INSTALLED。
+pub(crate) fn ensure_jdtls_installed(cache_root: &Path) -> Result<PathBuf, anyhow::Error> {
+    let spec = jdtls_install_spec();
     let ctx = InstallCtx {
         os: Os::current(),
         arch: Arch::current(),
         auto_install: true,
-        allow_unsigned_sha,
+        // jdtls 特例：见函数 doc —— snapshot 滚动无官方 hash，域白名单即信任锚。
+        allow_unsigned_sha: true,
         cache_root: cache_root.to_path_buf(),
     };
-    let outcome = DownloadInstaller.install(&ctx, &spec).map_err(|e| {
-        anyhow::anyhow!("jdtls auto-install failed: {e}")
-    })?;
-    let install_dir = cache_root.join(JDTLS_CACHE_ID).join(JDTLS_VERSION);
+    let outcome = DownloadInstaller
+        .install(&ctx, &spec)
+        .map_err(|e| anyhow::anyhow!("jdtls auto-install failed: {e}"))?;
     match outcome {
-        InstallOutcome::Ready(_) => Ok(install_dir),
-        InstallOutcome::UnsignedRefused { hint, .. } => {
-            // M2 占位：sha 未知拒绝 auto。告诉用户两条路径（预装 / 越狱）。
-            Err(anyhow::anyhow!(
-                "jdtls auto-install refused (sha unknown): {hint}; \
-                 either pre-install jdtls to PATH, or set SERENA_ALLOW_UNSIGNED_SHA=1 to override"
-            ))
-        }
-        InstallOutcome::NotInstalled { hint, .. } => {
-            Err(anyhow::anyhow!("jdtls install: {hint}"))
+        InstallOutcome::Ready(_) => Ok(cache_root.join(JDTLS_CACHE_ID).join(JDTLS_VERSION)),
+        // allow_unsigned_sha=true 且 kind=Download 时不可达（UnsignedRefused 仅 sha 门
+        // 拒绝时返回；NotInstalled 仅 PathOnly 返回）——defensive，不吞错不 panic。
+        InstallOutcome::UnsignedRefused { hint, .. } | InstallOutcome::NotInstalled { hint, .. } => {
+            Err(anyhow::anyhow!("jdtls auto-install: {hint}"))
         }
     }
+}
+
+/// 拼 `java -jar <equinox> -configuration <cfg> -data <ws>` 的 LaunchInfo。
+/// path 3（预装目录）与 path 4（auto-install 产物）共用。
+fn launch_via_jar(install_dir: &Path, ctx: &ProjectCtx, java: &Path) -> anyhow::Result<LaunchInfo> {
+    let args = jdtls_launch_args(install_dir, &ctx.project_root, java)?;
+    Ok(LaunchInfo {
+        cmd: args.into_iter().map(Into::into).collect(),
+        cwd: ctx.project_root.clone(),
+        env: vec![],
+        transport: TransportKind::Stdio,
+    })
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -232,42 +241,44 @@ impl LanguageServerAdapter for JdtlsAdapter {
                 transport: TransportKind::Stdio,
             });
         }
-        // 2. PATH 上有 `java` + jdtls 已经预装在常见位置（`JAVA_HOME` 同级）。
-        if let Some(java) = which_no_unc("java") {
-            // 检查常见预装路径：HOME/jdtls、HOME/.local/share/jdtls、HOME/.cache/jdtls。
-            let candidate_rel: &[&str] = &[
+        // 2. jdtls 本体是 equinox JAR 集合，必须 `java -jar` 启动 → JVM 是硬前置。
+        let java = which_no_unc("java").ok_or_else(|| {
+            not_installed_error(
                 "jdtls",
-                ".local/share/jdtls",
-                ".cache/jdtls",
-            ];
-            let home = std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(PathBuf::from);
-            if let Some(home) = home {
-                for rel in candidate_rel {
-                    let install = home.join(rel);
-                    if install.is_dir() && locate_equinox_launcher(&install).is_some() {
-                        let args = jdtls_launch_args(&install, &ctx.project_root, &java)?;
-                        let mut cmd: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
-                        for a in args {
-                            cmd.push(a.into());
-                        }
-                        return Ok(LaunchInfo {
-                            cmd,
-                            cwd: ctx.project_root.clone(),
-                            env: vec![],
-                            transport: TransportKind::Stdio,
-                        });
-                    }
+                "install a JRE 25+ (`java` on PATH; latest snapshot requires JavaSE 25); \
+                 the jdtls distribution itself is auto-downloaded to the local cache on first launch",
+            )
+        })?;
+        // 3. 常见预装位置（手工安装形态：~/jdtls、~/.local/share/jdtls、~/.cache/jdtls）。
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from);
+        if let Some(home) = home {
+            for rel in ["jdtls", ".local/share/jdtls", ".cache/jdtls"] {
+                let install = home.join(rel);
+                if install.is_dir() && locate_equinox_launcher(&install).is_some() {
+                    return launch_via_jar(&install, ctx, &java);
                 }
             }
         }
-        // 3. 都没有 → 报 not_installed。auto-install（M2 设计 §3.1）尚未 wire
-        //    到 ls-adapters（ls-registry Task 21 接线 + 安装策略）；M3 再开。
-        Err(not_installed_error(
-            "jdtls",
-            "install JRE 21+ (`java` on PATH) and either pre-install jdtls (https://download.eclipse.org/jdtls/snapshots/) to PATH or to ~/.local/share/jdtls/; auto-install via supervisor coming in M3",
-        ))
+        // 4. 都没有 → 首启自动下载（同步阻塞 IO，spawn_blocking 走阻塞线程池，
+        //    不占 runtime worker）。已装缓存在 DownloadInstaller 内短路（幂等，不触网）。
+        let cache_root = default_cache_root();
+        let dir = tokio::task::spawn_blocking(move || ensure_jdtls_installed(&cache_root))
+            .await
+            .map_err(|e| {
+                not_installed_error("jdtls", &format!("auto-install task join failed: {e}"))
+            })?
+            .map_err(|e| {
+                not_installed_error(
+                    "jdtls",
+                    &format!(
+                        "auto-install failed ({e:#}); pre-install jdtls \
+                         (https://download.eclipse.org/jdtls/snapshots/) to PATH or ~/.local/share/jdtls/"
+                    ),
+                )
+            })?;
+        launch_via_jar(&dir, ctx, &java)
     }
 
     fn initialize_patches(&self, _base: &mut InitializeParams) {
@@ -389,5 +400,47 @@ mod tests {
         assert_eq!(config_dir_suffix(Os::Linux), "linux");
         assert_eq!(config_dir_suffix(Os::Macos), "mac");
         assert_eq!(config_dir_suffix(Os::Windows), "win");
+    }
+
+    /// install spec 对齐真实 snapshot 布局：顶层即包体（strip=0，P-2——strip=1 会把
+    /// {bin,config_*,plugins}/ 拍平）；短路探针 = 全平台存在的 `bin/jdtls`（equinox
+    /// launcher JAR 文件名带滚动版本号，写死必失效）。
+    #[test]
+    fn install_spec_matches_snapshot_layout() {
+        let spec = jdtls_install_spec();
+        assert_eq!(spec.id, "jdtls");
+        let InstallKind::Download {
+            version,
+            url,
+            sha256,
+            archive,
+            strip_components,
+            bin_path,
+            allowed_hosts,
+        } = spec.kind
+        else {
+            panic!("expected Download kind, got {:?}", spec.kind);
+        };
+        assert_eq!(version, "latest");
+        assert_eq!(
+            url,
+            "https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz"
+        );
+        assert_eq!(sha256, "", "latest 滚动无钉 hash（sha 门由 ensure 特例跳过）");
+        assert!(matches!(archive, ArchiveKind::TarGz));
+        assert_eq!(strip_components, 0, "snapshot tar 顶层即包体");
+        assert_eq!(bin_path, "bin/jdtls");
+        assert!(allowed_hosts.contains(&"download.eclipse.org".to_string()));
+    }
+
+    /// 幂等：缓存内 `bin/jdtls` 已存在 → DownloadInstaller 短路秒回，不触网。
+    #[test]
+    fn ensure_short_circuits_when_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("jdtls/latest/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("jdtls"), b"#!/bin/sh\n").unwrap();
+        let got = ensure_jdtls_installed(dir.path()).expect("cached install must short-circuit");
+        assert_eq!(got, dir.path().join("jdtls/latest"));
     }
 }
