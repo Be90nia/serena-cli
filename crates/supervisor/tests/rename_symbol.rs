@@ -108,6 +108,10 @@ async fn rename_foo_to_bar_across_files() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_new_name_returns_bad_args() {
+    if !has_clangd() {
+        println!("skipped: clangd not in PATH");
+        return;
+    }
     let root = scratch("empty");
     let sup = Supervisor::direct().await.expect("supervisor");
     let _ = sup
@@ -129,6 +133,10 @@ async fn empty_new_name_returns_bad_args() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn whitespace_new_name_returns_bad_args() {
+    if !has_clangd() {
+        println!("skipped: clangd not in PATH");
+        return;
+    }
     let root = scratch("ws");
     let sup = Supervisor::direct().await.expect("supervisor");
     let _ = sup
