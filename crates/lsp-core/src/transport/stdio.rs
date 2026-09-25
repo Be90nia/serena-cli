@@ -67,7 +67,6 @@ pub fn pump(
         stdout,
         stderr,
         job,
-        pid: _,
         ..
     } = child;
 
@@ -201,7 +200,6 @@ pub fn record_pump(
         stdout,
         stderr,
         job,
-        pid: _,
         ..
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
@@ -371,7 +369,6 @@ pub fn pump_with_priority(
         stdout,
         stderr,
         job,
-        pid: _,
         ..
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
@@ -453,7 +450,6 @@ pub fn record_pump_with_priority(
         stdout,
         stderr,
         job,
-        pid: _,
         ..
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
