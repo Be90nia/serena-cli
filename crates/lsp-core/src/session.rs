@@ -36,8 +36,10 @@ use crate::transport::stdio::{
     OnEof, OnMsg, Pumps, pump_with_priority, record_pump_with_priority, replay_pump_with_priority,
 };
 
-/// 握手超时上限（10s）。真实 clangd 多在 1s 内回 initialize；mock_ls 同样。
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 握手超时上限（30s）。clangd 等 native LS 多在 1s 内回 initialize；但 node 系
+/// LS（bash-language-server 实测）冷启动链 npm shim → node → tree-sitter WASM
+/// 首载可超 10s，10s 窗口下冷启动会假报 LS_TIMEOUT（retryable 且重试同死）。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `shutdown` 请求超时（2s）。超时则放弃等回执直接走 kill 兜底。
 ///
