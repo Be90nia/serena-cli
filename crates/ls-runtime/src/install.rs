@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::deps::{verify_sha256, Arch, Os};
+use crate::deps::{Arch, Os, verify_sha256};
 use crate::process::RuntimeError;
 
 /// 解压形态（auto-install-design §2.2 `archive.kind`；Raw 为裸二进制扩展——
@@ -137,7 +137,10 @@ pub enum InstallOutcome {
         install_cmd: Option<String>,
     },
     /// sha 未知且未越狱（§2.9）：wire 映射 = LS_NOT_INSTALLED + hint。
-    UnsignedRefused { ls_id: String, hint: String },
+    UnsignedRefused {
+        ls_id: String,
+        hint: String,
+    },
 }
 
 /// Task 18 下载基建。DependencySource trait 全集（含 Npm/Uvx 等）随 Task 19 落，
@@ -207,11 +210,13 @@ impl DownloadInstaller {
         }
 
         // 锁（§5.3）：{install_dir}/install.lock —— 同 id 同 version 唯一。
-        std::fs::create_dir_all(&install_dir).map_err(|e| download_err(url, &format!("create install dir: {e}")))?;
+        std::fs::create_dir_all(&install_dir)
+            .map_err(|e| download_err(url, &format!("create install dir: {e}")))?;
         let _lock = acquire_install_lock(&install_dir)?;
 
         // 下载（§5.1：首跳显式校验 + 重定向逐跳校验在 client policy 内）。
-        let client = build_download_client(allowed).map_err(|e| download_err(url, &format!("http client: {e}")))?;
+        let client = build_download_client(allowed)
+            .map_err(|e| download_err(url, &format!("http client: {e}")))?;
         let bytes = download(&client, url, allowed)?;
 
         // sha 校验（Skip = 越狱跳过）。
@@ -250,8 +255,7 @@ impl DownloadInstaller {
         std::fs::write(&pkg, &bytes)
             .map_err(|e| download_err(url, &format!("write archive: {e}")))?;
 
-        extract(&pkg, archive, strip, &install_dir)
-            .map_err(|cause| download_err(url, &cause))?;
+        extract(&pkg, archive, strip, &install_dir).map_err(|cause| download_err(url, &cause))?;
         let _ = std::fs::remove_file(&pkg);
 
         if !exe.is_file() {
@@ -376,15 +380,16 @@ fn download(
     allowed: &[String],
 ) -> Result<bytes::Bytes, RuntimeError> {
     // 首跳显式校验（policy 只覆盖重定向链）。
-    let parsed: reqwest::Url = url.parse().map_err(|e| {
-        RuntimeError::Download {
-            url: url.to_string(),
-            expected_sha: None,
-            actual_sha: None,
-            cause: format!("parse url: {e}"),
-        }
+    let parsed: reqwest::Url = url.parse().map_err(|e| RuntimeError::Download {
+        url: url.to_string(),
+        expected_sha: None,
+        actual_sha: None,
+        cause: format!("parse url: {e}"),
     })?;
-    let first_host_ok = parsed.host_str().map(|h| host_allowed(h, allowed)).unwrap_or(false);
+    let first_host_ok = parsed
+        .host_str()
+        .map(|h| host_allowed(h, allowed))
+        .unwrap_or(false);
     if !first_host_ok {
         return Err(RuntimeError::Download {
             url: url.to_string(),
@@ -434,7 +439,12 @@ pub fn entry_is_safe(name: &str) -> bool {
 /// 解压到 `dest`。策略（设计 §1/§2.2）：系统 tar（bsdtar 支持 zip/tar.gz/tar.xz 与裸 gz；
 /// Windows 10+ 内置，macOS 默认 bsdtar）；Linux GNU tar 不解 zip → fallback `unzip`，
 /// 不解裸 gz → fallback `gunzip`。缺工具 → 带 MissingRuntime 语义的错误串。
-fn extract(pkg: &Path, kind: ArchiveKind, strip_components: usize, dest: &Path) -> Result<(), String> {
+fn extract(
+    pkg: &Path,
+    kind: ArchiveKind,
+    strip_components: usize,
+    dest: &Path,
+) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("create dest: {e}"))?;
     // §5.2 预检：解压前列清单逐条目消毒（裸 gz 无清单，单文件无路径语义）。
     if kind != ArchiveKind::SingleGz {
@@ -479,7 +489,12 @@ fn extract(pkg: &Path, kind: ArchiveKind, strip_components: usize, dest: &Path) 
             // 裸 gz：bsdtar（Windows/macOS）直接解；Linux GNU tar 不行 → gunzip -kc 落盘。
             if run_tool(
                 "tar",
-                &["-xzf", &pkg.to_string_lossy(), "-C", &dest.to_string_lossy()],
+                &[
+                    "-xzf",
+                    &pkg.to_string_lossy(),
+                    "-C",
+                    &dest.to_string_lossy(),
+                ],
             )
             .is_ok()
             {
@@ -602,7 +617,11 @@ mod tests {
     fn sha_gate_decides_by_known_hash_and_jail_flag() {
         let good = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         assert_eq!(sha_gate(good, false), ShaGate::Verify);
-        assert_eq!(sha_gate(good, true), ShaGate::Verify, "已知 sha 不受越狱 flag 影响");
+        assert_eq!(
+            sha_gate(good, true),
+            ShaGate::Verify,
+            "已知 sha 不受越狱 flag 影响"
+        );
         // 未知（空/假形态）：默认拒绝；越狱跳过。
         assert_eq!(sha_gate("", false), ShaGate::Refuse);
         assert_eq!(sha_gate("", true), ShaGate::Skip);
@@ -624,7 +643,10 @@ mod tests {
         assert!(host_allowed("objects.githubusercontent.com", &allowed));
         assert!(host_allowed("GITHUB.com", &allowed), "host 大小写折叠");
         assert!(!host_allowed("evil.github.com", &allowed), "子域不通配");
-        assert!(!host_allowed("github.com.evil.io", &allowed), "后缀伪装不通配");
+        assert!(
+            !host_allowed("github.com.evil.io", &allowed),
+            "后缀伪装不通配"
+        );
         assert!(!host_allowed("gitlab.com", &allowed));
     }
 
@@ -723,7 +745,9 @@ mod tests {
             },
             exec: vec!["{bin}".into()],
         };
-        let out = DownloadInstaller.install(&ctx, &spec).expect("全流程应成功");
+        let out = DownloadInstaller
+            .install(&ctx, &spec)
+            .expect("全流程应成功");
         let InstallOutcome::Ready(Launch::Process { exe, .. }) = out else {
             panic!("应 Ready，实际 {out:?}");
         };
@@ -735,5 +759,4 @@ mod tests {
             "二调应走已装短路，实际 {out2:?}"
         );
     }
-
 }

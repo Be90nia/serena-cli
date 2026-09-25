@@ -421,9 +421,7 @@ mod tests {
 
     #[test]
     fn samples_capped_at_three_per_group() {
-        let hits: Vec<RefSymbolHit> = (0..10)
-            .map(|i| hit("x.rs", "C", i, 0))
-            .collect();
+        let hits: Vec<RefSymbolHit> = (0..10).map(|i| hit("x.rs", "C", i, 0)).collect();
         let r = group_refs(hits, 1, 20);
         assert_eq!(r.group_count, 1);
         assert_eq!(r.groups[0].count, 10);

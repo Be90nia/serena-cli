@@ -354,7 +354,10 @@ pub fn catalog() -> serde_json::Value {
 /// 工具名 → 参数表对象（catalog().tools 子集）。catalog.rs 测试用。
 pub fn catalog_tool_names() -> Vec<String> {
     let v = catalog();
-    let tools = v.get("tools").and_then(|t| t.as_object()).expect("tools object");
+    let tools = v
+        .get("tools")
+        .and_then(|t| t.as_object())
+        .expect("tools object");
     let mut names: Vec<String> = tools.keys().cloned().collect();
     names.sort();
     names
@@ -387,9 +390,15 @@ mod tests {
         let v = catalog();
         let tools = v.get("tools").and_then(|t| t.as_object()).unwrap();
         for (tool_name, tool_def) in tools {
-            let args = tool_def.get("args").and_then(|a| a.as_object()).expect("args object");
+            let args = tool_def
+                .get("args")
+                .and_then(|a| a.as_object())
+                .expect("args object");
             for (arg_name, arg_def) in args {
-                let required = arg_def.get("required").and_then(|r| r.as_bool()).unwrap_or(false);
+                let required = arg_def
+                    .get("required")
+                    .and_then(|r| r.as_bool())
+                    .unwrap_or(false);
                 let has_default = arg_def.get("default").is_some();
                 if required {
                     assert!(

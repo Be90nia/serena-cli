@@ -150,8 +150,7 @@ pub struct Session {
     /// lsp-types 把 `diagnosticProvider` 编成 untagged enum (`Options` / `RegistrationOptions`),
     /// 实际 LS 还可能返简化 `true` literal，typed 反序列化会炸；后续探测只关心字段是否
     /// 非 null，不需要类型结构。
-    pub(crate) server_capabilities:
-        std::sync::Arc<Mutex<Option<serde_json::Value>>>,
+    pub(crate) server_capabilities: std::sync::Arc<Mutex<Option<serde_json::Value>>>,
     /// Phase 4 基建 Task 22c：`$/progress` 通知等待登记表。
     ///
     /// 一次合并：waiter 表（token → Notify）+ 早到通知记录（token 已到达但尚无 waiter）
@@ -361,10 +360,7 @@ impl Session {
 
     /// 握手协议：发送 `initialize`，等到响应，发 `initialized` 通知。失败 → CoreError。
     /// 成功返回 `Option<Value>`：LS 响应的 `capabilities` 子对象；缺则返 None。
-    async fn handshake(
-        session: &Arc<Self>,
-        params: InitializeParams,
-    ) -> Result<Option<Value>> {
+    async fn handshake(session: &Arc<Self>, params: InitializeParams) -> Result<Option<Value>> {
         let params_json = serde_json::to_value(params).map_err(|e| CoreError::Rpc {
             code: -1,
             message: format!("initialize params serialize: {e}"),
@@ -419,11 +415,7 @@ impl Session {
     /// `Session::progress` 同一把 `std::Mutex` 临界区，原子完成；如 resolved 命中直接返
     /// Ok，否则同临界区内插 waiter 并 Clone 出 Notify（之后才 .await 等门）。
     /// 临界区不持锁 .await——不会死锁当前 std Mutex。
-    pub async fn wait_for_progress(
-        &self,
-        token: &str,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub async fn wait_for_progress(&self, token: &str, timeout: Duration) -> Result<()> {
         // Failed 态直接返 —— 不会再有 progress 通知到达
         if matches!(*self.state.lock().unwrap(), SessionState::Failed(_)) {
             return Err(CoreError::Terminated {
@@ -505,7 +497,6 @@ impl Session {
         self.server_capabilities.lock().unwrap().clone()
     }
 
-
     /// LSP 请求转发。Ready 前到达则等就绪门，门开且 state == Ready 后才放行；
     /// 若 state 已 Failed 则立即回 `CoreError`（门开但语义失败）。
     pub async fn request<R>(&self, method: &str, params: Value, timeout: Duration) -> Result<R>
@@ -560,7 +551,10 @@ impl Session {
         R: serde::de::DeserializeOwned,
     {
         if matches!(*self.state.lock().unwrap(), SessionState::Ready) {
-            return self.client.request_at(method, params, timeout, priority).await;
+            return self
+                .client
+                .request_at(method, params, timeout, priority)
+                .await;
         }
         if matches!(*self.state.lock().unwrap(), SessionState::Failed(_)) {
             return Err(CoreError::Terminated {
@@ -571,13 +565,20 @@ impl Session {
 
         let notified = self.initialized_notify.notified();
         if matches!(*self.state.lock().unwrap(), SessionState::Ready) {
-            return self.client.request_at(method, params, timeout, priority).await;
+            return self
+                .client
+                .request_at(method, params, timeout, priority)
+                .await;
         }
         notified.await;
 
         let snap = self.state.lock().unwrap().clone();
         match snap {
-            SessionState::Ready => self.client.request_at(method, params, timeout, priority).await,
+            SessionState::Ready => {
+                self.client
+                    .request_at(method, params, timeout, priority)
+                    .await
+            }
             SessionState::Failed(cause) => Err(CoreError::Terminated {
                 ls: "ls".into(),
                 cause: format!("session failed: {cause}"),
@@ -678,9 +679,18 @@ mod tests {
 
     #[test]
     fn progress_token_to_string_normalizes_string_and_number() {
-        assert_eq!(progress_token_to_string(Some(&json!("abc"))).as_deref(), Some("abc"));
-        assert_eq!(progress_token_to_string(Some(&json!(42))).as_deref(), Some("42"));
-        assert_eq!(progress_token_to_string(Some(&json!(42u64))).as_deref(), Some("42"));
+        assert_eq!(
+            progress_token_to_string(Some(&json!("abc"))).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            progress_token_to_string(Some(&json!(42))).as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            progress_token_to_string(Some(&json!(42u64))).as_deref(),
+            Some("42")
+        );
     }
 
     #[test]

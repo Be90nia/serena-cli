@@ -87,7 +87,11 @@ pub async fn build(
                     .get("container")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let kind = s.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let kind = s
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 all_syms.push((file.to_string(), name, container, kind));
                 if all_syms.len() >= candidate_cap {
                     break;

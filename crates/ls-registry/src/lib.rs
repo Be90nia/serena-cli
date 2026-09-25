@@ -97,10 +97,7 @@ pub fn resolve_lang_name(path: &Path) -> Option<&'static str> {
         .iter()
         .find(|(e, _)| *e == ext)
         .map(|(_, lang)| lang.as_str())
-        .or_else(|| {
-            config::external_table()
-                .and_then(|t| config::match_external_ext(t, &ext))
-        })
+        .or_else(|| config::external_table().and_then(|t| config::match_external_ext(t, &ext)))
 }
 
 /// 语言字符串 → adapter 单例。M3 覆盖 7 手写语言。

@@ -392,11 +392,7 @@ enum Cmd {
         end_line: u32,
     },
     /// 光标位置的同符号高亮（textDocument/documentHighlight）。line/col 为 1-based。
-    DocumentHighlight {
-        file: String,
-        line: u32,
-        col: u32,
-    },
+    DocumentHighlight { file: String, line: u32, col: u32 },
     /// 折叠区（textDocument/foldingRange）。
     FoldingRange { file: String },
     /// 语义 token（textDocument/semanticTokens/full）。
@@ -428,11 +424,7 @@ enum Cmd {
         item: Option<String>,
     },
     /// 全局符号标识（textDocument/moniker）。line/col 为 1-based。
-    Moniker {
-        file: String,
-        line: u32,
-        col: u32,
-    },
+    Moniker { file: String, line: u32, col: u32 },
     /// workspace 级 pull diagnostics（workspace/diagnostic）。
     WorkspaceDiagnostic,
     /// daemon 状态（uptime / pid / loaded LS）。
@@ -474,7 +466,11 @@ enum Cmd {
     /// （有 finding 也 exit 0）；`--strict` 下存在 error 级 finding → exit 2。
     LintShell {
         /// 待检查的命令串（与 --cmd-stdin 二选一）。
-        #[arg(long, required_unless_present = "cmd_stdin", conflicts_with = "cmd_stdin")]
+        #[arg(
+            long,
+            required_unless_present = "cmd_stdin",
+            conflicts_with = "cmd_stdin"
+        )]
         cmd: Option<String>,
         /// 从 stdin 读命令串。
         #[arg(long)]
@@ -559,7 +555,12 @@ async fn cli_main() -> ExitCode {
         Some(Cmd::Status) => return cmd_status(&lock_path).await,
         Some(Cmd::StopAll) => return cmd_stop_all(&lock_path).await,
         // lint-shell：纯本地静态分析，不碰 daemon/lock。
-        Some(Cmd::LintShell { cmd, cmd_stdin, json, strict }) => {
+        Some(Cmd::LintShell {
+            cmd,
+            cmd_stdin,
+            json,
+            strict,
+        }) => {
             let text = if *cmd_stdin {
                 match std::io::read_to_string(std::io::stdin()) {
                     Ok(buf) => buf,
@@ -652,7 +653,9 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             .tool_def(&root, file, *line, *col, lang_ref)
             .await
             .and_then(|opt| print_json(&json!(opt))),
-        Some(Cmd::Refs { file, line, col, .. }) => sup
+        Some(Cmd::Refs {
+            file, line, col, ..
+        }) => sup
             .tool_refs(&root, file, *line, *col, lang_ref)
             .await
             .and_then(|vec| print_json(&json!(vec))),
@@ -681,18 +684,20 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             .and_then(|resp| print_json(&json!(resp)))
         }
         // ==== Phase 1 · 上游 wrapper 缺口（13 个 --direct 路径）====
-        Some(Cmd::CodeAction { file, line, col, kind }) => sup
-            .tool_code_action(
-                &root,
-                file,
-                *line,
-                *col,
-                kind.as_deref(),
-                lang_ref,
-            )
+        Some(Cmd::CodeAction {
+            file,
+            line,
+            col,
+            kind,
+        }) => sup
+            .tool_code_action(&root, file, *line, *col, kind.as_deref(), lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::Format { file, tab_size, insert_spaces }) => sup
+        Some(Cmd::Format {
+            file,
+            tab_size,
+            insert_spaces,
+        }) => sup
             .tool_format(&root, file, *tab_size, *insert_spaces, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
@@ -718,7 +723,11 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             )
             .await
             .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::InlayHint { file, start_line, end_line }) => sup
+        Some(Cmd::InlayHint {
+            file,
+            start_line,
+            end_line,
+        }) => sup
             .tool_inlay_hint(&root, file, *start_line, *end_line, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
@@ -742,28 +751,44 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             .tool_document_link(&root, file, lang_ref)
             .await
             .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::CallHierarchy { op, file, line, col, item }) => handle_call_hierarchy(
-            &sup,
-            &root,
+        Some(Cmd::CallHierarchy {
             op,
-            file.as_deref(),
-            *line,
-            *col,
-            item.as_deref(),
-            lang_ref,
-        )
-        .await,
-        Some(Cmd::TypeHierarchy { op, file, line, col, item }) => handle_type_hierarchy(
-            &sup,
-            &root,
+            file,
+            line,
+            col,
+            item,
+        }) => {
+            handle_call_hierarchy(
+                &sup,
+                &root,
+                op,
+                file.as_deref(),
+                *line,
+                *col,
+                item.as_deref(),
+                lang_ref,
+            )
+            .await
+        }
+        Some(Cmd::TypeHierarchy {
             op,
-            file.as_deref(),
-            *line,
-            *col,
-            item.as_deref(),
-            lang_ref,
-        )
-        .await,
+            file,
+            line,
+            col,
+            item,
+        }) => {
+            handle_type_hierarchy(
+                &sup,
+                &root,
+                op,
+                file.as_deref(),
+                *line,
+                *col,
+                item.as_deref(),
+                lang_ref,
+            )
+            .await
+        }
         Some(Cmd::Moniker { file, line, col }) => sup
             .tool_moniker(&root, file, *line, *col, lang_ref)
             .await
@@ -944,7 +969,10 @@ impl From<String> for ForwardFailure {
 /// 503 + wire 错误码 DAEMON_DRAINING 才触发自愈（区别于其他 503）。
 fn is_daemon_draining(status: reqwest::StatusCode, payload: &serde_json::Value) -> bool {
     status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        && payload.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str())
+        && payload
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
             == Some("DAEMON_DRAINING")
 }
 
@@ -1048,14 +1076,25 @@ fn hover_ready(data: &serde_json::Value) -> bool {
 /// 浅深度优先（深度 ≤4），跳过 VCS/构建/依赖目录；找不到返回 None。
 fn find_first_source_file(root: &Path) -> Option<PathBuf> {
     const SKIP: [&str; 10] = [
-        ".git", "target", "node_modules", ".venv", "venv", "dist", "build", "__pycache__",
-        ".idea", ".vscode",
+        ".git",
+        "target",
+        "node_modules",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        "__pycache__",
+        ".idea",
+        ".vscode",
     ];
     fn walk(dir: &Path, depth: u8) -> Option<PathBuf> {
         if depth > 4 {
             return None;
         }
-        let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.filter_map(Result::ok).collect();
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .collect();
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let p = e.path();
@@ -1104,7 +1143,10 @@ async fn probe_tool_call(
         return Err(format!("transport {status}: {payload}"));
     }
     match payload.get("ok").and_then(|v| v.as_bool()) {
-        Some(true) => Ok(payload.get("data").cloned().unwrap_or(serde_json::Value::Null)),
+        Some(true) => Ok(payload
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)),
         _ => Err(payload.get("error").cloned().unwrap_or(payload).to_string()),
     }
 }
@@ -1123,7 +1165,9 @@ async fn cmd_wait_ready(
 ) -> ExitCode {
     let timeout_secs = wait_ready_timeout_secs(
         timeout,
-        std::env::var("SERENA_WAIT_READY_TIMEOUT_SECS").ok().as_deref(),
+        std::env::var("SERENA_WAIT_READY_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
     );
     let root = resolve_project_root(cli.project.clone());
     let probe_path = match file {
@@ -1268,11 +1312,7 @@ async fn read_token_with_retry(lock_path: &Path) -> Result<String, String> {
 /// （调用方应更新缓存并重发一次），否则 `None`（403 另有原因，如实上报）。
 async fn refresh_token_if_stale(lock_path: &Path, current: &str) -> Option<String> {
     let fresh = read_token_with_retry(lock_path).await.ok()?;
-    if fresh != current {
-        Some(fresh)
-    } else {
-        None
-    }
+    if fresh != current { Some(fresh) } else { None }
 }
 
 /// 从子命令的第一个 file 形参（Pos 0）推断 LanguageId（仅当用户未传 --lang）。
@@ -1379,7 +1419,9 @@ fn daemon_creation_flags() -> u32 {
 /// 句柄无效（无控制台场景）时静默跳过——此时本就无可泄漏的管道。
 #[cfg(windows)]
 fn detach_stdio_inheritance() {
-    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
@@ -1433,7 +1475,10 @@ async fn wait_ready(port: u16, timeout: Duration) -> Result<(), String> {
 /// 仅对 `transient(e)` 为真的错误重试——连接未建立 = 请求未出网，重发无重复执行风险；
 /// HTTP 4xx/5xx、daemon 工具错误（有响应即语义结果）一律不重试。超时/解码错误
 /// 不在 `transient` 判定内（请求可能已到达 daemon，重发写类工具 = 重复执行）。
-async fn send_with_connect_retry<T, E, F, Fut>(mut send: F, transient: fn(&E) -> bool) -> Result<T, E>
+async fn send_with_connect_retry<T, E, F, Fut>(
+    mut send: F,
+    transient: fn(&E) -> bool,
+) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
@@ -1469,16 +1514,15 @@ async fn forward(
     let (tool, args): (&str, serde_json::Value) = match &cli.cmd {
         // 本地管理命令已在 main 提前 return；到达此处即编程错误。
         Some(Cmd::Overview { file, .. }) => ("overview", json!({"file": file})),
-        Some(Cmd::SymbolTree { dir, max_files }) => (
-            "symbol-tree",
-            json!({"dir": dir, "max_files": max_files}),
-        ),
+        Some(Cmd::SymbolTree { dir, max_files }) => {
+            ("symbol-tree", json!({"dir": dir, "max_files": max_files}))
+        }
         Some(Cmd::Def { file, line, col }) => {
             ("def", json!({"file": file, "line": line, "col": col}))
         }
-        Some(Cmd::Refs { file, line, col, .. }) => {
-            ("refs", json!({"file": file, "line": line, "col": col}))
-        }
+        Some(Cmd::Refs {
+            file, line, col, ..
+        }) => ("refs", json!({"file": file, "line": line, "col": col})),
         Some(Cmd::Hover { file, line, col }) => {
             ("hover", json!({"file": file, "line": line, "col": col}))
         }
@@ -1488,7 +1532,9 @@ async fn forward(
         Some(Cmd::FindSymbol { query, limit, .. }) => {
             ("find-symbol", json!({"query": query, "limit": limit}))
         }
-        Some(Cmd::FindImplementations { file, line, col, .. }) => (
+        Some(Cmd::FindImplementations {
+            file, line, col, ..
+        }) => (
             "find-implementations",
             json!({"file": file, "line": line, "col": col}),
         ),
@@ -1716,11 +1762,20 @@ async fn forward(
             }),
         ),
         // ==== Phase 1 · 上游 wrapper 缺口（13 个）====
-        Some(Cmd::CodeAction { file, line, col, kind }) => (
+        Some(Cmd::CodeAction {
+            file,
+            line,
+            col,
+            kind,
+        }) => (
             "code-action",
             json!({"file": file, "line": line, "col": col, "kind": kind}),
         ),
-        Some(Cmd::Format { file, tab_size, insert_spaces }) => (
+        Some(Cmd::Format {
+            file,
+            tab_size,
+            insert_spaces,
+        }) => (
             "format",
             json!({
                 "file": file,
@@ -1765,14 +1820,16 @@ async fn forward(
             json!({"file": file, "line": line, "col": col}),
         ),
         Some(Cmd::FoldingRange { file }) => ("folding-range", json!({"file": file})),
-        Some(Cmd::SemanticTokens { file }) => {
-            ("semantic-tokens", json!({"file": file}))
-        }
+        Some(Cmd::SemanticTokens { file }) => ("semantic-tokens", json!({"file": file})),
         Some(Cmd::CodeLens { file }) => ("code-lens", json!({"file": file})),
-        Some(Cmd::DocumentLink { file }) => {
-            ("document-link", json!({"file": file}))
-        }
-        Some(Cmd::CallHierarchy { op, file, line, col, item }) => {
+        Some(Cmd::DocumentLink { file }) => ("document-link", json!({"file": file})),
+        Some(Cmd::CallHierarchy {
+            op,
+            file,
+            line,
+            col,
+            item,
+        }) => {
             let mut args = json!({"op": op});
             if let (Some(f), Some(l), Some(c)) = (file, line, col) {
                 args["file"] = json!(f);
@@ -1786,7 +1843,13 @@ async fn forward(
             }
             ("call-hierarchy", args)
         }
-        Some(Cmd::TypeHierarchy { op, file, line, col, item }) => {
+        Some(Cmd::TypeHierarchy {
+            op,
+            file,
+            line,
+            col,
+            item,
+        }) => {
             let mut args = json!({"op": op});
             if let (Some(f), Some(l), Some(c)) = (file, line, col) {
                 args["file"] = json!(f);
@@ -1799,10 +1862,9 @@ async fn forward(
             }
             ("type-hierarchy", args)
         }
-        Some(Cmd::Moniker { file, line, col }) => (
-            "moniker",
-            json!({"file": file, "line": line, "col": col}),
-        ),
+        Some(Cmd::Moniker { file, line, col }) => {
+            ("moniker", json!({"file": file, "line": line, "col": col}))
+        }
         Some(Cmd::WorkspaceDiagnostic) => ("workspace-diagnostic", json!({})),
         Some(Cmd::Status)
         | Some(Cmd::StopAll)
@@ -1987,7 +2049,10 @@ fn cmd_install_all() -> ExitCode {
         "installed": ok,
         "failed": failed.iter().map(|(id, m)| json!({"id": id, "msg": m})).collect::<Vec<_>>(),
     });
-    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_default()
+    );
     if failed.is_empty() {
         ExitCode::SUCCESS
     } else {
@@ -2026,7 +2091,11 @@ fn check_cargo_metadata(project_root: &Path) -> supervisor::doctor::Check {
             let first = stderr.lines().next().unwrap_or_default().to_string();
             mk(
                 supervisor::doctor::Status::Miss,
-                if first.is_empty() { "exit != 0".into() } else { first },
+                if first.is_empty() {
+                    "exit != 0".into()
+                } else {
+                    first
+                },
                 Some(
                     "workspace 归属冲突会使 LSP 语义工具静默返空：把项目移出外部 \
                      workspace 目录，或在其 Cargo.toml 追加空 [workspace] 表"
@@ -2051,9 +2120,7 @@ async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path, project_root: &Path
     // 可选：--fix 尝试装 MISS 的 server 类别条目
     if fix {
         for c in &report.checks {
-            if c.status == supervisor::doctor::Status::Miss
-                && c.category == "ls"
-            {
+            if c.status == supervisor::doctor::Status::Miss && c.category == "ls" {
                 // `id` 是 server name（如 rust-analyzer）—— 不一定在 servers.toml
                 // （如 csharp-ls 是 dotnet tool）；只对 spec_for 能命中的跑 ensure_launch。
                 if ls_registry::config::spec_for(c.id).is_some() {
@@ -2091,7 +2158,13 @@ fn dedup_loaded_ls(body: &mut serde_json::Value) {
     }
     *arr = counts
         .into_iter()
-        .map(|(lang, n)| if n > 1 { json!(format!("{lang} x{n}")) } else { json!(lang) })
+        .map(|(lang, n)| {
+            if n > 1 {
+                json!(format!("{lang} x{n}"))
+            } else {
+                json!(lang)
+            }
+        })
         .collect();
 }
 
@@ -2527,8 +2600,7 @@ fn normalize_positions(cmd: &mut Cmd) -> Result<(), String> {
             Ok(())
         }
         // 仅 prepare 消费 file/line/col；incoming/outgoing 的 line/col 不使用、不动。
-        Cmd::CallHierarchy { op, line, col, .. }
-        | Cmd::TypeHierarchy { op, line, col, .. }
+        Cmd::CallHierarchy { op, line, col, .. } | Cmd::TypeHierarchy { op, line, col, .. }
             if op == "prepare" =>
         {
             if let (Some(l), Some(c)) = (line, col) {
@@ -2746,10 +2818,7 @@ mod tests {
         else {
             panic!("variant changed")
         };
-        assert_eq!(
-            (*start_line, *start_col, *end_line, *end_col),
-            (0, 0, 1, 4)
-        );
+        assert_eq!((*start_line, *start_col, *end_line, *end_col), (0, 0, 1, 4));
 
         let mut cmd = Cmd::InlayHint {
             file: "f.rs".into(),
@@ -2915,7 +2984,10 @@ mod net_retry_tests {
     fn is_daemon_draining_matches_only_503_with_wire_code() {
         let draining = json!({"ok": false, "error": {"code": "DAEMON_DRAINING", "message": "x"}});
         let other_code = json!({"ok": false, "error": {"code": "INTERNAL", "message": "x"}});
-        assert!(is_daemon_draining(reqwest::StatusCode::SERVICE_UNAVAILABLE, &draining));
+        assert!(is_daemon_draining(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            &draining
+        ));
         assert!(
             !is_daemon_draining(reqwest::StatusCode::SERVICE_UNAVAILABLE, &other_code),
             "非 DRAINING 503 不触发自愈"
@@ -2924,7 +2996,10 @@ mod net_retry_tests {
             !is_daemon_draining(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &draining),
             "非 503 不触发"
         );
-        assert!(!is_daemon_draining(reqwest::StatusCode::SERVICE_UNAVAILABLE, &json!("boom")));
+        assert!(!is_daemon_draining(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            &json!("boom")
+        ));
     }
 
     #[tokio::test]
@@ -2973,7 +3048,10 @@ mod net_retry_tests {
         )
         .await;
         let msg = r.unwrap_err();
-        assert!(msg.contains("daemon transport error"), "还原既有错误文本: {msg}");
+        assert!(
+            msg.contains("daemon transport error"),
+            "还原既有错误文本: {msg}"
+        );
         assert!(msg.contains("DAEMON_DRAINING"), "错误体保留 wire 码: {msg}");
         assert!(calls.get() >= 2, "窗口内至少重试过一轮: {}", calls.get());
     }
@@ -3065,7 +3143,10 @@ mod net_retry_tests {
         .unwrap();
         assert!(matches!(
             cli.cmd,
-            Some(Cmd::WaitReady { stage: WaitStage::Symbol, .. })
+            Some(Cmd::WaitReady {
+                stage: WaitStage::Symbol,
+                ..
+            })
         ));
     }
 
@@ -3074,14 +3155,17 @@ mod net_retry_tests {
         assert!(payload_is_empty(&json!({ "items": [], "warning": "w" })));
         assert!(payload_is_empty(&json!([])));
         assert!(!payload_is_empty(&json!({ "items": [1] })));
-        assert!(!payload_is_empty(&json!({ "compact": true, "items": ["a", "f:1:1"] })));
+        assert!(!payload_is_empty(
+            &json!({ "compact": true, "items": ["a", "f:1:1"] })
+        ));
         // hover 等无 items 的对象形态不算「空集合」——O2 hint 只管集合型工具。
         assert!(!payload_is_empty(&json!({ "contents": "" })));
     }
 
     #[test]
     fn find_first_source_file_skips_build_dirs_and_detects_by_ext() {
-        let tmp = std::env::temp_dir().join(format!("serena-waitready-test-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("serena-waitready-test-{}", std::process::id()));
         std::fs::create_dir_all(tmp.join("target")).unwrap();
         std::fs::write(tmp.join("target").join("aaa.rs"), "fn junk() {}").unwrap();
         std::fs::write(tmp.join("zmain.py"), "def main():\n    pass\n").unwrap();

@@ -170,8 +170,7 @@ async fn defining_symbol_resolves_to_same_symbol_across_positions() {
     assert_eq!(hits_a[0].symbol.name, "add");
     assert_eq!(hits_b[0].symbol.name, "add");
     assert_eq!(
-        hits_a[0].symbol.range.start.line,
-        hits_b[0].symbol.range.start.line,
+        hits_a[0].symbol.range.start.line, hits_b[0].symbol.range.start.line,
         "different cols on same identifier should land at same definition"
     );
 }

@@ -25,10 +25,11 @@ async fn wait_for_progress_resolves_when_ls_sends_notification() {
     .expect("spawn mock_ls");
 
     let params = base_initialize_params();
-    let session = tokio::time::timeout(Duration::from_secs(10), Session::start(Some(child), params))
-        .await
-        .expect("session start within 10s")
-        .expect("session start Ok");
+    let session =
+        tokio::time::timeout(Duration::from_secs(10), Session::start(Some(child), params))
+            .await
+            .expect("session start within 10s")
+            .expect("session start Ok");
 
     let started = Instant::now();
     let res = session
@@ -60,10 +61,11 @@ async fn wait_for_progress_returns_timeout_when_no_notification() {
     .expect("spawn mock_ls");
 
     let params = base_initialize_params();
-    let session = tokio::time::timeout(Duration::from_secs(10), Session::start(Some(child), params))
-        .await
-        .expect("session start within 10s")
-        .expect("session start Ok");
+    let session =
+        tokio::time::timeout(Duration::from_secs(10), Session::start(Some(child), params))
+            .await
+            .expect("session start within 10s")
+            .expect("session start Ok");
 
     let started = Instant::now();
     let res = session

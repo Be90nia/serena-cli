@@ -86,7 +86,8 @@ async fn bench_search_worker_release_during_long_scan() {
     let sup2 = sup.clone();
     let t_concurrent = Instant::now();
     let big_handle = tokio::spawn(async move {
-        sup2.tool_search_for_pattern(&root, &big, None, 50, true).await
+        sup2.tool_search_for_pattern(&root, &big, None, 50, true)
+            .await
     });
     let small_durations: Vec<f64> = {
         let mut durs = Vec::new();
@@ -109,7 +110,9 @@ async fn bench_search_worker_release_during_long_scan() {
     big_handle.await.unwrap().unwrap();
     let concurrent_total_ms = t_concurrent.elapsed().as_secs_f64() * 1000.0;
     let small_avg_ms = small_durations.iter().sum::<f64>() / small_durations.len() as f64;
-    println!("[P2-6 worker] concurrent total: {concurrent_total_ms:.2} ms (big + 10 small in parallel)");
+    println!(
+        "[P2-6 worker] concurrent total: {concurrent_total_ms:.2} ms (big + 10 small in parallel)"
+    );
     println!(
         "[P2-6 worker] small-search avg during big: {small_avg_ms:.3} ms (should be << big_alone)"
     );

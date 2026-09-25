@@ -79,7 +79,10 @@ fn merged_lookup_matches_builtin_without_external_table() {
     // 手写 T2 语言不进表；来源查询同步为 None。
     assert!(spec_for("rust").is_none());
     assert_eq!(spec_source("rust"), None);
-    assert_eq!(spec_for("markdown").map(|(id, _)| id), merged_spec_for("markdown").map(|(id, _)| id));
+    assert_eq!(
+        spec_for("markdown").map(|(id, _)| id),
+        merged_spec_for("markdown").map(|(id, _)| id)
+    );
 }
 
 /// §2 extension 路由：内置 EXT_TABLE 优先，未知扩展在无 external 表时回落 None；
@@ -91,7 +94,10 @@ fn resolve_lang_name_builtin_first_and_graceful_none() {
         Some("rust"),
         "内置扩展名大小写不敏感"
     );
-    assert_eq!(ls_registry::resolve_lang_name(Path::new("a.Md")), Some("markdown"));
+    assert_eq!(
+        ls_registry::resolve_lang_name(Path::new("a.Md")),
+        Some("markdown")
+    );
     // CI 无用户 external-servers.toml：external 兜底层空转 → None。
     assert_eq!(ls_registry::resolve_lang_name(Path::new("foo.mydsl")), None);
     assert_eq!(ls_registry::resolve_lang_name(Path::new("Makefile")), None);

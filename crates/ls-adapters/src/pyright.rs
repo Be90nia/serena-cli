@@ -90,10 +90,7 @@ impl LanguageServerAdapter for PyrightAdapter {
     fn initialize_patches(&self, base: &mut InitializeParams) {
         // M2 深度：探测 venv interpreter；命中 → 注入 `initializationOptions.python.pythonPath`。
         // pyright 用此路径解析 import 与 .pyi 搜索；缺省走系统 python，venv 项目会错乱。
-        let root = PROBE_ROOT
-            .lock()
-            .expect("PROBE_ROOT poisoned")
-            .clone();
+        let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
         let Some(interp) = root.as_deref().and_then(find_python_interpreter) else {
             return;
         };
@@ -103,7 +100,8 @@ impl LanguageServerAdapter for PyrightAdapter {
         if !opts.is_object() {
             *opts = serde_json::json!({});
         }
-        opts["python"]["pythonPath"] = serde_json::Value::String(interp.to_string_lossy().into_owned());
+        opts["python"]["pythonPath"] =
+            serde_json::Value::String(interp.to_string_lossy().into_owned());
     }
 
     fn set_project_root(&self, root: &Path) {
@@ -159,7 +157,11 @@ impl PyrightAdapter {
 /// ponytail: 不读 pyenv shims 名（`python3.x` → shim 链）—— shim 解析是 pyenv 域，
 /// 我们只兜到 `.venv/venv` 真实 venv，shimless CI 项目无 venv 时维持默认。
 pub(crate) fn find_python_interpreter(root: &Path) -> Option<PathBuf> {
-    let bin_name = if cfg!(windows) { "python.exe" } else { "python" };
+    let bin_name = if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python"
+    };
     let candidates: &[&str] = &[".venv", "venv"];
     for venv in candidates {
         let candidate = root.join(venv).join("bin").join(bin_name);
@@ -196,14 +198,22 @@ mod tests {
     #[test]
     fn find_python_interpreter_dotvenv() {
         let dir = tempfile::tempdir().unwrap();
-        let bin_name = if cfg!(windows) { "python.exe" } else { "python" };
+        let bin_name = if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        };
         let venv_bin = dir.path().join(".venv").join("bin");
         std::fs::create_dir_all(&venv_bin).unwrap();
         let py = venv_bin.join(bin_name);
         std::fs::write(&py, "").unwrap();
         let found = find_python_interpreter(dir.path()).expect(".venv 应命中");
         assert!(
-            found.ends_with(format!(".venv/bin/{bin_name}").replace('/', std::path::MAIN_SEPARATOR_STR).as_str()),
+            found.ends_with(
+                format!(".venv/bin/{bin_name}")
+                    .replace('/', std::path::MAIN_SEPARATOR_STR)
+                    .as_str()
+            ),
             "返回路径必须以 .venv/bin/python 结尾: {found:?}"
         );
     }

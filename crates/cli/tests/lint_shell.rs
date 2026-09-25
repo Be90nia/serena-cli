@@ -10,7 +10,10 @@ fn lint_cmd(cmd: &str, extra: &[&str]) -> (i32, String) {
         .args(extra)
         .output()
         .expect("spawn cli");
-    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
 }
 
 /// 验收 2：好命令零 error/warning → exit 0（bash -n 不可用时允许 info 级输出）。
@@ -18,7 +21,10 @@ fn lint_cmd(cmd: &str, extra: &[&str]) -> (i32, String) {
 fn good_tool_is_silent_and_passes() {
     let (rc, out) = lint_cmd("serena-cli find-symbol foo", &[]);
     assert_eq!(rc, 0);
-    assert!(!out.contains("[error]") && !out.contains("[warning]"), "got: {out}");
+    assert!(
+        !out.contains("[error]") && !out.contains("[warning]"),
+        "got: {out}"
+    );
 }
 
 /// 验收 3：错工具名 → warn-only exit 0 + [error][UNKNOWN_TOOL]；--strict → exit 2。
@@ -75,7 +81,12 @@ fn cmd_stdin_equivalent() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn cli");
-    child.stdin.as_mut().expect("stdin").write_all(b"serena-cli find-sympol x").expect("write");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"serena-cli find-sympol x")
+        .expect("write");
     let out = child.wait_with_output().expect("wait");
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).contains("UNKNOWN_TOOL"));

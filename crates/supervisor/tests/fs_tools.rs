@@ -154,7 +154,10 @@ fn should_ignore_builtin_dirs() {
         assert!(fs_tools::should_ignore(name), "{name} should be ignored");
     }
     for name in ["src", "main.rs", "output", "coverage-report", ".github"] {
-        assert!(!fs_tools::should_ignore(name), "{name} should NOT be ignored");
+        assert!(
+            !fs_tools::should_ignore(name),
+            "{name} should NOT be ignored"
+        );
     }
 }
 
@@ -184,5 +187,8 @@ async fn find_file_skips_builtin_ignore_dirs() {
 
     let hits = fs_tools::find_file(&d, "foo.rs", None, 100).unwrap();
     assert_eq!(hits.len(), 1, "only src/foo.rs expected, got {hits:?}");
-    assert!(hits[0].replace('\\', "/").contains("src/foo.rs"), "got {hits:?}");
+    assert!(
+        hits[0].replace('\\', "/").contains("src/foo.rs"),
+        "got {hits:?}"
+    );
 }

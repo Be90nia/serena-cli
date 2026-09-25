@@ -43,15 +43,30 @@ pub(crate) struct Finding {
 }
 
 fn err(code: &'static str, message: String, line: usize) -> Finding {
-    Finding { severity: Severity::Error, code, message, line }
+    Finding {
+        severity: Severity::Error,
+        code,
+        message,
+        line,
+    }
 }
 
 fn warn(code: &'static str, message: String, line: usize) -> Finding {
-    Finding { severity: Severity::Warning, code, message, line }
+    Finding {
+        severity: Severity::Warning,
+        code,
+        message,
+        line,
+    }
 }
 
 fn info(code: &'static str, message: String, line: usize) -> Finding {
-    Finding { severity: Severity::Info, code, message, line }
+    Finding {
+        severity: Severity::Info,
+        code,
+        message,
+        line,
+    }
 }
 
 // ============== 清单（手工同步自 main.rs） ==============
@@ -126,29 +141,109 @@ struct ToolShape {
 
 const POSITION_TOOLS: &[ToolShape] = &[
     // file line col —— 与 normalize_positions 的 14 个 line+col 变体一一对应。
-    ToolShape { tool: "def", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "refs", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "hover", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "find-implementations", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "rename-symbol", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "find-referencing-symbols", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "find-referencing-code-snippets", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "completion", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "containing-symbol", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "defining-symbol", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "signature-help", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "code-action", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "document-highlight", arity: 3, line_args: &[1, 2] },
-    ToolShape { tool: "moniker", arity: 3, line_args: &[1, 2] },
+    ToolShape {
+        tool: "def",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "refs",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "hover",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "find-implementations",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "rename-symbol",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "find-referencing-symbols",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "find-referencing-code-snippets",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "completion",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "containing-symbol",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "defining-symbol",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "signature-help",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "code-action",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "document-highlight",
+        arity: 3,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "moniker",
+        arity: 3,
+        line_args: &[1, 2],
+    },
     // file sl sc el ec
-    ToolShape { tool: "format-range", arity: 5, line_args: &[1, 2, 3, 4] },
+    ToolShape {
+        tool: "format-range",
+        arity: 5,
+        line_args: &[1, 2, 3, 4],
+    },
     // file start_line end_line（无 col）
-    ToolShape { tool: "inlay-hint", arity: 3, line_args: &[1, 2] },
+    ToolShape {
+        tool: "inlay-hint",
+        arity: 3,
+        line_args: &[1, 2],
+    },
     // 行级编辑（1-based，运行时同样 BAD_ARGS）。
-    ToolShape { tool: "insert-at-line", arity: 3, line_args: &[1] },
-    ToolShape { tool: "replace-lines", arity: 4, line_args: &[1, 2] },
-    ToolShape { tool: "delete-lines", arity: 4, line_args: &[1, 2] },
-    ToolShape { tool: "delete-text-in-symbol", arity: 4, line_args: &[2, 3] },
+    ToolShape {
+        tool: "insert-at-line",
+        arity: 3,
+        line_args: &[1],
+    },
+    ToolShape {
+        tool: "replace-lines",
+        arity: 4,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "delete-lines",
+        arity: 4,
+        line_args: &[1, 2],
+    },
+    ToolShape {
+        tool: "delete-text-in-symbol",
+        arity: 4,
+        line_args: &[2, 3],
+    },
 ];
 
 /// 第一位置参数为文件/目录路径的工具（路径存在性检查面）。排除 query/pattern/
@@ -231,7 +326,10 @@ fn tokenize(text: &str) -> Vec<Token> {
 
     fn flush(toks: &mut Vec<Token>, cur: &mut String, tok_line: usize, has_tok: &mut bool) {
         if *has_tok {
-            toks.push(Token { text: std::mem::take(cur), line: tok_line });
+            toks.push(Token {
+                text: std::mem::take(cur),
+                line: tok_line,
+            });
             *has_tok = false;
         }
     }
@@ -299,7 +397,10 @@ fn tokenize(text: &str) -> Vec<Token> {
             }
             ';' | '|' | '&' | '(' | ')' | '`' => {
                 flush(&mut toks, &mut cur, tok_line, &mut has_tok);
-                toks.push(Token { text: c.to_string(), line: cur_line });
+                toks.push(Token {
+                    text: c.to_string(),
+                    line: cur_line,
+                });
                 at_token_start = true;
             }
             '#' if at_token_start => {
@@ -347,7 +448,11 @@ fn find_tool(toks: &[Token], exe_idx: usize) -> Option<usize> {
     while j < toks.len() {
         let t = toks[j].text.as_str();
         if t.starts_with('-') && t.len() > 1 {
-            j += if GLOBAL_VALUE_FLAGS.contains(&t) { 2 } else { 1 };
+            j += if GLOBAL_VALUE_FLAGS.contains(&t) {
+                2
+            } else {
+                1
+            };
             continue;
         }
         return Some(j);
@@ -431,7 +536,8 @@ fn check_path_first(tool: &Token, args: &[&Token], findings: &mut Vec<Finding>) 
 fn check_cli_calls(toks: &[Token], findings: &mut Vec<Finding>) {
     let mut i = 0;
     while i < toks.len() {
-        if is_cli_exe(&toks[i].text) && is_command_pos(toks, i)
+        if is_cli_exe(&toks[i].text)
+            && is_command_pos(toks, i)
             && let Some(ti) = find_tool(toks, i)
         {
             let tool = &toks[ti];
@@ -478,7 +584,9 @@ fn check_flag_lines(toks: &[Token], findings: &mut Vec<Finding>) {
 
 fn is_python_cmd(line: &str) -> bool {
     let t = line.trim_start();
-    let rest = t.strip_prefix("python3").or_else(|| t.strip_prefix("python"));
+    let rest = t
+        .strip_prefix("python3")
+        .or_else(|| t.strip_prefix("python"));
     match rest {
         Some(r) => r.is_empty() || r.starts_with(|c: char| c.is_whitespace() || c == '-'),
         None => false,
@@ -616,7 +724,10 @@ fn check_bash_syntax(text: &str) -> Option<Finding> {
     }
     // Git Bash 的 bash.exe 接受正斜杠 Windows 路径；反斜杠会被当转义。
     let tmp_str = tmp.to_string_lossy().replace('\\', "/");
-    let out = std::process::Command::new("bash").arg("-n").arg(&tmp_str).output();
+    let out = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(&tmp_str)
+        .output();
     let _ = std::fs::remove_file(&tmp);
     match out {
         Err(_) => Some(info(
@@ -709,7 +820,13 @@ pub(crate) fn run(text: &str, json_output: bool, strict: bool) -> u8 {
         println!("{}", render_json(&findings));
     } else {
         for f in &findings {
-            println!("[{}][{}] {} (line {})", f.severity.as_str(), f.code, f.message, f.line);
+            println!(
+                "[{}][{}] {} (line {})",
+                f.severity.as_str(),
+                f.code,
+                f.message,
+                f.line
+            );
         }
     }
     decide_exit(&findings, strict)
@@ -729,14 +846,20 @@ mod tests {
     fn tokenize_quotes_continuation_and_lines() {
         let toks = tokenize("cli def 'a b.rs' \\\n  1 2\nhover c.rs 3 4");
         let texts: Vec<&str> = toks.iter().map(|t| t.text.as_str()).collect();
-        assert_eq!(texts, ["cli", "def", "a b.rs", "1", "2", "hover", "c.rs", "3", "4"]);
+        assert_eq!(
+            texts,
+            ["cli", "def", "a b.rs", "1", "2", "hover", "c.rs", "3", "4"]
+        );
         // 续行后的 token 记物理行 2。
         assert_eq!(toks[3].line, 2);
         assert_eq!(toks[5].line, 3);
         // 操作符切分 + 引号内换行保留。
         let toks2 = tokenize("ls && python -c 'x = 1\nos.system(\"ls\")'");
         let texts2: Vec<&str> = toks2.iter().map(|t| t.text.as_str()).collect();
-        assert_eq!(texts2, ["ls", "&", "&", "python", "-c", "x = 1\nos.system(\"ls\")"]);
+        assert_eq!(
+            texts2,
+            ["ls", "&", "&", "python", "-c", "x = 1\nos.system(\"ls\")"]
+        );
     }
 
     /// 锁定手工清单与 clap 派生自 enum Cmd 的子命令名完全一致（双向）。
@@ -747,7 +870,10 @@ mod tests {
         let clap_names: std::collections::BTreeSet<&str> =
             cmd.get_subcommands().map(|c| c.get_name()).collect();
         let mine: std::collections::BTreeSet<&str> = TOOL_NAMES.iter().copied().collect();
-        assert_eq!(mine, clap_names, "TOOL_NAMES 与 enum Cmd drift（见 main.rs enum Cmd）");
+        assert_eq!(
+            mine, clap_names,
+            "TOOL_NAMES 与 enum Cmd drift（见 main.rs enum Cmd）"
+        );
     }
 
     #[test]
@@ -758,7 +884,12 @@ mod tests {
             assert!(TOOL_NAMES.contains(&s.tool), "{} not in TOOL_NAMES", s.tool);
             assert!(!s.line_args.is_empty());
             let max = *s.line_args.iter().max().unwrap();
-            assert!(max < s.arity, "{}: line idx {max} >= arity {}", s.tool, s.arity);
+            assert!(
+                max < s.arity,
+                "{}: line idx {max} >= arity {}",
+                s.tool,
+                s.arity
+            );
         }
         for t in PATH_FIRST_TOOLS {
             assert!(TOOL_NAMES.contains(t), "{t} not in TOOL_NAMES");

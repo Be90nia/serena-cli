@@ -104,15 +104,24 @@ fn probe_runtime(name: &str) -> Option<String> {
 
 fn check_runtimes() -> Vec<Check> {
     let names: &[(&str, &str)] = &[
-        ("node", "JavaScript runtime (npm/typescript-language-server)"),
+        (
+            "node",
+            "JavaScript runtime (npm/typescript-language-server)",
+        ),
         ("npm", "npm package manager"),
         ("uv", "Python package manager (uv tool)"),
-        ("uvx", "Python package runner (uvx for pyright/basedpyright/ty/pyre/pyrefly)"),
+        (
+            "uvx",
+            "Python package runner (uvx for pyright/basedpyright/ty/pyre/pyrefly)",
+        ),
         ("dotnet", ".NET runtime (csharp-ls/fsautocomplete)"),
         ("gem", "RubyGems (ruby-lsp/solargraph)"),
         ("java", "JVM (jdtls/bsl/...)"),
         ("go", "Go toolchain (gopls)"),
-        ("cargo", "Rust build tool (rust-analyzer install via rustup)"),
+        (
+            "cargo",
+            "Rust build tool (rust-analyzer install via rustup)",
+        ),
         ("rustup", "Rust toolchain installer"),
         ("python", "Python interpreter"),
         ("python3", "Python 3 interpreter"),
@@ -120,25 +129,23 @@ fn check_runtimes() -> Vec<Check> {
     ];
     names
         .iter()
-        .map(|(name, label)| {
-            match probe_runtime(name) {
-                Some(detail) => Check {
-                    category: "runtime",
-                    id: name,
-                    label,
-                    status: Status::Ok,
-                    detail,
-                    hint: None,
-                },
-                None => Check {
-                    category: "runtime",
-                    id: name,
-                    label,
-                    status: Status::Miss,
-                    detail: format!("`{name}` not found on PATH"),
-                    hint: Some(format!("install `{name}` and ensure it is on PATH")),
-                },
-            }
+        .map(|(name, label)| match probe_runtime(name) {
+            Some(detail) => Check {
+                category: "runtime",
+                id: name,
+                label,
+                status: Status::Ok,
+                detail,
+                hint: None,
+            },
+            None => Check {
+                category: "runtime",
+                id: name,
+                label,
+                status: Status::Miss,
+                detail: format!("`{name}` not found on PATH"),
+                hint: Some(format!("install `{name}` and ensure it is on PATH")),
+            },
         })
         .collect()
 }
@@ -149,9 +156,17 @@ fn check_path_dirs() -> Check {
     let mut count = 0usize;
     if let Some(pv) = &path_var {
         if cfg!(windows) {
-            count = pv.to_string_lossy().split(';').filter(|s| !s.is_empty()).count();
+            count = pv
+                .to_string_lossy()
+                .split(';')
+                .filter(|s| !s.is_empty())
+                .count();
         } else {
-            count = pv.to_string_lossy().split(':').filter(|s| !s.is_empty()).count();
+            count = pv
+                .to_string_lossy()
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .count();
         }
     }
     if path_var.is_none() {
@@ -282,7 +297,11 @@ fn check_daemon(lock_path: &Path) -> Vec<Check> {
             let addr = format!("127.0.0.1:{port}");
             let alive = TcpStream::connect_timeout(
                 &addr.parse().unwrap_or_else(|_| {
-                    ("127.0.0.1", 7860u16).to_socket_addrs().unwrap().next().unwrap()
+                    ("127.0.0.1", 7860u16)
+                        .to_socket_addrs()
+                        .unwrap()
+                        .next()
+                        .unwrap()
                 }),
                 PORT_PROBE_TIMEOUT,
             )
@@ -304,8 +323,7 @@ fn check_daemon(lock_path: &Path) -> Vec<Check> {
                     status: Status::Warn,
                     detail: format!("present but port={port} unreachable (stale?)"),
                     hint: Some(
-                        "run `serena-cli stop-all` then retry; or delete the lock manually"
-                            .into(),
+                        "run `serena-cli stop-all` then retry; or delete the lock manually".into(),
                     ),
                 });
             }
@@ -330,7 +348,7 @@ fn check_daemon(lock_path: &Path) -> Vec<Check> {
                 hint: Some("check lock file permissions".into()),
             });
         }
-    }    // 4c. 安装缓存根可达性
+    } // 4c. 安装缓存根可达性
     let cache = dirs_cache_root();
     if cache.as_os_str().is_empty() {
         out.push(Check {
@@ -511,8 +529,7 @@ mod tests {
     fn run_all_returns_at_least_five_categories() {
         // 校验 5 类检查都跑了（即使 miss 也得有 entry）
         let r = run_all(&PathBuf::from("Z:/nonexistent_lock_xyz_12345"));
-        let cats: std::collections::HashSet<&str> =
-            r.checks.iter().map(|c| c.category).collect();
+        let cats: std::collections::HashSet<&str> = r.checks.iter().map(|c| c.category).collect();
         for cat in ["runtime", "path", "ls", "daemon", "net"] {
             assert!(cats.contains(cat), "missing category {cat}");
         }

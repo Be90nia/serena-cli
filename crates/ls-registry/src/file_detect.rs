@@ -38,10 +38,7 @@ fn by_shebang(hebang: &str) -> Option<LanguageId> {
     // 末个空白分隔 token 作为解释器名（自动剥离 `env` wrapper：取最末 token 而非第二段）。
     let mut tokens = hebang.split_whitespace();
     let raw = tokens.next_back()?.trim();
-    let interp = raw
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(raw);
+    let interp = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
     let interp = interp
         .strip_suffix(".exe")
         .or_else(|| interp.strip_suffix(".bat"))
@@ -102,20 +99,50 @@ mod tests {
 
     #[test]
     fn extension_routes_rs_py_ts_cpp_cs_java_md() {
-        assert_eq!(detect_language(&PathBuf::from("a.rs")), Some(LanguageId::Rust));
-        assert_eq!(detect_language(&PathBuf::from("a.py")), Some(LanguageId::Python));
-        assert_eq!(detect_language(&PathBuf::from("a.ts")), Some(LanguageId::TypeScript));
-        assert_eq!(detect_language(&PathBuf::from("a.tsx")), Some(LanguageId::TypeScript));
-        assert_eq!(detect_language(&PathBuf::from("a.cpp")), Some(LanguageId::Cpp));
-        assert_eq!(detect_language(&PathBuf::from("a.cs")), Some(LanguageId::CSharp));
-        assert_eq!(detect_language(&PathBuf::from("a.java")), Some(LanguageId::Java));
-        assert_eq!(detect_language(&PathBuf::from("a.md")), Some(LanguageId::Markdown));
+        assert_eq!(
+            detect_language(&PathBuf::from("a.rs")),
+            Some(LanguageId::Rust)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("a.py")),
+            Some(LanguageId::Python)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("a.ts")),
+            Some(LanguageId::TypeScript)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("a.tsx")),
+            Some(LanguageId::TypeScript)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("a.cpp")),
+            Some(LanguageId::Cpp)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("a.cs")),
+            Some(LanguageId::CSharp)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("a.java")),
+            Some(LanguageId::Java)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("a.md")),
+            Some(LanguageId::Markdown)
+        );
     }
 
     #[test]
     fn extension_is_case_insensitive() {
-        assert_eq!(detect_language(&PathBuf::from("Foo.CPP")), Some(LanguageId::Cpp));
-        assert_eq!(detect_language(&PathBuf::from("X.PY")), Some(LanguageId::Python));
+        assert_eq!(
+            detect_language(&PathBuf::from("Foo.CPP")),
+            Some(LanguageId::Cpp)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("X.PY")),
+            Some(LanguageId::Python)
+        );
     }
 
     #[test]

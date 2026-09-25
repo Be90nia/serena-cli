@@ -308,7 +308,11 @@ mod tests {
             (Os::Macos, Arch::Aarch64),
         ] {
             let r = rust_analyzer_release_for(os, arch).expect("4 主流平台必须有条目");
-            assert_eq!(r.sha256.len(), 64, "rust-analyzer 真值已锚定（GitHub digest）");
+            assert_eq!(
+                r.sha256.len(),
+                64,
+                "rust-analyzer 真值已锚定（GitHub digest）"
+            );
             assert!(r.url.contains("2026-09-07"), "版本钉死: {}", r.url);
             assert!(r.url.starts_with("https://github.com/rust-lang/"));
         }

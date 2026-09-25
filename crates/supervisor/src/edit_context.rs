@@ -245,7 +245,11 @@ mod tests {
     /// r-a 是否可达。false 时所有集成测试 skip（不构成 false failure）。
     /// ponytail: 不用 `which` crate（新增依赖），手工 PATH 查找 + Windows .exe 后缀。
     fn rust_analyzer_available() -> bool {
-        let exe = if cfg!(windows) { "rust-analyzer.exe" } else { "rust-analyzer" };
+        let exe = if cfg!(windows) {
+            "rust-analyzer.exe"
+        } else {
+            "rust-analyzer"
+        };
         if let Some(paths) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&paths) {
                 if dir.join(exe).is_file() {
@@ -276,7 +280,11 @@ mod tests {
         let mut report = collect(&sup, &root, "lib.rs", "add", Some("rust")).await;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
         while std::time::Instant::now() < deadline {
-            let callers_ok = report.callers.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+            let callers_ok = report
+                .callers
+                .as_ref()
+                .map(|c| !c.is_empty())
+                .unwrap_or(false);
             if callers_ok && report.doc.is_some() {
                 break;
             }

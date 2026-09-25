@@ -163,7 +163,15 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
 
 /// 源文件探测时的跳过目录（构建产物 / VCS / 依赖树，进去只会浪费扫描时间）。
 const PROBE_SKIP_DIRS: &[&str] = &[
-    "target", "node_modules", "build", "dist", ".git", ".hg", ".svn", "__pycache__", "vendor",
+    "target",
+    "node_modules",
+    "build",
+    "dist",
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "vendor",
 ];
 
 /// root 下找 adapter 语言的首个真实源文件（限深 4 层），触发 LS 的项目 lazy-load。
@@ -198,9 +206,10 @@ fn find_language_source_file(root: &Path, langs: &[LanguageId], depth: u8) -> Op
     for path in &entries {
         if path.is_dir() {
             let name = path.file_name().map(|n| n.to_string_lossy().to_string());
-            if name.as_deref().is_some_and(|n| {
-                PROBE_SKIP_DIRS.contains(&n) || n.starts_with('.')
-            }) {
+            if name
+                .as_deref()
+                .is_some_and(|n| PROBE_SKIP_DIRS.contains(&n) || n.starts_with('.'))
+            {
                 continue;
             }
             if let Some(hit) = find_language_source_file(path, langs, depth - 1) {
@@ -436,7 +445,10 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
         let uri = probe_uri_for_root(dir.path(), &[LanguageId::Rust], "file:///__fallback__");
         assert!(uri.starts_with("file:///"), "必须是 file URI: {uri}");
-        assert!(uri.ends_with(".gitignore"), "无语言源文件应退工程标记: {uri}");
+        assert!(
+            uri.ends_with(".gitignore"),
+            "无语言源文件应退工程标记: {uri}"
+        );
     }
 
     #[test]
@@ -453,11 +465,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // target/ 里的 .rs 不是用户源码 —— 不得被探针选中。
         std::fs::create_dir_all(dir.path().join("target").join("debug")).unwrap();
-        std::fs::write(
-            dir.path().join("target").join("debug").join("junk.rs"),
-            "",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("target").join("debug").join("junk.rs"), "").unwrap();
         assert_eq!(
             probe_uri_for_root(dir.path(), &[LanguageId::Rust], "file:///__fallback__"),
             "file:///__fallback__"
@@ -571,4 +579,3 @@ mod tests {
         );
     }
 }
-

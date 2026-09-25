@@ -68,10 +68,7 @@ const SYMBOL_CACHE_MAX_ENTRIES: usize = 512;
 ///
 /// `lang` 是 `session_for` 传入的语言名（或 id）；CLI / config override 的
 /// `lang` 字段必须按相同语义 lookup `spec_for`。
-pub fn effective_tool_timeout(
-    lang: Option<&str>,
-    args: &serde_json::Value,
-) -> Duration {
+pub fn effective_tool_timeout(lang: Option<&str>, args: &serde_json::Value) -> Duration {
     let from_args = args
         .get("_timeout_ms")
         .and_then(|v| v.as_u64())
@@ -85,10 +82,7 @@ pub fn effective_tool_timeout(
     Duration::from_millis(ms as u64)
 }
 
-pub fn effective_index_timeout(
-    lang: Option<&str>,
-    args: &serde_json::Value,
-) -> Duration {
+pub fn effective_index_timeout(lang: Option<&str>, args: &serde_json::Value) -> Duration {
     let from_args = args
         .get("_index_timeout_ms")
         .and_then(|v| v.as_u64())
@@ -97,8 +91,9 @@ pub fn effective_index_timeout(
         index_timeout_ms: from_args,
         ..Default::default()
     };
-    let ms = ls_registry::config::effective_index_timeout_ms(lang.unwrap_or(""), Some(&cli_override))
-        .unwrap_or(120_000);
+    let ms =
+        ls_registry::config::effective_index_timeout_ms(lang.unwrap_or(""), Some(&cli_override))
+            .unwrap_or(120_000);
     Duration::from_millis(ms as u64)
 }
 
@@ -262,7 +257,11 @@ fn root_source_mtime(root: &Path) -> Option<SystemTime> {
 /// ponytail: 全局静态锁 + HashMap；多根项目并行 scan 会争用，但对单一 root 串行
 /// find-symbol 场景（典型）零争用。万级 root 时换 DashMap——本项目禁 dashmap，
 /// 改回 path-hash 分片 Mutex 即可。
-type RootSignalEntry = (std::time::Instant, Option<SystemTime>, std::collections::BTreeSet<String>);
+type RootSignalEntry = (
+    std::time::Instant,
+    Option<SystemTime>,
+    std::collections::BTreeSet<String>,
+);
 const ROOT_SIGNAL_TTL: Duration = Duration::from_secs(2);
 
 static ROOT_SIGNAL_CACHE: LazyLock<Mutex<HashMap<PathBuf, RootSignalEntry>>> =
@@ -292,10 +291,9 @@ async fn root_signal_cached(
     }
     // Slow-path: spawn_blocking 跑同步 walk，不占 async worker。
     let root_owned = root.to_path_buf();
-    let (max, langs) =
-        tokio::task::spawn_blocking(move || walk_root_signal(&root_owned))
-            .await
-            .unwrap_or_else(|_| (None, std::collections::BTreeSet::new()));
+    let (max, langs) = tokio::task::spawn_blocking(move || walk_root_signal(&root_owned))
+        .await
+        .unwrap_or_else(|_| (None, std::collections::BTreeSet::new()));
     let mut cache = ROOT_SIGNAL_CACHE.lock().unwrap();
     // 二次检查：期间可能已被并发回填。
     if let Some(existing) = cache.get(root)
@@ -590,7 +588,10 @@ impl Supervisor {
     pub fn reclaim_idle_buffers_once(&self) -> usize {
         // 阈值（call 次）：节流，避免每工具调用都遍历 sessions。
         const RECLAIM_THRESHOLD: u64 = 32;
-        let n = self.idle_buffers_reclaim_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let n = self
+            .idle_buffers_reclaim_counter
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         if n < RECLAIM_THRESHOLD {
             return 0;
         }
@@ -745,7 +746,10 @@ impl Supervisor {
         match f(session.clone()).await {
             Err(ToolError::Core(CoreError::Terminated { .. })) => {
                 let key = Supervisor::key(root, lang);
-                tracing::warn!(?key, "session terminated mid-call; evicting and retrying once");
+                tracing::warn!(
+                    ?key,
+                    "session terminated mid-call; evicting and retrying once"
+                );
                 let _ = sup.evict(&key).await;
                 let session2 = sup.session_for(root, lang).await?;
                 f(session2).await
@@ -844,9 +848,9 @@ impl Supervisor {
                     .unwrap_or("root")
                     .to_string(),
             }];
-            folders.extend(lsp_core::workspace_folders::discover_additional_workspace_folders(
-                &key.root,
-            ));
+            folders.extend(
+                lsp_core::workspace_folders::discover_additional_workspace_folders(&key.root),
+            );
             folders
         });
         // T0 配置驱动路径无手写 adapter：无 initialize_patches（servers.toml 已含
@@ -925,24 +929,22 @@ impl Supervisor {
         for method in ["window/showMessage", "window/logMessage"] {
             let ws_err_root = ws_err_root.clone();
             let ws_errors = std::sync::Arc::clone(&self.workspace_errors);
-            session
-                .client()
-                .on_notification(method, move |msg| {
-                    let Some(message) = msg
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.get("message"))
-                        .and_then(|v| v.as_str())
-                    else {
-                        return;
-                    };
-                    if is_workspace_load_error(message) {
-                        ws_errors
-                            .lock()
-                            .unwrap()
-                            .insert(ws_err_root.clone(), message.to_owned());
-                    }
-                });
+            session.client().on_notification(method, move |msg| {
+                let Some(message) = msg
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("message"))
+                    .and_then(|v| v.as_str())
+                else {
+                    return;
+                };
+                if is_workspace_load_error(message) {
+                    ws_errors
+                        .lock()
+                        .unwrap()
+                        .insert(ws_err_root.clone(), message.to_owned());
+                }
+            });
         }
         // ↖ mirror: ls.py@43ae021 on_server_started — 把"等待 LS 索引就绪"
         // 推到 session_for 内，避免用户可见的首请求 = 索引懒加载。探针必须用
@@ -952,11 +954,9 @@ impl Supervisor {
         // documentSymbol 通用探针仍然生效。
         if let Some(adapter) = &t2 {
             adapter.set_project_root(&key.root);
-            if let Err(e) = tokio::time::timeout(
-                Duration::from_secs(30),
-                adapter.on_server_ready(&session),
-            )
-            .await
+            if let Err(e) =
+                tokio::time::timeout(Duration::from_secs(30), adapter.on_server_ready(&session))
+                    .await
             {
                 tracing::warn!(adapter = adapter.id(), error = %e, "on_server_ready probe failed/timed out; continuing");
             }
@@ -1489,8 +1489,7 @@ impl Supervisor {
             .request("textDocument/foldingRange", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::FoldingRange> =
-            serde_json::from_value(raw).unwrap_or_default();
+        let parsed: Vec<lsp_types::FoldingRange> = serde_json::from_value(raw).unwrap_or_default();
         Ok(parsed)
     }
 
@@ -1565,8 +1564,7 @@ impl Supervisor {
             .request("textDocument/documentLink", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::DocumentLink> =
-            serde_json::from_value(raw).unwrap_or_default();
+        let parsed: Vec<lsp_types::DocumentLink> = serde_json::from_value(raw).unwrap_or_default();
         Ok(parsed)
     }
 
@@ -1608,10 +1606,7 @@ impl Supervisor {
         item: serde_json::Value,
         lang_override: Option<&str>,
     ) -> ToolResult<Vec<lsp_types::CallHierarchyIncomingCall>> {
-        let item_str = item
-            .get("uri")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let item_str = item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
         let lang = resolve_lang_for_file(&file_path_from_uri(item_str), lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let params = json!({ "item": item });
@@ -1631,10 +1626,7 @@ impl Supervisor {
         item: serde_json::Value,
         lang_override: Option<&str>,
     ) -> ToolResult<Vec<lsp_types::CallHierarchyOutgoingCall>> {
-        let item_str = item
-            .get("uri")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let item_str = item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
         let lang = resolve_lang_for_file(&file_path_from_uri(item_str), lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let params = json!({ "item": item });
@@ -1683,10 +1675,7 @@ impl Supervisor {
         item: serde_json::Value,
         lang_override: Option<&str>,
     ) -> ToolResult<Vec<lsp_types::TypeHierarchyItem>> {
-        let item_str = item
-            .get("uri")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let item_str = item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
         let lang = resolve_lang_for_file(&file_path_from_uri(item_str), lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let params = json!({ "item": item });
@@ -1706,10 +1695,7 @@ impl Supervisor {
         item: serde_json::Value,
         lang_override: Option<&str>,
     ) -> ToolResult<Vec<lsp_types::TypeHierarchyItem>> {
-        let item_str = item
-            .get("uri")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let item_str = item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
         let lang = resolve_lang_for_file(&file_path_from_uri(item_str), lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let params = json!({ "item": item });
@@ -1763,7 +1749,13 @@ impl Supervisor {
             Some(l) => l.to_ascii_lowercase(),
             None => {
                 // 走 default LS（adapter 默认 lang）。
-                let entries = self.last_used.lock().unwrap().keys().cloned().collect::<Vec<_>>();
+                let entries = self
+                    .last_used
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 match entries.first() {
                     Some(k) => k.lang.to_string(),
                     None => {
@@ -1786,8 +1778,7 @@ impl Supervisor {
             return Ok(Vec::new());
         };
         let items = raw.get("items").cloned().unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::Diagnostic> =
-            serde_json::from_value(items).unwrap_or_default();
+        let parsed: Vec<lsp_types::Diagnostic> = serde_json::from_value(items).unwrap_or_default();
         Ok(parsed)
     }
 
@@ -1856,7 +1847,12 @@ impl Supervisor {
             return; // 非 cargo 项目（纯文件目录 / 其它语言），无从失败
         }
         let identity = key_root_identity(root);
-        if self.workspace_errors.lock().unwrap().contains_key(&identity) {
+        if self
+            .workspace_errors
+            .lock()
+            .unwrap()
+            .contains_key(&identity)
+        {
             return; // 本轮 session 生命周期内已有结论（含其它通道记录）
         }
         let manifest = root.join("Cargo.toml");
@@ -1888,12 +1884,11 @@ impl Supervisor {
         } else {
             detail.chars().take(400).collect()
         };
-        self.workspace_errors.lock().unwrap().insert(
-            identity,
-            format!("cargo metadata failed: {detail}"),
-        );
+        self.workspace_errors
+            .lock()
+            .unwrap()
+            .insert(identity, format!("cargo metadata failed: {detail}"));
     }
-
 
     /// workspace 加载错误 warning（bd serena-rust-xzb）：有记录即透出，**不依赖空
     /// 结果** —— 记录意味着该 root 的 workspace 未加载成功，语义结果整体不可信
@@ -1930,7 +1925,6 @@ impl Supervisor {
         }
     }
 
-
     /// LS 会话新建（session_for spawn 点）记账：开窗 + 清语义就绪标记。
     /// LS 重启（evict/懒重启）即重新冷启动，窗口必须重开。
     fn mark_ls_started(&self, root: &Path) {
@@ -1945,7 +1939,12 @@ impl Supervisor {
 
     /// 首个语义工具（hover/def/refs/find-implementations）非空成功 → 关窗。
     fn mark_semantic_ready(&self, root: &Path) {
-        if let Some(w) = self.ls_warmup.lock().unwrap().get_mut(&key_root_identity(root)) {
+        if let Some(w) = self
+            .ls_warmup
+            .lock()
+            .unwrap()
+            .get_mut(&key_root_identity(root))
+        {
             w.semantic_ok = true;
         }
     }
@@ -1958,9 +1957,7 @@ impl Supervisor {
             .lock()
             .unwrap()
             .get(&key_root_identity(root))
-            .is_some_and(|w| {
-                !w.semantic_ok && w.started.elapsed() < LS_WARMUP_WINDOW
-            });
+            .is_some_and(|w| !w.semantic_ok && w.started.elapsed() < LS_WARMUP_WINDOW);
         if active {
             vec![index_warming_message()]
         } else {
@@ -1970,10 +1967,10 @@ impl Supervisor {
 
     /// 写工具收尾标记（bd serena-rust-0em）：file 进入写后一致性窗口。
     fn mark_recent_write(&self, root: &Path, file: &str) {
-        self.recent_writes
-            .lock()
-            .unwrap()
-            .insert((root.to_path_buf(), file.to_lowercase()), std::time::Instant::now());
+        self.recent_writes.lock().unwrap().insert(
+            (root.to_path_buf(), file.to_lowercase()),
+            std::time::Instant::now(),
+        );
     }
 
     /// root 下仍在写后一致性窗口内的文件的归一 uri 集合（顺手清理过期条目）。
@@ -2045,7 +2042,10 @@ impl Supervisor {
         let key = format!("{}|{}", tool, root_key);
         if !delta {
             if !is_empty_response(&current) {
-                self.delta_cache.lock().unwrap().insert(key, current.clone());
+                self.delta_cache
+                    .lock()
+                    .unwrap()
+                    .insert(key, current.clone());
             }
             return current;
         }
@@ -2148,9 +2148,10 @@ impl Supervisor {
             });
         }
         let canon_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let canon_dir = dunce::canonicalize(canon_root.join(dir)).map_err(|e| ToolError::BadArgs {
-            detail: format!("dir not found: {dir} ({e})"),
-        })?;
+        let canon_dir =
+            dunce::canonicalize(canon_root.join(dir)).map_err(|e| ToolError::BadArgs {
+                detail: format!("dir not found: {dir} ({e})"),
+            })?;
         if !canon_dir.starts_with(&canon_root) {
             return Err(ToolError::BadArgs {
                 detail: format!("dir escapes root: {dir}"),
@@ -2213,10 +2214,7 @@ impl Supervisor {
             for (idx, file) in files.iter().enumerate() {
                 match resolve_lang_for_file(file, lang) {
                     Ok(lang_id) => {
-                        per_lang_buckets
-                            .entry(lang_id)
-                            .or_default()
-                            .push(idx);
+                        per_lang_buckets.entry(lang_id).or_default().push(idx);
                     }
                     Err(e) => {
                         // 与 tool_overview 一致：纯缓存命中也可走，但 miss 路径无法走 LS，
@@ -2325,8 +2323,7 @@ impl Supervisor {
             entries.sort_by_key(|(idx, _)| *idx);
         }
 
-        let final_entries: Vec<serde_json::Value> =
-            entries.into_iter().map(|(_, v)| v).collect();
+        let final_entries: Vec<serde_json::Value> = entries.into_iter().map(|(_, v)| v).collect();
 
         serde_json::to_value(serde_json::json!({
             "dir": dir,
@@ -2438,11 +2435,12 @@ impl Supervisor {
         }
 
         // 4) 读盘 → 切片 body（OffsetEncoding::Utf16 与 tool_symbol_body 一致）。
-        let text = tokio::fs::read_to_string(&target_path)
-            .await
-            .map_err(|e| ToolError::BadArgs {
-                detail: format!("read {}: {e}", target_path.display()),
-            })?;
+        let text =
+            tokio::fs::read_to_string(&target_path)
+                .await
+                .map_err(|e| ToolError::BadArgs {
+                    detail: format!("read {}: {e}", target_path.display()),
+                })?;
         let source = DefiningSymbolLocation {
             file: def_file.clone(),
             line: def_loc.range.start.line,
@@ -2479,7 +2477,6 @@ impl Supervisor {
             .collect();
         Ok(Some(out))
     }
-
 
     /// `workspace/symbol` → 全 workspace 跨文件符号查找（Task 20）。
     ///
@@ -2648,8 +2645,7 @@ impl Supervisor {
                 // 小写 uri（归一键）反推出的 path 中段大小写可能失真 —— 必须
                 // canonicalize 还原磁盘真实大小写，否则 path_to_uri 生成的 uri 与
                 // RA 记账（canonical）不一致 → RA 拒绝请求（日志实锤）。
-                let Some(path) = uri_to_path(uri).and_then(|p| dunce::canonicalize(p).ok())
-                else {
+                let Some(path) = uri_to_path(uri).and_then(|p| dunce::canonicalize(p).ok()) else {
                     continue;
                 };
                 if fresh_tables.contains_key(&path) {
@@ -3049,8 +3045,9 @@ impl Supervisor {
             // 打回修复（bd serena-rust-bxd）：暖机窗口内零命中 ≠ 符号不存在——
             // wssym 可能仍未爬完，错误必须带 hint 防 AI 误判（对齐 find-symbol
             // 的 partial warning，不能比它更误导）。
-            let mut detail =
-                format!("symbol `{name}` not found (documentSymbol cache and workspace index empty)");
+            let mut detail = format!(
+                "symbol `{name}` not found (documentSymbol cache and workspace index empty)"
+            );
             if warming {
                 detail.push_str(
                     "; index may still be warming (cold start), retry shortly or use find-symbol",
@@ -3281,8 +3278,7 @@ impl Supervisor {
         let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
-        let range =
-            find_symbol_range(resp.as_ref(), symbol).ok_or_else(|| ToolError::BadArgs {
+        let range = find_symbol_range(resp.as_ref(), symbol).ok_or_else(|| ToolError::BadArgs {
             detail: format!("symbol `{symbol}` not found in {}", path.display()),
         })?;
 
@@ -3303,10 +3299,12 @@ impl Supervisor {
             line: range.end.line,
             character: range.end.character,
         };
-        let start_byte = lsp_core::offsets::position_to_byte(&old_text, start, OffsetEncoding::Utf16)
-            .map_err(|e| ToolError::BadArgs {
-            detail: format!("start position: {e}"),
-        })?;
+        let start_byte =
+            lsp_core::offsets::position_to_byte(&old_text, start, OffsetEncoding::Utf16).map_err(
+                |e| ToolError::BadArgs {
+                    detail: format!("start position: {e}"),
+                },
+            )?;
         let end_byte = lsp_core::offsets::position_to_byte(&old_text, end, OffsetEncoding::Utf16)
             .map_err(|e| ToolError::BadArgs {
             detail: format!("end position: {e}"),
@@ -3437,10 +3435,12 @@ impl Supervisor {
             Self::search_sync_scan(&root, &regex, glob_re.as_ref(), max_results)
         })
         .await
-        .map_err(|e| ToolError::Core(CoreError::Rpc {
-            code: -1,
-            message: format!("search scan join error: {e}"),
-        }))?;
+        .map_err(|e| {
+            ToolError::Core(CoreError::Rpc {
+                code: -1,
+                message: format!("search scan join error: {e}"),
+            })
+        })?;
 
         Ok(SearchResponse {
             hits,
@@ -3469,8 +3469,7 @@ impl Supervisor {
             // standard_filters 的 hidden filter 默认排除，但 target/node_modules
             // 不一定在 .gitignore 里，需显式表驱动过滤；与 fs_tools::filtered_walker 语义一致。
             .filter_entry(|e| {
-                e.depth() == 0
-                    || !e.file_name().to_str().is_some_and(fs_tools::should_ignore)
+                e.depth() == 0 || !e.file_name().to_str().is_some_and(fs_tools::should_ignore)
             });
 
         let mut hits: Vec<SearchHit> = Vec::new();
@@ -3789,20 +3788,10 @@ impl Supervisor {
         // 文本交叉验证：workspace 内符号名仍有 ≥1 处可疑出现（排除定义行 +
         // 注释/字符串粗滤）→ 拒删，提示语义层可能不可用。RPC_ERROR 不可重试。
         let search = self
-            .tool_search_for_pattern(
-                root,
-                &regex::escape(symbol),
-                None,
-                TEXT_GATE_MAX_HITS,
-                true,
-            )
+            .tool_search_for_pattern(root, &regex::escape(symbol), None, TEXT_GATE_MAX_HITS, true)
             .await?;
-        let n = textual_occurrences_outside_def(
-            &search.hits,
-            file,
-            selection.start.line + 1,
-            symbol,
-        );
+        let n =
+            textual_occurrences_outside_def(&search.hits, file, selection.start.line + 1, symbol);
         if n > 0 {
             return Err(ToolError::Protocol {
                 tool: "safe-delete-symbol".to_string(),
@@ -4013,11 +4002,13 @@ fn replace_files_with_tables(
 ) -> Vec<SymbolHit> {
     let mut out: Vec<SymbolHit> = hits
         .into_iter()
-        .filter(|h| match uri_to_path(&h.uri).and_then(|p| dunce::canonicalize(p).ok()) {
-            Some(p) => !tables.contains_key(&p),
-            // 无法归一 → 保留（不误删他人条目）。
-            None => true,
-        })
+        .filter(
+            |h| match uri_to_path(&h.uri).and_then(|p| dunce::canonicalize(p).ok()) {
+                Some(p) => !tables.contains_key(&p),
+                // 无法归一 → 保留（不误删他人条目）。
+                None => true,
+            },
+        )
         .collect();
     for (path, table) in tables {
         let uri = path_to_uri_str(path).to_lowercase();
@@ -4412,9 +4403,14 @@ async fn enrich_search_with_symbols(
             let root_buf = root.to_path_buf();
             let lang_owned = lang.map(str::to_string);
             set.spawn(async move {
-                let res =
-                    overview_via_session(session, cache_arc, root_buf, file.clone(), lang_owned.as_deref())
-                        .await;
+                let res = overview_via_session(
+                    session,
+                    cache_arc,
+                    root_buf,
+                    file.clone(),
+                    lang_owned.as_deref(),
+                )
+                .await;
                 (file, res)
             });
         }
@@ -4506,7 +4502,10 @@ fn compact_symbol_hit(hit: &SymbolHit) -> String {
         // `uri_to_path` 走 None 分支退回 raw。
         Err(_) => lsp_types::Uri::from_str("file:///").expect("static file uri"),
     };
-    let fake = Location { uri, range: hit.range };
+    let fake = Location {
+        uri,
+        range: hit.range,
+    };
     compact_loc(&fake)
 }
 
@@ -4552,8 +4551,7 @@ fn symbol_hits_envelope(hits: &[SymbolHit], compact: bool) -> serde_json::Value 
 /// `additional_text_edits`——原嵌套 LSP range 结构压成 `["L{行}:{列}", 新文本]` 对）。
 /// `_compact=false`（CLI `--json`）走原 `CompletionResponse` 序列化，wire 零变化。
 fn completion_envelope(resp: &CompletionResponse) -> serde_json::Value {
-    let items: Vec<serde_json::Value> =
-        resp.items.iter().map(compact_completion_item).collect();
+    let items: Vec<serde_json::Value> = resp.items.iter().map(compact_completion_item).collect();
     let mut env = serde_json::json!({
         "compact": true,
         "items": items,
@@ -4687,8 +4685,7 @@ fn position_in_hits(hits: &[SymbolHit], line: u32, col: u32) -> bool {
     hits.iter().any(|h| {
         let (sl, sc) = (h.range.start.line, h.range.start.character);
         let (el, ec) = (h.range.end.line, h.range.end.character);
-        (sl < line || (sl == line && sc <= col))
-            && (line < el || (line == el && col <= ec))
+        (sl < line || (sl == line && sc <= col)) && (line < el || (line == el && col <= ec))
     })
 }
 
@@ -4722,12 +4719,8 @@ fn hover_is_empty(value: &serde_json::Value) -> bool {
     }
 }
 
-
 /// RefSymbolHit[] envelope：compact 时合并 `symbol` + `refs[]` 嵌套紧凑（按容器聚类）。
-fn ref_symbol_hits_envelope(
-    hits: &[ref_tools::RefSymbolHit],
-    compact: bool,
-) -> serde_json::Value {
+fn ref_symbol_hits_envelope(hits: &[ref_tools::RefSymbolHit], compact: bool) -> serde_json::Value {
     if compact {
         let items: Vec<serde_json::Value> = hits
             .iter()
@@ -4791,10 +4784,7 @@ fn is_empty_response(v: &serde_json::Value) -> bool {
 }
 
 /// `a` 中有而 `b` 中没有的条目（`added = diff(current, prev)`；参数对调即 removed）。
-fn diff_hits(
-    a: &serde_json::Value,
-    b: &serde_json::Value,
-) -> Vec<serde_json::Value> {
+fn diff_hits(a: &serde_json::Value, b: &serde_json::Value) -> Vec<serde_json::Value> {
     let b_keys: std::collections::HashSet<String> = items_of(b)
         .map(|arr| arr.iter().map(hit_key).collect())
         .unwrap_or_default();
@@ -5202,13 +5192,16 @@ impl SupervisorTrait for Supervisor {
                 Ok(self.maybe_delta("overview", &root_key, value, delta).await)
             }
             "symbol-tree" => {
-                let dir = args.get("dir").and_then(|v| v.as_str()).ok_or_else(|| {
-                    ToolError::BadArgs {
-                        detail: "missing 'dir'".into(),
-                    }
-                })?;
-                let max_files = args.get("max_files").and_then(|v| v.as_u64()).unwrap_or(200)
-                    as usize;
+                let dir =
+                    args.get("dir")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ToolError::BadArgs {
+                            detail: "missing 'dir'".into(),
+                        })?;
+                let max_files = args
+                    .get("max_files")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200) as usize;
                 serde_json::to_value(self.tool_symbol_tree(root, dir, lang, max_files).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
@@ -5234,7 +5227,9 @@ impl SupervisorTrait for Supervisor {
                 let mut value = symbol_hits_envelope(&raw, compact);
                 attach_warning(&mut value, &warnings);
                 let root_key = format!("{}|{}|{}", root.display(), query, limit);
-                Ok(self.maybe_delta("find-symbol", &root_key, value, delta).await)
+                Ok(self
+                    .maybe_delta("find-symbol", &root_key, value, delta)
+                    .await)
             }
             "signature-help" => {
                 let (file, line, col) = required_position(&args)?;
@@ -5256,7 +5251,10 @@ impl SupervisorTrait for Supervisor {
             }
             "format" => {
                 let file = required_file(&args)?;
-                let tab_size = args.get("tab_size").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let tab_size = args
+                    .get("tab_size")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
                 let insert_spaces = args.get("insert_spaces").and_then(|v| v.as_bool());
                 serde_json::to_value(
                     self.tool_format(root, &file, tab_size, insert_spaces, lang)
@@ -5267,30 +5265,33 @@ impl SupervisorTrait for Supervisor {
             "format-range" => {
                 let file = required_file(&args)?;
                 let start_line =
-                    args.get("start_line").and_then(|v| v.as_u64()).ok_or_else(|| {
-                        ToolError::BadArgs {
+                    args.get("start_line")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| ToolError::BadArgs {
                             detail: "missing 'start_line'".into(),
-                        }
+                        })? as u32;
+                let start_col = args
+                    .get("start_col")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'start_col'".into(),
                     })? as u32;
-                let start_col =
-                    args.get("start_col").and_then(|v| v.as_u64()).ok_or_else(|| {
-                        ToolError::BadArgs {
-                            detail: "missing 'start_col'".into(),
-                        }
+                let end_line = args
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'end_line'".into(),
                     })? as u32;
-                let end_line =
-                    args.get("end_line").and_then(|v| v.as_u64()).ok_or_else(|| {
-                        ToolError::BadArgs {
-                            detail: "missing 'end_line'".into(),
-                        }
+                let end_col = args
+                    .get("end_col")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'end_col'".into(),
                     })? as u32;
-                let end_col =
-                    args.get("end_col").and_then(|v| v.as_u64()).ok_or_else(|| {
-                        ToolError::BadArgs {
-                            detail: "missing 'end_col'".into(),
-                        }
-                    })? as u32;
-                let tab_size = args.get("tab_size").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let tab_size = args
+                    .get("tab_size")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
                 let insert_spaces = args.get("insert_spaces").and_then(|v| v.as_bool());
                 serde_json::to_value(
                     self.tool_format_range(
@@ -5311,16 +5312,16 @@ impl SupervisorTrait for Supervisor {
             "inlay-hint" => {
                 let file = required_file(&args)?;
                 let start_line =
-                    args.get("start_line").and_then(|v| v.as_u64()).ok_or_else(|| {
-                        ToolError::BadArgs {
+                    args.get("start_line")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| ToolError::BadArgs {
                             detail: "missing 'start_line'".into(),
-                        }
-                    })? as u32;
-                let end_line =
-                    args.get("end_line").and_then(|v| v.as_u64()).ok_or_else(|| {
-                        ToolError::BadArgs {
-                            detail: "missing 'end_line'".into(),
-                        }
+                        })? as u32;
+                let end_line = args
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'end_line'".into(),
                     })? as u32;
                 serde_json::to_value(
                     self.tool_inlay_hint(root, &file, start_line, end_line, lang)
@@ -5357,12 +5358,12 @@ impl SupervisorTrait for Supervisor {
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
             "call-hierarchy" => {
-                let op = args
-                    .get("op")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::BadArgs {
-                        detail: "missing 'op' (prepare|incoming|outgoing)".into(),
-                    })?;
+                let op =
+                    args.get("op")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ToolError::BadArgs {
+                            detail: "missing 'op' (prepare|incoming|outgoing)".into(),
+                        })?;
                 match op {
                     "prepare" => {
                         let (file, line, col) = required_position(&args)?;
@@ -5373,12 +5374,13 @@ impl SupervisorTrait for Supervisor {
                         .map_err(|e| ToolError::Serialize(e.into()))
                     }
                     "incoming" => {
-                        let item_value = args.get("item").cloned().ok_or_else(|| {
-                            ToolError::BadArgs {
-                                detail: "missing 'item' (CallHierarchyItem from prepare)"
-                                    .into(),
-                            }
-                        })?;
+                        let item_value =
+                            args.get("item")
+                                .cloned()
+                                .ok_or_else(|| ToolError::BadArgs {
+                                    detail: "missing 'item' (CallHierarchyItem from prepare)"
+                                        .into(),
+                                })?;
                         serde_json::to_value(
                             self.tool_call_hierarchy_incoming(root, item_value, lang)
                                 .await?,
@@ -5386,12 +5388,13 @@ impl SupervisorTrait for Supervisor {
                         .map_err(|e| ToolError::Serialize(e.into()))
                     }
                     "outgoing" => {
-                        let item_value = args.get("item").cloned().ok_or_else(|| {
-                            ToolError::BadArgs {
-                                detail: "missing 'item' (CallHierarchyItem from prepare)"
-                                    .into(),
-                            }
-                        })?;
+                        let item_value =
+                            args.get("item")
+                                .cloned()
+                                .ok_or_else(|| ToolError::BadArgs {
+                                    detail: "missing 'item' (CallHierarchyItem from prepare)"
+                                        .into(),
+                                })?;
                         serde_json::to_value(
                             self.tool_call_hierarchy_outgoing(root, item_value, lang)
                                 .await?,
@@ -5404,12 +5407,12 @@ impl SupervisorTrait for Supervisor {
                 }
             }
             "type-hierarchy" => {
-                let op = args
-                    .get("op")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolError::BadArgs {
-                        detail: "missing 'op' (prepare|supertypes|subtypes)".into(),
-                    })?;
+                let op =
+                    args.get("op")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ToolError::BadArgs {
+                            detail: "missing 'op' (prepare|supertypes|subtypes)".into(),
+                        })?;
                 match op {
                     "prepare" => {
                         let (file, line, col) = required_position(&args)?;
@@ -5420,12 +5423,13 @@ impl SupervisorTrait for Supervisor {
                         .map_err(|e| ToolError::Serialize(e.into()))
                     }
                     "supertypes" => {
-                        let item_value = args.get("item").cloned().ok_or_else(|| {
-                            ToolError::BadArgs {
-                                detail: "missing 'item' (TypeHierarchyItem from prepare)"
-                                    .into(),
-                            }
-                        })?;
+                        let item_value =
+                            args.get("item")
+                                .cloned()
+                                .ok_or_else(|| ToolError::BadArgs {
+                                    detail: "missing 'item' (TypeHierarchyItem from prepare)"
+                                        .into(),
+                                })?;
                         serde_json::to_value(
                             self.tool_type_hierarchy_supertypes(root, item_value, lang)
                                 .await?,
@@ -5433,12 +5437,13 @@ impl SupervisorTrait for Supervisor {
                         .map_err(|e| ToolError::Serialize(e.into()))
                     }
                     "subtypes" => {
-                        let item_value = args.get("item").cloned().ok_or_else(|| {
-                            ToolError::BadArgs {
-                                detail: "missing 'item' (TypeHierarchyItem from prepare)"
-                                    .into(),
-                            }
-                        })?;
+                        let item_value =
+                            args.get("item")
+                                .cloned()
+                                .ok_or_else(|| ToolError::BadArgs {
+                                    detail: "missing 'item' (TypeHierarchyItem from prepare)"
+                                        .into(),
+                                })?;
                         serde_json::to_value(
                             self.tool_type_hierarchy_subtypes(root, item_value, lang)
                                 .await?,
@@ -5455,10 +5460,10 @@ impl SupervisorTrait for Supervisor {
                 serde_json::to_value(self.tool_moniker(root, &file, line, col, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
-            "workspace-diagnostic" => serde_json::to_value(
-                self.tool_workspace_diagnostic(root, lang).await?,
-            )
-            .map_err(|e| ToolError::Serialize(e.into())),
+            "workspace-diagnostic" => {
+                serde_json::to_value(self.tool_workspace_diagnostic(root, lang).await?)
+                    .map_err(|e| ToolError::Serialize(e.into()))
+            }
             "hover" => {
                 let (file, line, col) = required_position(&args)?;
                 let resp = self.tool_hover(root, &file, line, col, lang).await?;
@@ -5580,7 +5585,9 @@ impl SupervisorTrait for Supervisor {
                 }
                 attach_warning(&mut value, &ws);
                 let root_key = format!("{}|{}|{}|{}", root.display(), file, line, col);
-                Ok(self.maybe_delta("find-implementations", &root_key, value, delta).await)
+                Ok(self
+                    .maybe_delta("find-implementations", &root_key, value, delta)
+                    .await)
             }
             "search" => {
                 let pattern = args
@@ -5628,10 +5635,7 @@ impl SupervisorTrait for Supervisor {
             "repo-map" => {
                 // E: workspace 级符号地图（ai-token-features §10-E）。
                 // 走 symbol-tree + per-symbol refs 计数，top_n 降序输出。
-                let top_n = args
-                    .get("top_n")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(20) as usize;
+                let top_n = args.get("top_n").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
                 let report = crate::repo_map::build(self, root, lang, top_n).await;
                 serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
             }
@@ -5736,10 +5740,8 @@ impl SupervisorTrait for Supervisor {
                     .unwrap_or(false);
                 if grouped {
                     let page = args.get("page").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-                    let page_size = args
-                        .get("page_size")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(20) as usize;
+                    let page_size =
+                        args.get("page_size").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
                     let report = ref_tools::group_refs(hits, page, page_size);
                     serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
                 } else {
@@ -5973,7 +5975,11 @@ impl SupervisorTrait for Supervisor {
         if let Some(max_tokens) = args.get("_max_tokens").and_then(|v| v.as_u64()) {
             apply_budget(&mut value, max_tokens as usize);
         }
-        if args.get("_compress").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if args
+            .get("_compress")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             apply_compress(&mut value);
         }
         Ok(value)
@@ -6439,9 +6445,7 @@ mod atomic_write_tests {
             "内容必须写到 target"
         );
         assert!(
-            std::fs::symlink_metadata(&link)
-                .unwrap()
-                .is_symlink(),
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
             "链接本体不得被替换成普通文件"
         );
     }
@@ -6501,7 +6505,10 @@ mod safe_delete_tests {
             hit_line("src/main.rs", 4, "    println!(\"add called\");"),          // 字符串
             hit_line("src/main.rs", 5, "    assert_eq!(add(2, 3), 5);"),          // 真引用
         ];
-        assert_eq!(textual_occurrences_outside_def(&hits, "src/lib.rs", 7, "add"), 2);
+        assert_eq!(
+            textual_occurrences_outside_def(&hits, "src/lib.rs", 7, "add"),
+            2
+        );
     }
 
     /// refs 空 + 文本无可疑出现（定义行本身 + 注释/字符串）→ 放行删除。
@@ -6512,14 +6519,20 @@ mod safe_delete_tests {
             hit_line("src/lib.rs", 8, "// orphan kept for docs"),
             hit_line("src/lib.rs", 9, "    let s = \"orphan\";"),
         ];
-        assert_eq!(textual_occurrences_outside_def(&hits, "src/lib.rs", 7, "orphan"), 0);
+        assert_eq!(
+            textual_occurrences_outside_def(&hits, "src/lib.rs", 7, "orphan"),
+            0
+        );
     }
 
     /// 定义文件路径分隔符/大小写差异不重开定义行豁免（Windows 调用方传 `\` 形态）。
     #[test]
     fn text_gate_normalizes_definition_path() {
         let hits = vec![hit_line("src/lib.rs", 7, "fn add() {}")];
-        assert_eq!(textual_occurrences_outside_def(&hits, "src\\lib.rs", 7, "add"), 0);
+        assert_eq!(
+            textual_occurrences_outside_def(&hits, "src\\lib.rs", 7, "add"),
+            0
+        );
     }
 }
 
@@ -6768,7 +6781,9 @@ mod signature_help_tests {
         assert_eq!(parsed.signatures.len(), 1);
         assert_eq!(parsed.signatures[0].label, "add(int, int)");
         // parameters[] 保留两个
-        let params = parsed.signatures[0].parameters.as_ref()
+        let params = parsed.signatures[0]
+            .parameters
+            .as_ref()
             .expect("parameters should be present");
         assert_eq!(params.len(), 2);
         assert_eq!(
@@ -6788,8 +6803,8 @@ mod signature_help_tests {
     fn lsp_signature_help_null_round_trips_as_none() {
         // clangd 在非函数调用位置返 null（与 hover 行为一致）。
         let raw = serde_json::Value::Null;
-        let parsed: Option<lsp_types::SignatureHelp> = serde_json::from_value(raw)
-            .expect("null should round-trip to None");
+        let parsed: Option<lsp_types::SignatureHelp> =
+            serde_json::from_value(raw).expect("null should round-trip to None");
         assert!(parsed.is_none());
     }
 
@@ -6803,8 +6818,8 @@ mod signature_help_tests {
                 "parameters": []
             }]
         });
-        let parsed: lsp_types::SignatureHelp = serde_json::from_value(raw)
-            .expect("missing activeParameter should still round-trip");
+        let parsed: lsp_types::SignatureHelp =
+            serde_json::from_value(raw).expect("missing activeParameter should still round-trip");
         assert_eq!(parsed.signatures.len(), 1);
         assert_eq!(parsed.signatures[0].label, "f()");
         assert_eq!(parsed.signatures[0].active_parameter, None);
@@ -6827,8 +6842,8 @@ mod pull_diagnostics_tests {
     //! （拉起 supervisor → tool_diagnostics → 字段缺失 → 自动走 push 缓存），
     //! 见完成报告 `end-to-end` 一节。
     use super::{Supervisor, diag_uri_key};
-    use lsp_core::init_params::supports_pull_diagnostics;
     use lsp_core::docsync::path_to_uri_str;
+    use lsp_core::init_params::supports_pull_diagnostics;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -6959,10 +6974,7 @@ mod pull_diagnostics_tests {
         };
 
         // 推一个非空 push：cache 应有 1 条，generation 1。
-        handler(
-            "file:///a.cpp".into(),
-            vec![json!({"message": "err1"})],
-        );
+        handler("file:///a.cpp".into(), vec![json!({"message": "err1"})]);
         assert_eq!(cache_arc.lock().unwrap().len(), 1);
         assert_eq!(generation.load(Ordering::Relaxed), 1);
 
@@ -6973,7 +6985,11 @@ mod pull_diagnostics_tests {
 
         // 推空 push 对未存在的 uri：cache 不增不减，generation 3。
         handler("file:///b.cpp".into(), vec![]);
-        assert_eq!(cache_arc.lock().unwrap().len(), 0, "空 push 对空 key 是 no-op");
+        assert_eq!(
+            cache_arc.lock().unwrap().len(),
+            0,
+            "空 push 对空 key 是 no-op"
+        );
         assert_eq!(generation.load(Ordering::Relaxed), 3);
     }
 
@@ -7001,7 +7017,11 @@ mod pull_diagnostics_tests {
             serde_json::json!([]),
             "root 不存在 → 必须降级为空数组"
         );
-        assert_eq!(a["pending"], serde_json::json!(true), "失败降级必带 pending");
+        assert_eq!(
+            a["pending"],
+            serde_json::json!(true),
+            "失败降级必带 pending"
+        );
 
         // 场景 B：root 存在但 lang 完全无法解析（未装 LS + 无 override 路径探测
         // 也未命中）→ tool_diagnostics 返 Err → helper 降级 pending 快照。
@@ -7084,7 +7104,10 @@ mod reclaim_idle_buffers_tests {
             candidates.push(cwd.join(format!("target/debug/mock_ls{}", ext)));
             candidates.push(cwd.join(format!("target/debug/deps/mock_ls{}", ext)));
         }
-        if let Some(ws) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2) {
+        if let Some(ws) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+        {
             candidates.push(ws.join(format!("target/debug/mock_ls{}", ext)));
         }
         candidates.into_iter().find(|p| p.is_file())
@@ -7112,7 +7135,9 @@ mod reclaim_idle_buffers_tests {
 
         let tmp = tempfile::TempDir::new().expect("TempDir::new");
         let file = tmp.path().join("a.cpp");
-        tokio::fs::write(&file, b"int x=0;\n").await.expect("write fixture");
+        tokio::fs::write(&file, b"int x=0;\n")
+            .await
+            .expect("write fixture");
 
         // 直连 mock_ls 拉 session。注入到 supervisor 实例池以便 reclaim 扫到。
         let child = Child::spawn(launch).expect("spawn mock_ls");
@@ -7152,7 +7177,10 @@ mod reclaim_idle_buffers_tests {
         // 第 32 次触发：阈值命中 + reclaim 调 Session::evict_idle_buffers(5ms)。
         // buffer 早超 5ms，应被回收。
         let reclaimed = sup.reclaim_idle_buffers_once();
-        assert!(reclaimed >= 1, "归零超 TTL 后生产路径必须能回收，至少 1 条；reclaimed={reclaimed}");
+        assert!(
+            reclaimed >= 1,
+            "归零超 TTL 后生产路径必须能回收，至少 1 条；reclaimed={reclaimed}"
+        );
         assert_eq!(
             sup.reclaim_count_snapshot(),
             0,
@@ -7317,8 +7345,13 @@ mod write_consistency_tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().to_string_lossy().replace('\\', "/");
         let mk_uri = |f: &str| format!("file:///{base}/{f}");
-        let mk_uri_pct = |f: &str| format!("file:///{base}/{f}").replacen("file:///C:/", "file:///C%3A/", 1);
-        std::fs::write(dir.path().join("moved.rs"), "fn stale_line() {}\nfn added() {}\n").unwrap();
+        let mk_uri_pct =
+            |f: &str| format!("file:///{base}/{f}").replacen("file:///C:/", "file:///C%3A/", 1);
+        std::fs::write(
+            dir.path().join("moved.rs"),
+            "fn stale_line() {}\nfn added() {}\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("other.rs"), "fn keep() {}\n").unwrap();
         let hits = vec![
             hit_at("stale_line", &mk_uri_pct("moved.rs"), 7), // percent-encode 盘符形态
@@ -7354,14 +7387,20 @@ mod write_consistency_tests {
     async fn recent_write_marks_and_expires_by_ttl() {
         let sup = Supervisor::direct().await.unwrap();
         let root = Path::new("Z:/no/such/write-proj");
-        assert!(sup.recent_written_uris(root, Duration::from_secs(10)).is_empty());
+        assert!(
+            sup.recent_written_uris(root, Duration::from_secs(10))
+                .is_empty()
+        );
         sup.mark_recent_write(root, "lib.rs");
         let uris = sup.recent_written_uris(root, Duration::from_secs(10));
         assert_eq!(uris.len(), 1, "窗口内标记必须可见");
         assert!(uris[0].ends_with("/lib.rs"), "归一 uri: {}", uris[0]);
         // TTL = 0 → 立即过期并清理。
         assert!(sup.recent_written_uris(root, Duration::ZERO).is_empty());
-        assert!(sup.recent_written_uris(root, Duration::from_secs(10)).is_empty());
+        assert!(
+            sup.recent_written_uris(root, Duration::from_secs(10))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -7454,8 +7493,10 @@ mod symbol_cache_tests {
             doc_symbol_cache_key(root, "b.rs"),
             vec![mk("ensure_open", "file:///x/b.rs", 4, 2)],
         );
-        let (file, line, col, note) =
-            sup.resolve_symbol_position(root, "ensure_open", None).await.unwrap();
+        let (file, line, col, note) = sup
+            .resolve_symbol_position(root, "ensure_open", None)
+            .await
+            .unwrap();
         assert_eq!((file.as_str(), line, col), ("b.rs", 4, 2));
         assert!(note.is_none(), "单命中不提示");
 
@@ -7464,8 +7505,10 @@ mod symbol_cache_tests {
             doc_symbol_cache_key(root, "c.rs"),
             vec![mk("ensure_open", "file:///x/c.rs", 1, 0)],
         );
-        let (file, _l, _c, note) =
-            sup.resolve_symbol_position(root, "ensure_open", None).await.unwrap();
+        let (file, _l, _c, note) = sup
+            .resolve_symbol_position(root, "ensure_open", None)
+            .await
+            .unwrap();
         assert_eq!(file, "b.rs", "同级按 (file, line, col) 排序取首");
         let note = note.unwrap();
         assert!(note.contains("2 matches"), "note 应报所选层级总数: {note}");
@@ -7492,7 +7535,9 @@ mod symbol_cache_tests {
             panic!("expected BadArgs: {err:?}")
         };
         assert!(
-            detail.contains("index may still be warming (cold start), retry shortly or use find-symbol"),
+            detail.contains(
+                "index may still be warming (cold start), retry shortly or use find-symbol"
+            ),
             "暖机窗口零命中必须带 hint: {detail}"
         );
         // 对照：非窗口 root（从未开窗）零命中 → 错误不带 warming hint。
@@ -7515,10 +7560,7 @@ mod symbol_cache_tests {
         let root = Path::new("Z:/no/such/project");
         let other = Path::new("Z:/no/such/other");
         sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs"), vec![hit("main")]);
-        sup.symbol_cache_put(
-            find_symbol_cache_key(root, "main", None),
-            vec![hit("main")],
-        );
+        sup.symbol_cache_put(find_symbol_cache_key(root, "main", None), vec![hit("main")]);
         sup.symbol_cache_put(doc_symbol_cache_key(other, "a.rs"), vec![hit("helper")]);
 
         // 模拟 (root, lang) 会话换代（session_for 挂入新会话前的失效动作）。
@@ -7535,7 +7577,8 @@ mod symbol_cache_tests {
             "会话换代后同 root workspace 级缓存必须 miss"
         );
         assert!(
-            sup.symbol_cache_get(&doc_symbol_cache_key(other, "a.rs")).is_some(),
+            sup.symbol_cache_get(&doc_symbol_cache_key(other, "a.rs"))
+                .is_some(),
             "其他 root 的缓存不受影响"
         );
     }
@@ -7727,7 +7770,10 @@ mod symbol_cache_tests {
             .tool_symbol_tree(root, ".", Some("rust"), 200)
             .await
             .unwrap();
-        assert_eq!(tree["files_scanned"], 2, "node_modules/notes.txt 必须被过滤: {tree}");
+        assert_eq!(
+            tree["files_scanned"], 2,
+            "node_modules/notes.txt 必须被过滤: {tree}"
+        );
         assert_eq!(tree["truncated"], false);
         let entries = tree["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2, "两文件各有符号条目: {tree}");
@@ -7737,7 +7783,10 @@ mod symbol_cache_tests {
             .tool_symbol_tree(root, "../elsewhere", Some("rust"), 200)
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::BadArgs { .. }), "unexpected: {err:?}");
+        assert!(
+            matches!(err, ToolError::BadArgs { .. }),
+            "unexpected: {err:?}"
+        );
     }
 
     /// symbol-tree：max_files 保险丝 —— 超限截断并标 truncated。
@@ -7880,16 +7929,17 @@ mod symbol_cache_tests {
 
         // lang = None 走逐文件 resolve（lang 是预置短路，下面的 resolve_lang_for_file
         // 不被 lang 短路，直接靠扩展名探测 —— 即 P0 修复的核心路径）。
-        let tree = sup
-            .tool_symbol_tree(root, ".", None, 200)
-            .await
-            .unwrap();
+        let tree = sup.tool_symbol_tree(root, ".", None, 200).await.unwrap();
         let entries = tree["entries"].as_array().unwrap();
         let errors = tree["errors"].as_array().unwrap();
 
         // 必须全部命中（cache priming）—— 任何 file 进 errors 即视为被误判为
         // "lang 不可解析"，是 P0 修复前的回归迹象。
-        assert_eq!(entries.len(), files.len(), "所有 5 个文件都应该进入 entries: {tree}");
+        assert_eq!(
+            entries.len(),
+            files.len(),
+            "所有 5 个文件都应该进入 entries: {tree}"
+        );
         assert!(
             errors.is_empty(),
             "5 个文件分属 4 种 lang（py/rs/java）应都解析通过；errors={errors:?}"
@@ -7915,7 +7965,9 @@ mod symbol_cache_tests {
     // ==== P2-18h · 外部修改感知（mtime+size 双因子对账）====
 
     /// mock_ls 带 track 钩子启动（didOpen/didChange/didClose 事件追加落盘，断言用）。
-    fn launch_mock_ls_track(track_log: &std::path::Path) -> Option<ls_runtime::process::LaunchInfo> {
+    fn launch_mock_ls_track(
+        track_log: &std::path::Path,
+    ) -> Option<ls_runtime::process::LaunchInfo> {
         let exe = crate::reclaim_idle_buffers_tests::find_mock_ls()?;
         Some(ls_runtime::process::LaunchInfo {
             cmd: vec![std::ffi::OsString::from(exe)],
@@ -7964,9 +8016,10 @@ mod symbol_cache_tests {
         let m0 = std::fs::metadata(&file).unwrap().modified().unwrap();
 
         let child = ls_runtime::process::Child::spawn(launch).unwrap();
-        let session = lsp_core::session::Session::start(Some(child), lsp_types::InitializeParams::default())
-            .await
-            .unwrap();
+        let session =
+            lsp_core::session::Session::start(Some(child), lsp_types::InitializeParams::default())
+                .await
+                .unwrap();
         let sup = Supervisor::direct().await.unwrap();
         let key = Supervisor::key(tmp.path(), "cpp");
         sup.instances
@@ -8120,10 +8173,7 @@ mod symbol_cache_tests {
             "刚好达到上限时不清空（< 阈值）"
         );
         // 第 cap+1 次 → 触发闸门 → 全清后只剩本条。
-        sup.symbol_cache_put(
-            doc_symbol_cache_key(root, "overflow.rs"),
-            vec![hit("y")],
-        );
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "overflow.rs"), vec![hit("y")]);
         assert_eq!(
             sup.symbol_cache_len(),
             1,
@@ -8135,7 +8185,8 @@ mod symbol_cache_tests {
             "新写入的 key 必须可命中"
         );
         assert!(
-            sup.symbol_cache_get(&doc_symbol_cache_key(root, "f0.rs")).is_none(),
+            sup.symbol_cache_get(&doc_symbol_cache_key(root, "f0.rs"))
+                .is_none(),
             "旧 entry 被全清"
         );
     }
@@ -8229,10 +8280,7 @@ mod symbol_cache_tests {
             );
         }
         // 触发全清
-        sup.symbol_cache_put(
-            doc_symbol_cache_key(root, "trigger.rs"),
-            vec![hit("y")],
-        );
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "trigger.rs"), vec![hit("y")]);
         let mut all_miss = true;
         for i in 0..cap {
             if sup
@@ -8264,10 +8312,7 @@ mod symbol_cache_tests {
         }
         sup.symbol_cache_put(doc_symbol_cache_key(root_b, "b0.rs"), vec![hit("b")]);
         // 触发全清
-        sup.symbol_cache_put(
-            doc_symbol_cache_key(root_a, "trigger.rs"),
-            vec![hit("t")],
-        );
+        sup.symbol_cache_put(doc_symbol_cache_key(root_a, "trigger.rs"), vec![hit("t")]);
         // 全清后 root_a 只有 trigger.rs + root_b 的 b0.rs
         // invalidate root_a → 只剩 root_b 的 1 条
         sup.invalidate_symbol_cache_for_root(root_a);
@@ -8321,7 +8366,9 @@ mod search_filter_tests {
             .unwrap();
         let files: Vec<&str> = resp.hits.iter().map(|h| h.file.as_str()).collect();
         assert!(
-            files.iter().all(|f| !f.starts_with(".git/") && !f.starts_with("target/")),
+            files
+                .iter()
+                .all(|f| !f.starts_with(".git/") && !f.starts_with("target/")),
             "search 不应扫到 .git/target，实际命中: {files:?}"
         );
         assert!(
@@ -8353,7 +8400,10 @@ mod search_filter_tests {
             .await
             .expect("default search ok");
         let all_hits = all["hits"].as_array().unwrap();
-        assert!(all_hits.len() >= 2, "默认形态应含代码+注释，实际: {all_hits:?}");
+        assert!(
+            all_hits.len() >= 2,
+            "默认形态应含代码+注释，实际: {all_hits:?}"
+        );
 
         let filtered = sup
             .execute_tool(
@@ -8371,7 +8421,7 @@ mod search_filter_tests {
             h["text"].as_str().unwrap()
         )));
     }
-}// ============================================================================
+} // ============================================================================
 // Phase 1 · 13 wrapper 测试（纯 LSP 协议层；不拉 LS / 不依赖 fix-ls-adapters）
 // ============================================================================
 
@@ -8470,10 +8520,7 @@ mod phase1_wrapper_tests {
     fn uri_to_path_uppercases_windows_drive_letter() {
         // 小写盘符 `d%3A` 解码后必须归一为 `D:`，否则与 canonical root 前缀比对失败。
         let p = uri_to_path("file:///d%3A/proj/a.rs").expect("file uri");
-        assert!(
-            p.to_string_lossy().starts_with("D:"),
-            "盘符必须大写: {p:?}"
-        );
+        assert!(p.to_string_lossy().starts_with("D:"), "盘符必须大写: {p:?}");
     }
 
     #[test]
@@ -8548,9 +8595,7 @@ mod phase1_wrapper_tests {
     async fn execute_tool_call_hierarchy_missing_op_returns_bad_args() {
         let sup = Supervisor::direct().await.unwrap();
         let args = json!({});
-        let r = sup
-            .execute_tool("call-hierarchy", ".", args, None)
-            .await;
+        let r = sup.execute_tool("call-hierarchy", ".", args, None).await;
         assert!(matches!(r, Err(ToolError::BadArgs { .. })));
     }
 
@@ -8558,9 +8603,7 @@ mod phase1_wrapper_tests {
     async fn execute_tool_call_hierarchy_incoming_missing_item_returns_bad_args() {
         let sup = Supervisor::direct().await.unwrap();
         let args = json!({"op": "incoming"});
-        let r = sup
-            .execute_tool("call-hierarchy", ".", args, None)
-            .await;
+        let r = sup.execute_tool("call-hierarchy", ".", args, None).await;
         assert!(matches!(r, Err(ToolError::BadArgs { .. })));
     }
 
@@ -8568,9 +8611,7 @@ mod phase1_wrapper_tests {
     async fn execute_tool_type_hierarchy_unknown_op_returns_bad_args() {
         let sup = Supervisor::direct().await.unwrap();
         let args = json!({"op": "bogus"});
-        let r = sup
-            .execute_tool("type-hierarchy", ".", args, None)
-            .await;
+        let r = sup.execute_tool("type-hierarchy", ".", args, None).await;
         assert!(matches!(r, Err(ToolError::BadArgs { .. })));
     }
 
@@ -8690,8 +8731,7 @@ mod phase1_wrapper_tests {
         // Mock 一个完整 response（items 字段缺失），确认提取路径不报错。
         let raw = json!({ "kind": "full" });
         let items = raw.get("items").cloned().unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::Diagnostic> =
-            serde_json::from_value(items).unwrap_or_default();
+        let parsed: Vec<lsp_types::Diagnostic> = serde_json::from_value(items).unwrap_or_default();
         assert!(parsed.is_empty());
     }
 }
@@ -8744,7 +8784,10 @@ mod timeout_resolution_tests {
         assert_eq!(out.get("file").and_then(|v| v.as_str()), Some("main.cpp"));
         assert_eq!(out.get("col").and_then(|v| v.as_u64()), Some(1));
         assert!(out.get("_timeout_ms").is_none(), "_timeout_ms 应被清掉");
-        assert!(out.get("_index_timeout_ms").is_none(), "_index_timeout_ms 应被清掉");
+        assert!(
+            out.get("_index_timeout_ms").is_none(),
+            "_index_timeout_ms 应被清掉"
+        );
     }
 
     #[test]
@@ -8888,11 +8931,20 @@ mod compact_locations_tests {
         let item = &v["items"][0];
         assert_eq!(item["label"], serde_json::json!("add"));
         assert_eq!(item["kind"], serde_json::json!("function"));
-        assert_eq!(item["detail"], serde_json::json!("fn add(a: i32, b: i32) -> i32"));
+        assert_eq!(
+            item["detail"],
+            serde_json::json!("fn add(a: i32, b: i32) -> i32")
+        );
         assert!(item.get("insert").is_none(), "insert==label 兜底副本应省略");
-        assert!(item.get("doc").is_none(), "compact 下 doc 应省略（--json 可取全）");
+        assert!(
+            item.get("doc").is_none(),
+            "compact 下 doc 应省略（--json 可取全）"
+        );
         assert!(item.get("deprecated").is_none(), "deprecated:false 应省略");
-        assert!(item.get("edits").is_none(), "空 additional_text_edits 应省略");
+        assert!(
+            item.get("edits").is_none(),
+            "空 additional_text_edits 应省略"
+        );
     }
 
     /// 偏离默认的字段必须出现：insert!=label、deprecated:true、非空 edits 扁平为
@@ -8928,7 +8980,10 @@ mod compact_locations_tests {
         assert_eq!(v.get("truncated"), None, "未截断不增 truncated 键");
         let edits = item["edits"].as_array().unwrap();
         assert_eq!(edits[0][0], serde_json::json!("L2:1"), "0-based → 1-based");
-        assert_eq!(edits[0][1], serde_json::json!("use std::collections::HashMap;\n"));
+        assert_eq!(
+            edits[0][1],
+            serde_json::json!("use std::collections::HashMap;\n")
+        );
     }
 
     /// symbol_hits_envelope compact 形态：`[name, "file:line:col"]` 二元组。
@@ -9113,7 +9168,11 @@ mod search_symbol_tests {
             json!(null),
             "FLAT 无 container_name → 容器 null"
         );
-        assert_eq!(by_line(6)["symbol"], json!("mock_helper"), "L6 = mock_helper");
+        assert_eq!(
+            by_line(6)["symbol"],
+            json!("mock_helper"),
+            "L6 = mock_helper"
+        );
         let _ = sup.evict(&Supervisor::key(tmp.path(), "rust")).await;
     }
 
@@ -9160,13 +9219,8 @@ mod search_symbol_tests {
             symbol: None,
             container: None,
         }];
-        enrich_search_with_symbols(
-            &sup,
-            Path::new("Z:/nonexistent_xyz_root"),
-            &mut hits,
-            None,
-        )
-        .await;
+        enrich_search_with_symbols(&sup, Path::new("Z:/nonexistent_xyz_root"), &mut hits, None)
+            .await;
         assert!(hits[0].symbol.is_none(), "overview 失败 → symbol 保持 None");
         assert!(hits[0].container.is_none());
     }
@@ -9196,7 +9250,10 @@ mod search_symbol_tests {
         // L1 只被 Foo 覆盖 → 容器 artifact（自身名）滤成 None。
         let (name, container) = find_covering_symbol(&syms, 1, 0).expect("covered");
         assert_eq!(name, "Foo");
-        assert_eq!(container, None, "顶层符号容器应为 None（滤 flatten 自身名）");
+        assert_eq!(
+            container, None,
+            "顶层符号容器应为 None（滤 flatten 自身名）"
+        );
         // L11 无覆盖 → None。
         assert!(find_covering_symbol(&syms, 11, 0).is_none());
     }
@@ -9261,7 +9318,10 @@ mod search_symbol_tests {
         assert_eq!(items[0]["name"], "x", "name 保留");
         assert_eq!(items[0]["file"], "a.rs", "位置字段保留");
         assert_eq!(items[1]["file"], "b.rs");
-        assert!(v["meta"].get("kind").is_none(), "递归删非 items 层的同名字段");
+        assert!(
+            v["meta"].get("kind").is_none(),
+            "递归删非 items 层的同名字段"
+        );
         assert_eq!(v["meta"]["file"], "c.rs", "非目标字段不动");
     }
 }
@@ -9360,7 +9420,11 @@ mod find_symbol_ls_error_tests {
             &mut v,
             &["python: language server for `python` not installed: x".to_string()],
         );
-        assert_eq!(v["compact"], serde_json::Value::Bool(true), "compact 键保留");
+        assert_eq!(
+            v["compact"],
+            serde_json::Value::Bool(true),
+            "compact 键保留"
+        );
         assert_eq!(v["raw_count"], 1);
         assert!(v["warning"].as_str().unwrap().contains("python"));
 
@@ -9533,9 +9597,15 @@ mod semantic_readiness_and_args_tests {
         assert!(hover_is_empty(&serde_json::json!({})));
         assert!(hover_is_empty(&serde_json::json!({"contents": ""})));
         assert!(hover_is_empty(&serde_json::json!({"contents": []})));
-        assert!(hover_is_empty(&serde_json::json!({"contents": {"value": ""}})));
-        assert!(!hover_is_empty(&serde_json::json!({"contents": {"value": "fn hello"}})));
-        assert!(!hover_is_empty(&serde_json::json!({"contents": [{"value": "x"}]})));
+        assert!(hover_is_empty(
+            &serde_json::json!({"contents": {"value": ""}})
+        ));
+        assert!(!hover_is_empty(
+            &serde_json::json!({"contents": {"value": "fn hello"}})
+        ));
+        assert!(!hover_is_empty(
+            &serde_json::json!({"contents": [{"value": "x"}]})
+        ));
     }
 
     /// hover 等返 Option 的工具空结果 = 裸 null：带 warning 时升级为对象形态；

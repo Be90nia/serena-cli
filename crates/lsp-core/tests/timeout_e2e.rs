@@ -25,10 +25,11 @@ async fn client_request_timeout_triggers_when_ls_silent() {
     .expect("spawn mock_ls");
 
     let params = base_initialize_params();
-    let session = tokio::time::timeout(Duration::from_secs(10), Session::start(Some(child), params))
-        .await
-        .expect("session start within 10s")
-        .expect("session start Ok");
+    let session =
+        tokio::time::timeout(Duration::from_secs(10), Session::start(Some(child), params))
+            .await
+            .expect("session start within 10s")
+            .expect("session start Ok");
 
     let started = Instant::now();
     let res: Result<serde_json::Value, _> = session

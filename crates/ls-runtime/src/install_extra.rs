@@ -24,7 +24,11 @@ impl DotnetInstaller {
         spec: &InstallSpec,
     ) -> Result<InstallOutcome, RuntimeError> {
         let (tool, version, args) = match &spec.kind {
-            InstallKind::Dotnet { tool, version, args } => (tool, version, args),
+            InstallKind::Dotnet {
+                tool,
+                version,
+                args,
+            } => (tool, version, args),
             _ => return Err(wrong_kind(spec)),
         };
         let dir_name = version.clone().unwrap_or_else(|| "latest".to_string());
@@ -44,10 +48,12 @@ impl DotnetInstaller {
                 install_cmd: Some(dotnet_install_cmd(tool, version.as_deref(), &install_dir)),
             });
         }
-        std::fs::create_dir_all(&install_dir).map_err(|e| toolchain_err(&format!(
-            "dotnet tool install: create install dir {}: {e}",
-            install_dir.display()
-        )))?;
+        std::fs::create_dir_all(&install_dir).map_err(|e| {
+            toolchain_err(&format!(
+                "dotnet tool install: create install dir {}: {e}",
+                install_dir.display()
+            ))
+        })?;
         let _lock = acquire_install_lock(&install_dir)?;
         let mut cmd_args = vec![
             "tool".to_string(),
@@ -95,8 +101,13 @@ pub fn dotnet_tool_bin_path(install_dir: &Path, tool: &str) -> Option<PathBuf> {
 }
 
 fn dotnet_install_cmd(tool: &str, version: Option<&str>, dir: &Path) -> String {
-    let ver = version.map(|v| format!(" --version {v}")).unwrap_or_default();
-    format!("dotnet tool install --tool-path {} {tool}{ver}", dir.display())
+    let ver = version
+        .map(|v| format!(" --version {v}"))
+        .unwrap_or_default();
+    format!(
+        "dotnet tool install --tool-path {} {tool}{ver}",
+        dir.display()
+    )
 }
 
 /// gem 类安装器：`gem install --user-install --bindir {cache}/{id}/{version}/bin
@@ -112,7 +123,12 @@ impl GemInstaller {
         spec: &InstallSpec,
     ) -> Result<InstallOutcome, RuntimeError> {
         let (gem, version, bin_rel, args) = match &spec.kind {
-            InstallKind::Gem { gem, version, bin_rel, args } => (gem, version, bin_rel, args),
+            InstallKind::Gem {
+                gem,
+                version,
+                bin_rel,
+                args,
+            } => (gem, version, bin_rel, args),
             _ => return Err(wrong_kind(spec)),
         };
         let dir_name = version.clone().unwrap_or_else(|| "latest".to_string());
@@ -126,19 +142,24 @@ impl GemInstaller {
         }
         if !ctx.auto_install {
             return Ok(InstallOutcome::NotInstalled {
-                hint: format!(
-                    "gem `{gem}` not installed (bindir {})",
-                    bindir.display()
-                ),
+                hint: format!("gem `{gem}` not installed (bindir {})", bindir.display()),
                 install_cmd: Some(gem_install_cmd(gem, version.as_deref(), &bindir)),
             });
         }
         std::fs::create_dir_all(&bindir).map_err(|e| {
-            toolchain_err(&format!("gem install: create bindir {}: {e}", bindir.display()))
+            toolchain_err(&format!(
+                "gem install: create bindir {}: {e}",
+                bindir.display()
+            ))
         })?;
         let _lock = acquire_install_lock(&install_dir)?;
-        run_pkg_cmd("gem", &gem_install_args(gem, version.as_deref(), &bindir), &install_dir, "gem",
-            "install Ruby (https://www.ruby-lang.org) and ensure `gem` is on PATH")?;
+        run_pkg_cmd(
+            "gem",
+            &gem_install_args(gem, version.as_deref(), &bindir),
+            &install_dir,
+            "gem",
+            "install Ruby (https://www.ruby-lang.org) and ensure `gem` is on PATH",
+        )?;
         let exe = gem_bin_path(&bindir, bin_rel).ok_or_else(|| {
             toolchain_err(&format!(
                 "gem install {gem}: bin_rel `{bin_rel}` missing under {} after install",
@@ -206,7 +227,12 @@ impl SourceInstaller {
         spec: &InstallSpec,
     ) -> Result<InstallOutcome, RuntimeError> {
         let (repo, pin, build_cmd, bin_rel) = match &spec.kind {
-            InstallKind::Source { repo, pin, build_cmd, bin_rel } => (repo, pin, build_cmd, bin_rel),
+            InstallKind::Source {
+                repo,
+                pin,
+                build_cmd,
+                bin_rel,
+            } => (repo, pin, build_cmd, bin_rel),
             _ => return Err(wrong_kind(spec)),
         };
         let dir_name = pin.clone().unwrap_or_else(|| "default".to_string());
@@ -214,7 +240,10 @@ impl SourceInstaller {
         let clone_dir = install_dir.join("src");
         let exe = clone_dir.join(bin_rel);
         if exe.is_file() {
-            return Ok(InstallOutcome::Ready(Launch::Process { exe, args: Vec::new() }));
+            return Ok(InstallOutcome::Ready(Launch::Process {
+                exe,
+                args: Vec::new(),
+            }));
         }
         if !ctx.auto_install {
             return Ok(InstallOutcome::NotInstalled {
@@ -222,32 +251,45 @@ impl SourceInstaller {
                     "source build of `{repo}` not present under {}",
                     install_dir.display()
                 ),
-                install_cmd: Some(format!("git clone {repo} && (cd src && {})", build_cmd.join(" "))),
+                install_cmd: Some(format!(
+                    "git clone {repo} && (cd src && {})",
+                    build_cmd.join(" ")
+                )),
             });
         }
         std::fs::create_dir_all(&install_dir).map_err(|e| {
-            toolchain_err(&format!("source build: create install dir {}: {e}", install_dir.display()))
+            toolchain_err(&format!(
+                "source build: create install dir {}: {e}",
+                install_dir.display()
+            ))
         })?;
         let _lock = acquire_install_lock(&install_dir)?;
         if !clone_dir.join(".git").exists() {
-            let mut args = vec![
-                "clone".to_string(),
-                "--depth".to_string(),
-                "1".to_string(),
-            ];
+            let mut args = vec!["clone".to_string(), "--depth".to_string(), "1".to_string()];
             if let Some(p) = pin.as_deref() {
                 args.push("--branch".to_string());
                 args.push(p.to_string());
             }
             args.push(repo.clone());
             args.push(clone_dir.to_string_lossy().to_string());
-            run_pkg_cmd("git", &args, &install_dir, "git", "install git (https://git-scm.com) and ensure it is on PATH")?;
+            run_pkg_cmd(
+                "git",
+                &args,
+                &install_dir,
+                "git",
+                "install git (https://git-scm.com) and ensure it is on PATH",
+            )?;
         }
-        let (program, build_args) = build_cmd.split_first().ok_or_else(|| {
-            toolchain_err("source build: empty build_cmd (InvalidSpec)")
-        })?;
-        run_pkg_cmd(program, build_args, &clone_dir, program,
-            "check the LS entry's build toolchain requirements")?;
+        let (program, build_args) = build_cmd
+            .split_first()
+            .ok_or_else(|| toolchain_err("source build: empty build_cmd (InvalidSpec)"))?;
+        run_pkg_cmd(
+            program,
+            build_args,
+            &clone_dir,
+            program,
+            "check the LS entry's build toolchain requirements",
+        )?;
         if !exe.is_file() {
             return Err(toolchain_err(&format!(
                 "source build: bin_rel `{bin_rel}` missing under {} after build",
@@ -259,7 +301,10 @@ impl SourceInstaller {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
         }
-        Ok(InstallOutcome::Ready(Launch::Process { exe, args: Vec::new() }))
+        Ok(InstallOutcome::Ready(Launch::Process {
+            exe,
+            args: Vec::new(),
+        }))
     }
 }
 
@@ -289,7 +334,11 @@ mod tests {
     }
 
     fn kind_spec(kind: InstallKind) -> InstallSpec {
-        InstallSpec { id: "my-ls".into(), kind, exec: vec![] }
+        InstallSpec {
+            id: "my-ls".into(),
+            kind,
+            exec: vec![],
+        }
     }
 
     #[test]
@@ -323,11 +372,13 @@ mod tests {
     #[test]
     fn dotnet_install_cmd_forms_with_and_without_version() {
         let with = dotnet_install_cmd("fsautocomplete", Some("0.83.0"), Path::new("/t"));
-        assert_eq!(with, "dotnet tool install --tool-path /t fsautocomplete --version 0.83.0");
+        assert_eq!(
+            with,
+            "dotnet tool install --tool-path /t fsautocomplete --version 0.83.0"
+        );
         let without = dotnet_install_cmd("csharp-ls", None, Path::new("/t"));
         assert_eq!(
-            without,
-            "dotnet tool install --tool-path /t csharp-ls",
+            without, "dotnet tool install --tool-path /t csharp-ls",
             "无版本 = latest，不带 --version"
         );
     }
@@ -350,15 +401,23 @@ mod tests {
         };
         assert!(hint.contains("fsautocomplete"), "hint: {hint}");
         let cmd = install_cmd.expect("install_cmd 应在");
-        assert!(cmd.contains("dotnet tool install --tool-path"), "cmd: {cmd}");
+        assert!(
+            cmd.contains("dotnet tool install --tool-path"),
+            "cmd: {cmd}"
+        );
         assert!(cmd.contains("--version 0.83.0"), "cmd: {cmd}");
         // wrong kind 路由守卫。
         let bad = kind_spec(InstallKind::PathOnly {
             binary_name: "x".into(),
             install_hint: "y".into(),
         });
-        let err = DotnetInstaller.install(&ctx(dir.path(), true), &bad).unwrap_err();
-        assert!(err.to_string().contains("wrong installer routed"), "err: {err}");
+        let err = DotnetInstaller
+            .install(&ctx(dir.path(), true), &bad)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("wrong installer routed"),
+            "err: {err}"
+        );
     }
 
     #[test]
@@ -389,7 +448,10 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            assert_eq!(gem_bin_path(&bindir, "ruby-lsp").unwrap(), bindir.join("ruby-lsp"));
+            assert_eq!(
+                gem_bin_path(&bindir, "ruby-lsp").unwrap(),
+                bindir.join("ruby-lsp")
+            );
         }
     }
 
@@ -478,7 +540,11 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         // "build" 步骤跨平台落一个文件到 bin_rel（git init 在任意平台可用）。
         #[cfg(windows)]
-        let build_cmd = vec!["cmd".to_string(), "/c".to_string(), "mkdir bin 2>nul & type nul > bin\\tool.txt".to_string()];
+        let build_cmd = vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "mkdir bin 2>nul & type nul > bin\\tool.txt".to_string(),
+        ];
         #[cfg(unix)]
         let build_cmd = vec![
             "sh".to_string(),
@@ -496,7 +562,9 @@ mod tests {
                 assert!(exe.is_file(), "build 产物应落地: {}", exe.display());
                 assert!(args.is_empty());
                 // 二调：缓存命中短路（Ready 且零重跑）。
-                let out2 = SourceInstaller.install(&ctx(cache.path(), true), &spec).unwrap();
+                let out2 = SourceInstaller
+                    .install(&ctx(cache.path(), true), &spec)
+                    .unwrap();
                 assert!(matches!(out2, InstallOutcome::Ready(_)), "{out2:?}");
             }
             Ok(other) => panic!("应 Ready，实际 {other:?}"),
@@ -530,8 +598,15 @@ mod tests {
         };
         // pin → 缓存目录名用 pin（非 default），探测/落位按版本隔离。
         assert!(hint.contains("v0.2.0"), "hint 应含 pin 版本目录: {hint}");
-        assert!(!hint.contains("default"), "pin 在场不应落 default 目录: {hint}");
-        assert!(install_cmd.unwrap().contains("git clone https://github.com/elbywan/crystalline"));
+        assert!(
+            !hint.contains("default"),
+            "pin 在场不应落 default 目录: {hint}"
+        );
+        assert!(
+            install_cmd
+                .unwrap()
+                .contains("git clone https://github.com/elbywan/crystalline")
+        );
     }
 
     #[test]
@@ -553,7 +628,10 @@ mod tests {
         };
         assert!(hint.contains("nixd"), "hint: {hint}");
         let cmd = install_cmd.expect("install_cmd 应在");
-        assert!(cmd.contains("git clone https://github.com/nix-community/nixd"), "cmd: {cmd}");
+        assert!(
+            cmd.contains("git clone https://github.com/nix-community/nixd"),
+            "cmd: {cmd}"
+        );
         // wrong kind 路由守卫。
         let bad = kind_spec(InstallKind::Uvx {
             package: "x".into(),
@@ -561,7 +639,12 @@ mod tests {
             entrypoint: "x".into(),
             args: None,
         });
-        let err = SourceInstaller.install(&ctx(dir.path(), true), &bad).unwrap_err();
-        assert!(err.to_string().contains("wrong installer routed"), "err: {err}");
+        let err = SourceInstaller
+            .install(&ctx(dir.path(), true), &bad)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("wrong installer routed"),
+            "err: {err}"
+        );
     }
 }

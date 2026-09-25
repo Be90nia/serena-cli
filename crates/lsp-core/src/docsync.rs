@@ -47,11 +47,7 @@ const INITIAL_VERSION: i64 = 1;
 /// `/` `:` 字母数字和 `-_~.` 是 RFC 3986 path 合法字符，保持原样；非 ASCII 字节
 /// （中文/emoji 等 UTF-8 序列）percent-encoding 无条件编码（bd serena-rust-cbd：
 /// rust `Uri` 拒绝非 ASCII，原样拼接会导致 ensure_open 链路误报 INTERNAL）。
-const PATH_UNSAFE: &percent_encoding::AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'#')
-    .add(b'?')
-    .add(b'%');
+const PATH_UNSAFE: &percent_encoding::AsciiSet = &CONTROLS.add(b' ').add(b'#').add(b'?').add(b'%');
 
 /// FileGuard TTL 窗口：归零到显式 evict 之间的"复用宽限"。串行工具调用场景下
 /// 几乎都覆盖；后台并发/批处理场景下 `evict_all_buffers()` 提供强制回收出口。
@@ -194,10 +190,8 @@ impl Session {
                     buf.last_released_at = None;
                     // mtime+size 双因子：同 mtime 粒度窗口内的外部改写靠 size 检出。
                     // 记账侧任一为 None（stat 异常）→ 保守按「变了」处理。
-                    let unchanged = mtime.is_some()
-                        && size.is_some()
-                        && mtime == buf.mtime
-                        && size == buf.size;
+                    let unchanged =
+                        mtime.is_some() && size.is_some() && mtime == buf.mtime && size == buf.size;
                     if unchanged {
                         (Action::None, buf.content_version, lru_evicted)
                     } else {
@@ -250,7 +244,9 @@ impl Session {
         // 走 client().notify（同步）而非 self.notify（async）：避免再走一次 ready
         // gate 等门——session 此时已 Ready，且 notify 等门是冗余开销。
         for uri in &lru_evicted {
-            let _ = self.client().notify("textDocument/didClose", make_did_close(uri));
+            let _ = self
+                .client()
+                .notify("textDocument/didClose", make_did_close(uri));
         }
 
         Ok(FileGuard {
@@ -259,18 +255,13 @@ impl Session {
         })
     }
 
-/// 强制回收所有缓冲：发 didClose + 移表。仅当调用方确认要立即关闭所有文档
+    /// 强制回收所有缓冲：发 didClose + 移表。仅当调用方确认要立即关闭所有文档
     /// 时使用（daemon shutdown / 测试清理 / LS 内存压力回收）。
     /// 锁内 drain 取待发列表，锁外发通知（outbound 关 send 失败忽略）。
     pub fn evict_all_buffers(&self) {
         let to_close: Vec<Uri> = {
-            let mut map = self
-                .buffers
-                .lock()
-                .expect("docsync buffers mutex poisoned");
-            map.drain()
-                .map(|(uri, _)| uri)
-                .collect()
+            let mut map = self.buffers.lock().expect("docsync buffers mutex poisoned");
+            map.drain().map(|(uri, _)| uri).collect()
         };
         for uri in &to_close {
             let _ = self
@@ -322,11 +313,17 @@ impl Session {
         results
             .into_iter()
             .enumerate()
-            .map(|(i, opt)| opt.unwrap_or_else(|| Err(CoreError::Io(std::io::Error::other(format!("ensure_open_batch slot {i} dropped"))))))
+            .map(|(i, opt)| {
+                opt.unwrap_or_else(|| {
+                    Err(CoreError::Io(std::io::Error::other(format!(
+                        "ensure_open_batch slot {i} dropped"
+                    ))))
+                })
+            })
             .collect()
     }
 
-/// 回收超过 TTL 的空闲缓冲：ref_count=0 且 last_released_at + ttl < now。
+    /// 回收超过 TTL 的空闲缓冲：ref_count=0 且 last_released_at + ttl < now。
     /// 复用路径（ref_count>0）一律不动。`FILE_GUARD_TTL` 为默认 ttl。
     /// 锁内 drain 取待发列表，锁外发通知（outbound 关 send 失败忽略）。
     ///
@@ -335,15 +332,11 @@ impl Session {
     /// 若需要严格语义，可换『两轮锁 + 比较戳』模式，本场景不引入复杂度。
     pub fn evict_idle_buffers(&self, ttl: std::time::Duration) -> usize {
         let now_idle: Vec<Uri> = {
-            let mut map = self
-                .buffers
-                .lock()
-                .expect("docsync buffers mutex poisoned");
+            let mut map = self.buffers.lock().expect("docsync buffers mutex poisoned");
             let now_idle: Vec<Uri> = map
                 .iter()
                 .filter(|(_, buf)| {
-                    buf.ref_count == 0
-                        && buf.last_released_at.is_some_and(|t| t.elapsed() >= ttl)
+                    buf.ref_count == 0 && buf.last_released_at.is_some_and(|t| t.elapsed() >= ttl)
                 })
                 .map(|(uri, _)| uri.clone())
                 .collect();

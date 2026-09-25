@@ -49,10 +49,7 @@ fn find_entry_file(root: &Path, lang: &str) -> Option<PathBuf> {
         .max_depth(Some(4))
         .build()
         .filter_map(Result::ok)
-        .find(|e| {
-            e.file_type().is_some_and(|t| t.is_file())
-                && entry_file_matches(e.path(), lang)
-        })
+        .find(|e| e.file_type().is_some_and(|t| t.is_file()) && entry_file_matches(e.path(), lang))
         .map(|e| e.into_path())
 }
 
@@ -89,11 +86,7 @@ pub(crate) async fn warm(
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match session
-            .request::<serde_json::Value>(
-                "textDocument/documentSymbol",
-                params.clone(),
-                remaining,
-            )
+            .request::<serde_json::Value>("textDocument/documentSymbol", params.clone(), remaining)
             .await
         {
             Ok(v) if v.as_array().is_some_and(|a| !a.is_empty()) => {

@@ -217,7 +217,12 @@ pub async fn insert_text_before_symbol(
         range.start.character,
         OffsetEncoding::Utf16,
     )?;
-    let new_content = format!("{}{}{}", &content[..start_byte], text, &content[start_byte..]);
+    let new_content = format!(
+        "{}{}{}",
+        &content[..start_byte],
+        text,
+        &content[start_byte..]
+    );
     let (end_line, end_col) = end_line_col(&new_content, start_byte + text.len());
     commit_change(session, file, root, &new_content).await?;
     Ok((end_line, end_col))
@@ -491,7 +496,8 @@ mod tests {
         assert_eq!((l, c), (2, 1));
         // 中间插入 + content 缺尾换行自动补；补入的 \n 属插入内容
         // → 尾 = 其后一行行首（原 b 行，新第 3 行）。
-        let (out, l, c) = apply_insert_at_line("int a = 1;\nint b = 2;\n", 2, "int c = 3;").unwrap();
+        let (out, l, c) =
+            apply_insert_at_line("int a = 1;\nint b = 2;\n", 2, "int c = 3;").unwrap();
         assert_eq!(out, "int a = 1;\nint c = 3;\nint b = 2;\n");
         assert_eq!((l, c), (3, 1));
         // total+1 = 追加 EOF；插入内容以 \n 结尾 → 尾 = one-past-EOF 行首

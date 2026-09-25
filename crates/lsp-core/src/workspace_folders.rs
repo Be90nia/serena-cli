@@ -176,7 +176,8 @@ fn strip_array_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn strip_quotes(s: &str) -> Option<&str> {
-    s.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+    s.strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
         .or_else(|| s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
 }
 
@@ -441,7 +442,8 @@ mod tests {
         write_cargo_workspace(tmp.path(), &["crates/a", "crates/b"]);
         let folders = discover_additional_workspace_folders(tmp.path());
         assert_eq!(folders.len(), 2, "应探测 2 个 cargo workspace member");
-        let names: std::collections::BTreeSet<_> = folders.iter().map(|f| f.name.as_str()).collect();
+        let names: std::collections::BTreeSet<_> =
+            folders.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains("a"));
         assert!(names.contains("b"));
     }
@@ -452,7 +454,8 @@ mod tests {
         write_go_work(tmp.path(), &["mod-a", "mod-b"]);
         let folders = discover_additional_workspace_folders(tmp.path());
         assert_eq!(folders.len(), 2, "应探测 2 个 go.work use 模块");
-        let names: std::collections::BTreeSet<_> = folders.iter().map(|f| f.name.as_str()).collect();
+        let names: std::collections::BTreeSet<_> =
+            folders.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains("mod-a"));
         assert!(names.contains("mod-b"));
     }
@@ -460,10 +463,14 @@ mod tests {
     #[test]
     fn git_submodules_are_each_a_workspace_folder() {
         let tmp = tempfile::tempdir().unwrap();
-        write_gitmodules(tmp.path(), &[("sub1", "vendor/sub1"), ("sub2", "vendor/sub2")]);
+        write_gitmodules(
+            tmp.path(),
+            &[("sub1", "vendor/sub1"), ("sub2", "vendor/sub2")],
+        );
         let folders = discover_additional_workspace_folders(tmp.path());
         assert_eq!(folders.len(), 2, "应探测 2 个 git submodule");
-        let names: std::collections::BTreeSet<_> = folders.iter().map(|f| f.name.as_str()).collect();
+        let names: std::collections::BTreeSet<_> =
+            folders.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains("sub1"));
         assert!(names.contains("sub2"));
     }
@@ -483,7 +490,8 @@ mod tests {
         std::fs::write(&cargo, text).unwrap();
         let folders = discover_additional_workspace_folders(tmp.path());
         assert_eq!(folders.len(), 3, "crates/* 通配应展开为 3 个");
-        let names: std::collections::BTreeSet<_> = folders.iter().map(|f| f.name.as_str()).collect();
+        let names: std::collections::BTreeSet<_> =
+            folders.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains("alpha") && names.contains("beta") && names.contains("gamma"));
     }
 

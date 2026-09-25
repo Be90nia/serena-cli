@@ -121,7 +121,11 @@ impl TokenBucket {
     /// 构造。`per_sec` ≤ 0 等价 30/s；`burst` ≤ 0 等价 2s 抑制窗。
     pub fn new(per_sec: u32, burst: u32) -> Self {
         let per_sec = if per_sec == 0 { 30 } else { per_sec };
-        let burst = if burst == 0 { per_sec.saturating_mul(2).max(1) } else { burst };
+        let burst = if burst == 0 {
+            per_sec.saturating_mul(2).max(1)
+        } else {
+            burst
+        };
         Self {
             per_sec,
             burst,

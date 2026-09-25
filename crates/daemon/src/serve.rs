@@ -69,22 +69,19 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     // 不触碰 lock——lock 只由 bind 赢家创建/接管。否则"动过 lock 却起不来"
     // 的进程会删掉真主人的 lock，制造无 lock 孤儿 + 空 token 403（bd y2y）。
     let addr = SocketAddr::from(([127, 0, 0, 1], cfg.port));
-    let listener = tokio::net::TcpListener::bind(addr).await
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
         .map_err(|e| anyhow::anyhow!("bind {addr} failed: {e}; not starting daemon"))?;
     // lock 仲裁：败者直接退出（正常路径 CLI 已探活转发，不会走到这）。
     let outcome = lockfile::try_become_daemon(&cfg.lock_path, cfg.port)?;
     let (token, own_boot) = match outcome {
-        Outcome::Won {
-            token,
-            boot_ms,
-            ..
-        } => (token, boot_ms),
+        Outcome::Won { token, boot_ms, .. } => (token, boot_ms),
         Outcome::Lost { addr } => {
             anyhow::bail!("another daemon already at {addr}; not starting a second one")
         }
     };
 
-let sup = Arc::new(Supervisor::direct().await?);
+    let sup = Arc::new(Supervisor::direct().await?);
     let state = AppState {
         supervisor: sup.clone(),
         token: Arc::new(token),

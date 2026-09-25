@@ -70,10 +70,7 @@ impl LanguageServerAdapter for GoplsAdapter {
         // M2 深度：探测 go.work / Cargo workspace / git submodules → 追加到 workspaceFolders。
         // supervisor 已设 root 为唯一 folder；这里 extend 多 module。
         // 探测未命中（单 module 项目）→ 不动 workspaceFolders。
-        let root = PROBE_ROOT
-            .lock()
-            .expect("PROBE_ROOT poisoned")
-            .clone();
+        let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
         let Some(root) = root else {
             return;
         };
@@ -81,9 +78,7 @@ impl LanguageServerAdapter for GoplsAdapter {
         if extra.is_empty() {
             return;
         }
-        let folders = base
-            .workspace_folders
-            .get_or_insert_with(Vec::new);
+        let folders = base.workspace_folders.get_or_insert_with(Vec::new);
         folders.extend(extra);
     }
 
@@ -140,7 +135,9 @@ mod tests {
     /// 探针选 root 下真实文件（触发项目索引）；无候选文件退虚拟 URI（向后兼容）。
     #[test]
     fn probe_uri_real_file_then_fallback() {
-        let _seq = PROBE_ROOT_TEST_LOCK.lock().expect("PROBE_ROOT_TEST_LOCK poisoned");
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
         let adapter = GoplsAdapter;
 
         let dir = tempfile::tempdir().unwrap();
@@ -159,7 +156,9 @@ mod tests {
     /// initialize_patches 后 workspaceFolders 至少 2 个（root + 至少 1 extra）。
     #[test]
     fn initialize_patches_appends_workspace_folders_on_go_work() {
-        let _seq = PROBE_ROOT_TEST_LOCK.lock().expect("PROBE_ROOT_TEST_LOCK poisoned");
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
         use std::str::FromStr;
         let dir = tempfile::tempdir().unwrap();
         // 造 go.work: 2 个 module（带 `./` 前缀，真实项目最常见形态）
@@ -194,7 +193,9 @@ mod tests {
     /// 未命中 monorepo marker：workspaceFolders 不变。
     #[test]
     fn initialize_patches_no_op_when_no_monorepo_marker() {
-        let _seq = PROBE_ROOT_TEST_LOCK.lock().expect("PROBE_ROOT_TEST_LOCK poisoned");
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
         use std::str::FromStr;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.go"), "package main\n").unwrap();

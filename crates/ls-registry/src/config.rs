@@ -52,8 +52,7 @@ pub fn user_config_path() -> Option<PathBuf> {
 /// external-ls-registration-design §2）。无 HOME/APPDATA → None（机制整体停用）。
 pub fn external_servers_path() -> Option<PathBuf> {
     if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map(|a| PathBuf::from(a).join("serena/external-servers.toml"))
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("serena/external-servers.toml"))
     } else {
         std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join(".config/serena/external-servers.toml"))
@@ -63,9 +62,8 @@ pub fn external_servers_path() -> Option<PathBuf> {
 /// external-servers.toml（运行时解析，不 include_str!；external-ls-registration-design §3）。
 /// 路径缺失/文件不存在/不可读 → None（静默，常态分支）；schema 校验失败 → warn +
 /// 当空表（永不触网、不 panic，静默容错对齐上游 entry-point discovery）。
-static EXTERNAL: LazyLock<Option<spec::ServersToml>> = LazyLock::new(|| {
-    external_servers_path().and_then(|p| load_external(&p))
-});
+static EXTERNAL: LazyLock<Option<spec::ServersToml>> =
+    LazyLock::new(|| external_servers_path().and_then(|p| load_external(&p)));
 
 /// `EXTERNAL` 的加载本体（路径参数化以供测试注入）。成功时对覆盖/扩展名冲突逐条 warn。
 pub(crate) fn load_external(path: &Path) -> Option<spec::ServersToml> {
@@ -73,7 +71,10 @@ pub(crate) fn load_external(path: &Path) -> Option<spec::ServersToml> {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            eprintln!("warning: external-servers.toml unreadable ({}): {e}", path.display());
+            eprintln!(
+                "warning: external-servers.toml unreadable ({}): {e}",
+                path.display()
+            );
             return None;
         }
     };
@@ -132,7 +133,10 @@ pub fn user_override(lang: &str) -> Option<LsOverride> {
     let value: toml::Value = toml::from_str(&text).ok()?;
     let ls = value.get("ls")?.get(lang)?;
     Some(LsOverride {
-        path: ls.get("ls_path").and_then(|v| v.as_str()).map(PathBuf::from),
+        path: ls
+            .get("ls_path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from),
         base_cmd: str_list(ls.get("ls_base_cmd")),
         args: str_list(ls.get("ls_args")),
         timeout_ms: ls.get("timeout_ms").and_then(toml_to_u32),
@@ -148,10 +152,12 @@ fn str_list(v: Option<&toml::Value>) -> Option<Vec<String>> {
 }
 
 fn toml_to_u32(v: &toml::Value) -> Option<u32> {
-    v.as_integer().and_then(|n| u32::try_from(n).ok()).or_else(|| {
-        // toml 字符串字面量也接受（与 ls_path 同语义）
-        v.as_str().and_then(|s| s.parse::<u32>().ok())
-    })
+    v.as_integer()
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| {
+            // toml 字符串字面量也接受（与 ls_path 同语义）
+            v.as_str().and_then(|s| s.parse::<u32>().ok())
+        })
 }
 
 /// Task 22b：tool 调用的 effective timeout（毫秒）。
@@ -204,9 +210,7 @@ pub fn merge_pick<'a>(
     external: Option<(&'a str, &'a ServerSpec)>,
 ) -> Option<(&'a str, &'a ServerSpec, bool)> {
     match (builtin, external) {
-        (Some((bi, bs)), Some((_, es))) if es.priority < bs.priority => {
-            Some((bi, bs, false))
-        }
+        (Some((bi, bs)), Some((_, es))) if es.priority < bs.priority => Some((bi, bs, false)),
         (Some(_), Some((ei, es))) => Some((ei, es, true)),
         (Some((bi, bs)), None) => Some((bi, bs, false)),
         (None, Some((ei, es))) => Some((ei, es, true)),
@@ -241,10 +245,7 @@ pub fn spec_for(lang_or_id: &str) -> Option<(&'static str, &'static ServerSpec)>
 /// external-servers.toml 扩展名匹配（design §2 extensions 字段）：小写命中 → 该条目
 /// `languages[0]`（session_for/spec_for 按语言名走配置驱动启动）。多条目同扩展名的
 /// 命中顺序未定义（HashMap 迭代序）——加载时已 warn。纯函数，测试可注入任意表。
-pub(crate) fn match_external_ext<'a>(
-    table: &'a spec::ServersToml,
-    ext: &str,
-) -> Option<&'a str> {
+pub(crate) fn match_external_ext<'a>(table: &'a spec::ServersToml, ext: &str) -> Option<&'a str> {
     table
         .servers
         .values()
@@ -299,9 +300,10 @@ pub fn to_install_spec(
                 format!("[{id}]: install=download but no download table (InvalidSpec)")
             })?;
             let key = platform_key(os, arch);
-            let url = dl.url_per_platform.get(&key).ok_or_else(|| {
-                format!("[{id}]: no url for platform `{key}` (InvalidSpec)")
-            })?;
+            let url = dl
+                .url_per_platform
+                .get(&key)
+                .ok_or_else(|| format!("[{id}]: no url for platform `{key}` (InvalidSpec)"))?;
             let sha256 = dl
                 .sha256_per_platform
                 .get(&key)
@@ -344,9 +346,10 @@ pub fn to_install_spec(
             })
         }
         "npm" => {
-            let npm = spec.npm.as_ref().ok_or_else(|| {
-                format!("[{id}]: install=npm but no npm table (InvalidSpec)")
-            })?;
+            let npm = spec
+                .npm
+                .as_ref()
+                .ok_or_else(|| format!("[{id}]: install=npm but no npm table (InvalidSpec)"))?;
             Ok(InstallSpec {
                 id: id.to_string(),
                 kind: InstallKind::Npm {
@@ -357,16 +360,19 @@ pub fn to_install_spec(
                     secondary: npm
                         .secondary_packages
                         .iter()
-                        .map(|s| ls_runtime::install_pkg::npm_pkg_ref(&s.package, s.version.as_deref()))
+                        .map(|s| {
+                            ls_runtime::install_pkg::npm_pkg_ref(&s.package, s.version.as_deref())
+                        })
                         .collect(),
                 },
                 exec: spec.exec.clone(),
             })
         }
         "uvx" => {
-            let uvx = spec.uvx.as_ref().ok_or_else(|| {
-                format!("[{id}]: install=uvx but no uvx table (InvalidSpec)")
-            })?;
+            let uvx = spec
+                .uvx
+                .as_ref()
+                .ok_or_else(|| format!("[{id}]: install=uvx but no uvx table (InvalidSpec)"))?;
             Ok(InstallSpec {
                 id: id.to_string(),
                 kind: InstallKind::Uvx {
@@ -393,9 +399,10 @@ pub fn to_install_spec(
             })
         }
         "gem" => {
-            let g = spec.gem.as_ref().ok_or_else(|| {
-                format!("[{id}]: install=gem but no gem table (InvalidSpec)")
-            })?;
+            let g = spec
+                .gem
+                .as_ref()
+                .ok_or_else(|| format!("[{id}]: install=gem but no gem table (InvalidSpec)"))?;
             Ok(InstallSpec {
                 id: id.to_string(),
                 kind: InstallKind::Gem {
@@ -475,9 +482,9 @@ fn launch_via_pkg_installer(
         Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process { exe, args })) => {
             Ok((exe, args))
         }
-        Ok(InstallOutcome::Ready(ls_runtime::install::Launch::External { host, port })) => {
-            Err(format!("external LS not supported by CLI launch: {host}:{port}"))
-        }
+        Ok(InstallOutcome::Ready(ls_runtime::install::Launch::External { host, port })) => Err(
+            format!("external LS not supported by CLI launch: {host}:{port}"),
+        ),
         Ok(InstallOutcome::UnsignedRefused { hint, .. }) => Err(hint),
         Ok(InstallOutcome::NotInstalled { hint, install_cmd }) => match install_cmd {
             Some(cmd) => Err(format!("{hint}; install with: {cmd}")),
@@ -495,8 +502,7 @@ pub fn ensure_launch(
     auto_install: bool,
     allow_unsigned_sha: bool,
 ) -> Result<(PathBuf, Vec<String>), String> {
-    let (id, spec) =
-        spec_for(lang).ok_or_else(|| format!("no servers.toml entry for `{lang}`"))?;
+    let (id, spec) = spec_for(lang).ok_or_else(|| format!("no servers.toml entry for `{lang}`"))?;
 
     // §4 override：CLI --ls-path 直接指定（不存在 → MissingRuntime 语义错误）。
     if let Some(LsOverride { path: Some(p), .. }) = effective_override(lang, cli_override) {
@@ -529,9 +535,10 @@ pub fn ensure_launch(
             // 缓存命中（未触网）：{cache_root}/{id}/{version|latest}/node_modules/.bin/{bin_rel}。
             // 最终 cmd 由安装机制决定，不走 {bin} 模板。
             let dir_name = npm.version.clone().unwrap_or_else(|| "latest".to_string());
-            if let Some(exe) =
-                ls_runtime::install_pkg::npm_bin_path(&cache_root.join(id).join(&dir_name), &npm.bin_rel)
-            {
+            if let Some(exe) = ls_runtime::install_pkg::npm_bin_path(
+                &cache_root.join(id).join(&dir_name),
+                &npm.bin_rel,
+            ) {
                 return Ok((exe, npm.npm_args.clone().unwrap_or_default()));
             }
             if !auto_install {
@@ -552,11 +559,14 @@ pub fn ensure_launch(
                     Ok((exe, args))
                 }
                 Ok(InstallOutcome::Ready(ls_runtime::install::Launch::External { host, port })) => {
-                    Err(format!("external LS not supported by CLI launch: {host}:{port}"))
+                    Err(format!(
+                        "external LS not supported by CLI launch: {host}:{port}"
+                    ))
                 }
-                Ok(InstallOutcome::UnsignedRefused { hint, .. } | InstallOutcome::NotInstalled { hint, .. }) => {
-                    Err(hint)
-                }
+                Ok(
+                    InstallOutcome::UnsignedRefused { hint, .. }
+                    | InstallOutcome::NotInstalled { hint, .. },
+                ) => Err(hint),
                 Err(e) => Err(format!("{e}")),
             }
         }
@@ -594,8 +604,11 @@ pub fn ensure_launch(
             }
             if !auto_install {
                 return Err(format!(
-                    "language server `{lang}` not installed; enable --auto-install or run `serena-cli install {id}` (url={})"
-                    , dl.url_per_platform.get(&platform_key(os, arch)).map(String::as_str).unwrap_or("?")
+                    "language server `{lang}` not installed; enable --auto-install or run `serena-cli install {id}` (url={})",
+                    dl.url_per_platform
+                        .get(&platform_key(os, arch))
+                        .map(String::as_str)
+                        .unwrap_or("?")
                 ));
             }
             let ictx = InstallCtx {
@@ -770,10 +783,16 @@ mod tests {
 
     #[test]
     fn expand_exec_substitutes_bin_placeholder() {
-        let out = expand_exec(&["{bin}".into(), "lsp".into()], Path::new("D:/x/marksman.exe"));
+        let out = expand_exec(
+            &["{bin}".into(), "lsp".into()],
+            Path::new("D:/x/marksman.exe"),
+        );
         assert_eq!(out, vec!["D:/x/marksman.exe", "lsp"]);
         // 空模板 = 裸启动默认 [{bin}]（G 类 path_only 批量条目形态）。
-        assert_eq!(expand_exec(&[], Path::new("D:/x/zls.exe")), vec!["D:/x/zls.exe"]);
+        assert_eq!(
+            expand_exec(&[], Path::new("D:/x/zls.exe")),
+            vec!["D:/x/zls.exe"]
+        );
     }
 
     /// A 类全链路（真下载，门控）：spec → InstallSpec → DownloadInstaller → bin 落地。
@@ -784,8 +803,7 @@ mod tests {
         }
         let (id, spec) = spec_for("markdown").unwrap();
         let install_spec =
-            to_install_spec(spec, id, Os::current(), ls_runtime::deps::Arch::current())
-                .unwrap();
+            to_install_spec(spec, id, Os::current(), ls_runtime::deps::Arch::current()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let ictx = InstallCtx {
             os: Os::current(),
@@ -822,10 +840,21 @@ args = ["-v"]
     fn to_install_spec_maps_npm_and_uvx() {
         let parsed = crate::spec::parse(NPM_TOML).unwrap();
         let npm = &parsed.servers["npm_probe"];
-        let mapped =
-            to_install_spec(npm, "npm_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        let mapped = to_install_spec(
+            npm,
+            "npm_probe",
+            Os::Windows,
+            ls_runtime::deps::Arch::X86_64,
+        )
+        .unwrap();
         match mapped.kind {
-            InstallKind::Npm { package, version, bin_rel, npm_args, secondary: _ } => {
+            InstallKind::Npm {
+                package,
+                version,
+                bin_rel,
+                npm_args,
+                secondary: _,
+            } => {
                 assert_eq!(package, "bash-language-server");
                 assert_eq!(version, None, "toml 未写 version → None（latest）");
                 assert_eq!(bin_rel, "bash-language-server");
@@ -834,10 +863,20 @@ args = ["-v"]
             other => panic!("expect Npm, got {other:?}"),
         }
         let uvx = &parsed.servers["uvx_probe"];
-        let mapped =
-            to_install_spec(uvx, "uvx_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        let mapped = to_install_spec(
+            uvx,
+            "uvx_probe",
+            Os::Windows,
+            ls_runtime::deps::Arch::X86_64,
+        )
+        .unwrap();
         match mapped.kind {
-            InstallKind::Uvx { package, version, entrypoint, args } => {
+            InstallKind::Uvx {
+                package,
+                version,
+                entrypoint,
+                args,
+            } => {
                 assert_eq!(package, "fake-ls");
                 assert_eq!(version.as_deref(), Some("0.9.0"));
                 assert_eq!(entrypoint, "fake-ls");
@@ -857,9 +896,13 @@ args = ["-v"]
         }
         let parsed = crate::spec::parse(NPM_TOML).unwrap();
         let spec = &parsed.servers["npm_probe"];
-        let install_spec =
-            to_install_spec(spec, "npm_probe", Os::current(), ls_runtime::deps::Arch::current())
-                .unwrap();
+        let install_spec = to_install_spec(
+            spec,
+            "npm_probe",
+            Os::current(),
+            ls_runtime::deps::Arch::current(),
+        )
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let ictx = InstallCtx {
             os: Os::current(),
@@ -940,7 +983,11 @@ package = "@vue/language-server"
         let mapped =
             to_install_spec(dn, "dn_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
         match mapped.kind {
-            InstallKind::Dotnet { tool, version, args } => {
+            InstallKind::Dotnet {
+                tool,
+                version,
+                args,
+            } => {
                 assert_eq!(tool, "fsautocomplete");
                 assert_eq!(version.as_deref(), Some("0.83.0"));
                 assert_eq!(args, Some(vec!["--stdio".to_string()]));
@@ -951,7 +998,12 @@ package = "@vue/language-server"
         let mapped =
             to_install_spec(gm, "gm_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
         match mapped.kind {
-            InstallKind::Gem { gem, version, bin_rel, args } => {
+            InstallKind::Gem {
+                gem,
+                version,
+                bin_rel,
+                args,
+            } => {
                 assert_eq!(gem, "solargraph");
                 assert_eq!(version.as_deref(), Some("0.51.1"));
                 assert_eq!(bin_rel, "solargraph");
@@ -960,10 +1012,20 @@ package = "@vue/language-server"
             other => panic!("expect Gem, got {other:?}"),
         }
         let src = &parsed.servers["src_probe"];
-        let mapped =
-            to_install_spec(src, "src_probe", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        let mapped = to_install_spec(
+            src,
+            "src_probe",
+            Os::Windows,
+            ls_runtime::deps::Arch::X86_64,
+        )
+        .unwrap();
         match mapped.kind {
-            InstallKind::Source { repo, pin, build_cmd, bin_rel } => {
+            InstallKind::Source {
+                repo,
+                pin,
+                build_cmd,
+                bin_rel,
+            } => {
                 assert_eq!(repo, "https://github.com/nix-community/nixd");
                 assert!(pin.is_none());
                 assert_eq!(build_cmd, vec!["nix", "build"]);
@@ -973,14 +1035,21 @@ package = "@vue/language-server"
         }
         // npm secondary → pkg@ver 引用（npm_pkg_ref 同形态；无版本 = 裸包名）。
         let npm = &parsed.servers["npm_sec_probe"];
-        let mapped =
-            to_install_spec(npm, "npm_sec_probe", Os::Windows, ls_runtime::deps::Arch::X86_64)
-                .unwrap();
+        let mapped = to_install_spec(
+            npm,
+            "npm_sec_probe",
+            Os::Windows,
+            ls_runtime::deps::Arch::X86_64,
+        )
+        .unwrap();
         match mapped.kind {
             InstallKind::Npm { secondary, .. } => {
                 assert_eq!(
                     secondary,
-                    vec!["typescript@5.9.3".to_string(), "@vue/language-server".to_string()]
+                    vec![
+                        "typescript@5.9.3".to_string(),
+                        "@vue/language-server".to_string()
+                    ]
                 );
             }
             other => panic!("expect Npm, got {other:?}"),
@@ -1024,7 +1093,10 @@ package = "@vue/language-server"
     #[test]
     fn load_external_unreadable_path_is_none() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(load_external(dir.path()).is_none(), "目录路径 → 读取失败 → None");
+        assert!(
+            load_external(dir.path()).is_none(),
+            "目录路径 → 读取失败 → None"
+        );
     }
 
     /// §2/§3 正常路径：合法 external 表加载成功；覆盖内置条目（marksman）时走
@@ -1045,7 +1117,14 @@ package = "@vue/language-server"
         std::fs::write(&p, toml_str).expect("write valid external toml");
         let t = load_external(&p).expect("valid table loads");
         assert_eq!(t.servers["marksman"].priority, 0);
-        assert_eq!(t.servers["marksman"].path_only.as_ref().unwrap().binary_name, "fake-marksman");
+        assert_eq!(
+            t.servers["marksman"]
+                .path_only
+                .as_ref()
+                .unwrap()
+                .binary_name,
+            "fake-marksman"
+        );
     }
 
     /// §2 extension 路由核心：小写命中条目 `languages[0]`；大小写不敏感；未命中 None。
@@ -1057,8 +1136,16 @@ package = "@vue/language-server"
         )
         .expect("valid");
         assert_eq!(match_external_ext(&t, "mydsl"), Some("mydsl"));
-        assert_eq!(match_external_ext(&t, "MYDSL"), Some("mydsl"), "大小写不敏感");
-        assert_eq!(match_external_ext(&t, "mydsl3"), Some("mydsl"), "无点前缀也命中");
+        assert_eq!(
+            match_external_ext(&t, "MYDSL"),
+            Some("mydsl"),
+            "大小写不敏感"
+        );
+        assert_eq!(
+            match_external_ext(&t, "mydsl3"),
+            Some("mydsl"),
+            "无点前缀也命中"
+        );
         assert_eq!(match_external_ext(&t, "other"), None);
     }
 }

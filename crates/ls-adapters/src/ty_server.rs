@@ -63,7 +63,10 @@ impl LanguageServerAdapter for TyServerAdapter {
     fn initialize_patches(&self, base: &mut InitializeParams) {
         // 与 pyright 同款 venv 探测 → 注入 python.pythonPath。
         let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
-        let Some(interp) = root.as_deref().and_then(crate::pyright::find_python_interpreter) else {
+        let Some(interp) = root
+            .as_deref()
+            .and_then(crate::pyright::find_python_interpreter)
+        else {
             return;
         };
         let opts = base
@@ -83,7 +86,11 @@ impl LanguageServerAdapter for TyServerAdapter {
     async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
         use serde_json::json;
         let uri = crate::probe_uri_for_root(
-            PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").as_deref().unwrap_or(Path::new(".")),
+            PROBE_ROOT
+                .lock()
+                .expect("PROBE_ROOT poisoned")
+                .as_deref()
+                .unwrap_or(Path::new(".")),
             self.languages(),
             "file:///__ty_ready_probe__",
         );

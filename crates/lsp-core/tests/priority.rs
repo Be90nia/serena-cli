@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn classify_text_document_is_high() {
-    assert_eq!(classify_method("textDocument/documentSymbol"), Priority::High);
+    assert_eq!(
+        classify_method("textDocument/documentSymbol"),
+        Priority::High
+    );
     assert_eq!(classify_method("textDocument/definition"), Priority::High);
     assert_eq!(classify_method("textDocument/hover"), Priority::High);
     assert_eq!(classify_method("textDocument/references"), Priority::High);
@@ -36,10 +39,7 @@ fn classify_execute_command_and_work_progress_are_high() {
 
 #[test]
 fn classify_workspace_ping_is_background() {
-    assert_eq!(
-        classify_method("$/workspace/_ping"),
-        Priority::Background
-    );
+    assert_eq!(classify_method("$/workspace/_ping"), Priority::Background);
     assert_eq!(classify_method("workspace/_ping"), Priority::Background);
 }
 
@@ -115,15 +115,9 @@ fn token_bucket_refills_over_time() {
     // 等 50ms → 应 refill 5 个（100/s × 0.05s = 5）。
     let later = now + Duration::from_millis(50);
     for i in 0..5 {
-        assert!(
-            bucket.try_acquire(later),
-            "refill 后第 {i} 次应成功"
-        );
+        assert!(bucket.try_acquire(later), "refill 后第 {i} 次应成功");
     }
-    assert!(
-        !bucket.try_acquire(later),
-        "refill 用完应再次拒绝"
-    );
+    assert!(!bucket.try_acquire(later), "refill 用完应再次拒绝");
 }
 
 #[test]

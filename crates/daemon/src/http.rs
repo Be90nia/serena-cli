@@ -134,7 +134,9 @@ async fn tools_post(
     if state.draining.load(std::sync::atomic::Ordering::Acquire) {
         return draining_response();
     }
-    state.in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    state
+        .in_flight
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     crate::reaper::note_activity();
 
     // d3a：invocation_id 三级来源——body envelope > X-Invocation-Id header >
@@ -199,7 +201,9 @@ async fn tools_post(
                     format: None,
                     approx_tokens: None,
                 };
-                let n = serde_json::to_vec(&probe).ok().map(|b| (b.len() / 4) as u64);
+                let n = serde_json::to_vec(&probe)
+                    .ok()
+                    .map(|b| (b.len() / 4) as u64);
                 // 计量后把 data 还回（probe 按构造恒为 Ok 变体）。
                 if let ToolResponse::Ok { data: measured, .. } = probe {
                     data = measured;
@@ -236,7 +240,9 @@ async fn tools_post(
             (status, Json(resp)).into_response()
         }
     };
-    state.in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    state
+        .in_flight
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     resp
 }
 
@@ -328,7 +334,10 @@ async fn status_get(State(state): State<AppState>) -> Response {
 
 async fn shutdown_post(State(state): State<AppState>) -> Response {
     // 幂等：重复 /shutdown（stop-all 重试）不叠加 drain 窗口。
-    if state.draining.swap(true, std::sync::atomic::Ordering::AcqRel) {
+    if state
+        .draining
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
         return (
             StatusCode::OK,
             Json(json!({"ok": true, "message": "already draining"})),
@@ -429,14 +438,18 @@ async fn batch_handler(State(state): State<AppState>, Json(req): Json<BatchReque
         )
             .into_response();
     }
-    state.in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    state
+        .in_flight
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     crate::reaper::note_activity();
     // batch 可混多项目；active_project 记最后一个请求的 root（「最近请求」语义同 tools_post）。
     if let Some(root) = req.calls.last().map(|c| c.project_root.clone()) {
         *state.active_project.lock().unwrap() = Some(root);
     }
     let results = run_batch(&state, req.calls).await;
-    state.in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    state
+        .in_flight
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     (StatusCode::OK, Json(BatchResponse { results })).into_response()
 }
 
@@ -485,7 +498,12 @@ async fn execute_batch_call(
     call: BatchCall,
 ) -> BatchResult {
     match sup
-        .execute_tool(&call.tool, &call.project_root, call.args, call.lang.as_deref())
+        .execute_tool(
+            &call.tool,
+            &call.project_root,
+            call.args,
+            call.lang.as_deref(),
+        )
         .await
     {
         Ok(value) => BatchResult {
@@ -761,7 +779,9 @@ mod tests {
         let (_, body) = oneshot_json(router.clone(), call("D:/proj-b")).await;
         let body = body.expect("json body");
         assert_eq!(body["ok"], true);
-        let w = body["data"]["warning"].as_str().expect("warning 键必须存在");
+        let w = body["data"]["warning"]
+            .as_str()
+            .expect("warning 键必须存在");
         assert!(w.contains("project switched"), "{w}");
         assert!(w.contains("D:/proj-a"), "{w}");
         assert!(w.contains("D:/proj-b"), "{w}");
@@ -1110,8 +1130,7 @@ mod tests {
     async fn shutdown_defers_notify_until_inflight_drains() {
         let mut st = state("secret", MockSupervisor::ok(json!(null)));
         st.drain_window = std::time::Duration::from_millis(200);
-        st.in_flight
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        st.in_flight.store(1, std::sync::atomic::Ordering::SeqCst);
         let notify = st.shutdown_notify.clone();
         let mut waiter = tokio::spawn(async move {
             notify.notified().await;

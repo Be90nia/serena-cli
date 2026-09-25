@@ -53,7 +53,12 @@ fn parse_secs(raw: Option<&str>, var: &str, default: u64) -> u64 {
         Some(s) => match s.trim().parse::<u64>() {
             Ok(n) => n,
             Err(_) => {
-                tracing::warn!(env = var, value = s, default, "invalid value; using default");
+                tracing::warn!(
+                    env = var,
+                    value = s,
+                    default,
+                    "invalid value; using default"
+                );
                 default
             }
         },
@@ -72,7 +77,9 @@ pub fn intervals_from_env() -> ReaperIntervals {
             base.global_idle.as_secs(),
         )),
         ls_idle: Duration::from_secs(parse_secs(
-            std::env::var("SERENA_LS_IDLE_EVICTION_SECS").ok().as_deref(),
+            std::env::var("SERENA_LS_IDLE_EVICTION_SECS")
+                .ok()
+                .as_deref(),
             "SERENA_LS_IDLE_EVICTION_SECS",
             base.ls_idle.as_secs(),
         )),
@@ -183,10 +190,7 @@ async fn reaper_loop(
 /// background threads / signal handlers 持有引用，runtime drop 后进程仍可能
 /// 残留；`process::exit` 直接终止并跳过 drop，等同 systemd / svchost 的
 /// SIGTERM-then-SIGKILL 语义（ARCH §3.2）。
-async fn finish_shutdown(
-    state: &AppState,
-    lock: &Option<(std::path::PathBuf, u128)>,
-) {
+async fn finish_shutdown(state: &AppState, lock: &Option<(std::path::PathBuf, u128)>) {
     shutdown_cleanup(state, lock).await;
     // cfg(not(test))：单测里 reaper_loop 走 finish_shutdown 时不强退——
     // 会把整个测试 binary 拽下来。生产 build 始终带这段。
@@ -198,10 +202,7 @@ async fn finish_shutdown(
 ///
 /// 从 `finish_shutdown` 抽出，让测试能断言"删 lock / notify 都做了"而不触发
 /// `process::exit`（强退会拽走测试 binary）。
-pub(crate) async fn shutdown_cleanup(
-    state: &AppState,
-    lock: &Option<(std::path::PathBuf, u128)>,
-) {
+pub(crate) async fn shutdown_cleanup(state: &AppState, lock: &Option<(std::path::PathBuf, u128)>) {
     // 不逐 LS evict、不再等 in-flight：两条调用路径（/shutdown、idle 15min）
     // 的排空窗口都已在 http 层给过（wait_drain），且最终都以 process::exit(0)
     // 收场——Windows Job 句柄随进程关闭带崩整个 LS 树（ARCH §3.2），优雅

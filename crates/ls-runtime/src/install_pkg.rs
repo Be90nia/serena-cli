@@ -57,7 +57,10 @@ impl NpmInstaller {
             url: String::new(),
             expected_sha: None,
             actual_sha: None,
-            cause: format!("npm install: create install dir {}: {e}", install_dir.display()),
+            cause: format!(
+                "npm install: create install dir {}: {e}",
+                install_dir.display()
+            ),
         })?;
         let _lock = acquire_install_lock(&install_dir)?;
         let mut pkg_refs = vec![npm_pkg_ref(package, version.as_deref())];
@@ -178,7 +181,11 @@ fn find_on_path(name: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBu
 /// 同步 `npm install --prefix <dir> <pkg_refs...>`（secondary 伴随包同一次 install 装齐）。
 fn run_npm_install(package_refs: &[String], dir: &Path) -> Result<(), RuntimeError> {
     let program = if cfg!(windows) { "npm.cmd" } else { "npm" };
-    let mut args = vec!["install".to_string(), "--prefix".to_string(), dir.to_string_lossy().to_string()];
+    let mut args = vec![
+        "install".to_string(),
+        "--prefix".to_string(),
+        dir.to_string_lossy().to_string(),
+    ];
     args.extend(package_refs.iter().cloned());
     run_pkg_cmd(
         program,
@@ -215,7 +222,10 @@ pub(crate) fn run_pkg_cmd(
                     install_hint: missing_hint.to_string(),
                 }
             } else {
-                RuntimeError::Spawn { cmd: cmd_label.clone(), cause: e }
+                RuntimeError::Spawn {
+                    cmd: cmd_label.clone(),
+                    cause: e,
+                }
             }
         })?;
     let deadline = std::time::Instant::now() + Duration::from_secs(600);
@@ -319,7 +329,10 @@ mod tests {
     #[test]
     fn find_on_path_matches_and_misses() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(find_on_path("uvx", Some(dir.path().as_os_str())).is_none(), "空目录未命中");
+        assert!(
+            find_on_path("uvx", Some(dir.path().as_os_str())).is_none(),
+            "空目录未命中"
+        );
         #[cfg(windows)]
         let probe = dir.path().join("uvx.exe");
         #[cfg(unix)]
@@ -359,7 +372,9 @@ mod tests {
             },
             exec: vec![],
         };
-        let out = NpmInstaller.install(&ctx, &spec).expect("缓存命中应直接 Ready");
+        let out = NpmInstaller
+            .install(&ctx, &spec)
+            .expect("缓存命中应直接 Ready");
         let InstallOutcome::Ready(Launch::Process { exe, args }) = out else {
             panic!("应 Ready，实际 {out:?}");
         };
@@ -380,7 +395,10 @@ mod tests {
             exec: vec![],
         };
         let err = NpmInstaller.install(&ctx, &bad).unwrap_err();
-        assert!(err.to_string().contains("wrong installer routed"), "err: {err}");
+        assert!(
+            err.to_string().contains("wrong installer routed"),
+            "err: {err}"
+        );
     }
 
     /// UvxInstaller：PATH 无 uvx → NotInstalled + 安装 hint（不触网）。
@@ -404,7 +422,9 @@ mod tests {
             },
             exec: vec![],
         };
-        let out = UvxInstaller.install(&ctx, &spec).expect("无安装步骤，不应 Err");
+        let out = UvxInstaller
+            .install(&ctx, &spec)
+            .expect("无安装步骤，不应 Err");
         match out {
             InstallOutcome::NotInstalled { hint, install_cmd } => {
                 assert!(hint.contains("uvx"), "hint: {hint}");

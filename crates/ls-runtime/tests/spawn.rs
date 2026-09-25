@@ -77,7 +77,10 @@ async fn descendants_reaped_on_kill() {
     child.kill();
 
     wait_gone(cmd_pid, "kill 后直接子进程 cmd 仍残留");
-    wait_gone(ping_pid, "kill 后孙子进程 ping 仍残留：job 未覆盖 LS 自 spawn 的子孙");
+    wait_gone(
+        ping_pid,
+        "kill 后孙子进程 ping 仍残留：job 未覆盖 LS 自 spawn 的子孙",
+    );
 }
 
 fn pid_running(pid: u32) -> bool {
@@ -94,9 +97,7 @@ fn child_pids(pid: u32) -> Vec<u32> {
         .args([
             "-NoProfile",
             "-Command",
-            &format!(
-                "(Get-CimInstance Win32_Process -Filter 'ParentProcessId={pid}').ProcessId"
-            ),
+            &format!("(Get-CimInstance Win32_Process -Filter 'ParentProcessId={pid}').ProcessId"),
         ])
         .output()
         .expect("powershell 可用（Windows 验收环境）");
@@ -110,10 +111,7 @@ fn child_pids(pid: u32) -> Vec<u32> {
 fn wait_gone(pid: u32, msg: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while pid_running(pid) {
-        assert!(
-            Instant::now() < deadline,
-            "{msg} (pid={pid})"
-        );
+        assert!(Instant::now() < deadline, "{msg} (pid={pid})");
         std::thread::sleep(Duration::from_millis(200));
     }
 }

@@ -53,9 +53,7 @@ fn execute_tool_branches_from_source(src: &str) -> BTreeSet<String> {
             && let Some(end) = rest.find('"')
         {
             let name = &rest[..end];
-            if !name.is_empty()
-                && name.chars().all(|c| c.is_ascii_lowercase() || c == '-')
-            {
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
                 names.insert(name.to_string());
             }
         }
@@ -86,10 +84,8 @@ fn execute_tool_branches_from_source(src: &str) -> BTreeSet<String> {
 #[test]
 fn catalog_matches_execute_tool_branches() {
     // 路径：CARGO_MANIFEST_DIR = crates/supervisor；lib.rs 在 src/。
-    let lib_rs = fs::read(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
-    )
-    .expect("read lib.rs");
+    let lib_rs = fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
+        .expect("read lib.rs");
     let lib_src = String::from_utf8(lib_rs).expect("lib.rs utf8");
 
     let mut branches = execute_tool_branches_from_source(&lib_src);
@@ -100,7 +96,8 @@ fn catalog_matches_execute_tool_branches() {
     let catalog_names: BTreeSet<String> = catalog::catalog_tool_names().into_iter().collect();
 
     assert_eq!(
-        branches, catalog_names,
+        branches,
+        catalog_names,
         "execute_tool match branches ({}) != catalog tools ({})\nmissing_in_catalog: {:?}\nextra_in_catalog: {:?}",
         branches.len(),
         catalog_names.len(),
@@ -154,7 +151,14 @@ fn catalog_private_prefixes_are_consistent_with_sanitize() {
     // 私有字段必须只在 args 出现，绝不出现在 tool name。
     let v = catalog::catalog();
     let tools = v.get("tools").and_then(|t| t.as_object()).unwrap();
-    let known_private = ["_timeout_ms", "_index_timeout_ms", "_compact", "_delta", "_max_tokens", "_compress"];
+    let known_private = [
+        "_timeout_ms",
+        "_index_timeout_ms",
+        "_compact",
+        "_delta",
+        "_max_tokens",
+        "_compress",
+    ];
     let mut seen_private: BTreeSet<String> = BTreeSet::new();
     for (tool_name, def) in tools {
         let args = def.get("args").and_then(|a| a.as_object()).unwrap();

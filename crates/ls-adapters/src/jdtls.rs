@@ -46,8 +46,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ls_runtime::deps::{Arch, Os};
 use ls_runtime::install::{
-    default_cache_root, ArchiveKind, DownloadInstaller, InstallCtx, InstallKind, InstallOutcome,
-    InstallSpec,
+    ArchiveKind, DownloadInstaller, InstallCtx, InstallKind, InstallOutcome, InstallSpec,
+    default_cache_root,
 };
 use ls_runtime::process::{LaunchInfo, TransportKind};
 use lsp_types::InitializeParams;
@@ -199,7 +199,8 @@ pub(crate) fn ensure_jdtls_installed(cache_root: &Path) -> Result<PathBuf, anyho
         InstallOutcome::Ready(_) => Ok(cache_root.join(JDTLS_CACHE_ID).join(JDTLS_VERSION)),
         // allow_unsigned_sha=true 且 kind=Download 时不可达（UnsignedRefused 仅 sha 门
         // 拒绝时返回；NotInstalled 仅 PathOnly 返回）——defensive，不吞错不 panic。
-        InstallOutcome::UnsignedRefused { hint, .. } | InstallOutcome::NotInstalled { hint, .. } => {
+        InstallOutcome::UnsignedRefused { hint, .. }
+        | InstallOutcome::NotInstalled { hint, .. } => {
             Err(anyhow::anyhow!("jdtls auto-install: {hint}"))
         }
     }
@@ -426,7 +427,10 @@ mod tests {
             url,
             "https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz"
         );
-        assert_eq!(sha256, "", "latest 滚动无钉 hash（sha 门由 ensure 特例跳过）");
+        assert_eq!(
+            sha256, "",
+            "latest 滚动无钉 hash（sha 门由 ensure 特例跳过）"
+        );
         assert!(matches!(archive, ArchiveKind::TarGz));
         assert_eq!(strip_components, 0, "snapshot tar 顶层即包体");
         assert_eq!(bin_path, "bin/jdtls");

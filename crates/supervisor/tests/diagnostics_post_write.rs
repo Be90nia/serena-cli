@@ -17,14 +17,25 @@ use supervisor::SupervisorTrait;
 fn has_clangd() -> bool {
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            if dir.join(if cfg!(windows) { "clangd.exe" } else { "clangd" }).is_file() {
+            if dir
+                .join(if cfg!(windows) {
+                    "clangd.exe"
+                } else {
+                    "clangd"
+                })
+                .is_file()
+            {
                 return true;
             }
         }
     }
     for dir in ["D:/Program Files/LLVM/bin", "C:/Program Files/LLVM/bin"] {
         if PathBuf::from(dir)
-            .join(if cfg!(windows) { "clangd.exe" } else { "clangd" })
+            .join(if cfg!(windows) {
+                "clangd.exe"
+            } else {
+                "clangd"
+            })
             .is_file()
         {
             return true;
@@ -39,8 +50,7 @@ async fn post_write_diagnostics_appears_in_tool_result() {
         println!("skipped: clangd not in PATH");
         return;
     }
-    let dir =
-        std::env::temp_dir().join(format!("serena-f2-postwrite-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("serena-f2-postwrite-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 

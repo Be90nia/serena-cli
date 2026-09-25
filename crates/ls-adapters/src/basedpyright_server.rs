@@ -70,7 +70,10 @@ impl LanguageServerAdapter for BasedpyrightServerAdapter {
     fn initialize_patches(&self, base: &mut InitializeParams) {
         // 与 pyright 同款 venv 探测 → 注入 python.pythonPath（共享探测函数）。
         let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
-        let Some(interp) = root.as_deref().and_then(crate::pyright::find_python_interpreter) else {
+        let Some(interp) = root
+            .as_deref()
+            .and_then(crate::pyright::find_python_interpreter)
+        else {
             return;
         };
         let opts = base
@@ -91,7 +94,11 @@ impl LanguageServerAdapter for BasedpyrightServerAdapter {
         // 探针逻辑同 pyright：根下真实 .py 文件 URI 触发项目解析。失败返回 Ok 放行。
         use serde_json::json;
         let uri = crate::probe_uri_for_root(
-            PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").as_deref().unwrap_or(Path::new(".")),
+            PROBE_ROOT
+                .lock()
+                .expect("PROBE_ROOT poisoned")
+                .as_deref()
+                .unwrap_or(Path::new(".")),
             self.languages(),
             "file:///__basedpyright_ready_probe__",
         );

@@ -126,7 +126,10 @@ async fn did_open_defaults_to_cpp_when_language_not_injected() {
         .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
         .collect();
     assert_eq!(opens.len(), 1, "应 1 次 didOpen；events={events:?}");
-    assert_eq!(opens[0].get("languageId").and_then(Value::as_str), Some("cpp"));
+    assert_eq!(
+        opens[0].get("languageId").and_then(Value::as_str),
+        Some("cpp")
+    );
 
     session.shutdown().await;
 }
@@ -298,9 +301,7 @@ async fn repeated_mtime_changes_yield_monotonic_versions() {
     let tmp = TempDir::new().expect("TempDir::new");
     let track_log = tmp.path().join("track.log");
     let file = tmp.path().join("d.cpp");
-    tokio::fs::write(&file, b"v1\n")
-        .await
-        .expect("write v1");
+    tokio::fs::write(&file, b"v1\n").await.expect("write v1");
 
     let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
     let session = Session::start(Some(child), dummy_init_params())
@@ -330,11 +331,24 @@ async fn repeated_mtime_changes_yield_monotonic_versions() {
         .iter()
         .filter(|e| e.get("event").and_then(Value::as_str) == Some("didChange"))
         .collect();
-    assert_eq!(opens.len(), 1, "4 次 ensure_open 仅首次 didOpen；events={events:?}");
-    assert_eq!(changes.len(), 3, "后 3 次 mtime 变化 → 3 次 didChange；events={events:?}");
-    let versions: Vec<i64> = std::iter::once(opens[0].get("version").and_then(Value::as_i64).unwrap())
-        .chain(changes.iter().map(|e| e.get("version").and_then(Value::as_i64).unwrap()))
-        .collect();
+    assert_eq!(
+        opens.len(),
+        1,
+        "4 次 ensure_open 仅首次 didOpen；events={events:?}"
+    );
+    assert_eq!(
+        changes.len(),
+        3,
+        "后 3 次 mtime 变化 → 3 次 didChange；events={events:?}"
+    );
+    let versions: Vec<i64> =
+        std::iter::once(opens[0].get("version").and_then(Value::as_i64).unwrap())
+            .chain(
+                changes
+                    .iter()
+                    .map(|e| e.get("version").and_then(Value::as_i64).unwrap()),
+            )
+            .collect();
     assert_eq!(versions, vec![1, 2, 3, 4], "version 必须严格单调递增");
 
     session.shutdown().await;
@@ -392,7 +406,10 @@ async fn guard_drop_then_reopen_in_ttl_keeps_version_no_new_did_open() {
 
     // 显式 evict → didClose + 移表；后续 ensure_open 才会重新走 didOpen（v=1）。
     session.evict_all_buffers();
-    let _g3 = session.ensure_open(&file).await.expect("reopen after evict");
+    let _g3 = session
+        .ensure_open(&file)
+        .await
+        .expect("reopen after evict");
     time::sleep(Duration::from_millis(300)).await;
 
     let events_after = read_track_events(&track_log).await;
@@ -474,7 +491,10 @@ async fn guard_drop_during_ttl_reopen_does_not_emit_did_open() {
     time::sleep(Duration::from_millis(60)).await;
     tokio::fs::write(&file, b"v2\n").await.expect("rewrite");
     time::sleep(Duration::from_millis(60)).await;
-    let _g3 = session.ensure_open(&file).await.expect("reopen after external edit");
+    let _g3 = session
+        .ensure_open(&file)
+        .await
+        .expect("reopen after external edit");
     time::sleep(Duration::from_millis(300)).await;
 
     let events = read_track_events(&track_log).await;
@@ -551,8 +571,12 @@ async fn evict_idle_buffers_skips_live_guards() {
     let track_log = tmp.path().join("track.log");
     let file_live = tmp.path().join("live.cpp");
     let file_idle = tmp.path().join("idle.cpp");
-    tokio::fs::write(&file_live, b"live1\n").await.expect("write live");
-    tokio::fs::write(&file_idle, b"idle1\n").await.expect("write idle");
+    tokio::fs::write(&file_live, b"live1\n")
+        .await
+        .expect("write live");
+    tokio::fs::write(&file_idle, b"idle1\n")
+        .await
+        .expect("write idle");
 
     let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
     let session = Session::start(Some(child), dummy_init_params())
@@ -609,8 +633,12 @@ async fn different_files_keep_independent_versions() {
     let _gb1 = session.ensure_open(&file_b).await.expect("b open");
 
     time::sleep(Duration::from_millis(60)).await;
-    tokio::fs::write(&file_a, b"a2\n").await.expect("rewrite a2");
-    tokio::fs::write(&file_b, b"b2\n").await.expect("rewrite b2");
+    tokio::fs::write(&file_a, b"a2\n")
+        .await
+        .expect("rewrite a2");
+    tokio::fs::write(&file_b, b"b2\n")
+        .await
+        .expect("rewrite b2");
     time::sleep(Duration::from_millis(60)).await;
 
     let _ga2 = session.ensure_open(&file_a).await.expect("a reopen");
@@ -650,8 +678,16 @@ async fn different_files_keep_independent_versions() {
         .collect();
     assert_eq!(a_opens.len(), 1, "a 仅首次 didOpen；events={events:?}");
     assert_eq!(b_opens.len(), 1, "b 仅首次 didOpen；events={events:?}");
-    assert_eq!(a_changes.len(), 1, "a mtime 变化 1 次 → 1 次 didChange；events={events:?}");
-    assert_eq!(b_changes.len(), 1, "b mtime 变化 1 次 → 1 次 didChange；events={events:?}");
+    assert_eq!(
+        a_changes.len(),
+        1,
+        "a mtime 变化 1 次 → 1 次 didChange；events={events:?}"
+    );
+    assert_eq!(
+        b_changes.len(),
+        1,
+        "b mtime 变化 1 次 → 1 次 didChange；events={events:?}"
+    );
     assert_eq!(a_opens[0].get("version").and_then(Value::as_i64), Some(1));
     assert_eq!(b_opens[0].get("version").and_then(Value::as_i64), Some(1));
     assert_eq!(a_changes[0].get("version").and_then(Value::as_i64), Some(2));
@@ -760,7 +796,9 @@ async fn lru_capacity_evicts_oldest_idle_buffers() {
     // 容量闸门语义：插入后池 41 > 32，需淘汰 `41 - (32-1) = 10` 个 idle 条目。
     // 即淘汰 f00..f09（最久未用 10 个）。
     let overflow = tmp.path().join("overflow.cpp");
-    tokio::fs::write(&overflow, b"// overflow\n").await.expect("write overflow");
+    tokio::fs::write(&overflow, b"// overflow\n")
+        .await
+        .expect("write overflow");
     let _g_overflow = session.ensure_open(&overflow).await.expect("overflow open");
 
     time::sleep(Duration::from_millis(300)).await;
@@ -793,13 +831,19 @@ async fn lru_capacity_evicts_oldest_idle_buffers() {
         .iter()
         .any(|e| e.get("uri").and_then(Value::as_str) == Some(uri_overflow_v.as_str()));
 
-    assert!(f00_closed, "f00 是最久未用，必被 LRU 淘汰并发 didClose；events={events:?}");
-    assert!(f01_closed, "f01 是次久未用，必被 LRU 淘汰并发 didClose；events={events:?}");
-    assert!(f09_closed, "f09 在淘汰边界内，必被 LRU 淘汰并发 didClose；events={events:?}");
     assert!(
-        !f10_closed,
-        "f10 在淘汰边界外，必保留；events={events:?}"
+        f00_closed,
+        "f00 是最久未用，必被 LRU 淘汰并发 didClose；events={events:?}"
     );
+    assert!(
+        f01_closed,
+        "f01 是次久未用，必被 LRU 淘汰并发 didClose；events={events:?}"
+    );
+    assert!(
+        f09_closed,
+        "f09 在淘汰边界内，必被 LRU 淘汰并发 didClose；events={events:?}"
+    );
+    assert!(!f10_closed, "f10 在淘汰边界外，必保留；events={events:?}");
     assert!(
         !overflow_in_closes,
         "overflow 新插入的必留下，不能有 didClose；events={events:?}"
@@ -840,7 +884,9 @@ async fn lru_capacity_skips_active_buffers_under_pressure() {
     // 此时池大小 = 32（正好容量）。再插入一个新文件 → 池 33 > 32 → LRU 应跳过
     // （全活）→ allow overflow，无 didClose 触发。
     let overflow = tmp.path().join("overflow2.cpp");
-    tokio::fs::write(&overflow, b"// overflow2\n").await.expect("write overflow");
+    tokio::fs::write(&overflow, b"// overflow2\n")
+        .await
+        .expect("write overflow");
     let _g_overflow = session.ensure_open(&overflow).await.expect("overflow open");
 
     time::sleep(Duration::from_millis(300)).await;
@@ -873,7 +919,9 @@ async fn ttl_expired_ensure_open_re_emits_did_open() {
     let tmp = TempDir::new().expect("TempDir::new");
     let track_log = tmp.path().join("track.log");
     let file = tmp.path().join("t.cpp");
-    tokio::fs::write(&file, b"v1\n").await.expect("write fixture");
+    tokio::fs::write(&file, b"v1\n")
+        .await
+        .expect("write fixture");
 
     let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
     let session = Session::start(Some(child), dummy_init_params())
@@ -886,7 +934,10 @@ async fn ttl_expired_ensure_open_re_emits_did_open() {
     // 等超过 FILE_GUARD_TTL 60s？测试不阻塞 60s——直接用 evict_idle_buffers(0)
     // 把 idle 条目手动驱逐（与 TTL 过期语义等价），再 ensure_open 必重新走 didOpen。
     let removed = session.evict_idle_buffers(Duration::from_secs(0));
-    assert!(removed >= 1, "TTL 模拟驱逐应回收至少 1 条；removed={removed}");
+    assert!(
+        removed >= 1,
+        "TTL 模拟驱逐应回收至少 1 条；removed={removed}"
+    );
 
     let _g2 = session.ensure_open(&file).await.expect("reopen after TTL");
 
@@ -952,7 +1003,10 @@ async fn session_shutdown_evicts_all_buffers() {
     let close_b = closes
         .iter()
         .any(|e| e.get("uri").and_then(Value::as_str) == Some(uri_b.as_str()));
-    assert!(close_a && close_b, "两文件都应收到 didClose；events={events:?}");
+    assert!(
+        close_a && close_b,
+        "两文件都应收到 didClose；events={events:?}"
+    );
 }
 
 /// 修 P1 #1（同文件 5 次连续访问 → 缓存命中）：AI 编辑回路的典型场景——
@@ -1024,7 +1078,9 @@ async fn ensure_open_batch_emits_single_did_open_per_uri() {
     let tmp = TempDir::new().expect("TempDir::new");
     let track_log = tmp.path().join("track.log");
     let f1 = tmp.path().join("a.cpp");
-    tokio::fs::write(&f1, b"fn a() {}\n").await.expect("write a");
+    tokio::fs::write(&f1, b"fn a() {}\n")
+        .await
+        .expect("write a");
 
     let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
     let session = Session::start(Some(child), dummy_init_params())
@@ -1075,10 +1131,7 @@ async fn ensure_open_batch_distinct_uris_each_get_one_did_open() {
     let tmp = TempDir::new().expect("TempDir::new");
     let track_log = tmp.path().join("track.log");
     let names = ["a.cpp", "b.cpp", "c.cpp", "d.cpp"];
-    let files: Vec<std::path::PathBuf> = names
-        .iter()
-        .map(|n| tmp.path().join(n))
-        .collect();
+    let files: Vec<std::path::PathBuf> = names.iter().map(|n| tmp.path().join(n)).collect();
     for f in &files {
         tokio::fs::write(f, b"fn x() {}\n").await.expect("write");
     }
@@ -1108,11 +1161,7 @@ async fn ensure_open_batch_distinct_uris_each_get_one_did_open() {
         .iter()
         .filter(|e| e.get("event").and_then(Value::as_str) == Some("didOpen"))
         .collect();
-    assert_eq!(
-        opens.len(),
-        4,
-        "4 不同 URI 各 1 次 didOpen: {events:?}"
-    );
+    assert_eq!(opens.len(), 4, "4 不同 URI 各 1 次 didOpen: {events:?}");
 
     session.shutdown().await;
 }

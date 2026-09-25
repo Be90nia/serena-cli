@@ -88,7 +88,6 @@ async fn diagnostics_returns_empty_on_clean_code() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
-
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -153,10 +152,7 @@ async fn diagnostics_wait_gen_at_current_returns_immediately_with_items() {
         .and_then(|i| i.as_array())
         .cloned()
         .unwrap_or_default();
-    assert!(
-        !items.is_empty(),
-        "expected items from cache, got: {diag}"
-    );
+    assert!(!items.is_empty(), "expected items from cache, got: {diag}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

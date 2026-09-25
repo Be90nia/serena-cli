@@ -723,10 +723,7 @@ enum NextAction {
     None,
 }
 
-async fn route_into(
-    queues: &std::sync::Arc<tokio::sync::Mutex<Queues>>,
-    it: OutboundItem,
-) {
+async fn route_into(queues: &std::sync::Arc<tokio::sync::Mutex<Queues>>, it: OutboundItem) {
     let mut q = queues.lock().await;
     match it.priority {
         Priority::High => {
@@ -764,9 +761,7 @@ fn bg_wait_duration(bucket: &crate::client::TokenBucket) -> std::time::Duration 
     std::time::Duration::from_secs_f64(secs)
 }
 
-async fn pick_next(
-    queues: &std::sync::Arc<tokio::sync::Mutex<Queues>>,
-) -> Option<JsonRpc> {
+async fn pick_next(queues: &std::sync::Arc<tokio::sync::Mutex<Queues>>) -> Option<JsonRpc> {
     let mut q = queues.lock().await;
     if let Some(m) = q.high.pop_front() {
         Some(m)

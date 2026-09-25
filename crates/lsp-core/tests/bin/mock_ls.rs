@@ -72,13 +72,13 @@ fn load_config() -> Config {
         send_server_requests: std::env::var("MOCK_LS_SEND_SERVER_REQUESTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
-progress_token: std::env::var("MOCK_LS_PROGRESS_TOKEN").ok(),
-    // 发 N 个 unique progress token（每个 kind="end"，递增编号）—— 模拟 LS 长索引期
-    // 大量 progress 通知。验证 Session::progress.resolved 表容量上限（P2-y5u）。
-    progress_tokens_multi: std::env::var("MOCK_LS_PROGRESS_TOKENS_MULTI")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok()),
-    track_file_events: std::env::var("MOCK_LS_TRACK_FILE_EVENTS")
+        progress_token: std::env::var("MOCK_LS_PROGRESS_TOKEN").ok(),
+        // 发 N 个 unique progress token（每个 kind="end"，递增编号）—— 模拟 LS 长索引期
+        // 大量 progress 通知。验证 Session::progress.resolved 表容量上限（P2-y5u）。
+        progress_tokens_multi: std::env::var("MOCK_LS_PROGRESS_TOKENS_MULTI")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok()),
+        track_file_events: std::env::var("MOCK_LS_TRACK_FILE_EVENTS")
             .ok()
             .map(std::path::PathBuf::from),
         diagnostic_provider: std::env::var("MOCK_LS_DIAGNOSTIC_PROVIDER")
@@ -313,7 +313,6 @@ async fn main() {
         }
     }
 }
-
 
 fn capabilities(config: &Config) -> Value {
     let mut caps = json!({

@@ -206,7 +206,9 @@ fn validate(id: &str, spec: &ServerSpec) -> Result<(), String> {
                 }
             }
             if dl.bin_path.is_empty() {
-                return Err(format!("[servers.{id}].download.bin_path must not be empty"));
+                return Err(format!(
+                    "[servers.{id}].download.bin_path must not be empty"
+                ));
             }
         }
         "path_only" => {
@@ -438,7 +440,10 @@ install = "download"
 exec = ["{bin}"]
 "#;
         let err = parse(bad).unwrap_err();
-        assert!(err.contains("requires [servers.broken.download]"), "err: {err}");
+        assert!(
+            err.contains("requires [servers.broken.download]"),
+            "err: {err}"
+        );
     }
 
     #[test]
@@ -548,9 +553,18 @@ version = "5.9.3"
         assert_eq!(s.build_cmd, vec!["nix", "build"]);
         assert_eq!(s.bin_rel, "result/bin/nixd");
         // kind_table 路由到新变体。
-        assert!(matches!(parsed.servers["dn"].kind_table(), Some(KindRef::Dotnet(_))));
-        assert!(matches!(parsed.servers["gm"].kind_table(), Some(KindRef::Gem(_))));
-        assert!(matches!(parsed.servers["src"].kind_table(), Some(KindRef::Source(_))));
+        assert!(matches!(
+            parsed.servers["dn"].kind_table(),
+            Some(KindRef::Dotnet(_))
+        ));
+        assert!(matches!(
+            parsed.servers["gm"].kind_table(),
+            Some(KindRef::Gem(_))
+        ));
+        assert!(matches!(
+            parsed.servers["src"].kind_table(),
+            Some(KindRef::Source(_))
+        ));
     }
 
     #[test]

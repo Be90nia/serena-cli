@@ -51,7 +51,10 @@ fn p2_4_100_call_per_call_under_1ms_with_ttl() {
         };
         if fast.is_none() {
             let (m, l) = walk_signal(&root);
-            cache.lock().unwrap().insert(root.clone(), (Instant::now(), m, l));
+            cache
+                .lock()
+                .unwrap()
+                .insert(root.clone(), (Instant::now(), m, l));
         }
         after_total += t0.elapsed();
     }
@@ -80,7 +83,8 @@ fn p2_4_100_call_per_call_under_1ms_with_ttl() {
     assert!(
         after_per < before_per,
         "TTL cache must be faster than full walk (got AFTER {:?} >= BEFORE {:?})",
-        after_per, before_per
+        after_per,
+        before_per
     );
     assert!(
         after_per < Duration::from_millis(5),
@@ -106,8 +110,14 @@ fn p2_4_ttl_returns_same_value_within_window() {
             break;
         }
     }
-    assert!(same, "TTL cache must return identical signal within 2s window");
-    println!("TTL signal stable within window: mtime={:?} langs={:?}", first.0, first.1);
+    assert!(
+        same,
+        "TTL cache must return identical signal within 2s window"
+    );
+    println!(
+        "TTL signal stable within window: mtime={:?} langs={:?}",
+        first.0, first.1
+    );
 }
 
 #[test]
@@ -142,10 +152,16 @@ fn p2_4_miss_path_no_second_walk() {
         "100 calls within TTL must trigger exactly 1 walk; got {}",
         walks
     );
-    println!("P0 (3): miss path no second walk — 100 calls = {} walk(s)", walks);
+    println!(
+        "P0 (3): miss path no second walk — 100 calls = {} walk(s)",
+        walks
+    );
 }
 
-fn get_or_walk(cache: &Arc<Mutex<SignalCache>>, root: &Path) -> (Option<SystemTime>, BTreeSet<String>) {
+fn get_or_walk(
+    cache: &Arc<Mutex<SignalCache>>,
+    root: &Path,
+) -> (Option<SystemTime>, BTreeSet<String>) {
     {
         let g = cache.lock().unwrap();
         if let Some((at, m, l)) = g.get(root)
@@ -155,7 +171,10 @@ fn get_or_walk(cache: &Arc<Mutex<SignalCache>>, root: &Path) -> (Option<SystemTi
         }
     }
     let (m, l) = walk_signal(root);
-    cache.lock().unwrap().insert(root.to_path_buf(), (Instant::now(), m, l.clone()));
+    cache
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), (Instant::now(), m, l.clone()));
     (m, l)
 }
 
@@ -206,4 +225,3 @@ fn ensure_test_workspace() -> PathBuf {
     }
     root
 }
-

@@ -61,7 +61,11 @@ async fn session_registers_content_modified_retry_whitelist() {
         )
         .await
         .expect("hover 的 -32801 应被白名单内部重试消化，而非外泄");
-    assert_eq!(hover, Value::Null, "mock_ls 对非 documentSymbol 回 null 结果");
+    assert_eq!(
+        hover,
+        Value::Null,
+        "mock_ls 对非 documentSymbol 回 null 结果"
+    );
 
     session.shutdown().await;
 }

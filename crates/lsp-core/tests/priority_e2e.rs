@@ -87,11 +87,7 @@ async fn priority_routing_serves_high_before_background() {
         .filter_map(|l| {
             serde_json::from_str::<Value>(l.trim_start_matches("--> "))
                 .ok()
-                .and_then(|v| {
-                    v.get("method")
-                        .and_then(Value::as_str)
-                        .map(String::from)
-                })
+                .and_then(|v| v.get("method").and_then(Value::as_str).map(String::from))
         })
         .collect();
 
@@ -152,23 +148,16 @@ async fn priority_routing_serves_normal_before_background() {
         .filter_map(|l| {
             serde_json::from_str::<Value>(l.trim_start_matches("--> "))
                 .ok()
-                .and_then(|v| {
-                    v.get("method")
-                        .and_then(Value::as_str)
-                        .map(String::from)
-                })
+                .and_then(|v| v.get("method").and_then(Value::as_str).map(String::from))
         })
         .collect();
 
     // 找第一个 Background 与第一个 Normal 的位置。
-    let first_bg = methods.iter().position(|m| {
-        m == "workspace/_ping" || m == "workspace/symbol"
-    });
+    let first_bg = methods
+        .iter()
+        .position(|m| m == "workspace/_ping" || m == "workspace/symbol");
     let first_normal = methods.iter().position(|m| m == "initialized");
     if let (Some(b), Some(n)) = (first_bg, first_normal) {
-        assert!(
-            n < b,
-            "Normal 应先于 Background 出；顺序 = {methods:?}"
-        );
+        assert!(n < b, "Normal 应先于 Background 出；顺序 = {methods:?}");
     }
 }

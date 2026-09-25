@@ -96,7 +96,9 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
         // 拉 @types/*，拖慢启动、引入网络依赖，离线/受限机器可挂死。与上游一致只依赖
         // 项目已装类型。Δ 上游 #1990：flag 必须在 initializationOptions 顶层——
         // typescript-language-server 新版不再读 preferences 包裹层。
-        let opts = base.initialization_options.get_or_insert_with(serde_json::Value::default);
+        let opts = base
+            .initialization_options
+            .get_or_insert_with(serde_json::Value::default);
         if !opts.is_object() {
             *opts = serde_json::json!({});
         }
@@ -227,7 +229,10 @@ mod tests {
         std::fs::write(dir.path().join("main.ts"), "export const x = 1;").unwrap();
         adapter.set_project_root(dir.path());
         let uri = adapter.probe_uri();
-        assert!(uri.ends_with("main.ts"), "应优先 tsconfig 旁的 main.ts: {uri}");
+        assert!(
+            uri.ends_with("main.ts"),
+            "应优先 tsconfig 旁的 main.ts: {uri}"
+        );
     }
 
     /// 无 tsconfig：退通用探针 → 语言源文件扫描优先选中 main.ts（对 tsserver
@@ -240,7 +245,10 @@ mod tests {
         std::fs::write(dir.path().join("main.ts"), "export const x = 1;").unwrap();
         adapter.set_project_root(dir.path());
         let uri = adapter.probe_uri();
-        assert!(uri.ends_with("main.ts"), "无 tsconfig 应回退语言源文件探针: {uri}");
+        assert!(
+            uri.ends_with("main.ts"),
+            "无 tsconfig 应回退语言源文件探针: {uri}"
+        );
     }
 
     /// node_modules 里的 tsconfig 不参与（上游 is_ignored_dirname 增补集）。
@@ -287,7 +295,10 @@ mod tests {
         let mut params = InitializeParams::default();
         assert!(params.initialization_options.is_none());
         adapter.initialize_patches(&mut params);
-        let opts = params.initialization_options.clone().expect("应注入 initializationOptions");
+        let opts = params
+            .initialization_options
+            .clone()
+            .expect("应注入 initializationOptions");
         assert_eq!(
             opts["disableAutomaticTypingAcquisition"],
             serde_json::Value::Bool(true),
