@@ -748,7 +748,18 @@ fn check_bash_syntax(text: &str) -> Option<Finding> {
                     text.lines().count(),
                 ));
             }
-            let first = stderr.lines().next().unwrap_or("bash -n failed");
+            let first = stderr.lines().next().unwrap_or("");
+            // bash 自身的报错必以 "bash:" 开头（`bash: -c: line N: ...`）；空 stderr
+            // 或非 bash 前缀（WSL stub 无输出现象、壳层包装错误）→ 无法归因脚本
+            // 语法错，降级 info 而非误报 warning（CI windows runner 实锤）。
+            if !first.starts_with("bash:") {
+                return Some(info(
+                    "BASH_UNAVAILABLE",
+                    "bash -n failed without a bash-format error; skipped bash syntax check"
+                        .to_string(),
+                    text.lines().count(),
+                ));
+            }
             let first: String = first.chars().take(200).collect();
             // stderr 形如 `bash: line 5: syntax error...`，能拿到就报告真实行号。
             let line = extract_bash_line(&stderr).unwrap_or_else(|| text.lines().count());
