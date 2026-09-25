@@ -238,7 +238,7 @@ fn check_local_ls() -> Vec<Check> {
             "dotnet tool install --global csharp-ls  OR  use built-in Roslyn LS via serena",
         ),
     ];
-    ls_specs
+    let mut out: Vec<Check> = ls_specs
         .iter()
         .map(|(name, label, hint)| {
             // jdtls 特判：PATH 无 `jdtls` 不再等于未安装——launch_info 首启自动下载
@@ -283,7 +283,114 @@ fn check_local_ls() -> Vec<Check> {
                 },
             }
         })
-        .collect()
+        .collect();
+    // Wave 1 新语言（bash/json/powershell）：npm PATH+缓存两级探测 / download 缓存探测。
+    out.push(check_npm_ls(
+        "bash-language-server",
+        "bash",
+        "bash-language-server (Bash LS)",
+        "serena-cli install bash",
+    ));
+    out.push(check_npm_ls(
+        "vscode-json-languageserver",
+        "json",
+        "vscode-json-languageserver (JSON LS)",
+        "serena-cli install json",
+    ));
+    out.push(check_npm_ls(
+        "vue-language-server",
+        "vue",
+        "vue-language-server (Vue LS, hybrid with companion TS LS)",
+        "serena-cli install vue",
+    ));
+    out.push(check_download_ls(
+        "powershell",
+        "PowerShellEditorServices (PowerShell LS)",
+        "run `serena-cli install powershell` (requires `pwsh` 7+ on PATH; see the runtime checks above)",
+    ));
+    out
+}
+
+/// npm 类 LS 装态探测：PATH 命中 → serena npm 缓存（servers.toml spec 驱动，不硬编码
+/// 版本/bin 名）→ MISS + 安装 hint。`install_cmd` 写进 hint（如 `serena-cli install bash`）。
+fn check_npm_ls(
+    bin_name: &'static str,
+    spec_id: &str,
+    label: &'static str,
+    install_cmd: &str,
+) -> Check {
+    let mk = |status: Status, detail: String, hint: Option<String>| Check {
+        category: "ls",
+        id: bin_name,
+        label,
+        status,
+        detail,
+        hint,
+    };
+    if let Some(p) = which_path(bin_name) {
+        return mk(Status::Ok, format!("PATH={}", p.display()), None);
+    }
+    if let Some(p) = probe_cached_npm_ls(spec_id) {
+        return mk(Status::Ok, format!("cache={}", p.display()), None);
+    }
+    mk(
+        Status::Miss,
+        format!("`{bin_name}` not on PATH and not in the serena cache"),
+        Some(format!(
+            "run `{install_cmd}`  OR  `npm i -g {bin_name}` (requires node on PATH)"
+        )),
+    )
+}
+
+/// download 类 LS（如 powershell）缓存装态：`{cache}/{id}/{version}/{bin_path}`。
+fn check_download_ls(spec_id: &'static str, label: &'static str, hint: &str) -> Check {
+    match probe_cached_download_ls(spec_id) {
+        Some(p) => Check {
+            category: "ls",
+            id: spec_id,
+            label,
+            status: Status::Ok,
+            detail: format!("cache={}", p.display()),
+            hint: None,
+        },
+        None => Check {
+            category: "ls",
+            id: spec_id,
+            label,
+            status: Status::Miss,
+            detail: "not in the serena cache".to_string(),
+            hint: Some(hint.to_string()),
+        },
+    }
+}
+
+/// serena npm 缓存装态（spec 驱动）：`{cache}/{id}/{version}/node_modules/.bin/{bin_rel}`。
+/// 与 `config::ensure_launch` 的缓存命中路径同构（单一事实源 = servers.toml）。
+fn probe_cached_npm_ls(spec_id: &str) -> Option<PathBuf> {
+    let (_, spec) = ls_registry::config::spec_for(spec_id)?;
+    let npm = spec.npm.as_ref()?;
+    probe_cached_npm_ls_at(&dirs_cache_root(), spec_id, &npm.version, &npm.bin_rel)
+}
+
+fn probe_cached_npm_ls_at(
+    cache_root: &Path,
+    id: &str,
+    version: &Option<String>,
+    bin_rel: &str,
+) -> Option<PathBuf> {
+    let dir_name = version.clone().unwrap_or_else(|| "latest".to_string());
+    ls_runtime::install_pkg::npm_bin_path(&cache_root.join(id).join(dir_name), bin_rel)
+}
+
+/// serena download 缓存装态（spec 驱动）：`{cache}/{id}/{version}/{bin_path}`。
+fn probe_cached_download_ls(spec_id: &str) -> Option<PathBuf> {
+    let (_, spec) = ls_registry::config::spec_for(spec_id)?;
+    let dl = spec.download.as_ref()?;
+    let p = dirs_cache_root()
+        .join(spec_id)
+        .join(&dl.version)
+        .join(&dl.bin_path);
+    p.is_file().then_some(p)
 }
 
 /// 4. daemon 状态：lock 存在性 + 端口 7860 + 活跃 LS 缓存根。
@@ -570,5 +677,86 @@ mod tests {
         assert!(s.contains("[MISS]"), "missing MISS tag: {s}");
         assert!(s.contains("[WARN]"), "missing WARN tag: {s}");
         assert!(s.contains("hint: install"));
+    }
+
+    /// npm 缓存探测命中：`{root}/bash/5.6.0/node_modules/.bin/` 下放 npm_bin_path 认可的
+    /// shim（Windows=.cmd / Unix=裸名）→ 命中；空目录 → None。spec（版本 5.6.0/bin_rel）
+    /// 直读内置 servers.toml，测的是真实 spec 形态。
+    #[test]
+    fn probe_cached_npm_ls_hits_when_shim_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir
+            .path()
+            .join("bash")
+            .join("5.6.0")
+            .join("node_modules")
+            .join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let shim_name = if cfg!(windows) {
+            "bash-language-server.cmd"
+        } else {
+            "bash-language-server"
+        };
+        std::fs::write(bin_dir.join(shim_name), b"shim").unwrap();
+        let hit = probe_cached_npm_ls_at(
+            dir.path(),
+            "bash",
+            &Some("5.6.0".into()),
+            "bash-language-server",
+        );
+        assert!(hit.is_some(), "shim 存在时必须命中");
+        // 真实 spec 驱动的同名探测（校验 spec 形态与手写参数一致）。
+        assert!(
+            probe_cached_npm_ls_at(dir.path(), "bash", &None, "bash-language-server").is_none(),
+            "version=None → latest 目录 → 必不命中（版本 pin 生效的证据）"
+        );
+    }
+
+    #[test]
+    fn probe_cached_npm_ls_misses_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            probe_cached_npm_ls_at(
+                dir.path(),
+                "bash",
+                &Some("5.6.0".into()),
+                "bash-language-server"
+            )
+            .is_none()
+        );
+        assert!(
+            probe_cached_npm_ls_at(
+                dir.path(),
+                "json",
+                &Some("1.3.4".into()),
+                "vscode-json-languageserver"
+            )
+            .is_none()
+        );
+    }
+
+    /// Wave 1 新条目必须在 run_all 里出现（bash/json MISS+hint 可接受，powershell 同）。
+    #[test]
+    fn run_all_includes_new_language_ls_entries() {
+        let r = run_all(&PathBuf::from("Z:/nonexistent_lock_xyz_12345"));
+        for id in [
+            "bash-language-server",
+            "vscode-json-languageserver",
+            "powershell",
+        ] {
+            let c = r
+                .checks
+                .iter()
+                .find(|c| c.category == "ls" && c.id == id)
+                .unwrap_or_else(|| panic!("doctor 必须包含 ls 条目 {id}"));
+            assert!(
+                matches!(c.status, Status::Ok | Status::Miss),
+                "{id}: {:?}",
+                c.status
+            );
+            if c.status == Status::Miss {
+                assert!(c.hint.is_some(), "{id} MISS 必须带安装 hint");
+            }
+        }
     }
 }
