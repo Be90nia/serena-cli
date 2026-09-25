@@ -12,10 +12,8 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
+    # v0.1.0: Windows-only. ls-runtime depends on win32job (ungated) — linux/macos
+    # targets need a cfg-gate + unix process-tree fallback first (next batch).
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
