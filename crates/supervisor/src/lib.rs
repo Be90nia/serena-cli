@@ -904,10 +904,10 @@ impl Supervisor {
                     version_seen
                         .lock()
                         .unwrap()
-                        .insert((cache_root.clone(), uri.to_lowercase()), true);
+                        .insert((cache_root.clone(), diag_uri_key(uri)), true);
                 }
                 let mut cache = cache.lock().unwrap();
-                let key = (cache_root.clone(), uri.to_lowercase());
+                let key = (cache_root.clone(), diag_uri_key(uri));
                 if items.is_empty() {
                     cache.insert(key, (Vec::new(), ver));
                 } else {
@@ -1096,7 +1096,7 @@ impl Supervisor {
                 .diag_cache
                 .lock()
                 .unwrap()
-                .get(&(key.root.clone(), uri.to_lowercase()))
+                .get(&(key.root.clone(), diag_uri_key(&uri)))
                 .cloned();
             if let Some((items, ver)) = hit {
                 let ok = match (ver, doc_cur) {
@@ -1133,7 +1133,7 @@ impl Supervisor {
             .diag_cache
             .lock()
             .unwrap()
-            .get(&(key.root.clone(), uri.to_lowercase()))
+            .get(&(key.root.clone(), diag_uri_key(&uri)))
             .cloned()
             .unwrap_or_default();
         let stale_entry = matches!((entry_ver, doc_cur), (Some(v), Some(c)) if v < c);
@@ -1827,7 +1827,7 @@ impl Supervisor {
         self.version_seen
             .lock()
             .unwrap()
-            .get(&(root.to_path_buf(), uri.to_lowercase()))
+            .get(&(root.to_path_buf(), diag_uri_key(uri)))
             .copied()
             .unwrap_or(false)
     }
@@ -4028,6 +4028,13 @@ fn replace_files_with_tables(
         }
     }
     out
+}
+
+/// 诊断缓存 uri 键归一：percent-decode（pyright 推 `file:///c%3A/...`，实测）+
+/// 小写（RA 推盘符小写 `file:///d:/...`）。path_to_uri 生成的形态两者皆非，
+/// 不归一则 push 缓存永不命中（2026-09-25 pyright 诊断恒空根因）。
+fn diag_uri_key(uri: &str) -> String {
+    percent_decode(uri).to_lowercase()
 }
 
 /// percent-decode `%XX` 序列（非法 / 截断序列原样保留）。
@@ -6819,10 +6826,24 @@ mod pull_diagnostics_tests {
     //! 真实端到端 fallback 验证走 fixtures/rust_demo + rust-analyzer 的 CLI smoke
     //! （拉起 supervisor → tool_diagnostics → 字段缺失 → 自动走 push 缓存），
     //! 见完成报告 `end-to-end` 一节。
-    use super::Supervisor;
+    use super::{Supervisor, diag_uri_key};
     use lsp_core::init_params::supports_pull_diagnostics;
+    use lsp_core::docsync::path_to_uri_str;
     use serde_json::json;
     use std::path::PathBuf;
+
+    /// pyright 推送 uri 形态（`file:///c%3A/...` 实测）与 path_to_uri 生成形态
+    /// （`file:///C:/...`）必须归一到同一缓存键 —— 否则 push 缓存永不命中，
+    /// python 诊断恒空（2026-09-25 实锤根因）。
+    #[test]
+    fn diag_uri_key_normalizes_percent_encoded_and_cased_uris() {
+        let path = std::path::Path::new("C:/Users/x/proj/broken.py");
+        let ours = diag_uri_key(&path_to_uri_str(path));
+        let pyright = diag_uri_key("file:///c%3A/Users/x/proj/broken.py");
+        let ra = diag_uri_key("file:///c:/users/x/proj/broken.py");
+        assert_eq!(ours, pyright, "pyright %3A 形态必须命中缓存");
+        assert_eq!(ours, ra, "RA 小写盘符形态必须命中缓存");
+    }
 
     /// #1 capabilities 缺 diagnosticProvider 字段（mock_ls 现状）。
     #[test]
@@ -7519,8 +7540,10 @@ mod symbol_cache_tests {
         );
     }
 
-    /// cache 命中：同 file 二次 overview 命中不拉 LS（命中路径 vs LS 往返秒级的量级差；
-    /// 并行全量测试下 CPU 调度抖动可达数 ms，阈值放宽到 10ms 仍比 LS 往返低两个量级）。
+    /// cache 命中：同 file 二次 overview 命中不拉 LS（命中路径 vs LS 往返秒级的量级差）。
+    /// 阈值 50ms：命中路径正常 <1ms（预热后 HashMap 查 + async 轮询），满载调度抖动
+    /// 实测数 ms 以上（10ms 已在并行全量下抖破一次，we0 在案）；慢路径是不存在 root
+    /// 的 LS spawn 尝试（百 ms~秒级），50ms 仍保留一个量级判定力。
     #[tokio::test]
     async fn overview_cache_hit_returns_under_1ms() {
         let sup = Supervisor::direct().await.unwrap();
@@ -7536,7 +7559,7 @@ mod symbol_cache_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "main");
         assert!(
-            elapsed < Duration::from_millis(10),
+            elapsed < Duration::from_millis(50),
             "cache hit took {elapsed:?}"
         );
     }
@@ -7661,10 +7684,12 @@ mod symbol_cache_tests {
             .unwrap();
         let elapsed = t0.elapsed();
         assert!(warnings.is_empty(), "cache hit must not fabricate warnings");
-        // 50ms：仍远低于 LS 往返（60ms+），防「命中路径意外走了慢路径」；
-        // 10ms 在 86 测试并行满载下会被 tempdir+walk 抖破（实测 16ms）。
+        // 100ms：命中路径正常 <1ms，意外走慢路径（LS 拉起 / root walk+报错）仍是
+        // 百 ms~秒级，判定力保留。50ms 在并行满载下抖破（h-report 实测 2/3 轮命中；
+        // tempdir walk + 86 测试并行调度抖动 16ms+），10ms 更必破——放宽到 100ms
+        // 是 h-report 建议值。
         assert!(
-            elapsed < Duration::from_millis(50),
+            elapsed < Duration::from_millis(100),
             "cache hit took {elapsed:?}"
         );
         assert_eq!(out.len(), 2, "limit must apply to cached full list");

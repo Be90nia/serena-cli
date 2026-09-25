@@ -24,12 +24,21 @@ mod tests {
     /// 并发两写串行化：两个 task 抢门，持有者顺序可预期（FIFO）。
     #[tokio::test]
     async fn concurrent_writes_serialize() {
-        let gate_task1 = tokio::spawn(async {
+        // task1 持门后经 channel 发信号，主测收到信号才开始计时。旧版固定
+        // sleep(10ms) 猜"task1 已持门"：满载下 task1 尚未被 poll（task2 先抢到门，
+        // waited≈0）或主测晚醒（task1 剩余持门 <80ms）都会误报——wall-clock sleep
+        // race，supfix/h4i 两份报告在案。
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let gate_task1 = tokio::spawn(async move {
             let _g = acquire().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(());
+            // 持门 200ms，阈值取 100ms 留 50% 余量：信号后调度抖动只会推迟 task2
+            // 的取样、不会提前（tokio 计时器不早触发，释放时机由 task1 独占），
+            // waited 只会偏大；100ms 仍足以拦住"门失效、task2 立即拿到"的回归。
+            tokio::time::sleep(Duration::from_millis(200)).await;
         });
-        // 等 task1 真正拿门后再 spawn task2：测 task2 等待 ≥80ms。
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // 阻塞到 task1 真正持门（信号同步，非墙钟猜测；j8b deadline 轮询同思路）。
+        rx.await.unwrap();
         let start2 = Instant::now();
         let gate_task2 = tokio::spawn(async {
             let _g = acquire().await;
@@ -39,7 +48,7 @@ mod tests {
         let t2 = gate_task2.await.unwrap();
         let waited = t2.duration_since(start2);
         assert!(
-            waited.as_millis() >= 80,
+            waited.as_millis() >= 100,
             "task2 应等 task1 释放后才拿到门，实际等了 {:?}",
             waited
         );
