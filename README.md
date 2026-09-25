@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 # serena-rust
 
 > A position-free, symbol-level code assistant for AI agents — Rust reimplementation of [oraios/serena](https://github.com/oraios/serena), exposed as a CLI + skill (no MCP server required).
@@ -18,7 +20,7 @@ Trade-off: you lose the "MCP auto-discovery" story. You gain `bash`-debuggabilit
 
 ## What it covers
 
-### CLI commands (24)
+### CLI commands (52)
 
 Read / navigate (7): `overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -32,9 +34,11 @@ Completion (1): `completion` (with `--limit` and per-file-suffix trigger inferen
 
 Admin (4): `status` · `stop-all` · `install <lang>` · `shell` (JSONL stdin/stdout session)
 
-**Position baseline convention**: commands taking `line`/`col` (position-addressed: `def`, `refs`, `hover`, `find-implementations`, `rename-symbol`, `find-referencing-*`, `containing-symbol`, `defining-symbol`, `signature-help`, `code-action`, `document-highlight`, `completion`, `format-range`, `inlay-hint`, `call-hierarchy prepare`, `type-hierarchy prepare`, `moniker`) are **0-based**, passed straight through as LSP `Position`. Line-range and line-editing commands (`read-file`, `insert-at-line`, `replace-lines`, `delete-lines`, `delete-text-in-symbol`) are **1-based inclusive**. Every command also states this in its `--help`.
+Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker`
 
-vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses). Not implemented: `documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint` — none of these have an agent-side consumer today; see [Phase 6 limitations](#limitations) for the criterion.
+**Position baseline convention**: commands taking `line`/`col` (position-addressed: `def`, `refs`, `hover`, `find-implementations`, `rename-symbol`, `find-referencing-*`, `containing-symbol`, `defining-symbol`, `signature-help`, `code-action`, `document-highlight`, `completion`, `format-range`, `inlay-hint`, `call-hierarchy prepare`, `type-hierarchy prepare`, `moniker`) are **1-based** on the CLI surface — converted to LSP's 0-based `Position` internally (`normalize_positions`, bd serena-rust-7xv); passing `0` is a usage error. Line-range and line-editing commands (`read-file`, `insert-at-line`, `replace-lines`, `delete-lines`, `delete-text-in-symbol`) are **1-based inclusive**. Every command also states this in its `--help`.
+
+vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses), plus the long tail (`documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint`) — all landed and verified 2026-09-23; `document-link`/`moniker` return empty on LS without the capability (e.g. rust-analyzer stable).
 
 ### Language servers (7 of 73 in upstream catalog)
 
@@ -48,7 +52,7 @@ vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent
 | C# | csharp-ls | ready (adapter shell) | decision log: `local/csharp-ls-decision.md` (upstream migrated to roslyn LS) |
 | Java | jdtls | ready (auto-download) | ~100MB download, JVM arg templates from `crates/ls-runtime/src/install.rs` |
 
-Code is present for all 7; **end-to-end smoke verified on 2/7** (rust + typescript) — the others need the corresponding binary installed locally. CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
+All 7 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
 
 ## Install
 
@@ -136,7 +140,6 @@ The single source of architectural truth is [`ARCHITECTURE.md`](ARCHITECTURE.md)
 | Limitation | Impact | When to revisit |
 |---|---|---|
 | SHA-256 download matrix for non-clangd LS is partial | `install` works for verified entries; unverified entries fall back to PATH probe | When CI needs hermetic installs — populate `local/ls-download-matrix.md` from upstream SolidLSP source |
-| 5 of 7 adapter shells not smoke-tested locally | Works in unit tests, needs binary locally for `cargo run` smoke | Add `scripts/ci_smoke.sh` runner to CI matrix |
 | No monorepo multi-root support | Each `serena-cli` invocation scopes to one workspace root | Add `additionalWorkspaceFolders` (Phase 4 stretch) |
 | No `$/progress` notification buffering | Long-running tools block until complete | When tools like refactor cross 30s boundaries |
 | Per-LS global timeout only | A slow single file blocks the whole session | Add per-call `timeout_ms` arg |
