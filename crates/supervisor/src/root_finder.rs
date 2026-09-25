@@ -3,7 +3,7 @@
 //! 算法（抄译 helix `find_lsp_workspace`，简化版）：
 //! 1. `from` canonicalize → 起点路径
 //! 2. 沿父链向上：每层检查是否含任一 marker 文件
-//! 3. 找到则返回该层路径；到达文件系统根仍未找到 → 返回 canonicalize 后的 from
+//! 3. 找到则返回该层路径；到达文件系统根仍未找到 → 返回起点所在目录
 //!
 //! marker 集合（PLAN / ARCHITECTURE 共识）：`.git/` / `compile_commands.json` /
 //! `.Cargo.toml` / `pyproject.toml` / `package.json` / `go.mod` / `pom.xml` /
@@ -41,6 +41,7 @@ pub fn find_project_root(from: &Path) -> PathBuf {
     } else {
         start.clone()
     };
+    let start_dir = cur.clone();
 
     loop {
         if has_marker(&cur) {
@@ -48,7 +49,9 @@ pub fn find_project_root(from: &Path) -> PathBuf {
         }
         match cur.parent() {
             Some(p) if p != cur => cur = p.to_path_buf(),
-            _ => return start,
+            // 到根仍无 marker → 返回起点所在目录（项目根必须是目录；
+            // 返回带文件名的 from 是错的——CI runner 无 marker 环境实锤）。
+            _ => return start_dir,
         }
     }
 }
