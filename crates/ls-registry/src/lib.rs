@@ -20,9 +20,10 @@ pub mod file_detect;
 pub mod spec;
 
 use ls_adapters::{
-    LanguageId, LanguageServerAdapter, clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter,
-    gopls::GoplsAdapter, jdtls::JdtlsAdapter, pyright::PyrightAdapter,
-    rust_analyzer::RustAnalyzerAdapter, typescript::TypescriptLanguageServerAdapter,
+    LanguageId, LanguageServerAdapter, bash::BashAdapter, clangd::ClangdAdapter,
+    csharp_ls::CsharpLsAdapter, gopls::GoplsAdapter, jdtls::JdtlsAdapter, json::JsonAdapter,
+    powershell::PowerShellAdapter, pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter,
+    typescript::TypescriptLanguageServerAdapter, vue::VueAdapter,
 };
 
 /// 扩展名 → LanguageId 静态表（小写键）。
@@ -58,6 +59,18 @@ pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("cs", LanguageId::CSharp),
     // Java
     ("java", LanguageId::Java),
+    // Bash / shell（bash-language-server 兼容 POSIX sh 语法）
+    ("sh", LanguageId::Bash),
+    ("bash", LanguageId::Bash),
+    // JSON（jsonc = 带注释 JSON，同一 LS 接管）
+    ("json", LanguageId::Json),
+    ("jsonc", LanguageId::Json),
+    // PowerShell
+    ("ps1", LanguageId::PowerShell),
+    ("psm1", LanguageId::PowerShell),
+    ("psd1", LanguageId::PowerShell),
+    // Vue 单文件组件
+    ("vue", LanguageId::Vue),
 ];
 
 /// 各 LanguageId 对应的 adapter 单例。
@@ -74,6 +87,10 @@ singleton!(GOPLS, GoplsAdapter);
 singleton!(TYPESCRIPT, TypescriptLanguageServerAdapter);
 singleton!(CSHARP_LS, CsharpLsAdapter);
 singleton!(JDTLS, JdtlsAdapter);
+singleton!(BASH, BashAdapter);
+singleton!(JSON, JsonAdapter);
+singleton!(POWERSHELL, PowerShellAdapter);
+singleton!(VUE, VueAdapter);
 
 /// 路径 → 语言。扩展名小写后查表，命中即返回；其余 None。
 ///
@@ -116,6 +133,10 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         LanguageId::TypeScript => TYPESCRIPT.clone(),
         LanguageId::CSharp => CSHARP_LS.clone(),
         LanguageId::Java => JDTLS.clone(),
+        LanguageId::Bash => BASH.clone(),
+        LanguageId::Json => JSON.clone(),
+        LanguageId::PowerShell => POWERSHELL.clone(),
+        LanguageId::Vue => VUE.clone(),
         // T0 配置驱动语言：无手写 adapter（见 config::ensure_launch）。
         LanguageId::Markdown => return None,
     })
@@ -195,5 +216,58 @@ mod tests {
             let _ = a.id();
         }
         assert!(adapter_for("lua").is_none());
+    }
+
+    /// Wave 1/2：--lang bash/json/powershell/vue 必须路由到手写 T2 adapter（supervisor
+    /// session_for 的 T2 优先分支）。
+    #[test]
+    fn adapter_for_routes_wave1_languages() {
+        for lang in ["bash", "json", "powershell", "vue"] {
+            let a =
+                adapter_for(lang).unwrap_or_else(|| panic!("--lang {lang} 必须路由到 T2 adapter"));
+            let b = adapter_for(lang).unwrap();
+            assert!(Arc::ptr_eq(&a, &b), "singleton broken for {lang}");
+        }
+        // T2 侧 languages 声明与 lang 字符串闭环（路由一致性）。
+        assert_eq!(
+            adapter_for("bash").unwrap().languages(),
+            &[LanguageId::Bash]
+        );
+        assert_eq!(
+            adapter_for("json").unwrap().languages(),
+            &[LanguageId::Json]
+        );
+        assert_eq!(
+            adapter_for("powershell").unwrap().languages(),
+            &[LanguageId::PowerShell]
+        );
+        assert_eq!(adapter_for("vue").unwrap().languages(), &[LanguageId::Vue]);
+        // alias：from_str_opt 接受 pwsh（LanguageId 层），adapter_for 同语义。
+        assert!(adapter_for("pwsh").is_some());
+    }
+
+    /// Wave 1 扩展名解析：sh/bash/json/jsonc/ps1/psm1/psd1/vue（resolve 锁定）。
+    #[test]
+    fn resolve_wave1_extensions() {
+        assert_eq!(resolve(&PathBuf::from("a.sh")), Some(LanguageId::Bash));
+        assert_eq!(resolve(&PathBuf::from("a.bash")), Some(LanguageId::Bash));
+        assert_eq!(resolve(&PathBuf::from("pkg.json")), Some(LanguageId::Json));
+        assert_eq!(
+            resolve(&PathBuf::from("tsconfig.jsonc")),
+            Some(LanguageId::Json)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("x.ps1")),
+            Some(LanguageId::PowerShell)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("x.psm1")),
+            Some(LanguageId::PowerShell)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("x.psd1")),
+            Some(LanguageId::PowerShell)
+        );
+        assert_eq!(resolve(&PathBuf::from("App.vue")), Some(LanguageId::Vue));
     }
 }

@@ -23,8 +23,8 @@ use ls_adapters::LanguageId;
 /// （CPP 系 LS 不靠扩展名匹配，是按 build 文件 fallback 探测；v1 不覆盖）。
 fn by_filename(name: &str) -> Option<LanguageId> {
     match name {
-        // bash 系 dotfile —— shell 解释器系可走 bash-language-server（T0）。
-        ".bashrc" | ".bash_profile" | ".zshrc" | ".profile" => None, // 无 LanguageId=Shell
+        // bash 系 dotfile —— shell 脚本，bash-language-server 接管。
+        ".bashrc" | ".bash_profile" | ".zshrc" | ".profile" => Some(LanguageId::Bash),
         _ => None,
     }
 }
@@ -51,6 +51,8 @@ fn by_shebang(hebang: &str) -> Option<LanguageId> {
     match interp {
         "python" | "python2" => Some(LanguageId::Python),
         "node" | "nodejs" | "deno" | "bun" => Some(LanguageId::TypeScript),
+        // shell 系（bash/POSIX sh/zsh）→ bash-language-server（tree-sitter-bash 解析）。
+        "bash" | "sh" | "zsh" => Some(LanguageId::Bash),
         "ruby" => None, // 无 LanguageId=Ruby（M3 未收）
         _ => None,
     }
@@ -176,5 +178,65 @@ mod tests {
         // 不存在 + 无扩展名 → 走到 shebang 路径 → I/O 错返 None，0 panic。
         let p = PathBuf::from("Z:/nonexistent_path_xyz_12345");
         assert_eq!(detect_language(&p), None);
+    }
+
+    /// Wave 1：shell 系扩展名 / dotfile / shebang 全部归 Bash。
+    #[test]
+    fn wave1_bash_detection() {
+        assert_eq!(
+            detect_language(&PathBuf::from("deploy.sh")),
+            Some(LanguageId::Bash)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("build.bash")),
+            Some(LanguageId::Bash)
+        );
+        // dotfile：.bashrc / .zshrc / .profile → 文件名特殊匹配 → Bash。
+        assert_eq!(
+            detect_language(&PathBuf::from(".bashrc")),
+            Some(LanguageId::Bash)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from(".zshrc")),
+            Some(LanguageId::Bash)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from(".profile")),
+            Some(LanguageId::Bash)
+        );
+        // shebang：`#!/bin/bash`（无扩展名脚本）→ Bash。
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("script");
+        std::fs::write(&p, "#!/bin/bash\nset -euo pipefail\n").unwrap();
+        assert_eq!(detect_language(&p), Some(LanguageId::Bash));
+    }
+
+    /// Wave 1：json / powershell / vue 扩展名。
+    #[test]
+    fn wave1_json_powershell_vue_detection() {
+        assert_eq!(
+            detect_language(&PathBuf::from("package.json")),
+            Some(LanguageId::Json)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("tsconfig.jsonc")),
+            Some(LanguageId::Json)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("script.ps1")),
+            Some(LanguageId::PowerShell)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("module.psm1")),
+            Some(LanguageId::PowerShell)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("manifest.psd1")),
+            Some(LanguageId::PowerShell)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("App.vue")),
+            Some(LanguageId::Vue)
+        );
     }
 }

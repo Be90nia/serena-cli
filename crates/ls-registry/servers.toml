@@ -1042,12 +1042,14 @@ bin_rel = "vtsls"
 languages = ["vue"]
 install = "npm"
 source_commit = "43ae0211"
+# 三包同装一目录（↖ mirror: vue_language_server.py@43ae021 `_setup_runtime_dependencies`：
+# hybrid 模式要求 vue LS / typescript / typescript-language-server 同一 node_modules，
+# tsdk 与 @vue/typescript-plugin 路径才能拼出）。
 [servers.vue.npm]
 package = "@vue/language-server"
 version = "3.1.5"
 bin_rel = "vue-language-server"
 npm_args = ["--stdio"]
-# 伴随 typescript + typescript-language-server（上游 vue_language_server.py L543-565）。
 [[servers.vue.npm.secondary_packages]]
 package = "typescript"
 version = "5.9.3"
