@@ -42,7 +42,7 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 对比上游 oraios/serena：19/19 高 ROI wrapper 全部覆盖（agent 实际会用的每个工具），外加长尾（`documentHighlight`、`codeLens`、`documentLink`、`foldingRange`、`call/type hierarchy`、`moniker`、`semanticTokens`、`inlayHint`）—— 全部落地并于 2026-09-23 验证；`document-link`/`moniker` 在不支持该能力的 LS 上返回空结果（如 rust-analyzer stable）。
 
-### Language server（上游目录 73 个中的 7 个）
+### Language server（上游目录 73 个中的 11 个）
 
 | 语言 | Server | 状态 | 备注 |
 |---|---|---|---|
@@ -53,8 +53,12 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 | Go | gopls | ready（adapter 壳） | `go.work` / 多模块目录检测为 stub |
 | C# | csharp-ls | ready（adapter 壳） | 决策记录：`local/csharp-ls-decision.md`（上游已迁移至 roslyn LS） |
 | Java | jdtls | ready（自动下载） | 约 100MB 下载，JVM 参数模板见 `crates/ls-runtime/src/install.rs` |
+| Bash | bash-language-server | ready（npm） | tree-sitter 语法诊断；ShellCheck 集成未捆绑 |
+| JSON | vscode-json-languageserver | ready（npm） | schema 驱动的 hover/诊断 |
+| PowerShell | PowerShellEditorServices | ready（下载） | 需要 `pwsh` 7+；内置 PSScriptAnalyzer 诊断 |
+| Vue | @vue/language-server | ready（npm，hybrid） | 伴生 typescript-language-server 挂 `@vue/typescript-plugin`；语义 hover/路由已通，诊断走 tsserver 桥待接 |
 
-7 门全部在真实 language server 上端到端冒烟验证（rust、typescript、c/cpp、python、go —— 2026-09-25；c#、java —— 2026-09-25；见 `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md`）。CI 7 语言冒烟脚本见 `scripts/ci_smoke.sh`。
+11 门全部在真实 language server 上端到端冒烟验证（rust、typescript、c/cpp、python、go —— 2026-09-25；c#、java —— 2026-09-25；bash、json、powershell、vue —— 2026-09-25；见 `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / 各 adapter 报告 `local/report-*-adapter.md`）。CI 7 语言冒烟脚本见 `scripts/ci_smoke.sh`。
 
 ## 安装
 

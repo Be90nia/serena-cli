@@ -40,7 +40,7 @@ Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `
 
 vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses), plus the long tail (`documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint`) — all landed and verified 2026-09-23; `document-link`/`moniker` return empty on LS without the capability (e.g. rust-analyzer stable).
 
-### Language servers (7 of 73 in upstream catalog)
+### Language servers (11 of 73 in upstream catalog)
 
 | Lang | Server | Status | Notes |
 |---|---|---|---|
@@ -51,8 +51,12 @@ vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent
 | Go | gopls | ready (adapter shell) | `go.work` / multi-module dir detection stubbed |
 | C# | csharp-ls | ready (adapter shell) | decision log: `local/csharp-ls-decision.md` (upstream migrated to roslyn LS) |
 | Java | jdtls | ready (auto-download) | ~100MB download, JVM arg templates from `crates/ls-runtime/src/install.rs` |
+| Bash | bash-language-server | ready (npm) | tree-sitter syntax diagnostics; ShellCheck integration not bundled |
+| JSON | vscode-json-languageserver | ready (npm) | schema-driven hover/diagnostics |
+| PowerShell | PowerShellEditorServices | ready (download) | requires `pwsh` 7+; bundled PSScriptAnalyzer diagnostics |
+| Vue | @vue/language-server | ready (npm, hybrid) | companion typescript-language-server with `@vue/typescript-plugin`; semantic hover/routing live, diagnostics via tsserver bridge pending |
 
-All 7 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
+All 11 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; bash, json, powershell, vue — 2026-09-25; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / per-adapter reports `local/report-*-adapter.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
 
 ## Install
 
