@@ -58,7 +58,7 @@ struct Cli {
     #[arg(long, value_name = "ROOT")]
     project: Option<PathBuf>,
 
-    /// JSON 输出：所有子命令输出可被 jq 解析的 JSON（默认人类可读文本）。
+    /// 完整 JSON 输出：关闭默认的紧凑裁剪（默认已是 JSON、紧凑形态；本 flag 保留全部字段）。
     #[arg(long, global = true)]
     json: bool,
 
@@ -125,6 +125,7 @@ enum Cmd {
     },
     /// 鼠标位置符号的 type / doc（textDocument/hover）。line/col 为 1-based。
     Hover { file: String, line: u32, col: u32 },
+    /// 拉取文件诊断（pull diagnostics）；`--wait-gen N` 等到 generation ≥ N 再返回。
     Diagnostics {
         file: String,
         /// 等 diagnostics generation >= N（替代盲轮询 5s）；0=立即返回当前；仍受 5s 上限。
