@@ -5317,7 +5317,15 @@ impl SupervisorTrait for Supervisor {
             .await;
         if undo::WRITE_TOOLS.contains(&tool) {
             match &result {
-                Ok(_) => undo::commit(root, txn_uid).await?,
+                Ok(_) => {
+                    // P3：commit 落盘移入写门。undo/redo 恢复路径（undo_at/redo_at）
+                    // 各自持门操作 undo 存储目录（prune/rename），走到这里时各工具
+                    // 函数内的 gate 已释放 —— commit 若在门外落盘，可与并发 undo/redo
+                    // 的 prune 交错。guard 活到 commit 完成：落盘毫秒级串行化，正确性
+                    // 优先。commit_at 自身不加门（非重入门），顺序保证全靠此处。
+                    let _gate = write_gate::acquire().await;
+                    undo::commit(root, txn_uid).await?;
+                }
                 Err(_) => undo::abort(txn_uid),
             }
         }
@@ -5334,6 +5342,55 @@ impl SupervisorTrait for Supervisor {
 }
 
 impl Supervisor {
+    /// P2-b：undo/redo 恢复写（盘上 atomic_write，不推 didChange）后同步 LS 内存态
+    /// —— 只靠 LS 盘上监听自愈对 rust-analyzer 可靠，pyright 等监听弱。逐文件：
+    /// - created 且已被删除（undo 删 created 文件）→ `force_close`（didClose，
+    ///   文件已不存在，didChange 无从谈起）；
+    /// - 其余（改写 / redo 重建）→ 仅当该文件在本 daemon 的 buffers 表内才
+    ///   `ensure_open` 推全量 didChange；表外 = LS 从未 didOpen（后续语义工具会
+    ///   按需 ensure_open 自盘读），跳过避免无谓 didOpen 洪泛。
+    /// - 遍历 root 下所有存活 session（rename 等多文件事务可能跨语言 LS）；
+    ///   无存活 session（如纯 create-text-file 后 undo，从未起 LS）→ 空转跳过。
+    /// - 任何同步失败只 warn：undo 本身已成功，绝不因 LS 同步失败让 undo 报错。
+    async fn sync_ls_after_undo(&self, root: &Path, touched: &[undo::TouchedFile]) {
+        if touched.is_empty() {
+            return;
+        }
+        // 与 Supervisor::key 同款归一：instances 键的 root 经 canonicalize + 去尾分隔符。
+        let mut canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        while matches!(
+            canon.as_os_str().as_encoded_bytes().last(),
+            Some(b'/' | b'\\')
+        ) {
+            canon.pop();
+        }
+        let sessions: Vec<std::sync::Arc<lsp_core::session::Session>> = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .iter()
+                .filter(|(k, _)| k.root == canon)
+                .map(|(_, s)| std::sync::Arc::clone(s))
+                .collect()
+        };
+        for t in touched {
+            let p = Path::new(&t.path);
+            let deleted = t.created && !p.exists();
+            for session in &sessions {
+                if matches!(session.state(), lsp_core::session::SessionState::Failed(_)) {
+                    continue;
+                }
+                if deleted {
+                    // 表外 = LS 没见过该文件，force_close 自行 no-op。
+                    session.force_close(p);
+                } else if session.is_open(p)
+                    && let Err(e) = session.ensure_open(p).await
+                {
+                    tracing::warn!("undo/redo LS sync (didChange) failed for {}: {e}", t.path);
+                }
+            }
+        }
+    }
+
     /// 工具名 → 实现的分发表（原 execute_tool 主体；undo/redo 事务边界壳见上）。
     /// inherent 方法：trait impl 只收 SupervisorTrait 成员，分发表留在自有块。
     pub(crate) async fn dispatch_tool(
@@ -6145,10 +6202,21 @@ impl Supervisor {
                 if args.get("list").and_then(|v| v.as_bool()).unwrap_or(false) {
                     undo::list(root).await
                 } else {
-                    undo::undo(root, steps).await
+                    let out = undo::undo(root, steps).await;
+                    // P2-b：恢复写已落盘，同步 LS 内存态。登记表恒取走（含失败路径
+                    // —— 中途冲突时已恢复的前缀文件同样要同步；同步失败不反转
+                    // undo 结果，见 sync_ls_after_undo）。
+                    let touched = undo::take_touched();
+                    self.sync_ls_after_undo(root, &touched).await;
+                    out
                 }
             }
-            "redo" => undo::redo(root).await,
+            "redo" => {
+                let out = undo::redo(root).await;
+                let touched = undo::take_touched();
+                self.sync_ls_after_undo(root, &touched).await;
+                out
+            }
             // 新建文件（created=true 快照场景的可执行路径；文件已存在 = 参数错）。
             "create-text-file" => {
                 let file = args.get("file").and_then(|v| v.as_str()).ok_or_else(|| {

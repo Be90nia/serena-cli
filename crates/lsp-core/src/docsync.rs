@@ -352,6 +352,46 @@ impl Session {
         }
         now_idle.len()
     }
+
+    /// 文件当前是否在 buffers 表（LS 侧文档态存活，含 TTL 宽限窗口内的条目）。
+    /// undo/redo LS 同步用：表外 = 本 daemon 从未 didOpen（或已 evict），LS 侧无
+    /// 陈旧文档态，跳过 didChange 避免 LS 收到"未打开文档"的变更。
+    pub fn is_open(&self, path: &Path) -> bool {
+        match path_to_uri(path) {
+            Ok(uri) => self
+                .buffers
+                .lock()
+                .expect("docsync buffers mutex poisoned")
+                .contains_key(&uri),
+            Err(_) => false,
+        }
+    }
+
+    /// 强制关闭单个文件的 LS 文档态：移表 + didClose（锁内移表、锁外发通知，
+    /// outbound 关闭时 send 失败忽略 —— 与 evict_* 同款纪律）。mirror ls.py 的
+    /// close 语义：LS 端文档表删除该 uri。
+    ///
+    /// undo 删除 created 文件专用：文件已不存在，didChange 无从谈起，必须走
+    /// didClose 让 LS 丢弃文档态。表中无此 uri = LS 从未见过该文件 → no-op。
+    /// 残余活 guard 的 drop 打在已移除表项上 = no-op（`FileGuard::drop` 容忍缺项）。
+    /// 返回是否真的关闭（表内存在并移除）。
+    pub fn force_close(&self, path: &Path) -> bool {
+        let Ok(uri) = path_to_uri(path) else {
+            return false;
+        };
+        let removed = {
+            let mut map = self.buffers.lock().expect("docsync buffers mutex poisoned");
+            map.remove(&uri).is_some()
+        };
+        if removed {
+            // 走 client().notify（同步）而非 self.notify（async）：与 evict_* 同款，
+            // 调用方（undo 收口）持有 session 时它必已过 ready 门，无需再等门。
+            let _ = self
+                .client()
+                .notify("textDocument/didClose", make_did_close(&uri));
+        }
+        removed
+    }
 }
 
 /// 把绝对路径转成 `file://` URL 字符串。`dunce` 去 UNC 前缀，`\` → `/`，

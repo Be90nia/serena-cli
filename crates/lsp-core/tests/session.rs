@@ -242,3 +242,69 @@ fn session_state_debug_is_stable() {
     // 防止 idle 警告
     let (_tx, _rx) = mpsc::channel::<JsonRpc>(1);
 }
+
+/// P2-b：`force_close` = 移表 + didClose **真发**（mock_ls track 钩子断言 wire 层）；
+/// `is_open` 反映 buffers 表状态；表外 force_close 为 no-op。
+/// undo 删除 created 文件后靠它让 LS 丢弃文档态（didChange 无从谈起）。
+#[tokio::test]
+async fn force_close_removes_buffer_and_emits_did_close() {
+    let exe: std::path::PathBuf = env!("CARGO_BIN_EXE_mock_ls").into();
+    let track = std::env::temp_dir().join(format!("serena-fc-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&track);
+    let child = Child::spawn(LaunchInfo {
+        cmd: vec![OsString::from(exe)],
+        cwd: std::env::temp_dir(),
+        env: vec![(
+            "MOCK_LS_TRACK_FILE_EVENTS".into(),
+            track.to_string_lossy().into_owned(),
+        )],
+        transport: TransportKind::Stdio,
+    })
+    .unwrap();
+    let session = std::sync::Arc::new(
+        Session::start(Some(child), dummy_init_params())
+            .await
+            .expect("Session::start 应成功"),
+    );
+
+    // ensure_open 要求文件在盘上存在（读内容 + stat）。
+    let f = std::env::temp_dir().join(format!("serena-fc-doc-{}.txt", std::process::id()));
+    std::fs::write(&f, "hello").unwrap();
+    let expected_uri = lsp_core::docsync::path_to_uri(&f).unwrap();
+
+    assert!(!session.is_open(&f), "表外 = 未打开");
+    let _guard = session.ensure_open(&f).await.expect("ensure_open");
+    assert!(session.is_open(&f), "ensure_open 后表内有条目");
+
+    assert!(session.force_close(&f), "表内条目被移除");
+    assert!(!session.is_open(&f), "close 后表外");
+    assert!(!session.force_close(&f), "表外 force_close = no-op");
+
+    // wire 层断言：LS 侧按序收到 didOpen → didClose，uri 与 path_to_uri 一致
+    // （didClose 是 undo 删 created 文件的正确同步动作，不能是 didChange）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let events = loop {
+        if let Ok(body) = std::fs::read_to_string(&track)
+            && body.lines().count() >= 2
+        {
+            break body
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).expect("track 行 JSON 合法"))
+                .collect::<Vec<_>>();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "track 日志未出现 2 条事件: {:?}",
+            std::fs::read_to_string(&track)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(events[0]["event"], "didOpen");
+    assert_eq!(events[0]["uri"], expected_uri.as_str());
+    assert_eq!(events[1]["event"], "didClose", "force_close 发 didClose");
+    assert_eq!(events[1]["uri"], expected_uri.as_str());
+
+    session.shutdown().await;
+    let _ = std::fs::remove_file(&track);
+    let _ = std::fs::remove_file(&f);
+}

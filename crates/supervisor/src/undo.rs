@@ -17,6 +17,8 @@
 //!   拒绝。错误映射复用 `ToolError::WriteConflict` → wire `WRITE_CONFLICT`（语义
 //!   同族：盘上内容与预期状态不符，C3 防线；exit 1、不可重试），零新错误码。
 //! - created=true 的文件 undo = 删除文件（用户拍板）；redo = 按 after 内容重建。
+//! - LS 态同步（P2-b）：整事务恢复成功后把涉及文件登记进 `TOUCHED`（uid 键侧信道），
+//!   undo/redo 收口取走并逐文件 didChange / didClose（lib.rs `sync_ls_after_undo`）。
 //! - 栈序：N 大 = 新。undo 取 N 最大的 `txn-{N}`；undo 后 rename 为
 //!   `undone-{N}`；redo 取 N 最大的 `undone-{N}` 重放后 rename 回 `txn-{N}`；
 //!   新事务落盘后删除全部 `undone-*`（IDE 语义：新写入清空 redo 链）。
@@ -101,6 +103,21 @@ struct Entry {
 /// 待落盘快照。键 = 事务 uid（execute_tool 每次调用分配，进程内唯一）。
 static PENDING: StdMutex<Vec<(u64, Entry)>> = StdMutex::new(Vec::new());
 static NEXT_UID: AtomicU64 = AtomicU64::new(1);
+
+/// undo/redo 恢复写涉及的文件登记（P2-b LS 态同步桥）。键 = 承载本次 undo/redo
+/// 工具调用的事务 uid —— 恢复路径在 execute_tool 的 TXN_UID 作用域内执行，并发
+/// undo/redo 各记各账（与 PENDING 同款 std 锁 + 短临界区）。选侧信道而非改
+/// undo_at/redo_at 返回类型：wire 输出与既有单测零改动，且中途冲突时已恢复的
+/// 前缀文件也能带出（返回值版会被 Err 吞掉）。
+static TOUCHED: StdMutex<Vec<(u64, TouchedFile)>> = StdMutex::new(Vec::new());
+
+/// undo/redo 恢复写涉及的单个文件（LS 态同步用）：路径 + 是否 created 文件。
+/// created 且已被删除 → didClose；其余（改写 / redo 重建）→ didChange。
+#[derive(Clone, Debug)]
+pub(crate) struct TouchedFile {
+    pub path: String,
+    pub created: bool,
+}
 
 tokio::task_local! {
     /// 当前事务 uid。execute_tool 用 `scope` 包裹工具执行；scope 外（--direct
@@ -189,6 +206,44 @@ pub(crate) fn abort(uid: u64) {
         .lock()
         .expect("undo PENDING lock poisoned")
         .retain(|(u, _)| *u != uid);
+}
+
+/// 登记一次恢复写涉及的文件（undo_one/redo_one 整事务恢复成功后调用；
+/// TXN_UID 作用域外 = --direct 路径，无 daemon LS 态可同步，丢弃）。
+fn register_touched(files: &[FileRec]) {
+    let uid = TXN_UID.try_with(|v| *v).unwrap_or(0);
+    if uid == 0 {
+        return;
+    }
+    TOUCHED
+        .lock()
+        .expect("undo TOUCHED lock poisoned")
+        .extend(files.iter().map(|f| {
+            (
+                uid,
+                TouchedFile {
+                    path: f.path.clone(),
+                    created: f.created,
+                },
+            )
+        }));
+}
+
+/// 取走并清空当前事务（TXN_UID 作用域内）登记的涉及文件清单。
+/// undo/redo 收口恒调用（含失败路径）——条目随取随清，不泄漏。
+pub(crate) fn take_touched() -> Vec<TouchedFile> {
+    let uid = TXN_UID.try_with(|v| *v).unwrap_or(0);
+    if uid == 0 {
+        return Vec::new();
+    }
+    let mut reg = TOUCHED.lock().expect("undo TOUCHED lock poisoned");
+    let taken: Vec<TouchedFile> = reg
+        .iter()
+        .filter(|(u, _)| *u == uid)
+        .map(|(_, f)| f.clone())
+        .collect();
+    reg.retain(|(u, _)| *u != uid);
+    taken
 }
 
 /// 提交某事务：无快照 = no-op；否则 prune → 落盘 `txn-{N}` → 清空 redo 链。
@@ -394,6 +449,8 @@ async fn undo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
             path: dir.display().to_string(),
             reason: format!("undo: mark txn undone failed: {e}"),
         })?;
+    // 整事务恢复成功后才登记（P2-b）：LS 同步只对真正落盘恢复的文件。
+    register_touched(&manifest.files);
     Ok(manifest.files.len())
 }
 
@@ -447,6 +504,8 @@ async fn redo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
             path: dir.display().to_string(),
             reason: format!("redo: mark txn active failed: {e}"),
         })?;
+    // 整事务重放成功后才登记（P2-b），同 undo_one。
+    register_touched(&manifest.files);
     Ok(manifest.files.len())
 }
 

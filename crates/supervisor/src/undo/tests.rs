@@ -476,3 +476,49 @@ async fn suite_runs_fast() {
     tokio::time::sleep(Duration::from_millis(1)).await;
     assert!(start.elapsed() < Duration::from_secs(5));
 }
+
+/// P2-b：undo/redo 整事务恢复成功 → TOUCHED 登记（created 标志保真）→
+/// take_touched 取走即清空；uid 作用域外 take 返回空（--direct 路径）。
+#[tokio::test]
+async fn touched_files_registered_on_restore_and_drained_by_take() {
+    let work = tmpdir("touched_work");
+    let store = tmpdir("touched_store");
+    let a = work.join("a.txt");
+    std::fs::write(&a, "v1").unwrap();
+    let b = work.join("b.txt"); // created 文件（写入前不存在）
+    let u = uid();
+    txn_write(&a, "v2", u).await;
+    txn_write(&b, "created-content", u).await;
+    commit_at(&store, u, &Limits::default()).await.unwrap();
+
+    // 模拟 execute_tool：undo 工具调用在 TXN_UID 作用域内执行，收口同作用域取走。
+    let undo_uid = uid();
+    let touched = TXN_UID
+        .scope(undo_uid, async {
+            undo_at(&store, 1).await.unwrap();
+            take_touched()
+        })
+        .await;
+    assert_eq!(touched.len(), 2, "both files registered: {touched:?}");
+    let created = touched
+        .iter()
+        .find(|t| t.created)
+        .expect("created flag preserved");
+    assert!(created.path.ends_with("b.txt"), "{touched:?}");
+    // 取走即清空：二次 take = 空（daemon 长跑不泄漏）。
+    let drained = TXN_UID.scope(undo_uid, async { take_touched() }).await;
+    assert!(drained.is_empty(), "registry drained after take");
+
+    // redo 重放同样登记。
+    let redo_uid = uid();
+    let touched = TXN_UID
+        .scope(redo_uid, async {
+            redo_at(&store).await.unwrap();
+            take_touched()
+        })
+        .await;
+    assert_eq!(touched.len(), 2, "redo re-registers: {touched:?}");
+
+    // 作用域外 take（--direct / 无 uid）：恒空，不误取他事务登记。
+    assert!(take_touched().is_empty(), "out-of-scope take is empty");
+}
