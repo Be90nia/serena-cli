@@ -356,8 +356,10 @@ async fn remove_all_undone(store: &Path) {
 async fn undo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
     let dir = store.join(format!("txn-{n}"));
     let manifest = read_manifest(&dir).await?;
-    // 冲突门：先全量校验，任一文件不匹配则整事务拒绝（契约设计第 4 条），
-    // 不产生半恢复状态。
+    // 冲突门：先全量校验，任一文件不匹配则整事务拒绝（契约设计第 4 条）。
+    // 注意：校验全过后的恢复写入阶段若 IO 失败（磁盘满/权限/占用），仍可能留下
+    // 半恢复状态——此时事务保持 txn-{n}，重试 undo 即幂等补完（created 已删跳过、
+    // before 内容确定性写回）。
     for f in &manifest.files {
         check_conflict_undo(f).await?;
     }
@@ -375,7 +377,10 @@ async fn undo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
             }
         } else {
             let before = side_content(&dir, &f.before, &f.before_file, "before").await?;
-            tokio::fs::write(p, before)
+            // 原子写（temp+rename）：undo 是数据恢复路径，截断写半途崩溃 = 文件损坏。
+            // Windows 上目标被编辑器占用时 rename 可能失败——此时返回冲突门错误，
+            // 用户关掉占用后重试 undo（幂等）即可。
+            crate::atomic_write(p, &before)
                 .await
                 .map_err(|e| ToolError::WriteConflict {
                     path: f.path.clone(),
@@ -428,7 +433,8 @@ async fn redo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
         if let Some(parent) = p.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        tokio::fs::write(p, after)
+        // 原子写，同 undo_one：恢复路径禁截断写（防半途损坏）。
+        crate::atomic_write(p, &after)
             .await
             .map_err(|e| ToolError::WriteConflict {
                 path: f.path.clone(),
