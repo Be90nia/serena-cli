@@ -346,6 +346,21 @@ pub fn catalog() -> serde_json::Value {
                     "end_line": {"type": "number", "required": true, "description": "1-based inclusive"},
                     "expected_hash": {"type": "string", "required": false}
                 }
+            },
+            "create-text-file": {
+                "args": {
+                    "file": {"type": "string", "required": true, "description": "target path relative to project root; must NOT exist"},
+                    "content": {"type": "string", "required": true, "description": "full file content"}
+                }
+            },
+            "undo": {
+                "args": {
+                    "steps": {"type": "number", "required": false, "description": "number of transactions to roll back (default 1)"},
+                    "list": {"type": "boolean", "required": false, "description": "list undo stack overview instead of rolling back"}
+                }
+            },
+            "redo": {
+                "args": {}
             }
         }
     })
