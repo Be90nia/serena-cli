@@ -871,6 +871,37 @@
     },
     "workspace-diagnostic": {
       "args": {}
+    },
+    "create-text-file": {
+      "args": {
+        "file": {
+          "description": "target path relative to project root; must NOT exist",
+          "required": true,
+          "type": "string"
+        },
+        "content": {
+          "description": "full file content",
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "undo": {
+      "args": {
+        "steps": {
+          "description": "number of transactions to roll back (default 1)",
+          "required": false,
+          "type": "number"
+        },
+        "list": {
+          "description": "list undo stack overview instead of rolling back",
+          "required": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "redo": {
+      "args": {}
     }
   },
   "version": 1

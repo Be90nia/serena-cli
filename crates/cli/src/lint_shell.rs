@@ -120,6 +120,10 @@ const TOOL_NAMES: &[&str] = &[
     "type-hierarchy",
     "moniker",
     "workspace-diagnostic",
+    // IDE undo/redo（事务版快照栈）+ 新建文件。
+    "create-text-file",
+    "undo",
+    "redo",
     "status",
     "stop-all",
     "install",
@@ -273,6 +277,8 @@ const PATH_FIRST_TOOLS: &[&str] = &[
     "insert-at-line",
     "replace-lines",
     "delete-lines",
+    // 新建文件：首位置参数同样是路径。undo/redo 无位置参数，不入此表。
+    "create-text-file",
     "completion",
     "containing-symbol",
     "defining-symbol",

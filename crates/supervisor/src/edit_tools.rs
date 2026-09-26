@@ -146,8 +146,9 @@ async fn commit_change(
     #[allow(unused_variables)] root: &Path,
     new_content: &str,
 ) -> EditResult<()> {
-    // atomic_write：tempfile 写 + rename（共享冲突重试 5×50ms）。
-    crate::atomic_write(file, new_content).await?;
+    // undo 收口：快照旧内容 → 原子写 → 入当前事务（符号级三件套与行级三件套
+    // 的公共写点）。io::Error 经 EditError::Io 冒泡，错误面与原 atomic_write 一致。
+    crate::undo::recorded_write(file, new_content).await?;
     // mtime 推进 → docsync 自动发 version=prev+1 的 didChange 全量。
     let _refreshed = session.ensure_open(file).await?;
     Ok(())

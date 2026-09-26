@@ -22,7 +22,7 @@
 
 ## 覆盖范围
 
-### CLI 命令（52 个）
+### CLI 命令（55 个）
 
 读取 / 导航（7 个）：`overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -30,7 +30,9 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 诊断（3 个）：`diagnostics`（支持 `--wait-gen N`）· pull diagnostics 兜底 · `signature-help`
 
-编辑（10 个）：`rename-symbol` · `safe-delete-symbol` · `replace-body` · `replace-text-in-symbol` · `insert-text-before-symbol` · `insert-text-after-symbol` · `delete-text-in-symbol` · `insert-at-line` · `replace-lines` · `delete-lines`
+编辑（11 个）：`rename-symbol` · `safe-delete-symbol` · `replace-body` · `replace-text-in-symbol` · `insert-text-before-symbol` · `insert-text-after-symbol` · `delete-text-in-symbol` · `insert-at-line` · `replace-lines` · `delete-lines` · `create-text-file`
+
+撤销 / 重做（2 个）：`undo`（`--steps N`、`--list`）· `redo` —— 事务级快照栈：每次写成功前记录旧状态；跨文件操作（如 rename 改多文件）是一个事务、整体回滚。事务中新建的文件 undo 时删除。冲突门：事务之后文件在磁盘上被改动过，undo 拒绝执行而不是覆盖。快照栈存于用户缓存目录（重启/升级不丢），上限 20 事务 / 200 MB / 30 天。
 
 补全（1 个）：`completion`（支持 `--limit` 与按文件后缀的 trigger 推断）
 

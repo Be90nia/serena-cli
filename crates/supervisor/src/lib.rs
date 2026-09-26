@@ -39,6 +39,7 @@ pub mod root_finder;
 pub mod catalog;
 pub mod ref_tools;
 pub mod repo_map;
+pub mod undo;
 pub mod warm;
 pub mod write_gate;
 
@@ -3343,7 +3344,8 @@ impl Supervisor {
             &old_text[end_byte..]
         );
 
-        atomic_write(path, &new_text)
+        // undo 收口：快照旧内容 → 原子写 → 入当前事务。
+        undo::recorded_write(path, &new_text)
             .await
             .map_err(|e| ToolError::WriteConflict {
                 path: path.display().to_string(),
@@ -3708,7 +3710,9 @@ impl Supervisor {
                 continue;
             }
 
-            atomic_write(&abs, &new_content)
+            // undo 收口：每文件快照入同一事务 —— rename-symbol 跨文件改动
+            // 聚合为单事务（契约设计第 2 条），undo 一次全部回滚。
+            undo::recorded_write(&abs, &new_content)
                 .await
                 .map_err(|e| ToolError::WriteConflict {
                     path: abs.display().to_string(),
@@ -3835,7 +3839,8 @@ impl Supervisor {
                 detail: format!("read {}: {e}", path.display()),
             })?;
         let new_text = delete_symbol_text(&old_text, range)?;
-        atomic_write(&path, &new_text)
+        // undo 收口：快照旧内容 → 原子写 → 入当前事务。
+        undo::recorded_write(&path, &new_text)
             .await
             .map_err(|e| ToolError::WriteConflict {
                 path: path.display().to_string(),
@@ -3883,6 +3888,54 @@ impl Supervisor {
         edit_tools::insert_at_line(&session, root, &abs, line, content, expected_hash)
             .await
             .map_err(line_edit_err("insert_at_line"))
+    }
+
+    /// `create-text-file`：新建文件（已存在 = 参数错）。走写门 + recorded_write
+    /// 收口 —— 旧文件不存在自动产生 created=true 快照，undo = 删除、redo = 重建。
+    /// LS 侧 ensure_open 失败不阻断返回（创建已成功；无 adapter/LS 未装时仅附 warning）。
+    pub async fn tool_create_text_file(
+        &self,
+        root: &Path,
+        file: &str,
+        content: &str,
+        lang_override: Option<&str>,
+    ) -> ToolResult<serde_json::Value> {
+        if file.is_empty() || file.contains("..") {
+            return Err(ToolError::BadArgs {
+                detail: "invalid file path".into(),
+            });
+        }
+        let abs = root.join(file);
+        let _gate = write_gate::acquire().await;
+        // 门内双检：并发两个 create 只成功一个（TOCTOU 防线）。
+        if abs.exists() {
+            return Err(ToolError::BadArgs {
+                detail: format!("file already exists: {file}"),
+            });
+        }
+        undo::recorded_write(&abs, content)
+            .await
+            .map_err(|e| ToolError::WriteConflict {
+                path: abs.display().to_string(),
+                reason: format!("atomic write failed: {e}"),
+            })?;
+        let mut warnings: Vec<String> = Vec::new();
+        match resolve_lang_for_file(file, lang_override) {
+            Ok(lang) => match self.session_for(root, lang.as_str()).await {
+                Ok(session) => {
+                    if let Err(e) = session.ensure_open(&abs).await {
+                        warnings.push(format!("created but LS sync failed: {e}"));
+                    }
+                }
+                Err(e) => warnings.push(format!("created but LS unavailable: {e}")),
+            },
+            Err(e) => warnings.push(format!("created but no language adapter: {e}")),
+        }
+        let mut value = serde_json::json!({ "created": true, "file": file });
+        if !warnings.is_empty() {
+            value["warnings"] = serde_json::json!(warnings);
+        }
+        Ok(value)
     }
 
     /// `replace-lines`：用 content 替换 [start_line, end_line]（1-based 含端）。
@@ -5234,6 +5287,62 @@ impl SupervisorTrait for Supervisor {
         // per-call override，并清掉这两个私有字段（避免传染给具体 tool 的 args 解析）。
         // 实际 timeout 在 tool_* 内部通过 `effective_tool_timeout(lang, &args)` 拿到。
         let args = sanitize_timeout_args(args);
+        // 修 P1 #2（TTL 生产执行者）：throttled reclaim。每 32 次调用扫一次所有
+        // 在线 Session 的空闲 FileBuffer（ref_count=0 + 超 60 s）→ didClose + 移表。
+        // 这是 TTL 窗口的实际触发点；daemon 周期性或 CLI 流式调用下都能覆盖。
+        // 计数原子增加、阈值归零，无锁；scan + evict 内部临界区微秒无 await。
+        // ponytail: 阈值 32 对应稳态 5~10 s 节流；测试直接调 reclaim_idle_buffers_once
+        // 绕过阈值验证语义。
+        let _reclaimed = self.reclaim_idle_buffers_once();
+        // bd serena-rust-84n：不存在文件 = 确定性参数错（wire §6.3 BAD_ARGS），
+        // 统一在入口拦截 —— 否则 ensure_open 的 io NotFound 经 Core 冒成 INTERNAL，
+        // AI 无法据错误码免重试。args 带 file 字段的工具（读/写/位置类）目标文件
+        // 全部要求已存在（create-text-file 例外：新建语义，file 不存在是前置条件）。
+        if let Some(f) = args.get("file").and_then(|v| v.as_str())
+            && tool != "create-text-file"
+            && !root.join(f).is_file()
+        {
+            return Err(ToolError::BadArgs {
+                detail: format!("file not found: {f}"),
+            });
+        }
+        // ==== IDE undo/redo：事务边界（契约设计第 2/3 条）====
+        // 写类工具一次 execute_tool 调用 = 一个 undo 事务：rename-symbol 跨文件
+        // 改动在同一调用内逐文件 recorded_write，天然聚合成单事务。工具成功 →
+        // 快照落盘（commit 含 prune 与清空 redo 链）；失败 → 丢弃本调用已记快照。
+        // TXN_UID task-local 隔离并发调用（batch 每条独立 task）。
+        let txn_uid = undo::next_uid();
+        let result = undo::TXN_UID
+            .scope(txn_uid, self.dispatch_tool(tool, root, &args, lang))
+            .await;
+        if undo::WRITE_TOOLS.contains(&tool) {
+            match &result {
+                Ok(_) => undo::commit(root, txn_uid).await?,
+                Err(_) => undo::abort(txn_uid),
+            }
+        }
+        result
+    }
+
+    fn loaded_entries(&self) -> Vec<Key> {
+        self.last_used.lock().unwrap().keys().cloned().collect()
+    }
+
+    async fn evict_failed(&self) -> usize {
+        Self::evict_failed_instances(self).await
+    }
+}
+
+impl Supervisor {
+    /// 工具名 → 实现的分发表（原 execute_tool 主体；undo/redo 事务边界壳见上）。
+    /// inherent 方法：trait impl 只收 SupervisorTrait 成员，分发表留在自有块。
+    pub(crate) async fn dispatch_tool(
+        &self,
+        tool: &str,
+        root: &Path,
+        args: &serde_json::Value,
+        lang: Option<&str>,
+    ) -> Result<serde_json::Value, ToolError> {
         // AI-token 特性 H（plan-h-compact-locations.md §1 / ai-token-features-design §10-H）：
         // 6 个位置工具（def/refs/find-symbol/find-implementations/find-referencing-*）
         // 默认走紧凑 `file:line:col` 字符串输出。`_compact` 在 sanitize 里**不**进过滤名单
@@ -5249,28 +5358,9 @@ impl SupervisorTrait for Supervisor {
             .get("_delta")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-
-        // 修 P1 #2（TTL 生产执行者）：throttled reclaim。每 32 次调用扫一次所有
-        // 在线 Session 的空闲 FileBuffer（ref_count=0 + 超 60 s）→ didClose + 移表。
-        // 这是 TTL 窗口的实际触发点；daemon 周期性或 CLI 流式调用下都能覆盖。
-        // 计数原子增加、阈值归零，无锁；scan + evict 内部临界区微秒无 await。
-        // ponytail: 阈值 32 对应稳态 5~10 s 节流；测试直接调 reclaim_idle_buffers_once
-        // 绕过阈值验证语义。
-        let _reclaimed = self.reclaim_idle_buffers_once();
-        // bd serena-rust-84n：不存在文件 = 确定性参数错（wire §6.3 BAD_ARGS），
-        // 统一在入口拦截 —— 否则 ensure_open 的 io NotFound 经 Core 冒成 INTERNAL，
-        // AI 无法据错误码免重试。args 带 file 字段的工具（读/写/位置类）目标文件
-        // 全部要求已存在（本项目无「file = 新建目标」语义的工具）。
-        if let Some(f) = args.get("file").and_then(|v| v.as_str())
-            && !root.join(f).is_file()
-        {
-            return Err(ToolError::BadArgs {
-                detail: format!("file not found: {f}"),
-            });
-        }
         let mut value: serde_json::Value = match tool {
             "overview" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 let raw = self.tool_overview(root, &file, lang).await?;
                 let value =
                     serde_json::to_value(raw).map_err(|e| ToolError::Serialize(e.into()))?;
@@ -5318,7 +5408,7 @@ impl SupervisorTrait for Supervisor {
                     .await)
             }
             "signature-help" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 serde_json::to_value(
                     self.tool_signature_help(root, &file, line, col, lang)
                         .await?,
@@ -5327,7 +5417,7 @@ impl SupervisorTrait for Supervisor {
             }
             // ==== Phase 1 · 上游 wrapper 缺口（13 个）====
             "code-action" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 let kind = args.get("kind").and_then(|v| v.as_str());
                 serde_json::to_value(
                     self.tool_code_action(root, &file, line, col, kind, lang)
@@ -5336,7 +5426,7 @@ impl SupervisorTrait for Supervisor {
                 .map_err(|e| ToolError::Serialize(e.into()))
             }
             "format" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 let tab_size = args
                     .get("tab_size")
                     .and_then(|v| v.as_u64())
@@ -5349,7 +5439,7 @@ impl SupervisorTrait for Supervisor {
                 .map_err(|e| ToolError::Serialize(e.into()))
             }
             "format-range" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 let start_line =
                     args.get("start_line")
                         .and_then(|v| v.as_u64())
@@ -5396,7 +5486,7 @@ impl SupervisorTrait for Supervisor {
                 .map_err(|e| ToolError::Serialize(e.into()))
             }
             "inlay-hint" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 let start_line =
                     args.get("start_line")
                         .and_then(|v| v.as_u64())
@@ -5416,7 +5506,7 @@ impl SupervisorTrait for Supervisor {
                 .map_err(|e| ToolError::Serialize(e.into()))
             }
             "document-highlight" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 serde_json::to_value(
                     self.tool_document_highlight(root, &file, line, col, lang)
                         .await?,
@@ -5424,22 +5514,22 @@ impl SupervisorTrait for Supervisor {
                 .map_err(|e| ToolError::Serialize(e.into()))
             }
             "folding-range" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 serde_json::to_value(self.tool_folding_range(root, &file, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
             "semantic-tokens" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 serde_json::to_value(self.tool_semantic_tokens(root, &file, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
             "code-lens" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 serde_json::to_value(self.tool_code_lens(root, &file, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
             "document-link" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 serde_json::to_value(self.tool_document_link(root, &file, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
@@ -5452,7 +5542,7 @@ impl SupervisorTrait for Supervisor {
                         })?;
                 match op {
                     "prepare" => {
-                        let (file, line, col) = required_position(&args)?;
+                        let (file, line, col) = required_position(args)?;
                         serde_json::to_value(
                             self.tool_call_hierarchy_prepare(root, &file, line, col, lang)
                                 .await?,
@@ -5501,7 +5591,7 @@ impl SupervisorTrait for Supervisor {
                         })?;
                 match op {
                     "prepare" => {
-                        let (file, line, col) = required_position(&args)?;
+                        let (file, line, col) = required_position(args)?;
                         serde_json::to_value(
                             self.tool_type_hierarchy_prepare(root, &file, line, col, lang)
                                 .await?,
@@ -5542,7 +5632,7 @@ impl SupervisorTrait for Supervisor {
                 }
             }
             "moniker" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 serde_json::to_value(self.tool_moniker(root, &file, line, col, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
@@ -5551,7 +5641,7 @@ impl SupervisorTrait for Supervisor {
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
             "hover" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 let resp = self.tool_hover(root, &file, line, col, lang).await?;
                 let mut value =
                     serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))?;
@@ -5571,13 +5661,13 @@ impl SupervisorTrait for Supervisor {
                 Ok(value)
             }
             "diagnostics" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 let wait_gen = args.get("wait_gen").and_then(|v| v.as_u64());
                 serde_json::to_value(self.tool_diagnostics(root, &file, lang, wait_gen).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
             "def" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 let raw = self.tool_def(root, &file, line, col, lang).await?;
                 // `def` 单 Location → 退化为单元素 envelope（AI 期望 `items[]` 统一）。
                 // None 是合法语义（位置无定义），保留为 `items: []` + `compact: true|false`。
@@ -5600,7 +5690,7 @@ impl SupervisorTrait for Supervisor {
             }
 
             "containing-symbol" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 serde_json::to_value(
                     self.tool_containing_symbol(root, &file, line, col, lang)
                         .await?,
@@ -5608,7 +5698,7 @@ impl SupervisorTrait for Supervisor {
                 .map_err(|e| ToolError::Serialize(e.into()))
             }
             "defining-symbol" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 serde_json::to_value(
                     self.tool_defining_symbol(root, &file, line, col, lang)
                         .await?,
@@ -5617,7 +5707,7 @@ impl SupervisorTrait for Supervisor {
             }
 
             "refs" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 let raw = self.tool_refs(root, &file, line, col, lang).await?;
                 let empty = raw.is_empty();
                 let mut value = locations_envelope(&raw, compact);
@@ -5637,7 +5727,7 @@ impl SupervisorTrait for Supervisor {
                 Ok(self.maybe_delta("refs", &root_key, value, delta).await)
             }
             "completion" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
                 let trigger = args.get("trigger").and_then(|v| v.as_str());
                 let resp = self
@@ -5652,7 +5742,7 @@ impl SupervisorTrait for Supervisor {
                 }
             }
             "find-implementations" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 let raw = self
                     .tool_find_implementations(root, &file, line, col, lang)
                     .await?;
@@ -5708,13 +5798,13 @@ impl SupervisorTrait for Supervisor {
                 serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
             }
             "symbol-body" => {
-                let (file, symbol) = required_symbol_body_args(&args)?;
+                let (file, symbol) = required_symbol_body_args(args)?;
                 serde_json::to_value(self.tool_symbol_body(root, &file, &symbol, lang).await?)
                     .map_err(|e| ToolError::Serialize(e.into()))
             }
             "edit-context" => {
                 // B: 单次调用拿 body + callers + doc + tests（ai-token-features §10-B）。
-                let (file, symbol) = required_symbol_body_args(&args)?;
+                let (file, symbol) = required_symbol_body_args(args)?;
                 let report = crate::edit_context::collect(self, root, &file, &symbol, lang).await;
                 serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
             }
@@ -5739,7 +5829,7 @@ impl SupervisorTrait for Supervisor {
                 crate::warm::warm(self, root, lang, Duration::from_secs(timeout_secs)).await
             }
             "replace-body" => {
-                let (file, symbol, new_body) = required_replace_args(&args)?;
+                let (file, symbol, new_body) = required_replace_args(args)?;
                 self.tool_replace_body(root, &file, &symbol, &new_body, lang)
                     .await?;
                 let diag = self.post_diag_for_write(root, &file, lang).await;
@@ -5751,7 +5841,7 @@ impl SupervisorTrait for Supervisor {
                 }))
             }
             "rename-symbol" => {
-                let (file, line, col, new_name) = required_rename_args(&args)?;
+                let (file, line, col, new_name) = required_rename_args(args)?;
                 serde_json::to_value(
                     self.tool_rename_symbol(root, &file, line, col, &new_name, lang)
                         .await?,
@@ -5759,7 +5849,7 @@ impl SupervisorTrait for Supervisor {
                 .map_err(|e| ToolError::Serialize(e.into()))
             }
             "read-file" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 let start_line = args
                     .get("start_line")
                     .and_then(|v| v.as_u64())
@@ -5816,7 +5906,7 @@ impl SupervisorTrait for Supervisor {
                 serde_json::to_value(hits).map_err(|e| ToolError::Serialize(e.into()))
             }
             "find-referencing-symbols" => {
-                let (file, line, col) = required_position(&args)?;
+                let (file, line, col) = required_position(args)?;
                 let hits = self
                     .tool_referencing_symbols(root, &file, line, col, lang)
                     .await?;
@@ -5841,7 +5931,7 @@ impl SupervisorTrait for Supervisor {
                     match args.get("symbol").and_then(|v| v.as_str()) {
                         Some(name) => self.resolve_symbol_position(root, name, lang).await?,
                         None => {
-                            let (f, l, c) = required_position(&args)?;
+                            let (f, l, c) = required_position(args)?;
                             (f, l, c, None)
                         }
                     };
@@ -5871,7 +5961,7 @@ impl SupervisorTrait for Supervisor {
                 Ok(value)
             }
             "replace-text-in-symbol" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 let symbol = args
                     .get("symbol")
                     .and_then(|v| v.as_str())
@@ -5904,7 +5994,7 @@ impl SupervisorTrait for Supervisor {
                 }))
             }
             "insert-text-after-symbol" => {
-                let (file, symbol, text) = required_edit_args(&args)?;
+                let (file, symbol, text) = required_edit_args(args)?;
                 let (end_line, end_col) = self
                     .tool_edit_insert_after_symbol(root, &file, &symbol, &text, lang)
                     .await?;
@@ -5916,7 +6006,7 @@ impl SupervisorTrait for Supervisor {
                 }))
             }
             "insert-text-before-symbol" => {
-                let (file, symbol, text) = required_edit_args(&args)?;
+                let (file, symbol, text) = required_edit_args(args)?;
                 let (end_line, end_col) = self
                     .tool_edit_insert_before_symbol(root, &file, &symbol, &text, lang)
                     .await?;
@@ -5928,7 +6018,7 @@ impl SupervisorTrait for Supervisor {
                 }))
             }
             "delete-text-in-symbol" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 let symbol = args
                     .get("symbol")
                     .and_then(|v| v.as_str())
@@ -5959,7 +6049,7 @@ impl SupervisorTrait for Supervisor {
                 }))
             }
             "safe-delete-symbol" => {
-                let (file, symbol) = required_symbol_body_args(&args)?;
+                let (file, symbol) = required_symbol_body_args(args)?;
                 let mut value = serde_json::to_value(
                     self.tool_safe_delete_symbol(root, &file, &symbol, lang)
                         .await?,
@@ -5974,7 +6064,7 @@ impl SupervisorTrait for Supervisor {
                 Ok(value)
             }
             "insert-at-line" => {
-                let file = required_file(&args)?;
+                let file = required_file(args)?;
                 let line =
                     args.get("line")
                         .and_then(|v| v.as_u64())
@@ -5994,7 +6084,7 @@ impl SupervisorTrait for Supervisor {
                         &file,
                         line,
                         &content,
-                        opt_expected_hash(&args).as_deref(),
+                        opt_expected_hash(args).as_deref(),
                         lang,
                     )
                     .await?;
@@ -6006,7 +6096,7 @@ impl SupervisorTrait for Supervisor {
                 }))
             }
             "replace-lines" => {
-                let (file, start_line, end_line) = required_line_range(&args)?;
+                let (file, start_line, end_line) = required_line_range(args)?;
                 let content = args
                     .get("content")
                     .and_then(|v| v.as_str())
@@ -6020,7 +6110,7 @@ impl SupervisorTrait for Supervisor {
                     start_line,
                     end_line,
                     &content,
-                    opt_expected_hash(&args).as_deref(),
+                    opt_expected_hash(args).as_deref(),
                     lang,
                 )
                 .await?;
@@ -6032,13 +6122,13 @@ impl SupervisorTrait for Supervisor {
                 }))
             }
             "delete-lines" => {
-                let (file, start_line, end_line) = required_line_range(&args)?;
+                let (file, start_line, end_line) = required_line_range(args)?;
                 self.tool_delete_lines(
                     root,
                     &file,
                     start_line,
                     end_line,
-                    opt_expected_hash(&args).as_deref(),
+                    opt_expected_hash(args).as_deref(),
                     lang,
                 )
                 .await?;
@@ -6048,6 +6138,34 @@ impl SupervisorTrait for Supervisor {
                     "file": file,
                     "post_write_diagnostics": diag,
                 }))
+            }
+            // ==== IDE undo/redo（事务版快照栈）====
+            "undo" => {
+                let steps = args.get("steps").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                if args.get("list").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    undo::list(root).await
+                } else {
+                    undo::undo(root, steps).await
+                }
+            }
+            "redo" => undo::redo(root).await,
+            // 新建文件（created=true 快照场景的可执行路径；文件已存在 = 参数错）。
+            "create-text-file" => {
+                let file = args.get("file").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::BadArgs {
+                        detail: "missing 'file'".into(),
+                    }
+                })?;
+                let content = args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'content'".into(),
+                    })?;
+                let report = self
+                    .tool_create_text_file(root, file, content, lang)
+                    .await?;
+                serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
             }
             other => Err(ToolError::BadArgs {
                 detail: format!("unknown tool: {other}"),
@@ -6069,14 +6187,6 @@ impl SupervisorTrait for Supervisor {
             apply_compress(&mut value);
         }
         Ok(value)
-    }
-
-    fn loaded_entries(&self) -> Vec<Key> {
-        self.last_used.lock().unwrap().keys().cloned().collect()
-    }
-
-    async fn evict_failed(&self) -> usize {
-        Self::evict_failed_instances(self).await
     }
 }
 

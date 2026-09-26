@@ -20,7 +20,7 @@ Trade-off: you lose the "MCP auto-discovery" story. You gain `bash`-debuggabilit
 
 ## What it covers
 
-### CLI commands (52)
+### CLI commands (55)
 
 Read / navigate (7): `overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -28,7 +28,9 @@ Symbols (8): `def` · `refs` · `find-symbol` · `symbol-body` · `find-implemen
 
 Diagnostics (3): `diagnostics` (with `--wait-gen N`) · pull diagnostics fallback · `signature-help`
 
-Editing (10): `rename-symbol` · `safe-delete-symbol` · `replace-body` · `replace-text-in-symbol` · `insert-text-before-symbol` · `insert-text-after-symbol` · `delete-text-in-symbol` · `insert-at-line` · `replace-lines` · `delete-lines`
+Editing (11): `rename-symbol` · `safe-delete-symbol` · `replace-body` · `replace-text-in-symbol` · `insert-text-before-symbol` · `insert-text-after-symbol` · `delete-text-in-symbol` · `insert-at-line` · `replace-lines` · `delete-lines` · `create-text-file`
+
+Undo / redo (2): `undo` (`--steps N`, `--list`) · `redo` — transactional snapshot stack: every successful write records the prior state; a multi-file edit (e.g. cross-file rename) is one transaction and rolls back as a whole. Files created by a transaction are deleted on undo. Conflict gate: if a file changed on disk after the transaction, undo refuses instead of overwriting. Stack lives in the user cache dir (survives restarts and upgrades), capped at 20 txns / 200 MB / 30 days.
 
 Completion (1): `completion` (with `--limit` and per-file-suffix trigger inference)
 

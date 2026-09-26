@@ -94,6 +94,7 @@ serena-rust/
 │   │       │                   #   ↖ mirror（形态）: serena project_server.py 的 per-root 加载锁；Δ 上游项目缓存只进不出，本设计加 LRU/回收
 │   │       ├── write_gate.rs   # 全局写互斥（§3.3，读并行写串行的实现位置）
 │   │       ├── edit_tools.rs   # 写类工具：replace-body / 行级三件套 / rename / safe-delete（写门 + hash 对账）
+│   │       ├── undo.rs         # IDE undo/redo 事务版快照栈：recorded_write 统一收口、txn-{N} 存储、冲突门、prune（20/200MB/30d）
 │   │       ├── ref_tools.rs    # 导航/引用类：refs / find-referencing-* / call·type-hierarchy / signature-help 等
 │   │       ├── fs_tools.rs     # 文件类：read-file / list-dir / find-file / search（不经 LS）
 │   │       ├── root_finder.rs  # LSP 项目根发现（marker 向上 / workspace 兜底）

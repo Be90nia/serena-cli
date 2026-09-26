@@ -332,6 +332,23 @@ enum Cmd {
         #[arg(long)]
         expected_hash: Option<String>,
     },
+    /// 新建文件（已存在 = 参数错）。写入自动进 undo 事务（created=true）。
+    CreateTextFile {
+        file: String,
+        /// 文件完整内容。
+        content: String,
+    },
+    /// 回滚最近的写事务（IDE undo）。project_root 由 --project 或 cwd 定位。
+    Undo {
+        /// 回滚事务数。
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        steps: u32,
+        /// 列出 undo 栈概览（txn id/时间/文件数/摘要），不执行回滚。
+        #[arg(long)]
+        list: bool,
+    },
+    /// 重放最近被 undo 的事务（IDE redo）。
+    Redo,
     /// 代码补全（textDocument/completion）—— AI-friendly 字段裁剪 + 自动推断 trigger。
     /// line/col 为 1-based（与 def/refs 同基线；CLI 层统一转 LSP 0-based）。
     Completion {
@@ -1866,6 +1883,12 @@ async fn forward(
             ("moniker", json!({"file": file, "line": line, "col": col}))
         }
         Some(Cmd::WorkspaceDiagnostic) => ("workspace-diagnostic", json!({})),
+        Some(Cmd::CreateTextFile { file, content }) => (
+            "create-text-file",
+            json!({"file": file, "content": content}),
+        ),
+        Some(Cmd::Undo { steps, list }) => ("undo", json!({"steps": steps, "list": list})),
+        Some(Cmd::Redo) => ("redo", json!({})),
         Some(Cmd::Status)
         | Some(Cmd::StopAll)
         | Some(Cmd::Install { .. })
@@ -2414,7 +2437,11 @@ async fn dispatch_shell_cmd(
         | "safe-delete-symbol"
         | "insert-at-line"
         | "replace-lines"
-        | "delete-lines" => cmd,
+        | "delete-lines"
+        // IDE undo/redo（事务版快照栈）+ 新建文件 —— supervisor 侧 tool 层实现。
+        | "create-text-file"
+        | "undo"
+        | "redo" => cmd,
         other => return Err(format!("unknown cmd: {other}")),
     };
     let body = json!({
