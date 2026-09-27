@@ -323,7 +323,14 @@ mod tests {
     async fn launch_uses_fake_pwsh_and_cached_script() {
         let pwsh_name = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
         let pwsh_dir = tempfile::tempdir().unwrap();
-        std::fs::write(pwsh_dir.path().join(pwsh_name), b"fake").unwrap();
+        let fake_pwsh = pwsh_dir.path().join(pwsh_name);
+        std::fs::write(&fake_pwsh, b"fake").unwrap();
+        // unix which() 走 X_OK：fs::write 产物 0644 无执行位会被判不存在。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_pwsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let cache_dir = tempfile::tempdir().unwrap();
         // default_cache_root = {LOCALAPPDATA}/serena/ls（Windows）→ fixture 带全两层。
         let script = cache_dir
