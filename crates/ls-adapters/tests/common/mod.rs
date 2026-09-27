@@ -32,10 +32,28 @@ pub fn dummy_ctx() -> ProjectCtx {
 
 /// 临时建一个目录，把 `bin_name`（如 "rust-analyzer" / "rust-analyzer.exe"）
 /// 写成一个 0 字节的 fake binary；返回目录与 fake 路径。
+/// 写 fake 可执行文件（unix 自动 +x：which() 走 X_OK，0644 会被判不存在）。
+pub fn write_fake_exec(bin: &std::path::Path, content: &[u8]) {
+    std::fs::write(bin, content).expect("write fake");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755))
+            .expect("set +x on fake binary");
+    }
+}
+
 pub fn fake_binary_dir(bin_name: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let bin = dir.path().join(bin_name);
     std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write fake");
+    // unix which() 走 X_OK：fs::write 产物 0644 无执行位会被判不存在。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("set +x on fake binary");
+    }
     assert!(bin.is_file());
     (dir, bin)
 }

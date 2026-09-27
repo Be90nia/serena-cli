@@ -9,6 +9,7 @@
 //!    PATH 无 clangd 时返回语义错误（`NotInstalled`），无 panic。
 //! 5. `request_hooks()` 默认无操作 + `initialize_patches` 不 panic（传空 base 即可）。
 
+mod common;
 use std::path::PathBuf;
 
 use ls_adapters::clangd::ClangdAdapter;
@@ -62,7 +63,7 @@ async fn launch_info_finds_clangd_in_path_when_present() {
         "clangd"
     };
     let bin = dir.path().join(bin_name);
-    std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write fake clangd");
+    common::write_fake_exec(&bin, b"#!/bin/sh\nexit 0\n");
     assert!(bin.is_file(), "fake clangd must exist");
 
     let original_path = std::env::var_os("PATH").unwrap_or_default();

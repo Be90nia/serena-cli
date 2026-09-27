@@ -33,7 +33,7 @@ async fn launch_finds_pyright_in_path_when_pyright_langserver_absent() {
         "pyright"
     };
     let bin = dir.path().join(bin_name);
-    std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write fake pyright");
+    common::write_fake_exec(&bin, b"#!/bin/sh\nexit 0\n");
     let info = common::launch_info_with_dir_on_path(PyrightAdapter, dir.path()).await;
     let info = info.expect("PATH 含 fake pyright 时 launch_info 必须成功");
     let has_stdio = info.cmd.iter().any(|a| a == "--stdio");
@@ -55,7 +55,7 @@ async fn launch_adds_stdio_flag_for_pyright_langserver() {
         "pyright-langserver"
     };
     let bin = dir.path().join(bin_name);
-    std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write fake langserver");
+    common::write_fake_exec(&bin, b"#!/bin/sh\nexit 0\n");
     let info = common::launch_info_with_dir_on_path(PyrightAdapter, dir.path()).await;
     let info = info.expect("PATH 含 fake pyright-langserver 时 launch_info 必须成功");
     let has_stdio = info.cmd.iter().any(|a| a == "--stdio");

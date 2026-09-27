@@ -28,7 +28,7 @@ async fn launch_finds_json_ls_on_path_with_stdio_flag() {
         "vscode-json-languageserver"
     };
     let bin = dir.path().join(bin_name);
-    std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("write fake");
+    common::write_fake_exec(&bin, b"#!/bin/sh\nexit 0\n");
     let dir_path = dir.path().to_path_buf();
     let info_holder: std::sync::Arc<
         std::sync::Mutex<Option<anyhow::Result<ls_runtime::process::LaunchInfo>>>,
