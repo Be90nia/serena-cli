@@ -332,10 +332,15 @@ mod tests {
             std::fs::set_permissions(&fake_pwsh, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let cache_dir = tempfile::tempdir().unwrap();
-        // default_cache_root = {LOCALAPPDATA}/serena/ls（Windows）→ fixture 带全两层。
-        let script = cache_dir
-            .path()
-            .join("serena/ls/powershell/4.4.0/PowerShellEditorServices/Start-EditorServices.ps1");
+        // default_cache_root：Windows = {LOCALAPPDATA}/serena/ls；unix = $HOME/.local/share/serena/ls
+        // → fixture 根按平台拼（cache_root 本体），下带两层 id/version。
+        let cache_root = if cfg!(windows) {
+            cache_dir.path().to_path_buf()
+        } else {
+            cache_dir.path().join(".local/share/serena/ls")
+        };
+        let script =
+            cache_root.join("powershell/4.4.0/PowerShellEditorServices/Start-EditorServices.ps1");
         std::fs::create_dir_all(script.parent().unwrap()).unwrap();
         std::fs::write(&script, b"# fake script").unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -386,11 +391,7 @@ mod tests {
         // bundled_modules_path = install_dir（脚本父目录的父），供 PSES 解析 zip
         // 内置 PSScriptAnalyzer/PSReadLine —— 上游 py bug（模块目录自身）的修正点。
         // join 形态对齐 resolve_start_script（分步 join），保证 display 分隔符一致。
-        let install_dir = cache_dir
-            .path()
-            .join("serena/ls")
-            .join("powershell")
-            .join("4.4.0");
+        let install_dir = cache_root.join("powershell").join("4.4.0");
         assert!(
             command_arg.contains(&format!("-BundledModulesPath '{}", install_dir.display())),
             "{command_arg}"
