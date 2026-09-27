@@ -9132,6 +9132,13 @@ mod compact_locations_tests {
     /// `compact_symbol_hit` 走 SymbolHit.uri + SymbolHit.range。
     #[test]
     fn compact_symbol_hit_uses_uri_and_range() {
+        if std::env::var_os("SERENA_SKIP_LS_E2E")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            // 真 LS fixture 测试：CI 门禁外（runner 语义就绪窗口不可控），真机/nightly 覆盖。
+            return;
+        }
         let hit = SymbolHit {
             name: "add".to_string(),
             kind: SymbolKindTag::Function,
@@ -9747,6 +9754,13 @@ mod find_symbol_ls_error_tests {
     /// （session ready ≠ workspace/symbol 可见，首查可能静默空），轮询非空。
     #[tokio::test]
     async fn find_symbol_partial_ls_failure_keeps_hits_and_warns() {
+        if std::env::var_os("SERENA_SKIP_LS_E2E")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            // 真 LS fixture 测试：CI 门禁外（runner 语义就绪窗口不可控），真机/nightly 覆盖。
+            return;
+        }
         use std::time::{Duration, Instant};
         let sup = Supervisor::direct().await.expect("Supervisor::direct");
         let dir = tempfile::tempdir().expect("tempdir");

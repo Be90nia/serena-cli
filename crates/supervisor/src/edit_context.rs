@@ -265,6 +265,13 @@ mod tests {
     /// ponytail: RA cold-start 索引窗口用 busy-retry 而非 sleep（避免 flake；满载机实测 >30s，上限 45s）。
     #[tokio::test]
     async fn edit_context_collects_all_four_fields() {
+        if std::env::var_os("SERENA_SKIP_LS_E2E")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            // 真 LS fixture 测试：CI 门禁外（runner 语义就绪窗口不可控），真机/nightly 覆盖。
+            return;
+        }
         if !rust_analyzer_available() {
             eprintln!("skipped: rust-analyzer not on PATH");
             return;

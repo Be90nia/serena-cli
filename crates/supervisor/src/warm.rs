@@ -180,6 +180,13 @@ mod tests {
     /// 零超时：不进等待环 → ready:false + partial:true（LS 已启动的降级路径）。
     #[tokio::test]
     async fn warm_partial_on_zero_timeout() {
+        if std::env::var_os("SERENA_SKIP_LS_E2E")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            // 真 LS fixture 测试：CI 门禁外（runner 语义就绪窗口不可控），真机/nightly 覆盖。
+            return;
+        }
         if !rust_analyzer_available() {
             eprintln!("skipped: rust-analyzer not on PATH");
             return;
@@ -197,6 +204,13 @@ mod tests {
     /// §13-M 核心验收：warm ready:true 后，首个 overview 立即有数据（热路径）。
     #[tokio::test]
     async fn warm_ready_then_first_overview_nonempty() {
+        if std::env::var_os("SERENA_SKIP_LS_E2E")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            // 真 LS fixture 测试：CI 门禁外（runner 语义就绪窗口不可控），真机/nightly 覆盖。
+            return;
+        }
         if !rust_analyzer_available() {
             eprintln!("skipped: rust-analyzer not on PATH");
             return;
