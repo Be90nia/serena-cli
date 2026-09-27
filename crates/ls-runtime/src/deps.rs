@@ -258,8 +258,13 @@ fn extract_sha256_hex(stdout: &[u8]) -> Result<String, String> {
             Err(_) => continue,
         };
         let trimmed = line.trim();
-        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(trimmed.to_ascii_lowercase());
+        // certutil 输出 hash 独占一行；sha256sum/shasum 是 "<hash>  <filename>"。
+        // 统一取行首 64 hex（三种工具的 hash 都顶格开头）。
+        if trimmed.len() >= 64 {
+            let candidate = &trimmed[..64];
+            if candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Ok(candidate.to_ascii_lowercase());
+            }
         }
     }
     Err(format!(
@@ -317,6 +322,17 @@ mod tests {
             assert!(r.url.starts_with("https://github.com/rust-lang/"));
         }
         assert!(rust_analyzer_release_for(Os::Windows, Arch::Aarch64).is_none());
+    }
+
+    #[test]
+    fn extract_accepts_sha256sum_hash_filename_line() {
+        // linux sha256sum / macos shasum 输出 "<hash>  <filename>"——hash 后跟
+        // 文件名，不再是 64 字符独占行（v0.2.0 CI linux 实锤）。
+        let out = b"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  /tmp/x.bin\n";
+        assert_eq!(
+            extract_sha256_hex(out).unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 
     #[test]
