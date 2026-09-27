@@ -151,10 +151,13 @@ async fn request_after_ready_completes_quickly() {
 /// 确保 Session::start 失败态（用 ping 这种不发任何 LSP 内容的进程）会回 CoreError，而非 panic。
 #[tokio::test]
 async fn session_start_failure_returns_core_error() {
+    // ping 语法分平台：Windows -n，unix -c（linux iputils 收到 -n 2 会 usage
+    // 报错退出，配合 30s 握手超时会击穿 12s 兜底窗——v0.2.0 CI linux 实锤）。
+    let count_flag = if cfg!(windows) { "-n" } else { "-c" };
     let info = LaunchInfo {
         cmd: vec![
             OsString::from("ping"),
-            OsString::from("-n"),
+            OsString::from(count_flag),
             OsString::from("2"),
             OsString::from("127.0.0.1"),
         ],
