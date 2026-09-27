@@ -1,9 +1,11 @@
-//! 托管子进程 spawn 与 Windows Job Object 进程树治理。
+//! 托管子进程 spawn 与进程树治理（Windows Job Object / Unix 进程组）。
 //!
 //! ↖ mirror: ls_process.py@43ae021 `ManagedSubprocess`
 //! Δ 上游以 `start_independent_lsp_process=True` 独立进程组躲 Python 崩溃连坐；
-//!   本设计语义反转：Job Object（KILL_ON_JOB_CLOSE）保证宿主崩溃/被杀时 LS 全家
-//!   陪葬，不留孤儿（ARCHITECTURE §3.2）。Unix 等价路径 PR_SET_PDEATHSIG 后续标注。
+//!   本设计语义反转：持有树治理句柄保证宿主崩溃/被杀时 LS 全家陪葬，不留孤儿
+//!   （ARCHITECTURE §3.2）。Windows 走 Job Object（KILL_ON_JOB_CLOSE），Unix 走
+//!   进程组 + `killpg(SIGKILL)`（linux 另挂 PDEATHSIG 补父死兜底，见
+//!   `ProcessTreeGuard` 文档的取舍说明）。
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -56,25 +58,60 @@ pub struct LaunchInfo {
     pub transport: TransportKind,
 }
 
+/// 进程树治理句柄（ARCH §3.2：持有即保活，drop/kill 即灭树）。
+///
+/// - Windows：Job Object（KILL_ON_JOB_CLOSE）——drop 关句柄由内核终止全树；宿主
+///   崩溃/被杀时句柄随进程回收，同机制兜底，无孤儿。
+/// - Unix：进程组（spawn 时 `setpgid(0,0)`，pgid == 直接子进程 pid）——drop =
+///   `killpg(pgid, SIGKILL)`。父死兜底**不对称**：linux 经
+///   `prctl(PR_SET_PDEATHSIG, SIGKILL)` 由内核补齐（注意 PDEATHSIG 绑定的是
+///   **创建线程**；tokio worker 线程与 runtime 同生命周期，线程退出≈进程退出，
+///   误杀窗口可忽略）；macos 无等价机制，退化为仅显式 kill/drop——父进程崩溃时
+///   可能残留孤儿树（与上游 Python 版 psutil 方案同边界）。取舍记录于此。
+#[derive(Debug)]
+pub enum ProcessTreeGuard {
+    #[cfg(windows)]
+    Job(win32job::Job),
+    #[cfg(unix)]
+    Group(u32),
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        // unix 编译下 Group 是唯一变体（单分支 match 穷尽，无 irrefutable 警告）；
+        // windows 下 Drop 体为空——内层 Job 字段 drop 即关句柄，内核灭树。
+        #[cfg(unix)]
+        match self {
+            ProcessTreeGuard::Group(pgid) => {
+                // SAFETY: killpg 仅投递信号；pgid 是 spawn 时登记的真实进程组。
+                // ESRCH（组不存在）= 目标已死，按成功处理（对齐 Job 句柄重复关闭语义）。
+                unsafe {
+                    libc::killpg(*pgid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
 /// 托管子进程句柄：spawn 后字段即刻可用，stdio 交泵消费（lsp-core transport）。
 pub struct ChildHandle {
     pub stdin: tokio::process::ChildStdin,
     pub stdout: tokio::process::ChildStdout,
     pub stderr: tokio::process::ChildStderr,
-    /// Windows Job Object（KILL_ON_JOB_CLOSE）。持有即保活；drop/kill 关句柄即灭树。
-    pub job: Option<win32job::Job>,
+    /// 进程树治理句柄。持有即保活；drop/kill 灭树（Windows=Job Object，Unix=killpg）。
+    pub tree: Option<ProcessTreeGuard>,
     /// 直接子进程 pid（测试断言进程回收用；spawn 后理论上不为 None）。
     pub pid: Option<u32>,
     /// 保留的进程本体：调用方需要 `wait()/try_wait()` 监视伴生进程时，在把 handle
     /// 交给 `Session::start` 前用 `take_child` 取走（stdio 已拆出，wait 只等进程退，
-    /// 不碰管道——安全）。不取则随 handle drop（脱离，job 兜底灭树）。
+    /// 不碰管道——安全）。不取则随 handle drop（脱离，tree 兜底灭树）。
     pub child: Option<tokio::process::Child>,
 }
 
 impl ChildHandle {
-    /// 显式终止进程树：丢掉 Job → 句柄关闭 → 内核按 KILL_ON_JOB_CLOSE 清场。
+    /// 显式终止进程树：丢 guard → Windows 关 Job 句柄（内核灭树）/ Unix killpg(SIGKILL)。
     pub fn kill(&mut self) {
-        self.job.take();
+        self.tree.take();
     }
 
     /// 取走进程本体供调用方监视（伴生进程编排：vue adapter 监听伴生 TS LS 退出）。
@@ -87,8 +124,7 @@ impl ChildHandle {
 pub struct Child;
 
 impl Child {
-    /// 拉起托管子进程：tokio `Command` 挂 CREATE_NO_WINDOW 后 spawn，
-    /// 进程句柄先登记进 Job Object 再取走 stdio。
+    /// 拉起托管子进程：tokio `Command` 挂平台树治理配置后 spawn，再取走 stdio。
     pub fn spawn(info: LaunchInfo) -> Result<ChildHandle> {
         let cmd_display = info
             .cmd
@@ -108,24 +144,45 @@ impl Child {
             .stderr(Stdio::piped());
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
+        // Unix：子进程自成进程组（setpgid(0,0)，pgid==pid）——kill/drop 兜底
+        // killpg 全灭，对齐 Job Object 的显式灭树路径。
+        #[cfg(unix)]
+        cmd.process_group(0);
+        // linux：父死兜底（PR_SET_PDEATHSIG）——父进程崩溃也带走子树，补齐
+        // Job Object「宿主崩溃连坐」语义；macos 无等价机制（见 guard 文档取舍）。
+        #[cfg(target_os = "linux")]
+        unsafe {
+            // SAFETY: pre_exec 闭包在 exec 前的子进程上下文执行；prctl 仅设置
+            // 当前进程的信号属性，无内存操作。闭包词法位于本 unsafe 块内，
+            // 体内无需再包 unsafe（外层覆盖，多余包裹会触发 unused_unsafe）。
+            cmd.pre_exec(|| {
+                // 父线程退出 → 内核发 SIGKILL；设置失败仅放弃兜底，exec 照常。
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         let spawn_err =
             |cmd: String| move |cause: std::io::Error| RuntimeError::Spawn { cmd, cause };
         let mut child = cmd.spawn().map_err(spawn_err(cmd_display.clone()))?;
 
-        // Job Object：先登记进程句柄再交出 stdio（句柄此刻必然有效）。
+        // 树治理句柄登记（句柄此刻必然有效）。
         //
         // ↖ mirror: oraios/serena PR #1918（subprocess_util.py `_get_process_descendants`
         //   + `_wait_for_processes`：psutil 快照子孙 → 逐个 wait → 超时 kill 兜底）。
-        //   Windows 侧等价实现走内核 Job Object，覆盖面严格更广：
+        //   Windows 侧走内核 Job Object，覆盖面严格更广：
         //   ① 本 job 未设 BREAKAWAY_OK/SILENT_BREAKAWAY_OK，故 LS 自行 spawn 的子孙
         //     （jdtls 的 java、ts-server 的 node 等）创建时自动并入同一 job —— 无需快照，
         //     快照窗口期后新生的进程同样被覆盖（快照式 reap 的盲区）；
         //   ② drop/kill 关闭 job 句柄 → KILL_ON_JOB_CLOSE 由内核终止全树（含 LS 已
         //     退出但其子孙仍存活的场景 —— 上游 PR #1918 要修的正是这个泄漏）；
         //   ③ 宿主崩溃时句柄随进程关闭，同机制兜底，无孤儿。
+        //   Unix 侧进程组覆盖 ①② 的直接子树（组内进程 killpg 全灭）；LS 若自行
+        //   setsid 脱组则脱离治理（现实中 LS 不这么做），③ 仅 linux 有 PDEATHSIG。
         #[cfg(windows)]
-        let job = {
+        let tree = {
             let job_err = |cmd: String| {
                 move |e: win32job::JobError| RuntimeError::Spawn {
                     cmd,
@@ -144,16 +201,16 @@ impl Child {
                 .expect("child just spawned; process handle alive");
             job.assign_process(handle as isize)
                 .map_err(job_err(cmd_display.clone()))?;
-            Some(job)
+            Some(ProcessTreeGuard::Job(job))
         };
-        #[cfg(not(windows))]
-        let job = None;
+        #[cfg(unix)]
+        let tree = child.id().map(ProcessTreeGuard::Group);
 
         Ok(ChildHandle {
             stdin: child.stdin.take().expect("stdin piped above"),
             stdout: child.stdout.take().expect("stdout piped above"),
             stderr: child.stderr.take().expect("stderr piped above"),
-            job,
+            tree,
             pid: child.id(),
             child: Some(child),
         })

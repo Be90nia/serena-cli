@@ -2,7 +2,11 @@
 
 All notable changes to `serena-rust` are recorded here, ordered by phase. Anchored to upstream `oraios/serena@43ae0211`. Commit hashes reflect `feature/solidlsp-phase0-1` at the time of this writing; run `git log --oneline | head -80` for the canonical list.
 
-## 0.1.1 (2026-09-27)
+## Unreleased
+
+| commit | summary | key metric |
+|---|---|---|
+| (pending v0.2.0) | 3-platform release support: `ProcessTreeGuard` unifies process-tree governance (Windows Job Object unchanged; Unix process_group+killpg, linux PR_SET_PDEATHSIG parent-death backstop, macos explicit-kill tradeoff documented) + win32job gated to cfg(windows) deps + release.yml matrix → windows/linux(x86_64-gnu)/macos(aarch64) + unix spawn tests; deps.rs unix compile fixes | dual-target zigbuild link-level green (x86_64-linux-gnu, aarch64-apple-darwin); Windows 66 suites / 677 tests zero regression; live CI verification pending |
 
 | commit | summary | key metric |
 |---|---|---|

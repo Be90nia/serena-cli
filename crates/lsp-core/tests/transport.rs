@@ -81,6 +81,9 @@ async fn pumps_roundtrip_requests() {
     }
 }
 
+/// 进程存在性检测（跨平台）：pid 精确过滤优先；按名过滤仅用于无 pid 手柄的场景。
+/// unix 侧 STAT 以 Z 开头（SIGKILL 后无人 reap 的僵尸）视为已死。
+#[cfg(windows)]
 fn mock_ls_running() -> bool {
     let out = std::process::Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq mock_ls.exe", "/NH"])
@@ -89,4 +92,17 @@ fn mock_ls_running() -> bool {
     String::from_utf8_lossy(&out.stdout)
         .to_lowercase()
         .contains("mock_ls.exe")
+}
+
+#[cfg(unix)]
+fn mock_ls_running() -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-eo", "comm,stat"])
+        .output()
+        .expect("ps 可用（unix 验收环境）");
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        let mut cols = line.split_whitespace();
+        cols.next().is_some_and(|comm| comm.ends_with("mock_ls"))
+            && cols.next().is_none_or(|stat| !stat.starts_with('Z'))
+    })
 }

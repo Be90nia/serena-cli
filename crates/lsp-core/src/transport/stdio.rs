@@ -12,7 +12,7 @@
 use bytes::BytesMut;
 use std::sync::Arc;
 
-use ls_runtime::process::ChildHandle;
+use ls_runtime::process::{ChildHandle, ProcessTreeGuard};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -30,21 +30,21 @@ pub type OnMsg = Arc<dyn Fn(JsonRpc) -> Option<JsonRpc> + Send + Sync>;
 /// 泵 stdout EOF 时的回调。让上层（Client）drain pending 并对所有等待者回 Terminated。
 pub type OnEof = Arc<dyn Fn() + Send + Sync>;
 
-/// 泵集合：三个常驻 task 的 JoinHandle + Job 保活句柄。
+/// 泵集合：三个常驻 task 的 JoinHandle + 树治理句柄。
 ///
-/// drop `Pumps` → Job 句柄关闭 → KILL_ON_JOB_CLOSE 清掉整棵 LS 进程树。
+/// drop `Pumps` → 树治理句柄释放 → Windows 内核灭 Job 全树 / Unix killpg(SIGKILL)。
 pub struct Pumps {
     pub writer: JoinHandle<()>,
     pub stdout: JoinHandle<()>,
     pub stderr: JoinHandle<()>,
-    /// 保活：drop 即灭树（Unix 为 None，PDEATHSIG 等价路径后续标注）。
-    pub job: Option<win32job::Job>,
+    /// 保活：drop 即灭树（Windows=Job Object，Unix=进程组；见 ls-runtime `ProcessTreeGuard`）。
+    pub tree: Option<ProcessTreeGuard>,
 }
 
 impl Pumps {
-    /// 显式终止进程树：丢 Job → 句柄关闭 → 内核清场。
+    /// 显式终止进程树：丢 guard → Windows 关 Job 句柄 / Unix killpg。
     pub fn kill(&mut self) {
-        self.job.take();
+        self.tree.take();
     }
 }
 
@@ -66,7 +66,7 @@ pub fn pump(
         stdin,
         stdout,
         stderr,
-        job,
+        tree,
         ..
     } = child;
 
@@ -169,7 +169,7 @@ pub fn pump(
         writer,
         stdout: stdout_task,
         stderr: stderr_task,
-        job,
+        tree,
     }
 }
 
@@ -199,7 +199,7 @@ pub fn record_pump(
         stdin,
         stdout,
         stderr,
-        job,
+        tree,
         ..
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
@@ -293,7 +293,7 @@ pub fn record_pump(
         writer,
         stdout: stdout_task,
         stderr: stderr_task,
-        job,
+        tree,
     }
 }
 
@@ -340,7 +340,7 @@ pub fn replay_pump(
         writer,
         stdout: stdout_task,
         stderr: stderr_task,
-        job: None,
+        tree: None,
     }
 }
 
@@ -368,7 +368,7 @@ pub fn pump_with_priority(
         stdin,
         stdout,
         stderr,
-        job,
+        tree,
         ..
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
@@ -431,7 +431,7 @@ pub fn pump_with_priority(
         writer,
         stdout: stdout_task,
         stderr: stderr_task,
-        job,
+        tree,
     }
 }
 
@@ -449,7 +449,7 @@ pub fn record_pump_with_priority(
         stdin,
         stdout,
         stderr,
-        job,
+        tree,
         ..
     } = child;
     let reply_tx_for_dispatch = reply_tx.clone();
@@ -514,7 +514,7 @@ pub fn record_pump_with_priority(
         writer,
         stdout: stdout_task,
         stderr: stderr_task,
-        job,
+        tree,
     }
 }
 
@@ -552,7 +552,7 @@ pub fn replay_pump_with_priority(
         writer,
         stdout: stdout_task,
         stderr: stderr_task,
-        job: None,
+        tree: None,
     }
 }
 

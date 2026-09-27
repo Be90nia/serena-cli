@@ -224,12 +224,27 @@ async fn session_start_failure_reaps_child() {
     }
 }
 
+/// unix 侧 STAT 以 Z 开头（SIGKILL 后无人 reap 的僵尸）视为已死。
+#[cfg(windows)]
 fn pid_running(pid: u32) -> bool {
     let out = std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .output()
         .expect("tasklist 可用（Windows 验收环境）");
     String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+}
+
+#[cfg(unix)]
+fn pid_running(pid: u32) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps 可用（unix 验收环境）");
+    if !out.status.success() {
+        return false; // 查无此 pid = 已 reap
+    }
+    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    !stat.is_empty() && !stat.starts_with('Z')
 }
 
 /// 单元测试：状态枚举的 Debug/PartialEq 形态稳定。

@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.1"
+version = "0.2.0"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "io-std", "sync", "time", "fs", "macros"] }
@@ -27,6 +27,7 @@ tempfile = "3"
 ignore = "0.4"
 regex = "1"
 win32job = "2"
+libc = "0.2"
 dunce = "1"
 percent-encoding = "2"
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }

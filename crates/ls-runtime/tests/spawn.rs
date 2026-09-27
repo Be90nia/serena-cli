@@ -4,6 +4,10 @@
 //!
 //! 进程树断言一律按 pid 精确过滤（tasklist /FI "PID eq"）：并行测试可能各自
 //! spawn 同名进程，IMAGENAME 级过滤会互相误判。
+//!
+//! Windows 专有行为测试（cmd /C、tasklist、PowerShell CIM）；unix 侧等价测试见
+//! spawn_unix.rs。
+#![cfg(windows)]
 
 use ls_runtime::process::{Child, LaunchInfo, TransportKind};
 use std::ffi::OsString;

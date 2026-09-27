@@ -246,7 +246,7 @@ fn run_sha256_tool(path: &std::path::Path) -> std::io::Result<std::process::Outp
 #[cfg(all(unix, not(target_os = "macos")))]
 fn run_sha256_tool(path: &std::path::Path) -> std::io::Result<std::process::Output> {
     std::process::Command::new("sha256sum")
-        .arg(&path.to_string_lossy())
+        .arg(path.as_os_str())
         .output()
 }
 
