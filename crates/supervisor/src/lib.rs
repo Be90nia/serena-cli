@@ -9092,7 +9092,9 @@ mod compact_locations_tests {
     /// `compact_loc` 3 件套：URI percent 解码 + 盘符大写 + 1-based 行/列。
     /// 输入 LSP 0-based line:9 char:4 → 期望人类 1-based "10:5"。
     #[test]
+    #[cfg(windows)]
     fn compact_loc_decodes_percent_and_normalizes_drive_and_one_based() {
+        // 盘符归一是 Windows 专有路径逻辑，unix 无盘符概念（v0.2.0 CI linux 实锤）。
         let s = compact_loc(&loc("file:///d%3A/proj/foo.rs", 9, 4));
         // 盘符大写归一 + percent 解码 + 1-based 行:列
         assert!(
