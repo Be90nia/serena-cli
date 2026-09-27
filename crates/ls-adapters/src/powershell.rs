@@ -333,9 +333,9 @@ mod tests {
         }
         let cache_dir = tempfile::tempdir().unwrap();
         // default_cache_root：Windows = {LOCALAPPDATA}/serena/ls；unix = $HOME/.local/share/serena/ls
-        // → fixture 根按平台拼（cache_root 本体），下带两层 id/version。
+        // → 注入 HOME/LOCALAPPDATA = tempdir 后，cache_root 本体按平台拼。
         let cache_root = if cfg!(windows) {
-            cache_dir.path().to_path_buf()
+            cache_dir.path().join("serena/ls")
         } else {
             cache_dir.path().join(".local/share/serena/ls")
         };
