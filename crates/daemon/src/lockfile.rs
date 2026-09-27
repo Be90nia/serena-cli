@@ -377,9 +377,11 @@ mod tests {
             token: "slow".into(),
         };
         write_final(&path, &slow).expect("write slow-owner lock");
-        // 700ms 后主人才 bind（> 单次 probe 500ms，< 宽限窗 ~1.4s）。
+        // 450ms 后主人才 bind：probe1@0ms、probe2@300ms 均未 bind（miss），
+        // probe3@600ms 必须命中 —— 700ms 会踩线（宽限窗 ~600ms，CI linux 调度
+        // 下三次探活全部早于 bind → 误判 stale 抢锁）。余量 150ms。
         let binder = std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(700));
+            std::thread::sleep(Duration::from_millis(450));
             std::net::TcpListener::bind(("127.0.0.1", 7867)).expect("bind 7867")
         });
         let out = try_become_daemon(&path, 7860).expect("arbitrate");
