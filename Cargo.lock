@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -828,7 +828,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "ls-adapters"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "ls-registry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ls-adapters",
  "ls-runtime",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "ls-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "reqwest",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "lsp-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "dunce",
@@ -1328,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "serena-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1424,7 +1424,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "supervisor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
