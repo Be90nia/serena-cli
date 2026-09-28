@@ -136,8 +136,9 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
 }
 
 impl TypescriptLanguageServerAdapter {
-    /// `on_server_ready` 将发出的探针 URI：优先 tsconfig/jsconfig 旁的真实 .ts 文件
-    /// （触发 tsserver 项目加载最有效）；无则退 root 通用探针；root 未设置退虚拟 URI。
+    /// `on_server_ready` 将发出的探针 URI：优先 tsconfig/jsconfig 项目内的真实 .ts
+    /// 文件（src/ 子树优先、退同目录，触发 tsserver 项目加载最有效）；无则退 root
+    /// 通用探针；root 未设置退虚拟 URI。
     fn probe_uri(&self) -> String {
         let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
         match root {
@@ -152,13 +153,43 @@ impl TypescriptLanguageServerAdapter {
     }
 
     /// ↖ mirror: typescript_language_server.py@43ae021 `_find_representative_source_file`
+    ///          ↖ mirror: @a4dff9e0 修订 —— tsconfig 同目录存在 src/ 子树时，优先递归
+    ///          取 src/ 内首个 `.ts`/`.tsx`（非 `.d.ts`），避免选中 tsconfig 旁被
+    ///          exclude 的根级工具配置（vitest.config.ts / jest.config.ts 等）。
     /// 浅层 walk root（跳 TS 专属 ignore 目录 + 文件数护栏），找 `tsconfig.json` /
-    /// `jsconfig.json` 同目录的首个 `.ts`/`.tsx`（非 `.d.ts`）—— tsconfig 位置即项目
-    /// 根标志，其旁文件最能触发 tsserver 的项目 lazy-load。
+    /// `jsconfig.json` 所在目录：首个命中目录即项目根，按「src/ 优先 → 同目录」顺位
+    /// 取代表文件；皆无则整体退通用探针（不再看其余目录）。
     fn tsconfig_adjacent_probe(&self, root: &Path) -> Option<String> {
         // 上游 TS 适配器 is_ignored_dirname 增补的三个目录（3.3 通用表之外 TS 特有集合）
         const TS_IGNORE: &[&str] = &["node_modules", "dist", "build", ".git"];
         const MAX_VISITED: usize = 500; // 护栏：异常大目录不全扫
+
+        // src/ 子树内递归找首个 .ts/.tsx（非 .d.ts），沿用 TS_IGNORE 过滤与护栏。
+        fn first_ts_in_tree(dir: &Path, visited: &mut usize) -> Option<PathBuf> {
+            let entries = std::fs::read_dir(dir).ok()?;
+            for entry in entries.flatten() {
+                *visited += 1;
+                if *visited > MAX_VISITED {
+                    return None; // 护栏熔断：不全扫，退下游兜底
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    if TS_IGNORE.contains(&name.as_ref()) {
+                        continue;
+                    }
+                    if let Some(p) = first_ts_in_tree(&entry.path(), visited) {
+                        return Some(p);
+                    }
+                } else if (name.ends_with(".ts") && !name.ends_with(".d.ts"))
+                    || name.ends_with(".tsx")
+                {
+                    return Some(entry.path());
+                }
+            }
+            None
+        }
 
         let mut stack = vec![(root.to_path_buf(), 0u8)];
         let mut visited = 0usize;
@@ -167,6 +198,7 @@ impl TypescriptLanguageServerAdapter {
                 continue;
             };
             let mut has_tsconfig = false;
+            let mut src_dir: Option<PathBuf> = None;
             let mut dir_ts: Option<PathBuf> = None;
             for entry in entries.flatten() {
                 visited += 1;
@@ -177,6 +209,9 @@ impl TypescriptLanguageServerAdapter {
                 let name = name.to_string_lossy();
                 let Ok(ft) = entry.file_type() else { continue };
                 if ft.is_dir() {
+                    if name == "src" && src_dir.is_none() {
+                        src_dir = Some(entry.path());
+                    }
                     if depth < 6 && !TS_IGNORE.contains(&name.as_ref()) {
                         stack.push((entry.path(), depth + 1));
                     }
@@ -189,8 +224,14 @@ impl TypescriptLanguageServerAdapter {
                     dir_ts = Some(entry.path());
                 }
             }
-            // 上游语义：只认 tsconfig 同目录的 .ts/.tsx —— 旁文件最有效触发项目加载
+            // 首个 tsconfig 目录即项目根：src/ 子树优先，其次同目录文件；皆无则整体
+            // 退通用探针（上游语义：不再看其余目录）。
             if has_tsconfig {
+                if let Some(src) = src_dir
+                    && let Some(p) = first_ts_in_tree(&src, &mut visited)
+                {
+                    return Some(lsp_core::docsync::path_to_uri_str(&p));
+                }
                 return dir_ts.map(|p| lsp_core::docsync::path_to_uri_str(&p));
             }
         }
@@ -202,9 +243,16 @@ impl TypescriptLanguageServerAdapter {
 mod tests {
     use super::*;
 
+    /// PROBE_ROOT 是进程级静态槽：cargo test 默认多线程并行，「set→use」会被另一
+    /// 测试的 set 插入（读到别人的 root 目录）。全程持锁串行。
+    static PROBE_ROOT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// 探针选 root 下真实文件（触发项目索引）；无候选文件退虚拟 URI（向后兼容）。
     #[test]
     fn probe_uri_real_file_then_fallback() {
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
         let adapter = TypescriptLanguageServerAdapter;
 
         let dir = tempfile::tempdir().unwrap();
@@ -222,6 +270,9 @@ mod tests {
     /// ↖ mirror: `_find_representative_source_file` —— tsconfig 同目录 .ts 优先于通用探针。
     #[test]
     fn probe_uri_prefers_tsconfig_adjacent_ts() {
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
         let adapter = TypescriptLanguageServerAdapter;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
@@ -239,6 +290,9 @@ mod tests {
     /// 比工程标记更能触发项目加载），.gitignore 仅在无语言源文件时兜底。
     #[test]
     fn probe_uri_falls_back_without_tsconfig() {
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
         let adapter = TypescriptLanguageServerAdapter;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
@@ -254,6 +308,9 @@ mod tests {
     /// node_modules 里的 tsconfig 不参与（上游 is_ignored_dirname 增补集）。
     #[test]
     fn tsconfig_probe_skips_node_modules() {
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
         let adapter = TypescriptLanguageServerAdapter;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
@@ -271,6 +328,9 @@ mod tests {
     /// tsserver 触发项目加载同样有效。
     #[test]
     fn probe_uri_ignores_d_ts() {
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
         let adapter = TypescriptLanguageServerAdapter;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
@@ -283,6 +343,72 @@ mod tests {
         assert!(
             uri.ends_with("legacy.d.ts"),
             "tsconfig-adjacent 不认 .d.ts 后应由语言扫描兜住: {uri}"
+        );
+    }
+
+    /// ↖ mirror: @a4dff9e0 —— tsconfig 旁有 src/ 子树时，src/ 内源文件优先于
+    /// tsconfig 旁被 exclude 的根级工具配置（vitest.config.ts）。
+    #[test]
+    fn probe_uri_prefers_src_subtree_over_root_config_ts() {
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
+        let adapter = TypescriptLanguageServerAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "").unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("vitest.config.ts"), "export default {};").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/app.ts"), "export const app = 1;").unwrap();
+        adapter.set_project_root(dir.path());
+        let uri = adapter.probe_uri();
+        assert!(
+            uri.ends_with("src/app.ts"),
+            "src/ 子树应优先于 tsconfig 旁工具配置: {uri}"
+        );
+    }
+
+    /// ↖ mirror: @a4dff9e0 —— 无 src/ 子树时保持旧行为：tsconfig 同目录 .ts 直接当选。
+    #[test]
+    fn probe_uri_picks_adjacent_ts_without_src_subtree() {
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
+        let adapter = TypescriptLanguageServerAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "").unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("a.ts"), "export const a = 1;").unwrap();
+        adapter.set_project_root(dir.path());
+        let uri = adapter.probe_uri();
+        assert!(
+            uri.ends_with("a.ts"),
+            "无 src/ 时仍应选 tsconfig 同目录 a.ts: {uri}"
+        );
+    }
+
+    /// src/ 子树内无可选源文件（仅 .d.ts）→ 退回 tsconfig 同目录 util.ts（不落通用探针）。
+    #[test]
+    fn probe_uri_falls_back_to_adjacent_when_src_has_no_ts() {
+        let _seq = PROBE_ROOT_TEST_LOCK
+            .lock()
+            .expect("PROBE_ROOT_TEST_LOCK poisoned");
+        let adapter = TypescriptLanguageServerAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "").unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("util.ts"), "export const u = 1;").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/types.d.ts"),
+            "declare const t: number;",
+        )
+        .unwrap();
+        adapter.set_project_root(dir.path());
+        let uri = adapter.probe_uri();
+        assert!(
+            uri.ends_with("util.ts"),
+            "src/ 无可选 .ts/.tsx 应回退同目录 util.ts: {uri}"
         );
     }
 

@@ -6,6 +6,7 @@ All notable changes to `serena-rust` are recorded here, ordered by phase. Anchor
 
 | commit | summary | key metric |
 |---|---|---|
+| (pending) | TS probe prefers `src/` subtree (mirror upstream a4dff9e0): tsconfig-adjacent representative file selection for tsserver warm-up now picks the first `.ts`/`.tsx` under `src/` before same-dir files, avoiding excluded root-level tool configs (`vitest.config.ts` etc.); mirror comment dual-anchored `@43ae021`+`@a4dff9e0`; + `PROBE_ROOT_TEST_LOCK` serializing 5 existing probe tests (parallel static-slot race) | `cargo test -p ls-adapters typescript` 9/9 (3 new cases); clippy `-D warnings` clean; upstream sync round 2026-09-28 (`local/upstream-sync-2026-09-28.md`, 28 commits reviewed, anchor → 7a296833) |
 | (pending v0.2.0) | 3-platform release support: `ProcessTreeGuard` unifies process-tree governance (Windows Job Object unchanged; Unix process_group+killpg, linux PR_SET_PDEATHSIG parent-death backstop, macos explicit-kill tradeoff documented) + win32job gated to cfg(windows) deps + release.yml matrix → windows/linux(x86_64-gnu)/macos(aarch64) + unix spawn tests; deps.rs unix compile fixes | dual-target zigbuild link-level green (x86_64-linux-gnu, aarch64-apple-darwin); Windows 66 suites / 677 tests zero regression; live CI verification pending |
 
 | commit | summary | key metric |
