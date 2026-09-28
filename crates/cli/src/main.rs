@@ -1089,6 +1089,57 @@ fn hover_ready(data: &serde_json::Value) -> bool {
     }
 }
 
+/// semantic 探针每轮 hover 候选符号上限：首符号 null 再试后续 1-2 个
+/// （bd serena-rust-7m8：csharp-ls 首符号 range=整声明行首 / astro 模板符号 hover 合法 null）。
+const SEMANTIC_PROBE_SYMBOLS: usize = 3;
+
+/// 行内定位符号名的 UTF-16 列（LSP Position.character 契约）；行内无该名 → None。
+fn name_column_in_line(line_text: &str, name: &str) -> Option<u32> {
+    let byte_col = line_text.find(name)?;
+    Some(line_text[..byte_col].chars().map(char::len_utf16).sum::<usize>() as u32)
+}
+
+/// semantic 档 hover 探针候选位置（bd serena-rust-7m8）：overview 符号数组 →
+/// 至多 [`SEMANTIC_PROBE_SYMBOLS`] 个「符号名自身」坐标。每符号 selectionRange.start
+/// 优先；无则读探针文件 range.start 行内找符号名文本（标识符偏移）；行内无该名 /
+/// 行越界（模板符号等）→ 退 range.start，保证仍有候选可试（不把假阴性换成丢探针）。
+fn hover_probe_positions(data: &serde_json::Value, file_text: Option<&str>) -> Vec<(u32, u32)> {
+    let Some(symbols) = data.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for sym in symbols.iter().take(SEMANTIC_PROBE_SYMBOLS) {
+        let sel_start = sym.get("selectionRange").and_then(|r| r.get("start"));
+        if let Some((line, col)) = sel_start.and_then(|s| {
+            Some((
+                s.get("line")?.as_u64()? as u32,
+                s.get("character")?.as_u64()? as u32,
+            ))
+        }) {
+            out.push((line, col));
+            continue;
+        }
+        let name = sym.get("name").and_then(|n| n.as_str());
+        let range_start = sym.get("range").and_then(|r| r.get("start"));
+        let (Some(name), Some(range_start)) = (name, range_start) else {
+            continue;
+        };
+        let Some(line) = range_start.get("line").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let start_col = range_start
+            .get("character")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let col = file_text
+            .and_then(|t| t.split('\n').nth(line as usize))
+            .and_then(|l| name_column_in_line(l.strip_suffix('\r').unwrap_or(l), name))
+            .unwrap_or(start_col);
+        out.push((line as u32, col));
+    }
+    out
+}
+
 /// 默认探测目标：项目内首个源文件（扩展名经 ls-registry 识别即算）。
 /// 浅深度优先（深度 ≤4），跳过 VCS/构建/依赖目录；找不到返回 None。
 fn find_first_source_file(root: &Path) -> Option<PathBuf> {
@@ -1169,9 +1220,10 @@ async fn probe_tool_call(
 }
 
 /// `wait-ready` 子命令（bd serena-rust-55m / bxd）：阻塞到所选档位就绪。
-/// 两段探测：overview 首符号非空（符号索引起）→ semantic 档再 hover 该位置
-/// contents 非空（类型分析起；未就绪响应带 we0 warning，`hover_ready` 解析即判据）。
-/// 就绪 exit 0（stderr 'ready in NNs'）；超时 exit 4。进度行带阶段
+/// 两段探测：overview 首符号非空（符号索引起）→ semantic 档再逐符号 hover 其
+/// 符号名坐标（selectionRange / range 内 name 文本定位；bd serena-rust-7m8），
+/// contents 非空即就绪（类型分析起；未就绪响应带 we0 warning，`hover_ready`
+/// 解析即判据）。就绪 exit 0（stderr 'ready in NNs'）；超时 exit 4。进度行带阶段
 /// （`probe #N symbol-pending` / `probe #N symbol-ok hover-pending`）。
 async fn cmd_wait_ready(
     cli: &Cli,
@@ -1224,7 +1276,7 @@ async fn cmd_wait_ready(
     let mut round = 0usize;
     loop {
         // 段 1：符号索引——overview 首符号位置（LSP 0-based，wire 契约直接透传）。
-        let hit_pos = probe_tool_call(
+        let overview = probe_tool_call(
             &client,
             &base,
             &token,
@@ -1233,9 +1285,14 @@ async fn cmd_wait_ready(
             json!({"file": rel}),
             lang.as_deref(),
         )
-        .await
-        .ok()
-        .and_then(|data| {
+        .await;
+        if let Err(e) = &overview {
+            // 7m8 观测补口：.ok() 静默吞错会让「恒 symbol-pending」无法与「真未就绪」
+            // 区分（实例：token 失配 403 / LS spawn 失败被误读为索引未就绪）。
+            eprintln!("probe overview error (keep waiting): {e}");
+        }
+        let overview = overview.ok();
+        let symbol_up = overview.as_ref().and_then(|data| {
             data.get(0)
                 .and_then(|h| h.get("range"))
                 .and_then(|r| r.get("start"))
@@ -1246,38 +1303,47 @@ async fn cmd_wait_ready(
                     ))
                 })
         });
-        if let Some((line, col)) = hit_pos {
+        if symbol_up.is_some() {
             if stage == WaitStage::Symbol {
                 eprintln!("ready (symbol) in {}s", started.elapsed().as_secs());
                 return ExitCode::SUCCESS;
             }
-            // 段 2：类型分析——hover 首符号位置（we0 warning = 未就绪标记）。
-            // 探测期瞬态（RA -32801 content modified / 连接抖动）≠ 确认就绪，
-            // 一律退避续等到 deadline——等待语义不做硬失败。
-            match probe_tool_call(
-                &client,
-                &base,
-                &token,
-                &root,
-                "hover",
-                json!({"file": rel, "line": line, "col": col}),
-                lang.as_deref(),
-            )
-            .await
-            {
-                Ok(data) if hover_ready(&data) => {
-                    eprintln!("ready in {}s", started.elapsed().as_secs());
-                    return ExitCode::SUCCESS;
+            // 段 2：类型分析——标识符偏移探针（bd serena-rust-7m8）：hover 逐符号打在
+            // 符号名起点（selectionRange / range 内 name 文本定位；首符号 null 再试后续
+            // —— csharp-ls range.start=行首 / astro 模板符号 hover 合法 null）。
+            // we0 warning / 全候选未就绪 → pending 续等；探测期瞬态 ≠ 确认就绪，
+            // 等待语义不做硬失败，超时判据不变。
+            let file_text = std::fs::read_to_string(&probe_path).ok();
+            let positions = overview
+                .as_ref()
+                .map(|data| hover_probe_positions(data, file_text.as_deref()))
+                .unwrap_or_default();
+            for (line, col) in positions {
+                match probe_tool_call(
+                    &client,
+                    &base,
+                    &token,
+                    &root,
+                    "hover",
+                    json!({"file": rel, "line": line, "col": col}),
+                    lang.as_deref(),
+                )
+                .await
+                {
+                    Ok(data) if hover_ready(&data) => {
+                        eprintln!("ready in {}s", started.elapsed().as_secs());
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("probe error (keep waiting): {e}"),
                 }
-                Ok(_) => {}
-                Err(e) => eprintln!("probe error (keep waiting): {e}"),
             }
         }
         if Instant::now() >= deadline {
             eprintln!("wait-ready: not ready within {timeout_secs}s");
             return ExitCode::from(4);
         }
-        let progress = if hit_pos.is_some() {
+        let progress = if symbol_up.is_some() {
             "symbol-ok hover-pending"
         } else {
             "symbol-pending"
@@ -3118,6 +3184,60 @@ mod net_retry_tests {
         assert!(hover_ready(&json!({"contents": {"value": "fn hello"}})));
         assert!(hover_ready(&json!({"contents": [{"value": "x"}]})));
         assert!(hover_ready(&json!({"contents": "plain text"})));
+    }
+
+    // ---- bd serena-rust-7m8：semantic 探针标识符偏移 ----
+
+    #[test]
+    fn probe_positions_prefers_selection_range() {
+        // wire 带 selectionRange → 直接用其 start，不查文件文本。
+        let wire = json!([
+            {"name": "Foo", "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 16}},
+             "selectionRange": {"start": {"line": 2, "character": 13}, "end": {"line": 2, "character": 16}}}
+        ]);
+        assert_eq!(
+            hover_probe_positions(&wire, Some("public class Foo")),
+            vec![(2, 13)]
+        );
+    }
+
+    #[test]
+    fn probe_positions_locate_symbol_name_in_range_line() {
+        // 无 selectionRange → range.start 行内按 name 文本定位（UTF-16 列）。
+        let wire = json!([
+            {"name": "Greeter", "range": {"start": {"line": 2, "character": 0}, "end": {"line": 4, "character": 1}}}
+        ]);
+        let text = "namespace App;\n\npublic class Greeter\n{\n}\n";
+        assert_eq!(
+            hover_probe_positions(&wire, Some(text)),
+            vec![(2, 13)],
+            "hover 落在 Greeter 的 G（'public class ' = 13 列），非行首"
+        );
+        // UTF-16 偏移：非 ASCII 前缀按 code unit 计列，不是字节/char 混算。
+        let wire_cjk = json!([
+            {"name": "值", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 8}}}
+        ]);
+        assert_eq!(
+            hover_probe_positions(&wire_cjk, Some("let 值 = 1;")),
+            vec![(0, 4)]
+        );
+    }
+
+    #[test]
+    fn probe_positions_fall_back_and_null_hovers_stay_pending() {
+        // name 不在 range.start 行（模板/复合符号形态）或行越界 → 退 range.start，
+        // 候选不丢；全 null hover 响应仍判 pending（等待语义不变，超时判据兜底）。
+        let wire = json!([
+            {"name": "p", "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 9}}},
+            {"name": "q", "range": {"start": {"line": 9, "character": 2}, "end": {"line": 9, "character": 12}}}
+        ]);
+        assert_eq!(
+            hover_probe_positions(&wire, Some("<div>\n</div>")),
+            vec![(0, 4), (9, 2)]
+        );
+        // 全 null/空 hover → hover_ready 全 false → 循环判 pending（非假阳性）。
+        assert!(!hover_ready(&serde_json::Value::Null));
+        assert!(!hover_ready(&json!({"contents": null})));
     }
 
     #[test]

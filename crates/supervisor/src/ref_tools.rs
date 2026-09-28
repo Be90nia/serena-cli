@@ -215,6 +215,70 @@ fn semantic_session_for_file(
     std::sync::Arc::clone(session)
 }
 
+/// astro `.astro` 出发的双查合并是否适用：宿主语言是 astro 且目标文件是 `.astro`。
+/// ts/js 系文件已由 `semantic_session_for_file` 纯伴生路由覆盖，不进双查。
+fn astro_companion_applicable(language_id: &str, file: &Path) -> bool {
+    language_id == "astro"
+        && file
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("astro"))
+}
+
+/// 主+伴生两路 `Location` 按 (uri, line, col) 去重合并，主路优先。
+/// ↖ mirror: astro_language_server.py@7a296833 `_deduplicate_reference_locations`。
+fn merge_reference_locations(primary: Vec<Location>, companion: Vec<Location>) -> Vec<Location> {
+    let mut seen = HashSet::with_capacity(primary.len() + companion.len());
+    let mut out = Vec::with_capacity(primary.len() + companion.len());
+    for loc in primary.into_iter().chain(companion) {
+        let key = (
+            loc.uri.as_str().to_string(),
+            loc.range.start.line,
+            loc.range.start.character,
+        );
+        if seen.insert(key) {
+            out.push(loc);
+        }
+    }
+    out
+}
+
+/// astro `.astro` 出发的 references 主+伴生双查合并：主 astro-ls 对 .ts 文件侧
+/// 引用恒空（真机帧录制实证），伴生 TS LS 补齐（↖ mirror: 同上 `request_references`
+/// `_is_astro_file` 分支）。伴生缺失/查询失败降级主查结果（上游 try/except 同款，
+/// 不新增失败模式）；不适用场景原样返回 primary（其余语言逐字节不变）。
+async fn fetch_references_with_astro_companion(
+    session: &Arc<Session>,
+    root: &Path,
+    abs_file: &Path,
+    line: u32,
+    col: u32,
+    primary: Vec<Location>,
+) -> Vec<Location> {
+    if !astro_companion_applicable(&session.language_id(), abs_file) {
+        return primary;
+    }
+    let Some(companion) = ls_registry::adapter_for(&session.language_id())
+        .and_then(|a| a.semantic_session(root))
+    else {
+        tracing::warn!(
+            root = %root.display(),
+            "astro companion semantic session unavailable; using primary only"
+        );
+        return primary;
+    };
+    match fetch_references(&companion, abs_file, line, col).await {
+        Ok(companion_refs) => merge_reference_locations(primary, companion_refs),
+        Err(e) => {
+            tracing::warn!(
+                file = %abs_file.display(),
+                error = %e,
+                "astro companion TS references failed; falling back to primary only"
+            );
+            primary
+        }
+    }
+}
+
 pub async fn find_referencing_symbols(
     session: &Arc<Session>,
     root: &Path,
@@ -225,12 +289,17 @@ pub async fn find_referencing_symbols(
     // hybrid 双服务器语言（astro）的 per-file 路由：ts/js 系文件的引用语义只在伴生
     // TS LS（↖ mirror: astro_language_server.py@7a296833 `request_references` 对
     // `_is_ts_file` 路由伴生；主 astro-ls 对 .ts 文件 references 恒空 —— 真机帧录制
-    // 实证）。`.astro` 与其余扩展名留主会话（主 LS 主业；上游主+伴生双查合并不做 ——
-    // ponytail: 单查已满足跨文件断言，合并召回等真需要 .astro 出发的全量引用再加）。
-    let session = semantic_session_for_file(session, root, file);
+    // 实证）。`.astro` 留主会话查一次，再由 `fetch_references_with_astro_companion`
+    // 补伴生 TS 侧引用并去重合并（上游 `_is_astro_file` 分支主+伴生双查语义）。
+    // 伴生查找用 canon_root：COMPANION 槽的 key 是 `Supervisor::key` 的 canonical
+    // 形态，CLI 原始 root 形态不等时 `r == root` 失配 → 伴生永远查不到。
     let canon_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let session = semantic_session_for_file(session, &canon_root, file);
     let abs_file = canon_root.join(file);
     let refs = fetch_references(&session, &abs_file, line, col).await?;
+    let refs =
+        fetch_references_with_astro_companion(&session, &canon_root, &abs_file, line, col, refs)
+            .await;
 
     let mut by_file: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
     for loc in refs {
@@ -340,10 +409,13 @@ pub async fn find_referencing_code_snippets(
     context_lines: u32,
     max_results: usize,
 ) -> RefResult<Vec<RefSnippetHit>> {
-    let session = semantic_session_for_file(session, root, file);
     let canon_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let session = semantic_session_for_file(session, &canon_root, file);
     let abs_file = canon_root.join(file);
     let refs = fetch_references(&session, &abs_file, line, col).await?;
+    let refs =
+        fetch_references_with_astro_companion(&session, &canon_root, &abs_file, line, col, refs)
+            .await;
 
     let mut cache: HashMap<String, String> = HashMap::new();
     let mut out = Vec::new();
@@ -400,6 +472,7 @@ pub async fn find_referencing_code_snippets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     fn hit(file: &str, container: &str, line: u32, col: u32) -> RefSymbolHit {
         RefSymbolHit {
@@ -467,5 +540,77 @@ mod tests {
         assert_eq!(r.groups[0].samples[0].line, 0);
         assert_eq!(r.groups[0].samples[1].line, 1);
         assert_eq!(r.groups[0].samples[2].line, 2);
+    }
+
+    fn loc(uri: &str, line: u32, col: u32) -> Location {
+        Location {
+            uri: lsp_types::Uri::from_str(uri).expect("valid uri"),
+            range: Range {
+                start: Position::new(line, col),
+                end: Position::new(line, col),
+            },
+        }
+    }
+
+    #[test]
+    fn merge_reference_locations_dedupes_overlapping() {
+        let primary = vec![loc("file:///w/a.astro", 3, 4), loc("file:///w/b.ts", 5, 6)];
+        let companion = vec![
+            loc("file:///w/b.ts", 5, 6), // 与 primary 重叠 → 舍弃伴生份
+            loc("file:///w/c.ts", 7, 8),
+        ];
+        let merged = merge_reference_locations(primary, companion);
+        let keys: Vec<(String, u32, u32)> = merged
+            .iter()
+            .map(|l| {
+                (
+                    l.uri.as_str().to_string(),
+                    l.range.start.line,
+                    l.range.start.character,
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("file:///w/a.astro".into(), 3, 4),
+                ("file:///w/b.ts".into(), 5, 6),
+                ("file:///w/c.ts".into(), 7, 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_reference_locations_companion_missing_degrades_to_primary() {
+        let primary = vec![loc("file:///w/a.astro", 3, 4)];
+        // 伴生缺失（空）→ 主查结果原样保留，不新增也不丢条目
+        let merged = merge_reference_locations(primary, vec![]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].uri.as_str(), "file:///w/a.astro");
+        assert_eq!(merged[0].range.start.line, 3);
+    }
+
+    #[test]
+    fn astro_companion_applicable_only_for_astro_astro_files() {
+        assert!(astro_companion_applicable(
+            "astro",
+            Path::new("src/pages/index.astro")
+        ));
+        // 扩展名大小写不敏感（Windows 常见）
+        assert!(astro_companion_applicable(
+            "astro",
+            Path::new("src/pages/index.ASTRO")
+        ));
+        // ts/js 系文件走纯伴生路由，不进双查
+        assert!(!astro_companion_applicable("astro", Path::new("src/utils/fmt.ts")));
+        // 非 astro 宿主语言不动
+        assert!(!astro_companion_applicable(
+            "typescript",
+            Path::new("src/pages/index.astro")
+        ));
+        assert!(!astro_companion_applicable(
+            "rust",
+            Path::new("src/lib.rs")
+        ));
     }
 }
