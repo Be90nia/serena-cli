@@ -42,7 +42,7 @@ Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `
 
 vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses), plus the long tail (`documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint`) — all landed and verified 2026-09-23; `document-link`/`moniker` return empty on LS without the capability (e.g. rust-analyzer stable).
 
-### Language servers (12 of 73 in upstream catalog)
+### Language servers (14 of 73 in upstream catalog)
 
 | Lang | Server | Status | Notes |
 |---|---|---|---|
@@ -58,8 +58,12 @@ vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent
 | PowerShell | PowerShellEditorServices | ready (download) | requires `pwsh` 7+; bundled PSScriptAnalyzer diagnostics |
 | Vue | @vue/language-server | ready (npm, hybrid) | companion typescript-language-server with `@vue/typescript-plugin`; semantic hover/routing live, diagnostics via tsserver bridge pending |
 | Astro | @astrojs/language-server | ready (npm, hybrid) | companion typescript-language-server with `@astrojs/ts-plugin` (upstream `7a296833`); ts/js refs route to companion, `.astro` semantic hover live |
+| Docker | docker-langserver | ready (npm) | `Dockerfile*` (incl. `Dockerfile.dev` variants) + `*.dockerfile`; didOpen languageId sent as `dockerfile` |
+| SQL | sqls | ready (download) | `*.sql`; session/syntax layer live (formatting works), semantic hover/def need a `sqls` config (DB connection); no documentSymbol/references capability |
+| PostgreSQL | postgres-language-server (pgls) | ready (download) | `--lang pgsql` (`.sql` defaults to the sql entry); syntax diagnostics live without a DB (libpg_query local parser); documentSymbol/schema hover need a DB connection — LS capability boundary |
+| MySQL | sqls | ready (download) | `--lang mysql`; same sqls binary as the sql entry (separate cache dir); hover/diagnostics need a DB connection (LS warns "no database connection") |
 
-All 12 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; bash, json, powershell, vue — 2026-09-25; astro — 2026-09-28; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / per-adapter reports `local/report-*-adapter.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
+All 16 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; bash, json, powershell, vue — 2026-09-25; astro — 2026-09-28; docker, sql — 2026-09-28; postgresql, mysql — 2026-09-28; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / per-adapter reports `local/report-*-adapter.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
 
 ## Install
 

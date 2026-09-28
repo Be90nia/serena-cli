@@ -56,12 +56,19 @@ pub enum LanguageId {
     Java,
     /// T0 配置驱动（servers.toml，Task 19）：无手写 T2 适配器的语言从 here 起。
     Markdown,
+    /// T0 配置驱动（bd 56a 第一批，Δ 自有设计：上游 serena 无 docker/sql 注册）。
+    Docker,
+    Sql,
     Bash,
     Json,
     PowerShell,
     Vue,
     /// T2 手写双服务器适配器（astro.rs，上游 7a296833）。
     Astro,
+    /// T0 配置驱动（bd 56a 第二批，Δ 上游无此语言）：.sql 扩展名归 sql 门，
+    /// 本两门经 `--lang pgsql|mysql` 显式路由到 servers.toml 条目，无扩展名映射。
+    Pgsql,
+    Mysql,
 }
 
 impl LanguageId {
@@ -75,11 +82,15 @@ impl LanguageId {
             Self::CSharp => "csharp",
             Self::Java => "java",
             Self::Markdown => "markdown",
+            Self::Docker => "docker",
+            Self::Sql => "sql",
             Self::Bash => "bash",
             Self::Json => "json",
             Self::PowerShell => "powershell",
             Self::Vue => "vue",
             Self::Astro => "astro",
+            Self::Pgsql => "pgsql",
+            Self::Mysql => "mysql",
         }
     }
     /// 反向：lang 字符串 → LanguageId。未知返 None。
@@ -93,11 +104,15 @@ impl LanguageId {
             "csharp" => Some(Self::CSharp),
             "java" => Some(Self::Java),
             "markdown" => Some(Self::Markdown),
+            "docker" => Some(Self::Docker),
+            "sql" => Some(Self::Sql),
             "bash" => Some(Self::Bash),
             "json" => Some(Self::Json),
             "powershell" | "pwsh" => Some(Self::PowerShell),
             "vue" => Some(Self::Vue),
             "astro" => Some(Self::Astro),
+            "pgsql" | "postgres" => Some(Self::Pgsql),
+            "mysql" => Some(Self::Mysql),
             _ => None,
         }
     }
@@ -115,11 +130,15 @@ impl LanguageId {
             "cs" => Some(Self::CSharp),
             "java" => Some(Self::Java),
             "md" | "markdown" => Some(Self::Markdown),
+            "sql" => Some(Self::Sql),
+            "dockerfile" => Some(Self::Docker),
             "sh" | "bash" => Some(Self::Bash),
             "json" | "jsonc" => Some(Self::Json),
             "ps1" | "psm1" | "psd1" => Some(Self::PowerShell),
             "vue" => Some(Self::Vue),
             "astro" => Some(Self::Astro),
+            // pgsql/mysql（bd 56a）无专属扩展名：.sql 归 Sql 门（上游 get_priority
+            // superset 的默认归属语义），本两门经 --lang pgsql|mysql 显式路由。
             _ => None,
         }
     }
@@ -184,11 +203,14 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::TypeScript => &["ts", "tsx", "js", "jsx"],
         // T0 注册语言，无 T2 适配器/LS 就绪门语义；探针走工程标记名单。
         LanguageId::Markdown => &[],
+        LanguageId::Docker => &["dockerfile"],
+        LanguageId::Sql => &["sql"],
         LanguageId::Bash => &["sh", "bash"],
         LanguageId::Json => &["json"],
         LanguageId::PowerShell => &["ps1", "psm1", "psd1"],
         LanguageId::Vue => &["vue"],
         LanguageId::Astro => &["astro"],
+        LanguageId::Pgsql | LanguageId::Mysql => &[],
     }
 }
 

@@ -29,6 +29,10 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(300);
 const MGMT_TIMEOUT: Duration = Duration::from_secs(3);
 /// lazy-spawn 后等 daemon 就绪的总窗口。
 const SPAWN_WAIT: Duration = Duration::from_secs(10);
+/// 残留 daemon 端口探活超时（bd 3ab）。
+const RESIDUAL_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+/// 终止残留进程后等 listen socket 释放再复测的间隔。
+const REAP_RECHECK_DELAY: Duration = Duration::from_millis(300);
 
 /// bd de4：负载波峰下 loopback connect 瞬断实测 5-10%（daemon accept 处理不过来）。
 /// 客户端 4 次指数退避（50/100/200/400ms）实测 12 线程并发 0% 错误（T2 验证；
@@ -2287,10 +2291,12 @@ async fn cmd_status(lock_path: &Path) -> ExitCode {
     }
 }
 
-/// `stop-all` 子命令：POST /shutdown + 删 lock。
+/// `stop-all` 子命令：POST /shutdown + 删 lock；锁缺失时按端口探活兜底清残留（bd 3ab）。
 async fn cmd_stop_all(lock_path: &Path) -> ExitCode {
     let Some(entry) = daemon::lockfile::read(lock_path).unwrap_or(None) else {
         println!("daemon: not running");
+        // bd 3ab：锁已删但残留 daemon 仍占 7860 时，这里是管辖真空——探活兜底。
+        reap_residual_listener(7860);
         return ExitCode::SUCCESS;
     };
     let client = http_client();
@@ -2315,6 +2321,148 @@ async fn cmd_stop_all(lock_path: &Path) -> ExitCode {
             eprintln!("shutdown probe failed: {other:?}; lock left for lazy-spawn arbitration");
             ExitCode::from(3)
         }
+    }
+}
+
+/// bd 3ab：锁不在但端口仍有 listener = 残留 daemon（lazy-spawn 被 kill 脱管/超时
+/// 截断的产物），后续 lazy-spawn bind 失败或请求打到老进程。按端口反查 PID：
+/// 是自家映像才终止并复测确认；反查失败/非自家进程只告警不动手（防误杀）。
+fn reap_residual_listener(port: u16) {
+    if !port_has_listener(port) {
+        return;
+    }
+    eprintln!("warning: lock absent but 127.0.0.1:{port} still has a listener (residual daemon?)");
+    let Some(pid) = listener_pid_on_port(port) else {
+        eprintln!("{}", residual_warn_msg(None, port));
+        return;
+    };
+    match pid_process_name(pid).as_deref() {
+        Some(name) if is_serena_daemon_image(name) => {
+            if kill_process(pid) {
+                // listen socket 释放非原子，短暂等待后复测。
+                std::thread::sleep(REAP_RECHECK_DELAY);
+                if port_has_listener(port) {
+                    eprintln!("{}", residual_warn_msg(Some(pid), port));
+                } else {
+                    eprintln!("residual daemon pid={pid} on port {port} terminated");
+                }
+            } else {
+                eprintln!("{}", residual_warn_msg(Some(pid), port));
+            }
+        }
+        Some(other) => {
+            eprintln!("warning: port {port} held by non-daemon process {other} (pid {pid}); not killing")
+        }
+        None => eprintln!("{}", residual_warn_msg(Some(pid), port)),
+    }
+}
+
+/// loopback 端口是否有 listener（TCP connect 探测，500ms 封顶）。
+fn port_has_listener(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, RESIDUAL_PROBE_TIMEOUT).is_ok()
+}
+
+/// 按端口反查 LISTENING 进程 PID；反查工具缺失/无命中 → None。
+fn listener_pid_on_port(port: u16) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("netstat")
+            .args(["-ano", "-p", "TCP"])
+            .output()
+            .ok()?;
+        parse_netstat_listeners(&String::from_utf8_lossy(&out.stdout), port)
+    }
+    #[cfg(not(windows))]
+    {
+        let out = std::process::Command::new("lsof")
+            .args(["-t", "-nP", "-sTCP:LISTEN", &format!("-iTCP:{port}")])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
+}
+
+/// `netstat -ano -p TCP` 输出按端口反查 LISTENING PID（纯函数，跨平台单测锚）。
+/// 行形态：`  TCP    127.0.0.1:7860    0.0.0.0:0    LISTENING    4092`。
+fn parse_netstat_listeners(output: &str, port: u16) -> Option<u32> {
+    let suffix = format!(":{port}");
+    output.lines().find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 5
+            && cols[0].eq_ignore_ascii_case("tcp")
+            && cols[3].eq_ignore_ascii_case("LISTENING")
+            && cols[1].ends_with(&suffix)
+        {
+            cols[4].parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// PID 对应进程映像名（tasklist/ps）；查询失败或无匹配 → None。
+#[cfg(windows)]
+fn pid_process_name(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next()?;
+    // 无匹配时 tasklist 输出本地化提示语，非 CSV 引号行。
+    if !line.starts_with('"') {
+        return None;
+    }
+    line.trim_matches('"').split("\",\"").next().map(str::to_string)
+}
+
+#[cfg(not(windows))]
+fn pid_process_name(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// 只对自家映像动手：现名 serena-cli（兼容更名前 cli.exe 旧残留）。
+fn is_serena_daemon_image(name: &str) -> bool {
+    ["serena-cli.exe", "serena-cli", "cli.exe", "cli"]
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
+}
+
+/// 终止进程：Windows taskkill /F；Unix kill -9。成功与否看 exit code。
+#[cfg(windows)]
+fn kill_process(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn kill_process(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// 无法自动清理时的 stderr 告警（pid 反查失败走手动 netstat 分支）。
+fn residual_warn_msg(pid: Option<u32>, port: u16) -> String {
+    match pid {
+        Some(p) => format!("残留 daemon pid={p} 仍占端口 {port}，请手动 taskkill /F /PID {p}"),
+        None => format!("端口 {port} 仍有 listener 但反查 PID 失败，请手动 netstat -ano 查占并 taskkill"),
     }
 }
 
@@ -3319,5 +3467,46 @@ mod net_retry_tests {
         let hit = find_first_source_file(&tmp).unwrap();
         assert_eq!(hit, tmp.join("zmain.py"), "target/ 被跳过");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+}
+
+/// bd 3ab：残留 daemon 探活兜底的纯函数锚（netstat 解析 / 告警文案 / 映像白名单）。
+#[cfg(test)]
+mod residual_reap_tests {
+    use super::*;
+
+    /// 中文 Windows netstat 表头 + 同端口非 LISTENING 行必须跳过。
+    #[test]
+    fn netstat_parse_hits_listen_row_skips_established_and_headers() {
+        let out = "\r\n 活动连接\r\n\r\n  Proto  本地地址          远程地址        状态           PID\r\n  TCP    127.0.0.1:7860    5.6.7.8:443           ESTABLISHED     999\r\n  TCP    127.0.0.1:7860    0.0.0.0:0              LISTENING       4092\r\n  TCP    [::]:7860         [::]:0                 LISTENING       111\r\n  UDP    127.0.0.1:7860    *:*                                    333\r\n";
+        assert_eq!(parse_netstat_listeners(out, 7860), Some(4092));
+    }
+
+    #[test]
+    fn netstat_parse_ignores_other_ports_and_port_number_suffixes() {
+        // :17860 不得因 ends_with 误命中 :7860
+        let out = "  TCP    0.0.0.0:17860     0.0.0.0:0              LISTENING       111\r\n  TCP    0.0.0.0:7861      0.0.0.0:0              LISTENING       222\r\n";
+        assert_eq!(parse_netstat_listeners(out, 7860), None);
+        assert_eq!(parse_netstat_listeners(out, 7861), Some(222));
+    }
+
+    #[test]
+    fn residual_warn_msg_names_pid_and_port_and_manual_action() {
+        let m = residual_warn_msg(Some(4092), 7860);
+        assert!(
+            m.contains("4092") && m.contains("7860") && m.contains("taskkill"),
+            "{m}"
+        );
+        let m = residual_warn_msg(None, 7860);
+        assert!(m.contains("7860") && m.contains("netstat"), "{m}");
+    }
+
+    #[test]
+    fn serena_image_match_is_case_insensitive_and_excludes_foreign() {
+        assert!(is_serena_daemon_image("serena-cli.exe"));
+        assert!(is_serena_daemon_image("SERENA-CLI.EXE"));
+        assert!(is_serena_daemon_image("cli.exe"));
+        assert!(!is_serena_daemon_image("python.exe"));
+        assert!(!is_serena_daemon_image("serena-cli-helper.exe"));
     }
 }

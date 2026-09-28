@@ -1210,3 +1210,110 @@ install = "source"
 repo = "https://github.com/elbywan/crystalline"
 build_cmd = ["shards", "build", "--release"]
 bin_rel = "bin/crystalline"
+
+# ---- bd 56a 第一批（Δ 自有设计：上游 serena 无 docker/sql 注册，无 mirror 锚；
+# source_commit 省略 = Δ 标注）----
+
+[servers.docker]
+languages = ["docker"]
+extensions = [".dockerfile"]
+install = "npm"
+# npm 一手数据（registry.npmjs.org/…/latest，2026-09-28）：bin 名实为 docker-langserver
+# （包 bin 字段），非包名。T0 配置驱动会话；LSP didOpen languageId 用官方 "dockerfile"
+# （ls-registry::lsp_language_id 统一换算）。Dockerfile 主形态无扩展名，探测走
+# file_detect by_filename（.dockerfile 扩展名归 EXT_TABLE）。
+[servers.docker.npm]
+package = "dockerfile-language-server-nodejs"
+version = "0.15.0"
+bin_rel = "docker-langserver"
+npm_args = ["--stdio"]
+
+[servers.sql]
+languages = ["sql"]
+extensions = [".sql"]
+install = "download"
+exec = ["{bin}"]
+# sqls GitHub release 无 SHA256SUMS 文件；sha256 真值锚 = GitHub API assets[].digest
+# （v0.2.48，2026-09-28）+ 本机下载实测双锚一致——无需 jdtls-exception 信任锚降级。
+# 裸启动即 stdio（0.2.48 无 --stdio flag，`sqls --stdio` 报 "flag provided but not
+# defined" exit 1——真机实测）。
+# 能力边界（裸探针 + daemon 双实锤 2026-09-28）：无 config（DB 连接）时 hover/def/
+# completion 内容全空；formatting 真实输出（语法层活）；capability 无 documentSymbol/
+# references/diagnostics——语义三关的 hover/表名内容需用户自配 sqls config，非接线缺陷。
+# 平台组策略同 A 类先例（单值 bin_path 仅容 windows 组：zip 根 sqls.exe）；上游仅
+# 三个资产（windows/linux/darwin 各一，未按 arch 分拆），其余形态待上游细分。
+[servers.sql.download]
+version = "0.2.48"
+archive = "zip"
+bin_path = "sqls.exe"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.sql.download.url_per_platform]
+"windows-x86_64" = "https://github.com/sqls-server/sqls/releases/download/v0.2.48/sqls-windows-0.2.48.zip"
+
+[servers.sql.download.sha256_per_platform]
+"windows-x86_64" = "df6453b2ddcb4e748547d0288b826251a24af099749dc7a9ddea587aac3d4365"
+# 其余平台资产（bin_path 互异：unix zip 根为 sqls 无 .exe，单值字段仅容一组）：
+#   linux-x86_64: sqls-linux-0.2.48.zip
+#     sha256 30047b92c41658c821b7803d2c2a3a1ce4e17ee769ceff6f24bb9e3daaf5d4dc
+#     bin sqls
+#   macos（darwin 未分 arch，保守不启用）: sqls-darwin-0.2.48.zip
+#     sha256 b44165ca597a4b4298d56657bc911aa3ca8a591befefde4e29566923c6229f3d
+#     bin sqls
+
+# ---- bd 56a 第二批（Δ 自有设计：上游 serena 无 pgsql/mysql 注册，无 mirror 锚；
+# source_commit 省略 = Δ 标注）。.sql 扩展名归 sql 门（EXT_TABLE），本两门无扩展名
+# 路由，经 --lang pgsql|mysql 显式路由到本两条目 ----
+
+[servers.pgls]
+# supabase-community/postgres-language-server（pgls，Rust）。LSP 入口是 `lsp-proxy`
+# 子命令（裸跑 = CLI 帮助即退，非 stdio LS）。无 DB 连接时语法诊断可用（libpg_query
+# 本地 parser，真机实测 broken.sql 推 2 条语法错）；documentSymbol/workspaceSymbol/
+# definition 无 capability（符号层 hover 需 DB 连接 —— LS 能力边界，非接线缺陷）。
+languages = ["pgsql"]
+install = "download"
+exec = ["{bin}", "lsp-proxy"]
+
+[servers.pgls.download]
+version = "0.25.7"
+archive = "raw"
+bin_path = "postgres-language-server.exe"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.pgls.download.url_per_platform]
+"windows-x86_64" = "https://github.com/supabase-community/postgres-language-server/releases/download/0.25.7/postgres-language-server_x86_64-pc-windows-msvc.exe"
+
+[servers.pgls.download.sha256_per_platform]
+"windows-x86_64" = "9b67d59032275810e76e3557ad06c700c7b6cd71a8e3fac7656b926cc5603248"
+# 其余平台资产（raw 裸文件无 .exe 后缀，单值字段仅容 windows 组）：
+#   linux-x86_64: postgres-language-server_x86_64-unknown-linux-gnu
+#     sha256 d48346664b55b396dbc1aca4fcb0308d6e6c311803d6e4c57da2d9fc547466c4
+#   linux-aarch64: postgres-language-server_aarch64-unknown-linux-gnu
+#     sha256 b176bea67ce666045fc1697ac4a867516e4ac2847e6c1d3d7f356c2e2b541162
+#   macos-x86_64: postgres-language-server_x86_64-apple-darwin
+#     sha256 d133f1c32232f781855137cec75b64230a5340161351a4e9afc5e3cfb566cb93
+#   macos-aarch64: postgres-language-server_aarch64-apple-darwin
+#     sha256 f153d1f4a3f903e3cc3fa5999b66dce39e37fc3b84000bb88935a1794d20bf17
+# sha256 锚 = release 页 expanded_assets 官方标注（0.25.7），本机下载实测一致。
+
+[servers.sqls-mysql]
+# 与 sql 门（[servers.sql]）同一 sqls 二进制（v0.2.48 同 zip 同 sha256），仅语言名
+# 不同（language_routes_are_unique 约束：sql/pgsql/mysql 各自独立路由）；缓存目录
+# 按 id 分落（sqls-mysql/0.2.48/），10MB 冗余换零跨条目共享机制。无 DB 连接时
+# hover/definition/诊断静默（LS 侧显式 "no database connection" 警告，能力边界）；
+# 方言差异（ENGINE=InnoDB 等）无 DB 语法层不参与评估。
+languages = ["mysql"]
+install = "download"
+
+[servers.sqls-mysql.download]
+version = "0.2.48"
+archive = "zip"
+bin_path = "sqls.exe"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.sqls-mysql.download.url_per_platform]
+"windows-x86_64" = "https://github.com/sqls-server/sqls/releases/download/v0.2.48/sqls-windows-0.2.48.zip"
+
+[servers.sqls-mysql.download.sha256_per_platform]
+"windows-x86_64" = "df6453b2ddcb4e748547d0288b826251a24af099749dc7a9ddea587aac3d4365"
+# 其余平台资产同 [servers.sql] 注释（同一组 zip，bin_path 互异 unix 无 .exe）。

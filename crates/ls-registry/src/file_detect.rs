@@ -18,13 +18,19 @@ use ls_adapters::LanguageId;
 
 /// 文件名（含 dotfile）→ LanguageId 静态表（小写精确匹配）。
 ///
-/// 仅收录 M3+ 真实会被打 LS 的文件名：build 文件（Makefile / Dockerfile / .bashrc /
-/// .zshrc / .profile）。CMakeLists.txt 走 C++ 系，hits .txt 后无命中 → 走无扩展名 → None
-/// （CPP 系 LS 不靠扩展名匹配，是按 build 文件 fallback 探测；v1 不覆盖）。
+/// 仅收录真实会被打 LS 的文件名：bash dotfile 与 Dockerfile（bd 56a，含点后缀变体）。
+/// CMakeLists.txt 等无扩展名 build 文件不覆盖（CPP 系 LS 按 build 文件 fallback 探测，
+/// 不走本表）。
 fn by_filename(name: &str) -> Option<LanguageId> {
     match name {
         // bash 系 dotfile —— shell 脚本，bash-language-server 接管。
         ".bashrc" | ".bash_profile" | ".zshrc" | ".profile" => Some(LanguageId::Bash),
+        // Dockerfile 及点后缀变体（Dockerfile.dev / Dockerfile.prod 等，vscode-docker
+        // 同款 `Dockerfile*` 惯例；大小写不敏感）。"dockerfile2" 这类无点粘连不命中。
+        _ if name.eq_ignore_ascii_case("dockerfile") => Some(LanguageId::Docker),
+        _ if name.get(..11).is_some_and(|p| p.eq_ignore_ascii_case("dockerfile.")) => {
+            Some(LanguageId::Docker)
+        }
         _ => None,
     }
 }
@@ -238,5 +244,42 @@ mod tests {
             detect_language(&PathBuf::from("App.vue")),
             Some(LanguageId::Vue)
         );
+    }
+
+    /// bd 56a 第一批：Dockerfile 文件名变体 + *.dockerfile / *.sql 扩展名。
+    #[test]
+    fn batch56a_docker_sql_detection() {
+        // Dockerfile 主形态（无扩展名 → 文件名探测）。
+        assert_eq!(
+            detect_language(&PathBuf::from("Dockerfile")),
+            Some(LanguageId::Docker)
+        );
+        // 点后缀变体（vscode-docker `Dockerfile*` 惯例）。
+        assert_eq!(
+            detect_language(&PathBuf::from("Dockerfile.dev")),
+            Some(LanguageId::Docker)
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("dockerfile.prod")),
+            Some(LanguageId::Docker)
+        );
+        // 大小写不敏感。
+        assert_eq!(
+            detect_language(&PathBuf::from("DOCKERFILE")),
+            Some(LanguageId::Docker)
+        );
+        // *.dockerfile 扩展名形态。
+        assert_eq!(
+            detect_language(&PathBuf::from("app.dockerfile")),
+            Some(LanguageId::Docker)
+        );
+        // .sql 扩展名。
+        assert_eq!(
+            detect_language(&PathBuf::from("schema.sql")),
+            Some(LanguageId::Sql)
+        );
+        // 无点粘连（dockerfile2）不算 Dockerfile 变体；未知扩展名不受牵连。
+        assert_eq!(detect_language(&PathBuf::from("dockerfile2")), None);
+        assert_eq!(detect_language(&PathBuf::from("readme.dockerfilex")), None);
     }
 }

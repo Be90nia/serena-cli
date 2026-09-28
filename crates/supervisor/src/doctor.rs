@@ -309,6 +309,27 @@ fn check_local_ls() -> Vec<Check> {
         "astro-ls (Astro LS, hybrid with companion TS LS)",
         "serena-cli install astro",
     ));
+    out.push(check_npm_ls(
+        "docker-langserver",
+        "docker",
+        "docker-langserver (Dockerfile LS)",
+        "serena-cli install docker",
+    ));
+    out.push(check_download_ls(
+        "sql",
+        "sqls (SQL LS)",
+        "run `serena-cli install sql`",
+    ));
+    out.push(check_download_ls(
+        "pgls",
+        "postgres-language-server (Postgres LS, bd 56a)",
+        "run `serena-cli install pgsql`",
+    ));
+    out.push(check_download_ls(
+        "sqls-mysql",
+        "sqls (MySQL LS, bd 56a — same binary as the sql entry)",
+        "run `serena-cli install mysql`",
+    ));
     out.push(check_download_ls(
         "powershell",
         "PowerShellEditorServices (PowerShell LS)",
@@ -442,14 +463,9 @@ fn check_daemon(lock_path: &Path) -> Vec<Check> {
             }
         }
         Ok(None) => {
-            out.push(Check {
-                category: "daemon",
-                id: "lock",
-                label: "daemon lock file",
-                status: Status::Ok,
-                detail: "absent (daemon not running, lazy-spawn on first tool call)".into(),
-                hint: None,
-            });
+            // bd 3ab：锁不在但端口仍有 listener = 残留 daemon（stop-all 只认锁，
+            // 该进程原处于管辖真空；stop-all 现已带探活兜底）。
+            out.push(daemon_check_lock_absent(port_has_listener(7860)));
         }
         Err(e) => {
             out.push(Check {
@@ -483,6 +499,38 @@ fn check_daemon(lock_path: &Path) -> Vec<Check> {
         });
     }
     out
+}
+
+/// 锁缺失分支的 daemon 检查项（端口态注入参数化，纯函数便于单测）。
+fn daemon_check_lock_absent(port_listening: bool) -> Check {
+    if port_listening {
+        Check {
+            category: "daemon",
+            id: "lock",
+            label: "daemon lock file",
+            status: Status::Warn,
+            detail: "absent but port=7860 has a listener (residual daemon?)".into(),
+            hint: Some(
+                "run `serena-cli stop-all` (reaps residual daemons); or inspect with `netstat -ano | findstr :7860`"
+                    .into(),
+            ),
+        }
+    } else {
+        Check {
+            category: "daemon",
+            id: "lock",
+            label: "daemon lock file",
+            status: Status::Ok,
+            detail: "absent (daemon not running, lazy-spawn on first tool call)".into(),
+            hint: None,
+        }
+    }
+}
+
+/// loopback 端口是否有 listener（bd 3ab：锁缺失盲区探测）。
+fn port_has_listener(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, PORT_PROBE_TIMEOUT).is_ok()
 }
 
 /// 读 lock 文件（daemon 格式 `{pid, port, boot_ms, token}`），错/缺失 → None。
@@ -750,6 +798,8 @@ mod tests {
             "vscode-json-languageserver",
             "powershell",
             "astro-ls",
+            "docker-langserver",
+            "sql",
         ] {
             let c = r
                 .checks
@@ -765,5 +815,25 @@ mod tests {
                 assert!(c.hint.is_some(), "{id} MISS 必须带安装 hint");
             }
         }
+    }
+
+    /// bd 3ab：锁缺失 + 端口有 listener = 残留 daemon，必须 WARN 且 hint 指向 stop-all。
+    #[test]
+    fn lock_absent_with_listener_is_warn() {
+        let c = daemon_check_lock_absent(true);
+        assert!(matches!(c.status, Status::Warn), "{:?}", c.status);
+        assert!(c.detail.contains("listener"), "{}", c.detail);
+        assert!(
+            c.hint.as_deref().is_some_and(|h| h.contains("stop-all")),
+            "hint 必须给出可操作动作: {:?}",
+            c.hint
+        );
+    }
+
+    #[test]
+    fn lock_absent_without_listener_is_ok() {
+        let c = daemon_check_lock_absent(false);
+        assert!(matches!(c.status, Status::Ok), "{:?}", c.status);
+        assert!(c.detail.contains("absent"), "{}", c.detail);
     }
 }

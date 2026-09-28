@@ -165,8 +165,8 @@ fn legacy_entries_survive_batch_addition() {
     }
     assert_eq!(
         servers.len(),
-        63,
-        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）"
+        67,
+        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）+ bd 56a 第一批 +2 docker/sql + 第二批 +2 pgls/sqls-mysql"
     );
     let marksman = &servers["marksman"];
     assert_eq!(marksman.install, "download");
@@ -433,4 +433,158 @@ fn astro_entry_pins_match_upstream_7a296833() {
         ],
         "astro 伴生三包 pin 漂移"
     );
+}
+
+/// bd 56a 第一批（Δ 自有设计，上游无对应物，source_commit 省略 = Δ 标注）：
+/// docker npm 条目 + sql download 条目 pin 锚，防数据漂移（astro 同款 spot-check 形态）。
+#[test]
+fn batch56a_docker_sql_entries_pins_match_research() {
+    let servers = parsed_servers();
+
+    // docker：npm 一手数据（registry.npmjs.org/…/latest，2026-09-28）；bin 名实为
+    // docker-langserver（包 bin 字段），非包名。
+    let docker = servers
+        .get("docker")
+        .unwrap_or_else(|| panic!("[servers.docker] missing"));
+    assert_eq!(docker.install, "npm");
+    assert_eq!(docker.languages, vec!["docker"]);
+    assert_eq!(docker.extensions, vec![".dockerfile"]);
+    let npm = docker.npm.as_ref().expect("docker: npm table");
+    assert_eq!(npm.package, "dockerfile-language-server-nodejs");
+    assert_eq!(npm.version.as_deref(), Some("0.15.0"));
+    assert_eq!(npm.bin_rel, "docker-langserver");
+    assert_eq!(
+        npm.npm_args.as_deref(),
+        Some(["--stdio".to_string()].as_slice())
+    );
+
+    // sql：download；sha256 双锚 = GitHub API assets[].digest + 本机下载实测
+    // （v0.2.48 windows 资产，2026-09-28）。
+    let sql = servers
+        .get("sql")
+        .unwrap_or_else(|| panic!("[servers.sql] missing"));
+    assert_eq!(sql.install, "download");
+    assert_eq!(sql.languages, vec!["sql"]);
+    assert_eq!(sql.extensions, vec![".sql"]);
+    let dl = sql.download.as_ref().expect("sql: download table");
+    assert_eq!(dl.version, "0.2.48");
+    assert_eq!(dl.archive, "zip");
+    assert_eq!(dl.bin_path, "sqls.exe");
+    assert_eq!(
+        dl.url_per_platform.get("windows-x86_64").map(String::as_str),
+        Some("https://github.com/sqls-server/sqls/releases/download/v0.2.48/sqls-windows-0.2.48.zip")
+    );
+    assert_eq!(
+        dl.sha256_per_platform
+            .get("windows-x86_64")
+            .map(String::as_str),
+        Some("df6453b2ddcb4e748547d0288b826251a24af099749dc7a9ddea587aac3d4365")
+    );
+    assert!(sql.source_commit.is_none(), "Δ 自有设计条目无上游锚");
+}
+
+/// bd 56a 第二批（Δ 自有设计）：pgls download 条目 + sqls-mysql download 条目 pin 锚
+/// （astro 同款 spot-check 形态）。sha256 双锚 = release 页 expanded_assets 官方标注
+/// + 本机下载实测（0.25.7 exe / v0.2.48 zip，2026-09-28）。
+#[test]
+fn batch56a2_pgls_sqls_mysql_entries_pins_match_research() {
+    let servers = parsed_servers();
+
+    let pgls = servers
+        .get("pgls")
+        .unwrap_or_else(|| panic!("[servers.pgls] missing"));
+    assert_eq!(pgls.install, "download");
+    assert_eq!(pgls.languages, vec!["pgsql"]);
+    // pgls 的 LSP 入口是 lsp-proxy 子命令（裸跑 = CLI 帮助即退）。
+    assert_eq!(
+        pgls.exec,
+        vec!["{bin}".to_string(), "lsp-proxy".to_string()]
+    );
+    let dl = pgls.download.as_ref().expect("pgls: download table");
+    assert_eq!(dl.version, "0.25.7");
+    assert_eq!(dl.archive, "raw");
+    assert_eq!(dl.bin_path, "postgres-language-server.exe");
+    assert_eq!(
+        dl.url_per_platform.get("windows-x86_64").map(String::as_str),
+        Some("https://github.com/supabase-community/postgres-language-server/releases/download/0.25.7/postgres-language-server_x86_64-pc-windows-msvc.exe")
+    );
+    assert_eq!(
+        dl.sha256_per_platform
+            .get("windows-x86_64")
+            .map(String::as_str),
+        Some("9b67d59032275810e76e3557ad06c700c7b6cd71a8e3fac7656b926cc5603248")
+    );
+    assert!(pgls.source_commit.is_none(), "Δ 自有设计条目无上游锚");
+
+    // sqls-mysql：与 sql 门同一 sqls 二进制（同 zip 同 sha256），仅语言名不同；
+    // exec 省略 = 裸启动 [{bin}]（sqls 裸跑即 stdio LS，真机实测）。
+    let mysql = servers
+        .get("sqls-mysql")
+        .unwrap_or_else(|| panic!("[servers.sqls-mysql] missing"));
+    assert_eq!(mysql.install, "download");
+    assert_eq!(mysql.languages, vec!["mysql"]);
+    assert!(mysql.exec.is_empty(), "sqls 裸启动即 stdio，exec 省略");
+    let mdl = mysql.download.as_ref().expect("sqls-mysql: download table");
+    assert_eq!(mdl.version, "0.2.48");
+    assert_eq!(mdl.bin_path, "sqls.exe");
+    assert_eq!(
+        mdl.sha256_per_platform
+            .get("windows-x86_64")
+            .map(String::as_str),
+        Some("df6453b2ddcb4e748547d0288b826251a24af099749dc7a9ddea587aac3d4365")
+    );
+    assert!(mysql.source_commit.is_none(), "Δ 自有设计条目无上游锚");
+}
+
+/// --lang 显式路由闭环（bd 56a 第二批验收单测）：`--lang pgsql|mysql` 经
+/// supervisor `resolve_lang_for_file`（override 直接小写透传）→ `spec_for` 必须命中
+/// 本批条目，且 T0 分流成立（adapter_for 返 None → session_for 走 config::ensure_launch）。
+/// 默认归属承诺：.sql 扩展名归 sql 门，pgsql/mysql 不经扩展名抢占（--lang 才可达）。
+#[test]
+fn lang_override_routes_pgsql_mysql_to_batch2_entries() {
+    use ls_registry::adapter_for;
+    use ls_registry::config::spec_for;
+    use ls_registry::LanguageId;
+
+    for (lang, want_id) in [("pgsql", "pgls"), ("mysql", "sqls-mysql")] {
+        // --lang 透传值 → spec_for 命中本批条目（install 链 / doctor hint 同源）。
+        let (id, spec) =
+            spec_for(lang).unwrap_or_else(|| panic!("--lang {lang} must route to a spec"));
+        assert_eq!(id, want_id, "spec_for(\"{lang}\") routes to [servers.{id}]");
+        assert!(spec.download.is_some(), "{lang}: T0 download 条目形态");
+        // T0 分流：无手写 adapter，session_for 走 ensure_launch。
+        assert!(
+            adapter_for(lang).is_none(),
+            "{lang}: T0 配置驱动语言不得有 T2 adapter"
+        );
+    }
+
+    // LanguageId 反查（doctor / install 按语言名工作所需的入口面）。
+    assert_eq!(
+        LanguageId::from_str_opt("pgsql"),
+        Some(LanguageId::Pgsql)
+    );
+    assert_eq!(
+        LanguageId::from_str_opt("postgres"),
+        Some(LanguageId::Pgsql),
+        "postgres 别名同归 Pgsql"
+    );
+    assert_eq!(
+        LanguageId::from_str_opt("mysql"),
+        Some(LanguageId::Mysql)
+    );
+    // 优先级语义：.sql 默认归 sql 门（兄弟批 EXT_TABLE 落地），pgsql/mysql 门
+    // 不经扩展名路由——from_extension 任何情况下不得返回本批语言。
+    for ext in ["sql", "SQL", "ddl"] {
+        assert_ne!(
+            LanguageId::from_extension(ext),
+            Some(LanguageId::Pgsql),
+            "{ext}: pgsql 无扩展名路由"
+        );
+        assert_ne!(
+            LanguageId::from_extension(ext),
+            Some(LanguageId::Mysql),
+            "{ext}: mysql 无扩展名路由"
+        );
+    }
 }

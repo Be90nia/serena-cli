@@ -19,8 +19,9 @@ pub mod config;
 pub mod file_detect;
 pub mod spec;
 
+pub use ls_adapters::LanguageId;
 use ls_adapters::{
-    LanguageId, LanguageServerAdapter, astro::AstroAdapter, bash::BashAdapter,
+    LanguageServerAdapter, astro::AstroAdapter, bash::BashAdapter,
     clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter, gopls::GoplsAdapter, jdtls::JdtlsAdapter,
     json::JsonAdapter, powershell::PowerShellAdapter, pyright::PyrightAdapter,
     rust_analyzer::RustAnalyzerAdapter, typescript::TypescriptLanguageServerAdapter,
@@ -42,6 +43,10 @@ pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("hpp", LanguageId::Cpp),
     // Markdown（T0 配置驱动：servers.toml marksman，Task 21 双路径）
     ("md", LanguageId::Markdown),
+    // SQL / Dockerfile（T0 配置驱动：servers.toml sql/docker，bd 56a 第一批）。
+    // 本批 sql 独占 .sql（pgsql/mysql 第二批用 --lang 显式覆盖，不进本表）。
+    ("sql", LanguageId::Sql),
+    ("dockerfile", LanguageId::Docker),
     // Rust
     ("rs", LanguageId::Rust),
     // Python
@@ -145,7 +150,25 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         LanguageId::Astro => ASTRO.clone(),
         // T0 配置驱动语言：无手写 adapter（见 config::ensure_launch）。
         LanguageId::Markdown => return None,
+        // T0 配置驱动（bd 56a 第一批）：docker/sql 走 servers.toml docker/sql 条目。
+        LanguageId::Docker | LanguageId::Sql => return None,
+        // T0 配置驱动（bd 56a 第二批）：pgsql/mysql 走 servers.toml pgls/sqls-mysql 条目。
+        LanguageId::Pgsql | LanguageId::Mysql => return None,
     })
+}
+
+/// 内部语言名 → LSP didOpen 的 languageId。多数语言与内部名恒等；LSP 官方 languageId
+/// 与内部 id 不一致时在此登记（`Session::set_language_id` 前的唯一换算点，session_for
+/// 统一调用）。bd 56a：内部 "docker" 的 LSP 官方 languageId 是 "dockerfile"——发错值
+/// dockerfile-ls 侧语义未定义（三关可能静默降级），故显式映射而非赌 LS 宽容。
+pub fn lsp_language_id(lang: &str) -> String {
+    match lang {
+        "docker" => "dockerfile".to_string(),
+        // bd 56a 第二批：LSP 官方 SQL languageId 是 "sql"（VS Code 口径）；pgls/sqls
+        // 实测对任意值宽容，但同 docker 原则显式映射而非赌 LS 行为。
+        "pgsql" | "mysql" => "sql".to_string(),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +303,27 @@ mod tests {
         );
         assert_eq!(resolve(&PathBuf::from("x.astro")), Some(LanguageId::Astro));
         assert_eq!(resolve(&PathBuf::from("App.vue")), Some(LanguageId::Vue));
+    }
+
+    /// bd 56a 第一批：docker/sql 走 T0（无手写 adapter），servers.toml 语言路由 +
+    /// LSP didOpen languageId 换算（docker → 官方 "dockerfile"）。
+    #[test]
+    fn batch56a_docker_sql_t0_routing_and_lsp_language_id() {
+        // T0：无手写 adapter（session_for 落 config::ensure_launch）。
+        assert!(adapter_for("docker").is_none());
+        assert!(adapter_for("sql").is_none());
+        // servers.toml 语言路由命中（spec_for 按 languages 扫描）。
+        assert!(config::spec_for("docker").is_some());
+        assert!(config::spec_for("sql").is_some());
+        // LSP 官方 languageId 换算：docker→dockerfile；sql 及既有语言恒等。
+        assert_eq!(lsp_language_id("docker"), "dockerfile");
+        assert_eq!(lsp_language_id("sql"), "sql");
+        assert_eq!(lsp_language_id("rust"), "rust");
+        // 扩展名解析（EXT_TABLE）。
+        assert_eq!(resolve(&PathBuf::from("schema.sql")), Some(LanguageId::Sql));
+        assert_eq!(
+            resolve(&PathBuf::from("app.dockerfile")),
+            Some(LanguageId::Docker)
+        );
     }
 }

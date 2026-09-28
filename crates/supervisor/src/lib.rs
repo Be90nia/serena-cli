@@ -863,8 +863,8 @@ impl Supervisor {
         let session = Session::start(Some(child), params).await?;
         // didOpen 的 languageId 用 adapter 真实语言（默认 "cpp" 对 rust-analyzer
         // 等严格 LS 是错语言 → 文档拒收）。session_for 是唯一 spawn 点，此处注入
-        // 覆盖全部会话路径。
-        session.set_language_id(lang);
+        // 覆盖全部会话路径。lsp_language_id 换算 LSP 官方名（docker→dockerfile）。
+        session.set_language_id(&ls_registry::lsp_language_id(lang));
         // 注册 publishDiagnostics handler → 写 diag_cache + 累 generation。
         let cache_root = key.root.clone();
         let cache = std::sync::Arc::clone(&self.diag_cache);
@@ -5040,11 +5040,16 @@ async fn lsp_position_from_byte(
 
 /// 解析 lang: 有 override 直接用 (大小写折叠), 否则按文件扩展名探测
 /// （内置 EXT_TABLE → external-servers.toml extensions 兜底）。
+/// EXT_TABLE 只看扩展名；再落 file_detect（文件名/shebang）兜底无扩展名文件
+/// （Dockerfile 等，bd 56a）。
 fn resolve_lang_for_file(file: &str, lang_override: Option<&str>) -> ToolResult<String> {
     if let Some(l) = lang_override {
         return Ok(l.to_ascii_lowercase());
     }
     ls_registry::resolve_lang_name(Path::new(file))
+        .or_else(|| {
+            ls_registry::file_detect::detect_language(Path::new(file)).map(|l| l.as_str())
+        })
         .map(str::to_string)
         .ok_or_else(|| ToolError::BadArgs {
             detail: format!("file not supported: {file}"),

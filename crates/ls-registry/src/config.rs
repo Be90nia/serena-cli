@@ -458,6 +458,15 @@ pub fn effective_override(lang: &str, cli: Option<&LsOverride>) -> Option<LsOver
     user_override(lang)
 }
 
+/// `Launch::Process`（exe + 附加 args）→ ensure_launch 的完整 argv 契约（首元素 exe）；
+/// session_for 直接把 args 当 cmd。npm 安装/缓存命中与 launch_via_pkg_installer 共用。
+fn full_argv(exe: &Path, args: Vec<String>) -> Vec<String> {
+    let mut argv = Vec::with_capacity(1 + args.len());
+    argv.push(exe.to_string_lossy().into_owned());
+    argv.extend(args);
+    argv
+}
+
 /// 包管理器类安装 + 拉起组装的共享尾部（uvx/dotnet/gem/source 四分支同构）：
 /// spec → InstallSpec → installer → outcome 归一为 (exe, args) 或语义错误串。
 fn launch_via_pkg_installer(
@@ -480,7 +489,8 @@ fn launch_via_pkg_installer(
     };
     match install(&ictx, &install_spec) {
         Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process { exe, args })) => {
-            Ok((exe, args))
+            let argv = full_argv(&exe, args);
+            Ok((exe, argv))
         }
         Ok(InstallOutcome::Ready(ls_runtime::install::Launch::External { host, port })) => Err(
             format!("external LS not supported by CLI launch: {host}:{port}"),
@@ -539,7 +549,8 @@ pub fn ensure_launch(
                 &cache_root.join(id).join(&dir_name),
                 &npm.bin_rel,
             ) {
-                return Ok((exe, npm.npm_args.clone().unwrap_or_default()));
+                let args = npm.npm_args.clone().unwrap_or_default();
+                return Ok((exe.clone(), full_argv(&exe, args)));
             }
             if !auto_install {
                 return Err(format!(
@@ -555,9 +566,10 @@ pub fn ensure_launch(
                 cache_root,
             };
             match NpmInstaller.install(&ictx, &install_spec) {
-                Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process { exe, args })) => {
-                    Ok((exe, args))
-                }
+                Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process {
+                    exe,
+                    args,
+                })) => Ok((exe.clone(), full_argv(&exe, args))),
                 Ok(InstallOutcome::Ready(ls_runtime::install::Launch::External { host, port })) => {
                     Err(format!(
                         "external LS not supported by CLI launch: {host}:{port}"

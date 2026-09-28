@@ -44,7 +44,7 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 对比上游 oraios/serena：19/19 高 ROI wrapper 全部覆盖（agent 实际会用的每个工具），外加长尾（`documentHighlight`、`codeLens`、`documentLink`、`foldingRange`、`call/type hierarchy`、`moniker`、`semanticTokens`、`inlayHint`）—— 全部落地并于 2026-09-23 验证；`document-link`/`moniker` 在不支持该能力的 LS 上返回空结果（如 rust-analyzer stable）。
 
-### Language server（上游目录 73 个中的 11 个）
+### Language server（上游目录 73 个中的 16 个）
 
 | 语言 | Server | 状态 | 备注 |
 |---|---|---|---|
@@ -59,8 +59,13 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 | JSON | vscode-json-languageserver | ready（npm） | schema 驱动的 hover/诊断 |
 | PowerShell | PowerShellEditorServices | ready（下载） | 需要 `pwsh` 7+；内置 PSScriptAnalyzer 诊断 |
 | Vue | @vue/language-server | ready（npm，hybrid） | 伴生 typescript-language-server 挂 `@vue/typescript-plugin`；语义 hover/路由已通，诊断走 tsserver 桥待接 |
+| Astro | @astrojs/language-server | ready（npm，hybrid） | 伴生 typescript-language-server 挂 `@astrojs/ts-plugin`（上游 `7a296833`）；ts/js refs 路由到伴生 LS，`.astro` 语义 hover 已通 |
+| Docker | docker-langserver | ready（npm） | `Dockerfile*`（含 `Dockerfile.dev` 变体）+ `*.dockerfile`；didOpen languageId 发 `dockerfile` |
+| SQL | sqls | ready（下载） | `*.sql`；无 config 文件时语法层 hover/def 可用 |
+| PostgreSQL | postgres-language-server（pgls） | ready（下载） | `--lang pgsql`（`.sql` 默认归 sql 条目）；无 DB 时语法诊断可用（libpg_query 本地 parser）；documentSymbol/schema hover 需 DB 连接 —— LS 能力边界 |
+| MySQL | sqls | ready（下载） | `--lang mysql`；与 sql 条目同一 sqls 二进制（独立缓存目录）；hover/诊断需 DB 连接（LS 警告 "no database connection"） |
 
-11 门全部在真实 language server 上端到端冒烟验证（rust、typescript、c/cpp、python、go —— 2026-09-25；c#、java —— 2026-09-25；bash、json、powershell、vue —— 2026-09-25；见 `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / 各 adapter 报告 `local/report-*-adapter.md`）。CI 7 语言冒烟脚本见 `scripts/ci_smoke.sh`。
+16 门全部在真实 language server 上端到端冒烟验证（rust、typescript、c/cpp、python、go —— 2026-09-25；c#、java —— 2026-09-25；bash、json、powershell、vue —— 2026-09-25；astro —— 2026-09-28；docker、sql —— 2026-09-28；postgresql、mysql —— 2026-09-28；见 `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / 各 adapter 报告 `local/report-*-adapter.md`）。CI 7 语言冒烟脚本见 `scripts/ci_smoke.sh`。
 
 ## 安装
 
