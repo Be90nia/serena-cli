@@ -315,6 +315,24 @@ fn check_local_ls() -> Vec<Check> {
         "docker-langserver (Dockerfile LS)",
         "serena-cli install docker",
     ));
+    out.push(check_npm_ls(
+        "yaml-language-server",
+        "yaml",
+        "yaml-language-server (YAML LS)",
+        "serena-cli install yaml",
+    ));
+    out.push(check_npm_ls(
+        "vscode-html-language-server",
+        "html",
+        "vscode-html-language-server (HTML LS, bd 56a)",
+        "serena-cli install html",
+    ));
+    out.push(check_npm_ls(
+        "vscode-css-language-server",
+        "css",
+        "vscode-css-language-server (CSS LS, bd 56a — same npm package as the html entry)",
+        "serena-cli install css",
+    ));
     out.push(check_download_ls(
         "sql",
         "sqls (SQL LS)",
@@ -329,6 +347,21 @@ fn check_local_ls() -> Vec<Check> {
         "sqls-mysql",
         "sqls (MySQL LS, bd 56a — same binary as the sql entry)",
         "run `serena-cli install mysql`",
+    ));
+    out.push(check_download_ls(
+        "kotlin",
+        "Kotlin LSP (JetBrains managed intellij-server, bd 56a follow-up)",
+        "run `serena-cli install kotlin`",
+    ));
+    out.push(check_download_ls(
+        "dart",
+        "Dart analysis server via the Dart SDK (`dart language-server`, bd 56a follow-up)",
+        "run `serena-cli install dart`",
+    ));
+    out.push(check_download_ls(
+        "marksman",
+        "marksman (Markdown LS)",
+        "run `serena-cli install markdown`",
     ));
     out.push(check_download_ls(
         "powershell",
@@ -800,6 +833,12 @@ mod tests {
             "astro-ls",
             "docker-langserver",
             "sql",
+            "kotlin",
+            "dart",
+            "vscode-html-language-server",
+            "vscode-css-language-server",
+            "yaml-language-server",
+            "marksman",
         ] {
             let c = r
                 .checks

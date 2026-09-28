@@ -369,7 +369,12 @@ pub fn build_download_client(
                 attempt.error(format!("redirect host not in allowed_hosts: {url}"))
             }
         }))
-        .timeout(Duration::from_secs(600))
+        // 总时长 timeout 是 blocking builder 唯一可用的停摆保护（read_timeout 仅 async
+        // builder 提供，0.12.28 实测）。600s 会砍死慢链路大包：dart SDK 206MiB /
+        // kotlin 346MiB 在 ~400KB/s 以下必死于 "error decoding response body"
+        // （2026-09-28 dart 实测）。1800s = 覆盖 ~300KB/s 持续速率；停摆连接最迟
+        // 30 分钟报错，有界。
+        .timeout(Duration::from_secs(1800))
         .connect_timeout(Duration::from_secs(30))
         .build()
 }

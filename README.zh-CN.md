@@ -44,7 +44,7 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 对比上游 oraios/serena：19/19 高 ROI wrapper 全部覆盖（agent 实际会用的每个工具），外加长尾（`documentHighlight`、`codeLens`、`documentLink`、`foldingRange`、`call/type hierarchy`、`moniker`、`semanticTokens`、`inlayHint`）—— 全部落地并于 2026-09-23 验证；`document-link`/`moniker` 在不支持该能力的 LS 上返回空结果（如 rust-analyzer stable）。
 
-### Language server（上游目录 73 个中的 16 个）
+### Language server（上游目录 73 个中的 20 个）
 
 | 语言 | Server | 状态 | 备注 |
 |---|---|---|---|
@@ -64,8 +64,14 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 | SQL | sqls | ready（下载） | `*.sql`；无 config 文件时语法层 hover/def 可用 |
 | PostgreSQL | postgres-language-server（pgls） | ready（下载） | `--lang pgsql`（`.sql` 默认归 sql 条目）；无 DB 时语法诊断可用（libpg_query 本地 parser）；documentSymbol/schema hover 需 DB 连接 —— LS 能力边界 |
 | MySQL | sqls | ready（下载） | `--lang mysql`；与 sql 条目同一 sqls 二进制（独立缓存目录）；hover/诊断需 DB 连接（LS 警告 "no database connection"） |
+| HTML | vscode-html-language-server | ready（npm） | `*.html`/`*.htm`；文件内元素/id 符号 + mdn 驱动 hover/补全（`vscode-langservers-extracted`）；跨文件 refs/def 对 HTML 无意义（上游明示） |
+| CSS | vscode-css-language-server | ready（npm） | `*.css`；属性/选择器 mdn 驱动 hover/补全；与 html 条目同一 npm 包（独立缓存目录） |
+| Kotlin | Kotlin LSP（JetBrains managed intellij-server） | ready（下载） | `*.kt`/`*.kts`；同文件 hover/def + documentSymbol 可用（managed LSP 钉上游 `263.4702.0`，sha 校验，包内捆绑 JBR 免系统 JDK）；跨文件 def/refs 需 LS 工程导入（`build.gradle.kts`/`pom.xml` 标记，会自动下载 Gradle 发行包）—— LS 能力边界 |
+| Dart | Dart SDK analysis server（`dart language-server`） | ready（下载） | `*.dart`；整 SDK 下载（206 MiB zip，sha 校验；钉上游 `3.7.1`）；裸目录即可 hover/def/refs/documentSymbol（pubspec.yaml 自动识别） |
+| YAML | yaml-language-server | ready（npm） | `*.yaml`/`*.yml`；schema 驱动 hover/补全/诊断（schemastore）；无 schema 时语法诊断可用 |
+| Markdown | marksman | ready（下载） | `*.md`/`*.markdown`；标题 documentSymbol/workspace symbol；链接 def/refs/hover 需项目根可识别（git 仓库或 `.marksman.toml`）—— marksman 侧项目识别，无标记散目录降级为单文件辅助 |
 
-16 门全部在真实 language server 上端到端冒烟验证（rust、typescript、c/cpp、python、go —— 2026-09-25；c#、java —— 2026-09-25；bash、json、powershell、vue —— 2026-09-25；astro —— 2026-09-28；docker、sql —— 2026-09-28；postgresql、mysql —— 2026-09-28；见 `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / 各 adapter 报告 `local/report-*-adapter.md`）。CI 7 语言冒烟脚本见 `scripts/ci_smoke.sh`。
+20 门全部在真实 language server 上端到端冒烟验证（rust、typescript、c/cpp、python、go —— 2026-09-25；c#、java —— 2026-09-25；bash、json、powershell、vue —— 2026-09-25；astro —— 2026-09-28；docker、sql —— 2026-09-28；postgresql、mysql —— 2026-09-28；yaml、markdown —— 2026-09-28；kotlin、dart、html、css —— 2026-09-28；见 `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / 各 adapter 报告 `local/report-*-adapter.md`）。CI 7 语言冒烟脚本见 `scripts/ci_smoke.sh`。
 
 ## 安装
 

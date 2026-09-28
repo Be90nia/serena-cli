@@ -134,9 +134,16 @@ fn new_download_entries_parse_with_complete_fields() {
             spec.exec.iter().any(|arg| arg.contains("{bin}")),
             "{id}: exec must reference {{bin}} placeholder"
         );
+        // 升版锚例外：kotlin 263.4702.0（上游 DEFAULT_KOTLIN_LSP_VERSION + sha 锚）取自
+        // 7a296833 kotlin_language_server.py 与同 commit 的 downloaded_dependency_hashes.json；
+        // 其余条目数据源锚 43ae0211。
+        let anchor = match *id {
+            "kotlin" => "7a296833",
+            _ => "43ae0211",
+        };
         assert_eq!(
             spec.source_commit.as_deref(),
-            Some("43ae0211"),
+            Some(anchor),
             "{id}: upstream anchor"
         );
     }
@@ -165,8 +172,8 @@ fn legacy_entries_survive_batch_addition() {
     }
     assert_eq!(
         servers.len(),
-        67,
-        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）+ bd 56a 第一批 +2 docker/sql + 第二批 +2 pgls/sqls-mysql"
+        68,
+        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）+ bd 56a 第一批 +2 docker/sql + 第二批 +2 pgls/sqls-mysql + 后续批 +1 css（html/yaml/marksman/kotlin/dart 为存量条目，本批零新增）"
     );
     let marksman = &servers["marksman"];
     assert_eq!(marksman.install, "download");
@@ -483,6 +490,112 @@ fn batch56a_docker_sql_entries_pins_match_research() {
     assert!(sql.source_commit.is_none(), "Δ 自有设计条目无上游锚");
 }
 
+/// bd 56a 后续批：html（上游 43ae0211 既有数据条目，本批 T2 接线）+ css（Δ 自有设计，
+/// 同包 vscode-langservers-extracted 双入口）pin 锚，防数据漂移（astro 同款 spot-check
+/// 形态）。包/版本 = npm registry 一手 + 上游 vscode_html_language_server.py
+/// DEFAULT_PACKAGE（4.10.0，2026-09-28 查证；bin 名≠包名，registry bin 字段）。
+#[test]
+fn html_css_entries_pins_match_research() {
+    let servers = parsed_servers();
+
+    let html = servers
+        .get("html")
+        .unwrap_or_else(|| panic!("[servers.html] missing"));
+    assert_eq!(html.install, "npm");
+    assert_eq!(html.languages, vec!["html"]);
+    assert_eq!(html.source_commit.as_deref(), Some("43ae0211"));
+    let html_npm = html.npm.as_ref().expect("html: npm table");
+    assert_eq!(html_npm.package, "vscode-langservers-extracted");
+    assert_eq!(html_npm.version.as_deref(), Some("4.10.0"));
+    assert_eq!(html_npm.bin_rel, "vscode-html-language-server");
+    assert_eq!(
+        html_npm.npm_args.as_deref(),
+        Some(["--stdio".to_string()].as_slice())
+    );
+
+    // css：同包 css 双入口（Δ 上游无对应注册，source_commit 省略 = Δ 标注）；
+    // 缓存按 id 分落（html/css 各一份，sqls-mysql 先例）。
+    let css = servers
+        .get("css")
+        .unwrap_or_else(|| panic!("[servers.css] missing"));
+    assert_eq!(css.install, "npm");
+    assert_eq!(css.languages, vec!["css"]);
+    let css_npm = css.npm.as_ref().expect("css: npm table");
+    assert_eq!(css_npm.package, "vscode-langservers-extracted");
+    assert_eq!(css_npm.version.as_deref(), Some("4.10.0"));
+    assert_eq!(css_npm.bin_rel, "vscode-css-language-server");
+    assert_eq!(
+        css_npm.npm_args.as_deref(),
+        Some(["--stdio".to_string()].as_slice())
+    );
+    assert!(css.source_commit.is_none(), "Δ 自有设计条目无上游锚");
+}
+
+/// bd 56a 后续批：kotlin download 条目（JetBrains managed LSP 升版 263.4702.0）+ dart
+/// download 条目（整 SDK，windows 组）pin 锚，防数据漂移（astro 同款 spot-check 形态）。
+/// sha256 锚 = oraios/serena@7a296833 downloaded_dependency_hashes.json（kotlin）/
+/// dart_language_server.py DEFAULT_DART_SDK_SHA256_BY_PLATFORM（dart）。
+#[test]
+fn kotlin_dart_entries_pins_match_upstream_7a296833() {
+    let servers = parsed_servers();
+
+    let kotlin = servers
+        .get("kotlin")
+        .unwrap_or_else(|| panic!("[servers.kotlin] missing"));
+    assert_eq!(kotlin.install, "download");
+    assert_eq!(kotlin.languages, vec!["kotlin"]);
+    assert_eq!(kotlin.extensions, vec![".kt", ".kts"]);
+    assert_eq!(kotlin.source_commit.as_deref(), Some("7a296833"));
+    assert_eq!(
+        kotlin.exec,
+        vec![
+            "{bin}".to_string(),
+            "--stdio".to_string(),
+            "--system-path".to_string(),
+            "{bin_dir}/system".to_string(),
+        ]
+    );
+    let kdl = kotlin.download.as_ref().expect("kotlin: download table");
+    assert_eq!(kdl.version, "263.4702.0");
+    assert_eq!(kdl.archive, "zip");
+    assert_eq!(kdl.bin_path, "bin/intellij-server.exe");
+    assert_eq!(
+        kdl.allowed_hosts,
+        vec!["download-cdn.jetbrains.com".to_string()]
+    );
+    assert_eq!(
+        kdl.url_per_platform.get("windows-x86_64").map(String::as_str),
+        Some("https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0.win.zip")
+    );
+    assert_eq!(
+        kdl.sha256_per_platform
+            .get("windows-x86_64")
+            .map(String::as_str),
+        Some("a9b471b16025b1bfb3b0a097862580abb40e3c35406c44242c18b1d70f5d0e44")
+    );
+
+    let dart = servers
+        .get("dart")
+        .unwrap_or_else(|| panic!("[servers.dart] missing"));
+    assert_eq!(dart.install, "download");
+    assert_eq!(dart.languages, vec!["dart"]);
+    assert_eq!(dart.extensions, vec![".dart"]);
+    let ddl = dart.download.as_ref().expect("dart: download table");
+    assert_eq!(ddl.version, "3.7.1");
+    assert_eq!(ddl.archive, "zip");
+    assert_eq!(ddl.bin_path, "dart-sdk/bin/dart.exe");
+    assert_eq!(
+        ddl.url_per_platform.get("windows-x86_64").map(String::as_str),
+        Some("https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-windows-x64-release.zip")
+    );
+    assert_eq!(
+        ddl.sha256_per_platform
+            .get("windows-x86_64")
+            .map(String::as_str),
+        Some("f56c03122e17abe5be1429eee0a975fb8ed511b6731ec90c6475992d3dee4ea5")
+    );
+}
+
 /// bd 56a 第二批（Δ 自有设计）：pgls download 条目 + sqls-mysql download 条目 pin 锚
 /// （astro 同款 spot-check 形态）。sha256 双锚 = release 页 expanded_assets 官方标注
 /// + 本机下载实测（0.25.7 exe / v0.2.48 zip，2026-09-28）。
@@ -587,4 +700,82 @@ fn lang_override_routes_pgsql_mysql_to_batch2_entries() {
             "{ext}: mysql 无扩展名路由"
         );
     }
+}
+
+/// bd 56a 后续批次（yaml/markdown）验收单测：`--lang yaml|markdown` 显式路由闭环 ——
+/// yaml/markdown 经 spec_for 命中 yaml/marksman 条目，T0 分流成立（adapter_for 返 None
+/// → session_for 走 config::ensure_launch）；LanguageId 反查 + 扩展名路由闭环
+/// （.md/.markdown/.yaml/.yml）；yaml npm 条目 pin 锚（上游 DEFAULT_YAML_LANGUAGE_SERVER_VERSION）。
+#[test]
+fn lang_yaml_markdown_routes_and_ext_roundtrip() {
+    use ls_registry::adapter_for;
+    use ls_registry::config::spec_for;
+    use ls_registry::LanguageId;
+
+    for (lang, want_id) in [("yaml", "yaml"), ("markdown", "marksman")] {
+        // --lang 透传值 → spec_for 命中条目（install 链 / doctor hint 同源）。
+        let (id, _) =
+            spec_for(lang).unwrap_or_else(|| panic!("--lang {lang} must route to a spec"));
+        assert_eq!(id, want_id, "spec_for(\"{lang}\") routes to [servers.{id}]");
+        // T0 分流：无手写 adapter，session_for 走 ensure_launch。
+        assert!(
+            adapter_for(lang).is_none(),
+            "{lang}: T0 配置驱动语言不得有 T2 adapter"
+        );
+        // LSP didOpen languageId 恒等（marksman / yaml-language-server 官方口径同内部名）。
+        assert_eq!(ls_registry::lsp_language_id(lang), lang);
+    }
+
+    // LanguageId 反查 + 扩展名闭环（doctor / warm / file_detect 入口面）。
+    assert_eq!(LanguageId::from_str_opt("yaml"), Some(LanguageId::Yaml));
+    assert_eq!(LanguageId::from_extension("yaml"), Some(LanguageId::Yaml));
+    assert_eq!(LanguageId::from_extension("yml"), Some(LanguageId::Yaml));
+    assert_eq!(
+        LanguageId::from_extension("md"),
+        Some(LanguageId::Markdown)
+    );
+    assert_eq!(
+        LanguageId::from_extension("markdown"),
+        Some(LanguageId::Markdown)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("a.yaml")),
+        Some(LanguageId::Yaml)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("b.yml")),
+        Some(LanguageId::Yaml)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("c.md")),
+        Some(LanguageId::Markdown)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("d.markdown")),
+        Some(LanguageId::Markdown)
+    );
+}
+
+/// yaml npm 条目 pin 锚（防数据漂移；docker/sql 同款 spot-check 形态）。
+#[test]
+fn yaml_entry_pins_match_upstream() {
+    let servers = parsed_servers();
+    let spec = servers
+        .get("yaml")
+        .unwrap_or_else(|| panic!("[servers.yaml] missing"));
+    assert_eq!(spec.install, "npm");
+    assert_eq!(spec.languages, vec!["yaml"]);
+    assert_eq!(spec.source_commit.as_deref(), Some("43ae0211"));
+    let npm = spec.npm.as_ref().expect("yaml: npm table");
+    assert_eq!(npm.package, "yaml-language-server");
+    assert_eq!(
+        npm.version.as_deref(),
+        Some("1.19.2"),
+        "上游 DEFAULT_YAML_LANGUAGE_SERVER_VERSION 原值"
+    );
+    assert_eq!(npm.bin_rel, "yaml-language-server");
+    assert_eq!(
+        npm.npm_args.as_deref(),
+        Some(["--stdio".to_string()].as_slice())
+    );
 }

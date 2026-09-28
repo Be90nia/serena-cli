@@ -372,7 +372,11 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 #     sha256 e0c15ce53f73e8609b0e8ce6507298f3474b334ac5eb0c826c9497a811fd0cce
 
 [servers.dart]
+# Dart SDK 内置 analysis server（`dart language-server`，上游 dart_language_server.py
+# 7a296833 同源）。上游 quirk：rootUri 会被当额外分析根（无去重，oraios/serena#2045），
+# 本 T0 路径仍发 rootUri —— 小项目无感，monorepo 根上空闲 CPU 会偏高（已知边界）。
 languages = ["dart"]
+extensions = [".dart"]
 install = "download"
 exec = ["{bin}", "language-server", "--client-id", "multilspy.dart", "--client-version", "1.2"]
 source_commit = "43ae0211"
@@ -380,24 +384,29 @@ source_commit = "43ae0211"
 [servers.dart.download]
 version = "3.7.1"
 archive = "zip"
-bin_path = "dart-sdk/bin/dart"
+bin_path = "dart-sdk/bin/dart.exe"
 allowed_hosts = ["storage.googleapis.com"]
 
 [servers.dart.download.url_per_platform]
-"linux-x86_64" = "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-linux-x64-release.zip"
-"macos-x86_64" = "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-macos-x64-release.zip"
-"macos-aarch64" = "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-macos-arm64-release.zip"
+"windows-x86_64" = "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-windows-x64-release.zip"
 
 [servers.dart.download.sha256_per_platform]
-"linux-x86_64" = "2813959e7d9650334015b927cc533f5beadfbf7fa48248beec471f8942a0ee71"
-"macos-x86_64" = "a2765917b6ae49d1ac119553df9584989f9c441a46e8f18c129ba52489658d2e"
-"macos-aarch64" = "f57c25163092bac818f8ca6250a0d8b2c56344c6a075a1bd7c60da7ac28b32a4"
-# 整 Dart SDK zip（~1GB 级）；bin 组 unix=dart-sdk/bin/dart、win=dart.exe，win 组待扩展：
-#   windows-x86_64: dartsdk-windows-x64-release.zip
-#     sha256 f56c03122e17abe5be1429eee0a975fb8ed511b6731ec90c6475992d3dee4ea5
+"windows-x86_64" = "f56c03122e17abe5be1429eee0a975fb8ed511b6731ec90c6475992d3dee4ea5"
+# 整 Dart SDK zip（压缩 ~300MB / 解压 ~1.6GB）；sha256 锚 = 上游
+# dart_language_server.py DEFAULT_DART_SDK_SHA256_BY_PLATFORM。平台组策略同 A 类
+# 先例（单值 bin_path 仅容 windows 组：win=dart.exe / unix=dart）：
+#   linux-x86_64: dartsdk-linux-x64-release.zip
+#     sha256 2813959e7d9650334015b927cc533f5beadfbf7fa48248beec471f8942a0ee71
+#     bin dart-sdk/bin/dart
+#   macos-x86_64: dartsdk-macos-x64-release.zip
+#     sha256 a2765917b6ae49d1ac119553df9584989f9c441a46e8f18c129ba52489658d2e
+#     bin dart-sdk/bin/dart
+#   macos-aarch64: dartsdk-macos-arm64-release.zip
+#     sha256 f57c25163092bac818f8ca6250a0d8b2c56344c6a075a1bd7c60da7ac28b32a4
+#     bin dart-sdk/bin/dart
 #   windows-aarch64: dartsdk-windows-arm64-release.zip
 #     sha256 fada411c6538d0ac24c35d6360767241f1298f64cbc5e88716387d54757a105a
-#   bin dart-sdk/bin/dart.exe
+#     bin dart-sdk/bin/dart.exe
 
 [servers.elixir]
 languages = ["elixir"]
@@ -484,39 +493,47 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 # 非单二进制下载形态，不入本表）。
 
 [servers.kotlin]
+# JetBrains managed Kotlin LSP（IntelliJ 平台 headless 形态；上游 kotlin_language_server.py
+# 7a296833 同源，sha 锚 = 其 downloaded_dependency_hashes.json）。包内捆绑 JBR，无需系统
+# JDK；上游另设 env JAVA_TOOL_OPTIONS=-Xmx2G（堆上限，T0 无 env 通道，JVM 默认 1/4 RAM
+# 可用）。server→client 请求（workspace/*/refresh 等）未注册时 lsp-core 默认回 null 成功
+# ——KLS 对 MethodNotFound 是致命退出（上游注释实锤），本架构天然规避。
 languages = ["kotlin"]
+extensions = [".kt", ".kts"]
 install = "download"
-exec = ["{bin}", "--stdio", "--system-path", "{system_path}"]
-source_commit = "43ae0211"
+exec = ["{bin}", "--stdio", "--system-path", "{bin_dir}/system"]
+source_commit = "7a296833"
 
 [servers.kotlin.download]
-version = "262.9593.0"
+version = "263.4702.0"
 archive = "zip"
 bin_path = "bin/intellij-server.exe"
 allowed_hosts = ["download-cdn.jetbrains.com"]
 
 [servers.kotlin.download.url_per_platform]
-"windows-x86_64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/262.9593.0/kotlin-server-262.9593.0.win.zip"
-"windows-aarch64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/262.9593.0/kotlin-server-262.9593.0-aarch64.win.zip"
+"windows-x86_64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0.win.zip"
+"windows-aarch64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0-aarch64.win.zip"
 
 [servers.kotlin.download.sha256_per_platform]
-"windows-x86_64" = "f2daaa476f26d99301b406f76de6d87c437d04dc72f06845154619d8f991c51f"
-"windows-aarch64" = "73a552a6a420158622e5ad8d96b53da8aa8ced3f88a24fded01575927a2fd8e7"
+"windows-x86_64" = "a9b471b16025b1bfb3b0a097862580abb40e3c35406c44242c18b1d70f5d0e44"
+"windows-aarch64" = "3bf008d8c94fa70eb13fc998eaa42f29b9d13f368984d4cec46277808f94e1de"
 # 包内路径/压缩形态随平台变化，单值字段仅容 win 组：
-#   macos-x86_64: kotlin-server-262.9593.0.sit（zip 格式）
-#     sha256 17369fda97c85418ac24ab38a9df56b21522a3468dfe193832fe455c13920745
+#   macos-x86_64: kotlin-server-263.4702.0.sit（zip 格式）
+#     sha256 62ab735947b1c855b505f64f5db8fbd7ff0b52a35ab1897938c6dbfc7b24c8a3
 #     bin bin/intellij-server
-#   macos-aarch64: kotlin-server-262.9593.0-aarch64.sit
-#     sha256 6ba6021a706b21e64cef33f7e2b79f187c0910320722bb2d3ed05ad1115ec43f
+#   macos-aarch64: kotlin-server-263.4702.0-aarch64.sit
+#     sha256 95da3fc6d3b9092c7616345044a05edb85e5408dc648d081e4e433595c892bec
 #     bin bin/intellij-server
-#   linux-x86_64: kotlin-server-262.9593.0.tar.gz（包内多一层 kotlin-server-{v}/）
-#     sha256 2d99d8e198fbe4aa8f4481e37799724ce94803b4ea12a60b416040e3fcd7cc5e
-#     bin kotlin-server-262.9593.0/bin/intellij-server
-#   linux-aarch64: kotlin-server-262.9593.0-aarch64.tar.gz
-#     sha256 2317831c6e5607d05b7ebc1da655330125ce0e3d66fbf24517dfce442debc14e
-#     bin kotlin-server-262.9593.0/bin/intellij-server
-# exec：{system_path} = 运行时占位（缓存下 kotlin-lsp-system 目录）；需 env
-# JAVA_TOOL_OPTIONS=-Xmx2G 与 JDK。JetBrains CDN 无版本列表端点（latest MISSING）。
+#   linux-x86_64: kotlin-server-263.4702.0.tar.gz（包内多一层 kotlin-server-{v}/）
+#     sha256 1e11d2e5fefbf9ea215ad8dd6be95f2222897cd086e8cb7a661a52084a590405
+#     bin kotlin-server-263.4702.0/bin/intellij-server
+#   linux-aarch64: kotlin-server-263.4702.0-aarch64.tar.gz
+#     sha256 ec7cb254a6662a07fff9f10e4365226afab6c40008f8a974c10ac5e785d6510f
+#     bin kotlin-server-263.4702.0/bin/intellij-server
+# exec：{bin_dir} = {bin} 所在目录（config::expand_exec 占位符）；system-path 指向安装
+# 缓存内可写目录（上游语义 = per-project 索引存储，静态模板只能给共享目录 —— 并发多
+# 项目会话有索引争用风险，oraios/serena#1966 上游同款边界）。JetBrains CDN 无版本列表
+# 端点（latest MISSING）。
 
 [servers.lua]
 languages = ["lua"]
@@ -1317,3 +1334,18 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 [servers.sqls-mysql.download.sha256_per_platform]
 "windows-x86_64" = "df6453b2ddcb4e748547d0288b826251a24af099749dc7a9ddea587aac3d4365"
 # 其余平台资产同 [servers.sql] 注释（同一组 zip，bin_path 互异 unix 无 .exe）。
+
+# ---- bd 56a 后续批：css（T2 接线）。同包 [servers.html]（vscode-langservers-extracted）
+# 的 css 双入口：bin 名≠包名（npm registry bin 字段：vscode-{html,css}-language-server，
+# 2026-09-28 查证 4.10.0）。css 上游 serena 无对应注册（Δ 自有设计，source_commit 省略），
+# 包/版本 pin 与 [servers.html] 同源；缓存按 id 分落（html/css 各一份，sqls-mysql 先例）。
+
+[servers.css]
+languages = ["css"]
+install = "npm"
+
+[servers.css.npm]
+package = "vscode-langservers-extracted"
+version = "4.10.0"
+bin_rel = "vscode-css-language-server"
+npm_args = ["--stdio"]

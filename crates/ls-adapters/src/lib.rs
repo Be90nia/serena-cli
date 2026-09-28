@@ -29,7 +29,9 @@ pub mod astro;
 pub mod bash;
 pub mod clangd;
 pub mod csharp_ls;
+pub mod css;
 pub mod gopls;
+pub mod html;
 pub mod jdtls;
 pub mod jedi_server;
 pub mod json;
@@ -65,10 +67,23 @@ pub enum LanguageId {
     Vue,
     /// T2 手写双服务器适配器（astro.rs，上游 7a296833）。
     Astro,
+    /// T2 手写适配器（bd 56a 后续批：html.rs 镜像上游 7a296833；css.rs Δ 自有设计，
+    /// 同包 vscode-langservers-extracted 双入口）。
+    Html,
+    Css,
     /// T0 配置驱动（bd 56a 第二批，Δ 上游无此语言）：.sql 扩展名归 sql 门，
     /// 本两门经 `--lang pgsql|mysql` 显式路由到 servers.toml 条目，无扩展名映射。
     Pgsql,
     Mysql,
+    /// T0 配置驱动（servers.toml yaml 条目，bd 56a 后续批次接线）：npm
+    /// yaml-language-server，扩展名 .yaml/.yml。
+    Yaml,
+    /// T0 配置驱动（servers.toml kotlin 条目，bd 56a 后续批）：JetBrains managed
+    /// Kotlin LSP（下载锚 7a296833，钉 263.4702.0），扩展名 .kt/.kts。
+    Kotlin,
+    /// T0 配置驱动（servers.toml dart 条目，bd 56a 后续批）：Dart SDK 内置
+    /// analysis server（`dart language-server`），扩展名 .dart。
+    Dart,
 }
 
 impl LanguageId {
@@ -89,8 +104,13 @@ impl LanguageId {
             Self::PowerShell => "powershell",
             Self::Vue => "vue",
             Self::Astro => "astro",
+            Self::Html => "html",
+            Self::Css => "css",
             Self::Pgsql => "pgsql",
             Self::Mysql => "mysql",
+            Self::Yaml => "yaml",
+            Self::Kotlin => "kotlin",
+            Self::Dart => "dart",
         }
     }
     /// 反向：lang 字符串 → LanguageId。未知返 None。
@@ -111,8 +131,13 @@ impl LanguageId {
             "powershell" | "pwsh" => Some(Self::PowerShell),
             "vue" => Some(Self::Vue),
             "astro" => Some(Self::Astro),
+            "html" => Some(Self::Html),
+            "css" => Some(Self::Css),
             "pgsql" | "postgres" => Some(Self::Pgsql),
             "mysql" => Some(Self::Mysql),
+            "yaml" => Some(Self::Yaml),
+            "kotlin" => Some(Self::Kotlin),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }
@@ -137,6 +162,11 @@ impl LanguageId {
             "ps1" | "psm1" | "psd1" => Some(Self::PowerShell),
             "vue" => Some(Self::Vue),
             "astro" => Some(Self::Astro),
+            "html" | "htm" => Some(Self::Html),
+            "css" => Some(Self::Css),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "kt" | "kts" => Some(Self::Kotlin),
+            "dart" => Some(Self::Dart),
             // pgsql/mysql（bd 56a）无专属扩展名：.sql 归 Sql 门（上游 get_priority
             // superset 的默认归属语义），本两门经 --lang pgsql|mysql 显式路由。
             _ => None,
@@ -203,6 +233,7 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::TypeScript => &["ts", "tsx", "js", "jsx"],
         // T0 注册语言，无 T2 适配器/LS 就绪门语义；探针走工程标记名单。
         LanguageId::Markdown => &[],
+        LanguageId::Yaml => &[],
         LanguageId::Docker => &["dockerfile"],
         LanguageId::Sql => &["sql"],
         LanguageId::Bash => &["sh", "bash"],
@@ -210,7 +241,11 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::PowerShell => &["ps1", "psm1", "psd1"],
         LanguageId::Vue => &["vue"],
         LanguageId::Astro => &["astro"],
+        LanguageId::Html => &["html", "htm"],
+        LanguageId::Css => &["css"],
         LanguageId::Pgsql | LanguageId::Mysql => &[],
+        LanguageId::Kotlin => &["kt", "kts"],
+        LanguageId::Dart => &["dart"],
     }
 }
 

@@ -42,7 +42,7 @@ Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `
 
 vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses), plus the long tail (`documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint`) — all landed and verified 2026-09-23; `document-link`/`moniker` return empty on LS without the capability (e.g. rust-analyzer stable).
 
-### Language servers (14 of 73 in upstream catalog)
+### Language servers (20 of 73 in upstream catalog)
 
 | Lang | Server | Status | Notes |
 |---|---|---|---|
@@ -62,8 +62,14 @@ vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent
 | SQL | sqls | ready (download) | `*.sql`; session/syntax layer live (formatting works), semantic hover/def need a `sqls` config (DB connection); no documentSymbol/references capability |
 | PostgreSQL | postgres-language-server (pgls) | ready (download) | `--lang pgsql` (`.sql` defaults to the sql entry); syntax diagnostics live without a DB (libpg_query local parser); documentSymbol/schema hover need a DB connection — LS capability boundary |
 | MySQL | sqls | ready (download) | `--lang mysql`; same sqls binary as the sql entry (separate cache dir); hover/diagnostics need a DB connection (LS warns "no database connection") |
+| Kotlin | Kotlin LSP (JetBrains managed intellij-server) | ready (download) | `*.kt`/`*.kts`; same-file hover/def + documentSymbol live (managed LSP pinned to upstream `263.4702.0`, sha-verified, bundled JBR — no system JDK); cross-file def/refs need the LS project import (a `build.gradle.kts`/`pom.xml` marker), which auto-downloads the Gradle distribution — LS capability boundary |
+| Dart | Dart SDK analysis server (`dart language-server`) | ready (download) | `*.dart`; full SDK download (206 MiB zip, sha-verified; pinned to upstream `3.7.1`); hover/def/refs/documentSymbol live on a bare folder (pubspec.yaml picked up automatically) |
+| HTML | vscode-html-language-server | ready (npm) | `*.html`/`*.htm`; in-file element/id symbols + mdn-driven hover/completion (`vscode-langservers-extracted`); cross-file refs/def not meaningful for HTML (upstream) |
+| CSS | vscode-css-language-server | ready (npm) | `*.css`; mdn-driven hover/completion for properties/selectors; same npm package as the html entry (separate cache dir) |
+| YAML | yaml-language-server | ready (npm) | `*.yaml`/`*.yml`; schema-driven hover/completion/diagnostics (schemastore); syntax diagnostics live without a schema |
+| Markdown | marksman | ready (download) | `*.md`/`*.markdown`; heading documentSymbols/workspace symbols; link def/refs/hover live when the project root is detectable (git repo or `.marksman.toml`) — marksman-side project detection, marker-less scratch dirs degrade to per-file assist |
 
-All 16 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; bash, json, powershell, vue — 2026-09-25; astro — 2026-09-28; docker, sql — 2026-09-28; postgresql, mysql — 2026-09-28; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / per-adapter reports `local/report-*-adapter.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
+All 20 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; bash, json, powershell, vue — 2026-09-25; astro — 2026-09-28; docker, sql — 2026-09-28; postgresql, mysql — 2026-09-28; yaml, markdown — 2026-09-28; kotlin, dart, html, css — 2026-09-28; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / per-adapter reports `local/report-*-adapter.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
 
 ## Install
 

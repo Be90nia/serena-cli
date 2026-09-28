@@ -433,17 +433,26 @@ pub fn to_install_spec(
     }
 }
 
-/// 展开占位符模板：`{bin}` → exe 路径；空模板默认 `[{bin}]`（裸启动即 stdio LS）。
+/// 展开占位符模板：`{bin}` → exe 路径、`{bin_dir}` → exe 所在目录（kotlin 的
+/// `--system-path {bin_dir}/system` 等需要可写伴随路径的条目用）；空模板默认
+/// `[{bin}]`（裸启动即 stdio LS）。`{bin_dir}` 先于 `{bin}` 替换——后者是前者的
+/// 字符串前缀，顺序反了会把 `{bin_dir}` 咬成 `<bin路径>_dir`。
 pub fn expand_exec(exec: &[String], bin: &Path) -> Vec<String> {
     if exec.is_empty() {
         return vec![bin.to_string_lossy().to_string()];
     }
+    let bin_s = bin.to_string_lossy().to_string();
+    let bin_dir_s = bin
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".into());
     exec.iter()
         .map(|a| {
-            if a == "{bin}" {
-                bin.to_string_lossy().to_string()
+            let a = a.replace("{bin_dir}", &bin_dir_s);
+            if a.contains("{bin}") {
+                a.replace("{bin}", &bin_s)
             } else {
-                a.clone()
+                a
             }
         })
         .collect()
@@ -804,6 +813,27 @@ mod tests {
         assert_eq!(
             expand_exec(&[], Path::new("D:/x/zls.exe")),
             vec!["D:/x/zls.exe"]
+        );
+    }
+
+    /// {bin_dir} 子串替换 + 先于 {bin}（前缀互吞回归）：kotlin --system-path 形态。
+    #[test]
+    fn expand_exec_substitutes_bin_dir_before_bin() {
+        let out = expand_exec(
+            &[
+                "{bin}".into(),
+                "--system-path".into(),
+                "{bin_dir}/system".into(),
+            ],
+            Path::new("C:/cache/kotlin/1.0/bin/server.exe"),
+        );
+        assert_eq!(
+            out,
+            vec![
+                "C:/cache/kotlin/1.0/bin/server.exe",
+                "--system-path",
+                "C:/cache/kotlin/1.0/bin/system",
+            ]
         );
     }
 

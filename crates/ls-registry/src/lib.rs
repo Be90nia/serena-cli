@@ -22,10 +22,10 @@ pub mod spec;
 pub use ls_adapters::LanguageId;
 use ls_adapters::{
     LanguageServerAdapter, astro::AstroAdapter, bash::BashAdapter,
-    clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter, gopls::GoplsAdapter, jdtls::JdtlsAdapter,
-    json::JsonAdapter, powershell::PowerShellAdapter, pyright::PyrightAdapter,
-    rust_analyzer::RustAnalyzerAdapter, typescript::TypescriptLanguageServerAdapter,
-    vue::VueAdapter,
+    clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter, css::CssAdapter, gopls::GoplsAdapter,
+    html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter, powershell::PowerShellAdapter,
+    pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter,
+    typescript::TypescriptLanguageServerAdapter, vue::VueAdapter,
 };
 
 /// 扩展名 → LanguageId 静态表（小写键）。
@@ -43,6 +43,10 @@ pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("hpp", LanguageId::Cpp),
     // Markdown（T0 配置驱动：servers.toml marksman，Task 21 双路径）
     ("md", LanguageId::Markdown),
+    ("markdown", LanguageId::Markdown),
+    // YAML（T0 配置驱动：servers.toml yaml 条目，bd 56a 后续批次）
+    ("yaml", LanguageId::Yaml),
+    ("yml", LanguageId::Yaml),
     // SQL / Dockerfile（T0 配置驱动：servers.toml sql/docker，bd 56a 第一批）。
     // 本批 sql 独占 .sql（pgsql/mysql 第二批用 --lang 显式覆盖，不进本表）。
     ("sql", LanguageId::Sql),
@@ -77,9 +81,17 @@ pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("psd1", LanguageId::PowerShell),
     // Vue 单文件组件
     ("vue", LanguageId::Vue),
+    // Kotlin / Dart（bd 56a 后续批，T0 配置驱动：servers.toml kotlin/dart 条目）
+    ("kt", LanguageId::Kotlin),
+    ("kts", LanguageId::Kotlin),
+    ("dart", LanguageId::Dart),
     // Astro 单文件组件（ts/js 仍归 TypeScript —— 上游 superset 优先级 1 的
     // 项目级覆盖我们无对应机制，--lang astro 显式指定即达同效）
     ("astro", LanguageId::Astro),
+    // HTML / CSS（bd 56a 后续批）
+    ("html", LanguageId::Html),
+    ("htm", LanguageId::Html),
+    ("css", LanguageId::Css),
 ];
 
 /// 各 LanguageId 对应的 adapter 单例。
@@ -101,6 +113,8 @@ singleton!(JSON, JsonAdapter);
 singleton!(POWERSHELL, PowerShellAdapter);
 singleton!(VUE, VueAdapter);
 singleton!(ASTRO, AstroAdapter);
+singleton!(HTML, HtmlAdapter);
+singleton!(CSS, CssAdapter);
 
 /// 路径 → 语言。扩展名小写后查表，命中即返回；其余 None。
 ///
@@ -148,12 +162,18 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         LanguageId::PowerShell => POWERSHELL.clone(),
         LanguageId::Vue => VUE.clone(),
         LanguageId::Astro => ASTRO.clone(),
-        // T0 配置驱动语言：无手写 adapter（见 config::ensure_launch）。
-        LanguageId::Markdown => return None,
+        // bd 56a 后续批：html/css 手写 T2（同包 vscode-langservers-extracted 双入口）。
+        LanguageId::Html => HTML.clone(),
+        LanguageId::Css => CSS.clone(),
+        // T0 配置驱动语言（markdown/yaml）：无手写 adapter（见 config::ensure_launch）。
+        LanguageId::Markdown | LanguageId::Yaml => return None,
         // T0 配置驱动（bd 56a 第一批）：docker/sql 走 servers.toml docker/sql 条目。
         LanguageId::Docker | LanguageId::Sql => return None,
         // T0 配置驱动（bd 56a 第二批）：pgsql/mysql 走 servers.toml pgls/sqls-mysql 条目。
         LanguageId::Pgsql | LanguageId::Mysql => return None,
+        // T0 配置驱动（bd 56a 后续批）：kotlin/dart 走 servers.toml kotlin/dart 条目
+        // （download 形态，ensure_launch 接管）。
+        LanguageId::Kotlin | LanguageId::Dart => return None,
     })
 }
 
@@ -277,6 +297,27 @@ mod tests {
         );
         // alias：from_str_opt 接受 pwsh（LanguageId 层），adapter_for 同语义。
         assert!(adapter_for("pwsh").is_some());
+    }
+
+    /// bd 56a 后续批：--lang html/css 必须路由到手写 T2 adapter（同包双入口），
+    /// 扩展名 html/htm/css 走 EXT_TABLE，lsp_language_id 恒等。
+    #[test]
+    fn adapter_for_routes_html_css() {
+        for lang in ["html", "css"] {
+            let a =
+                adapter_for(lang).unwrap_or_else(|| panic!("--lang {lang} 必须路由到 T2 adapter"));
+            let b = adapter_for(lang).unwrap();
+            assert!(Arc::ptr_eq(&a, &b), "singleton broken for {lang}");
+        }
+        assert_eq!(adapter_for("html").unwrap().languages(), &[LanguageId::Html]);
+        assert_eq!(adapter_for("css").unwrap().languages(), &[LanguageId::Css]);
+        // lsp_language_id 恒等（LSP 官方口径同内部名）。
+        assert_eq!(lsp_language_id("html"), "html");
+        assert_eq!(lsp_language_id("css"), "css");
+        // 扩展名解析（EXT_TABLE）：html/htm 归 Html 门，css 归 Css 门。
+        assert_eq!(resolve(&PathBuf::from("index.html")), Some(LanguageId::Html));
+        assert_eq!(resolve(&PathBuf::from("page.htm")), Some(LanguageId::Html));
+        assert_eq!(resolve(&PathBuf::from("style.css")), Some(LanguageId::Css));
     }
 
     /// Wave 1 扩展名解析：sh/bash/json/jsonc/ps1/psm1/psd1/vue（resolve 锁定）。
