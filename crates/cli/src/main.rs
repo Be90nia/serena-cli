@@ -463,6 +463,15 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// 卸载 serena 托管的 LS 安装缓存（`{cache_root}/{id}/` 全版本/变体）。
+    /// PATH 探测型（path_only/uvx）非 serena 托管，明确拒删、不受影响。
+    Uninstall {
+        /// lang 或 servers.toml 条目 id。
+        lang: String,
+        /// 输出 JSON {ok, lang, removed_dirs, bytes_freed}。
+        #[arg(long)]
+        json: bool,
+    },
     /// 长连接 shell（stdin/stdout JSONL）。Task 18。
     ///
     /// 每行 stdin 一个 JSON 请求，响应逐行写 stdout。协议形状：
@@ -608,6 +617,14 @@ async fn cli_main() -> ExitCode {
             }
             let lang = lang.clone();
             return tokio::task::spawn_blocking(move || cmd_install(&lang))
+                .await
+                .unwrap_or(ExitCode::from(3));
+        }
+        // uninstall 纯本地 fs 操作，同 install 先例走阻塞线程。
+        Some(Cmd::Uninstall { lang, json }) => {
+            let lang = lang.clone();
+            let json = *json;
+            return tokio::task::spawn_blocking(move || cmd_uninstall(&lang, json))
                 .await
                 .unwrap_or(ExitCode::from(3));
         }
@@ -1962,6 +1979,7 @@ async fn forward(
         Some(Cmd::Status)
         | Some(Cmd::StopAll)
         | Some(Cmd::Install { .. })
+        | Some(Cmd::Uninstall { .. })
         | Some(Cmd::Shell)
         | Some(Cmd::Doctor { .. })
         | Some(Cmd::LintShell { .. })
@@ -2151,6 +2169,82 @@ fn cmd_install_all() -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+/// `uninstall <lang>`：删除 serena 托管 LS 缓存（`{cache_root}/{id}/` 全版本/变体）。
+/// 安全铁律：canonicalize 后目标必须仍在缓存根内（`ensure_within_cache_root`）——
+/// 防 servers.toml 条目 id 被改成 `../..` 形态 / 缓存目录被软链出根后误删任意路径。
+/// path_only（PATH 探测）/ uvx（uv 自管缓存）型 serena 不落缓存，报非托管不删。
+fn cmd_uninstall(lang: &str, json: bool) -> ExitCode {
+    let Some((id, spec)) = ls_registry::config::spec_for(lang) else {
+        eprintln!("uninstall failed: no servers.toml entry for `{lang}`");
+        return ExitCode::from(3);
+    };
+    if matches!(
+        spec.kind_table(),
+        Some(ls_registry::spec::KindRef::PathOnly(_))
+            | Some(ls_registry::spec::KindRef::Uvx(_))
+    ) {
+        eprintln!("uninstall: `{id}` is not serena-managed (no cache dir); nothing removed");
+        return ExitCode::from(1);
+    }
+    let cache_root = ls_registry::config::dirs_cache_root();
+    let dir = cache_root.join(id);
+    if !dir.is_dir() {
+        eprintln!(
+            "uninstall failed: language server `{lang}` not installed; run `serena-cli install {id}`"
+        );
+        return ExitCode::from(3);
+    }
+    let dir = match ls_registry::config::ensure_within_cache_root(&cache_root, &dir) {
+        Ok(d) => d,
+        Err(m) => {
+            eprintln!("uninstall refused: {m}");
+            return ExitCode::from(1);
+        }
+    };
+    let bytes_freed = dir_size(&dir);
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        eprintln!("uninstall failed: remove `{}`: {e}", dir.display());
+        return ExitCode::from(3);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "lang": id,
+                "removed_dirs": [dir.display().to_string()],
+                "bytes_freed": bytes_freed,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "uninstalled `{id}` -> {} ({bytes_freed} bytes freed)",
+            dir.display()
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// 目录递归字节数（uninstall `bytes_freed` 用）；symlink 不跟进防环。
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if meta.is_dir() {
+            total += dir_size(&entry.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 /// cargo metadata 健康检查（bd xzb-doctor 的 doctor 侧）：项目目录落在别的

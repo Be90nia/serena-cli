@@ -20,7 +20,7 @@ Trade-off: you lose the "MCP auto-discovery" story. You gain `bash`-debuggabilit
 
 ## What it covers
 
-### CLI commands (55)
+### CLI commands (56)
 
 Read / navigate (7): `overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -34,7 +34,7 @@ Undo / redo (2): `undo` (`--steps N`, `--list`) · `redo` — transactional snap
 
 Completion (1): `completion` (with `--limit` and per-file-suffix trigger inference)
 
-Admin (4): `status` · `stop-all` · `install <lang>` · `shell` (JSONL stdin/stdout session)
+Admin (5): `status` · `stop-all` · `install <lang>` · `uninstall <lang>` · `shell` (JSONL stdin/stdout session)
 
 Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker`
 

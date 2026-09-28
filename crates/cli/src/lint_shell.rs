@@ -127,6 +127,7 @@ const TOOL_NAMES: &[&str] = &[
     "status",
     "stop-all",
     "install",
+    "uninstall",
     "shell",
     "doctor",
     "lint-shell",

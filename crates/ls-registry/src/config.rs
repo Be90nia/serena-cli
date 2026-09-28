@@ -667,6 +667,12 @@ pub fn dirs_cache_root() -> PathBuf {
     ls_runtime::install::default_cache_root()
 }
 
+/// 卸载安全门转发（实现锚 `ls_runtime::install::ensure_within_cache_root`；
+/// 同 dirs_cache_root 转发先例：cli 只依赖本 crate）。
+pub fn ensure_within_cache_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
+    ls_runtime::install::ensure_within_cache_root(root, target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

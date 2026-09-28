@@ -347,6 +347,28 @@ pub fn default_cache_root() -> PathBuf {
     }
 }
 
+/// 卸载安全门（`uninstall <lang>` 唯一删除入口）：解析（canonicalize）后的目标
+/// 目录必须仍在缓存根内部，否则拒删。防 servers.toml 条目 id 被改成 `../..`
+/// 形态、或 `{cache_root}/{id}` 被软链/联接指到根外后误删任意目录。
+/// target 不存在时 canonicalize 失败同样拒绝——装态探测由调用方先行。
+pub fn ensure_within_cache_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
+    let root_can = root
+        .canonicalize()
+        .map_err(|e| format!("cache root `{}`: {e}", root.display()))?;
+    let target_can = target
+        .canonicalize()
+        .map_err(|e| format!("`{}`: {e}", target.display()))?;
+    if target_can.starts_with(&root_can) {
+        Ok(target_can)
+    } else {
+        Err(format!(
+            "resolved target `{}` is outside cache root `{}`; refusing to delete",
+            target_can.display(),
+            root_can.display()
+        ))
+    }
+}
+
 /// 构造带 §5.1 重定向逐跳校验的 blocking client。
 pub fn build_download_client(
     allowed_hosts: &[String],
@@ -617,6 +639,42 @@ impl Drop for InstallLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// uninstall 安全门：根内放行、根外/traversal/软链/不存在拒绝。
+    #[test]
+    fn uninstall_safety_gate_prefix_check() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ls");
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("html/4.10.0");
+        std::fs::create_dir_all(&inside).unwrap();
+        let victim = base.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+
+        // 根内目录放行，返回 canonical 路径。
+        let got = ensure_within_cache_root(&root, &inside).unwrap();
+        assert!(got.starts_with(root.canonicalize().unwrap()));
+        // 缓存根外独立目录拒绝。
+        assert!(ensure_within_cache_root(&root, &victim).is_err());
+        // traversal 形态 id（ls/../victim，存在且解析后出根）拒绝。
+        let traversal = root.join("..").join("victim");
+        assert!(ensure_within_cache_root(&root, &traversal).is_err());
+        // 不存在的目标拒绝（装态探测归调用方）。
+        assert!(ensure_within_cache_root(&root, &root.join("nope")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_safety_gate_blocks_symlink_escape() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ls");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = base.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        // {cache_root}/{id} 是指向根外的软链 → canonicalize 解析后前缀失配，拒删。
+        std::fs::symlink(&victim, root.join("html")).unwrap();
+        assert!(ensure_within_cache_root(&root, &root.join("html")).is_err());
+    }
 
     #[test]
     fn sha_gate_decides_by_known_hash_and_jail_flag() {
