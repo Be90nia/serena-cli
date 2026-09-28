@@ -7,7 +7,9 @@
 //!
 //! 启动 quirk：
 //! - csharp_ls 启动需 ~3s 加载 Roslyn workspaces。
-//! - 默认 .sln/.csproj 自动发现；不需要 --solution。
+//! - 默认 .sln/.csproj 自动发现；但「恰好 1 个 .sln」不成立时（vendored/多 sln 仓）
+//!   会退化成全量 .csproj 加载（0.15.0 实测）→ `launch_info` 按内置 ignore 规则
+//!   选出唯一 .sln 时传 `--solution` 限定项目面，见 `find_unique_sln`。
 //!
 //! ## 深度（M2 落地）
 //!
@@ -63,8 +65,15 @@ impl LanguageServerAdapter for CsharpLsAdapter {
                 "install csharp-ls (`dotnet tool install -g csharp-ls`) and ensure `csharp-ls` is on PATH",
             )
         })?;
+        let mut cmd: Vec<std::ffi::OsString> = vec![exe.into_os_string()];
+        if let Some(rel) = find_unique_sln(&ctx.project_root) {
+            // csharp-ls: "--solution, -s <solution> — .sln file to load (relative to CWD)"，
+            // cwd 即 project_root（下方 LaunchInfo.cwd），相对路径成立。
+            cmd.push("--solution".into());
+            cmd.push(rel.as_os_str().to_os_string());
+        }
         Ok(LaunchInfo {
-            cmd: vec![exe.into_os_string()],
+            cmd,
             cwd: ctx.project_root.clone(),
             env: vec![],
             transport: TransportKind::Stdio,
@@ -116,6 +125,68 @@ impl CsharpLsAdapter {
     }
 }
 
+/// root 下唯一非忽略 `.sln` 相对 root 的路径（限深 4、跳 [`crate::PROBE_SKIP_DIRS`]
+/// 与点目录——vendored `.sln` 因此不参与唯一性判定）。0 或 ≥2 个 → `None`，保持
+/// csharp-ls 自身自动发现（零回归）。
+///
+/// 为什么值得传 `--solution`：csharp-ls 0.15.0 自动发现只在「恰好 1 个 .sln」时走
+/// solution 加载；0 或 ≥2 个（vendored/示例 sln 常凑数，它不看 ignore）→ showMessage
+/// "no or multiple .sln files found" → 递归加载 root 下**所有** .csproj/.fsproj（仅排
+/// node_modules），启动变慢且 restore 噪音淹没真实诊断（Spike-B B1/B2 真机复现，
+/// `--solution` 后 vendored 符号从 workspace/symbol 消失 = B3）。
+fn find_unique_sln(root: &Path) -> Option<PathBuf> {
+    fn walk(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
+        if depth == 0 || out.len() > 1 {
+            return; // 已确认非唯一，提前止损
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for path in entries.filter_map(Result::ok).map(|e| e.path()) {
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+        files.sort();
+        for path in files {
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("sln"))
+            {
+                out.push(path);
+                if out.len() > 1 {
+                    return;
+                }
+            }
+        }
+        dirs.sort();
+        for dir_path in dirs {
+            let name = dir_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string());
+            let skipped = name
+                .as_deref()
+                .is_some_and(|n| crate::PROBE_SKIP_DIRS.contains(&n) || n.starts_with('.'));
+            if !skipped {
+                walk(&dir_path, depth - 1, out);
+                if out.len() > 1 {
+                    return;
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, 4, &mut found);
+    match found.len() {
+        1 => found.pop().and_then(|p| p.strip_prefix(root).ok().map(Path::to_path_buf)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +218,50 @@ mod tests {
             resolved.is_none(),
             "M2 stub 必须返 None（决策暂留 csharp_ls）: got {resolved:?}"
         );
+    }
+
+    #[test]
+    fn unique_sln_is_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("src").join("App");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("App.sln"), "").unwrap();
+        std::fs::write(sub.join("App.csproj"), "").unwrap();
+        let expected = std::path::PathBuf::from("src").join("App").join("App.sln");
+        assert_eq!(find_unique_sln(dir.path()).unwrap(), expected);
+    }
+
+    /// vendored 目录（内置 ignore 表）里的 .sln 不参与唯一性判定：真 sln + vendored
+    /// sln 并存时仍应选中真 sln（csharp-ls 自动发现不认 ignore，两 sln 会让它退化成
+    /// 全量 .csproj 加载 —— Spike-B B2 实测）。
+    #[test]
+    fn vendored_sln_does_not_block_uniqueness() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendored = dir.path().join("vendor").join("lib");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(dir.path().join("App.sln"), "").unwrap();
+        std::fs::write(vendored.join("Vendored.sln"), "").unwrap();
+        assert_eq!(find_unique_sln(dir.path()).unwrap(), std::path::PathBuf::from("App.sln"));
+    }
+
+    /// ≥2 个非忽略 .sln：意图不明 → None，保持 csharp-ls 自动发现（零回归）。
+    #[test]
+    fn multiple_visible_slns_fall_back_to_autodiscovery() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.sln"), "").unwrap();
+        std::fs::write(dir.path().join("B.sln"), "").unwrap();
+        assert_eq!(find_unique_sln(dir.path()), None);
+    }
+
+    /// 唯一 sln 本身在 vendor/ 下 = vendored 产物 → 不选（选了会把 vendored 项目面
+    /// 当成用户项目面）。
+    #[test]
+    fn sln_only_under_ignored_dir_is_not_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendored = dir.path().join("vendor");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(vendored.join("Vendored.sln"), "").unwrap();
+        assert_eq!(find_unique_sln(dir.path()), None);
     }
 }
 

@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use lsp_types::InitializeParams;
 
 pub mod basedpyright_server;
+pub mod astro;
 pub mod bash;
 pub mod clangd;
 pub mod csharp_ls;
@@ -59,6 +60,8 @@ pub enum LanguageId {
     Json,
     PowerShell,
     Vue,
+    /// T2 手写双服务器适配器（astro.rs，上游 7a296833）。
+    Astro,
 }
 
 impl LanguageId {
@@ -76,6 +79,7 @@ impl LanguageId {
             Self::Json => "json",
             Self::PowerShell => "powershell",
             Self::Vue => "vue",
+            Self::Astro => "astro",
         }
     }
     /// 反向：lang 字符串 → LanguageId。未知返 None。
@@ -93,6 +97,7 @@ impl LanguageId {
             "json" => Some(Self::Json),
             "powershell" | "pwsh" => Some(Self::PowerShell),
             "vue" => Some(Self::Vue),
+            "astro" => Some(Self::Astro),
             _ => None,
         }
     }
@@ -114,6 +119,7 @@ impl LanguageId {
             "json" | "jsonc" => Some(Self::Json),
             "ps1" | "psm1" | "psd1" => Some(Self::PowerShell),
             "vue" => Some(Self::Vue),
+            "astro" => Some(Self::Astro),
             _ => None,
         }
     }
@@ -182,11 +188,12 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::Json => &["json"],
         LanguageId::PowerShell => &["ps1", "psm1", "psd1"],
         LanguageId::Vue => &["vue"],
+        LanguageId::Astro => &["astro"],
     }
 }
 
 /// 源文件探测时的跳过目录（构建产物 / VCS / 依赖树，进去只会浪费扫描时间）。
-const PROBE_SKIP_DIRS: &[&str] = &[
+pub(crate) const PROBE_SKIP_DIRS: &[&str] = &[
     "target",
     "node_modules",
     "build",
@@ -369,6 +376,17 @@ pub trait LanguageServerAdapter: Send + Sync {
     fn supports_implementation(&self) -> bool {
         false
     }
+
+    /// 跨文件引用类查询（references）发请求前的 `$/progress` 索引等待。
+    ///
+    /// ↖ mirror: ls.py@43ae021 `_wait_for_cross_file_references_if_needed`（调用位次：
+    ///           didOpen 之后、请求之前）
+    ///           ↖ mirror: @cf54869a 修订 —— 首查 latch 只覆盖 start-grace 等待；
+    ///           后续查询若仍有在飞索引 token 则继续 drain，避免 tsserver 后台索引期
+    ///           跨文件查询静默返回空/部分结果。
+    /// 默认空实现：不跟踪 `$/progress` 的 LS 直接放行。等待/超时不报错 —— 超时由
+    /// 实现方 warn 后放行（上游 permissive 行为），请求自身超时兜底。
+    async fn wait_for_cross_file_index(&self, _session: &lsp_core::session::Session) {}
 }
 
 /// 在 PATH 中查找可执行文件（去 UNC 前缀 dunce），返回 None 表示未找到。

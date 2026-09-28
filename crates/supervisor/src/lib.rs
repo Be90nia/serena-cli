@@ -1257,6 +1257,30 @@ impl Supervisor {
         self.diag_generation.load(Ordering::Relaxed)
     }
 
+    /// hybrid 双服务器语言（astro）的 per-file 语义会话：ts/js 系文件的语义只在伴生
+    /// TS LS（上游 `_is_ts_file` 路由语义），其余回落 [`Self::semantic_session_or_main`]。
+    async fn semantic_session_for_file(
+        &self,
+        root: &Path,
+        file: &str,
+        lang: &str,
+    ) -> ToolResult<Arc<Session>> {
+        let is_ts_like = std::path::Path::new(file)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .is_some_and(|e| {
+                matches!(e.as_str(), "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+            });
+        if is_ts_like
+            && let Some(adapter) = ls_registry::adapter_for(lang)
+            && let Some(s) = adapter.semantic_session(root)
+        {
+            return Ok(s);
+        }
+        self.semantic_session_or_main(root, lang).await
+    }
+
     /// hybrid 语言语义路由：adapter 提供语义会话（vue 的伴生 TS LS）时优先，否则
     /// 主会话（session_for 兼带首次拉起 —— 冷启动首个请求必经此处拉起主 + 伴生）。
     /// 仅位置类语义请求（hover / signature-help）经此；结构类（documentSymbol）
@@ -2813,7 +2837,11 @@ impl Supervisor {
         lang_override: Option<&str>,
     ) -> ToolResult<Vec<Location>> {
         let lang = resolve_lang_for_file(file, lang_override)?;
-        let session = self.session_for(root, lang.as_str()).await?;
+        // hybrid 双服务器语言（astro）per-file 路由：ts/js 系文件的引用语义只在
+        // 伴生 TS LS（↖ mirror: astro_language_server.py@7a296833 `request_references`
+        // 对 `_is_ts_file` 路由伴生；主 astro-ls 对 .ts references 恒空 —— 帧录制
+        // 实证）。.astro 与非 hybrid 语言回落主会话（semantic_session_or_main）。
+        let session = self.semantic_session_for_file(root, file, lang.as_str()).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;

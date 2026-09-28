@@ -41,6 +41,10 @@ struct Config {
     /// P2-y5u 复现：握手后立刻发 N 个 unique progress token —— 模拟长会话 progress
     /// 风暴，触发 `Session::progress.resolved` 表容量上限测试。
     progress_tokens_multi: Option<u32>,
+    /// cf54869a mirror 集成测试钩子：progress_token 设了且本项开启时，initialize 后发
+    /// `$/progress` begin，收到首个 didOpen 通知才发 end —— 模拟「didOpen 触发的
+    /// 索引在请求方等待期间才完成」，证明 track→drain 全链路真实等待。
+    progress_end_on_open: bool,
     /// 文档事件跟踪日志路径（Task 7）。设了就把 didOpen/didChange/didClose 追加写入。
     track_file_events: Option<std::path::PathBuf>,
     /// 开启后 capabilities 加 `diagnosticProvider: { ... }`，
@@ -78,6 +82,9 @@ fn load_config() -> Config {
         progress_tokens_multi: std::env::var("MOCK_LS_PROGRESS_TOKENS_MULTI")
             .ok()
             .and_then(|s| s.parse::<u32>().ok()),
+        progress_end_on_open: std::env::var("MOCK_LS_PROGRESS_END_ON_OPEN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
         track_file_events: std::env::var("MOCK_LS_TRACK_FILE_EVENTS")
             .ok()
             .map(std::path::PathBuf::from),
@@ -184,6 +191,7 @@ async fn main() {
     let mut decoder = Decoder::default();
     let mut chunk = [0u8; 4096];
     let mut initialized = false;
+    let mut progress_end_on_open = config.progress_end_on_open;
     loop {
         match stdin.read(&mut chunk).await {
             Ok(0) | Err(_) => return,
@@ -193,6 +201,26 @@ async fn main() {
             // 文件事件跟踪：didOpen/didChange/didClose 是通知（无 id），默认「忽略」
             // 路径会丢；这里按方法名前缀判断追加写日志。
             track_event(&config.track_file_events, &msg).await;
+
+            // cf54869a mirror 钩子：首个 didOpen 到达时补发 `$/progress` end。
+            if progress_end_on_open
+                && msg.method.as_deref() == Some("textDocument/didOpen")
+            {
+                progress_end_on_open = false;
+                if let Some(token) = &config.progress_token {
+                    let progress = JsonRpc::notification(
+                        "$/progress",
+                        json!({
+                            "token": token,
+                            "value": { "kind": "end", "message": "mock_ls progress done" },
+                        }),
+                    );
+                    if stdout.write_all(&encode(&progress)).await.is_err() {
+                        return;
+                    }
+                    let _ = stdout.flush().await;
+                }
+            }
 
             // Phase 4 Task 22a：把 initialize params 写到测试日志路径，
             // 断言 supervisor 端构造的 workspaceFolders 数组形态。
@@ -277,11 +305,14 @@ async fn main() {
             // Phase 4 Task 22c：发 `$/progress` 通知（kind="end"，模拟 LS 完成）。
             if msg.method.as_deref() == Some("initialize") {
                 if let Some(token) = &config.progress_token {
+                    // cf54869a mirror 钩子：end_on_open 时 initialize 后只发 begin，
+                    // end 推迟到首个 didOpen（下方分支）—— 模拟 didOpen 触发的索引。
+                    let kind = if config.progress_end_on_open { "begin" } else { "end" };
                     let progress = JsonRpc::notification(
                         "$/progress",
                         json!({
                             "token": token,
-                            "value": { "kind": "end", "message": "mock_ls progress done" },
+                            "value": { "kind": kind, "message": "mock_ls progress" },
                         }),
                     );
                     if stdout.write_all(&encode(&progress)).await.is_err() {

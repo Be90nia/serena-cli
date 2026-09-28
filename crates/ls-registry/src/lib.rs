@@ -20,10 +20,11 @@ pub mod file_detect;
 pub mod spec;
 
 use ls_adapters::{
-    LanguageId, LanguageServerAdapter, bash::BashAdapter, clangd::ClangdAdapter,
-    csharp_ls::CsharpLsAdapter, gopls::GoplsAdapter, jdtls::JdtlsAdapter, json::JsonAdapter,
-    powershell::PowerShellAdapter, pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter,
-    typescript::TypescriptLanguageServerAdapter, vue::VueAdapter,
+    LanguageId, LanguageServerAdapter, astro::AstroAdapter, bash::BashAdapter,
+    clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter, gopls::GoplsAdapter, jdtls::JdtlsAdapter,
+    json::JsonAdapter, powershell::PowerShellAdapter, pyright::PyrightAdapter,
+    rust_analyzer::RustAnalyzerAdapter, typescript::TypescriptLanguageServerAdapter,
+    vue::VueAdapter,
 };
 
 /// 扩展名 → LanguageId 静态表（小写键）。
@@ -71,6 +72,9 @@ pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("psd1", LanguageId::PowerShell),
     // Vue 单文件组件
     ("vue", LanguageId::Vue),
+    // Astro 单文件组件（ts/js 仍归 TypeScript —— 上游 superset 优先级 1 的
+    // 项目级覆盖我们无对应机制，--lang astro 显式指定即达同效）
+    ("astro", LanguageId::Astro),
 ];
 
 /// 各 LanguageId 对应的 adapter 单例。
@@ -91,6 +95,7 @@ singleton!(BASH, BashAdapter);
 singleton!(JSON, JsonAdapter);
 singleton!(POWERSHELL, PowerShellAdapter);
 singleton!(VUE, VueAdapter);
+singleton!(ASTRO, AstroAdapter);
 
 /// 路径 → 语言。扩展名小写后查表，命中即返回；其余 None。
 ///
@@ -137,6 +142,7 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         LanguageId::Json => JSON.clone(),
         LanguageId::PowerShell => POWERSHELL.clone(),
         LanguageId::Vue => VUE.clone(),
+        LanguageId::Astro => ASTRO.clone(),
         // T0 配置驱动语言：无手写 adapter（见 config::ensure_launch）。
         LanguageId::Markdown => return None,
     })
@@ -218,11 +224,11 @@ mod tests {
         assert!(adapter_for("lua").is_none());
     }
 
-    /// Wave 1/2：--lang bash/json/powershell/vue 必须路由到手写 T2 adapter（supervisor
+    /// Wave 1/2：--lang bash/json/powershell/vue/astro 必须路由到手写 T2 adapter（supervisor
     /// session_for 的 T2 优先分支）。
     #[test]
     fn adapter_for_routes_wave1_languages() {
-        for lang in ["bash", "json", "powershell", "vue"] {
+        for lang in ["bash", "json", "powershell", "vue", "astro"] {
             let a =
                 adapter_for(lang).unwrap_or_else(|| panic!("--lang {lang} 必须路由到 T2 adapter"));
             let b = adapter_for(lang).unwrap();
@@ -242,6 +248,10 @@ mod tests {
             &[LanguageId::PowerShell]
         );
         assert_eq!(adapter_for("vue").unwrap().languages(), &[LanguageId::Vue]);
+        assert_eq!(
+            adapter_for("astro").unwrap().languages(),
+            &[LanguageId::Astro]
+        );
         // alias：from_str_opt 接受 pwsh（LanguageId 层），adapter_for 同语义。
         assert!(adapter_for("pwsh").is_some());
     }
@@ -268,6 +278,7 @@ mod tests {
             resolve(&PathBuf::from("x.psd1")),
             Some(LanguageId::PowerShell)
         );
+        assert_eq!(resolve(&PathBuf::from("x.astro")), Some(LanguageId::Astro));
         assert_eq!(resolve(&PathBuf::from("App.vue")), Some(LanguageId::Vue));
     }
 }

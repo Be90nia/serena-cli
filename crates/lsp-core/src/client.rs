@@ -293,6 +293,13 @@ impl Client {
         guard.insert(method.into(), Arc::new(f));
     }
 
+    /// 移除指定方法的 server→client request handler（与 [`Self::clear_notification`]
+    /// 对称；`Session::shutdown` 清 `window/workDoneProgress/create` 用）。
+    pub fn clear_server_request(&self, method: &str) -> bool {
+        let mut guard = self.inner.server_request_handlers.lock().unwrap();
+        guard.remove(method).is_some()
+    }
+
     /// 发送通知（无 id、不期待响应）。按 method 自动归类 priority（P0B）。
     /// textDocument/* 等用户面向请求由调用方走 [`Client::notify_at`] 显式 High；
     /// 本方法默认按 `classify_method` 推断（didOpen/didChange/didClose 等 Normal）。

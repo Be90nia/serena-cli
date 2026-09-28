@@ -113,6 +113,7 @@ fn adapter_for_each_m3_language() {
         ("javascript", "typescript-language-server"),
         ("csharp", "csharp-ls"),
         ("java", "jdtls"),
+        ("astro", "astro-ls"),
     ];
     for (lang, expected_id) in cases {
         let ad =

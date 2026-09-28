@@ -27,6 +27,15 @@ use crate::{
 
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 首查等待 tsserver *开始*发 `$/progress` 的宽限窗：tsserver 须先解析项目图才能创建
+/// 首个 progress token，大项目光"开始上报"就慢。
+/// ↖ mirror: typescript_language_server.py@43ae021 `INDEXING_START_GRACE`（5.0s）
+const INDEXING_START_GRACE: Duration = Duration::from_secs(5);
+
+/// `$/progress` 索引等待兜底超时：正常远小于此，仅 LS 从不发 end 时耗满。
+/// ↖ mirror: typescript_language_server.py@43ae021 `INDEXING_PROGRESS_TIMEOUT`（30.0s）
+const INDEXING_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// root 未设置 / 无候选文件时的退路：旧版虚拟探针 URI（不触发项目索引，仅保底）。
 const PROBE_FALLBACK: &str = "file:///__ts_ls_ready_probe__";
 
@@ -132,6 +141,40 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
     fn supports_implementation(&self) -> bool {
         // TypeScript LS 支持 `textDocument/implementation`（interface → class）。
         true
+    }
+
+    /// 跨文件引用查询前的索引等待。
+    ///
+    /// ↖ mirror: typescript_language_server.py@43ae021
+    ///          `_wait_for_cross_file_references_if_needed`
+    ///          ↖ mirror: @cf54869a 修订 —— 首查 latch 后，后续查询若仍有在飞
+    ///          `$/progress` token（后开的新文件/新项目触发新一轮索引）则继续 drain；
+    ///          旧版只有首查 latch，后续查询对在飞索引视而不见 → references 静默
+    ///          空/部分。超时 warn 后放行（上游 permissive 语义）。
+    async fn wait_for_cross_file_index(&self, session: &lsp_core::session::Session) {
+        let completed = if session.take_cross_file_first_query() {
+            // 首查：等索引开始并 drain，或 grace 内证明无需索引。
+            session
+                .wait_indexing_start_or_completion(
+                    INDEXING_PROGRESS_TIMEOUT,
+                    INDEXING_START_GRACE,
+                )
+                .await
+        } else if session.index_active_progress() > 0 {
+            // 后续查询：cf54869a 修订核心 —— 有在飞 token 就 drain。
+            session.wait_indexing_drain(INDEXING_PROGRESS_TIMEOUT).await
+        } else {
+            return;
+        };
+        if completed {
+            tracing::debug!("typescript cross-file indexing complete");
+        } else {
+            tracing::warn!(
+                "typescript cross-file indexing did not complete within {}s; proceeding (active tokens: {})",
+                INDEXING_PROGRESS_TIMEOUT.as_secs(),
+                session.index_active_progress()
+            );
+        }
     }
 }
 

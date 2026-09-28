@@ -179,7 +179,7 @@ impl Session {
                     lru_evicted = evict_lru_idle_locked(&mut map, FILE_BUFFER_CAPACITY);
                     let action = Action::Send {
                         method: "textDocument/didOpen",
-                        params: make_did_open(&uri, &text, version, &self.language_id()),
+                        params: make_did_open(&uri, &text, version, &self.language_id_for(path)),
                     };
                     (action, version, lru_evicted)
                 }

@@ -42,7 +42,7 @@ Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `
 
 vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses), plus the long tail (`documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint`) — all landed and verified 2026-09-23; `document-link`/`moniker` return empty on LS without the capability (e.g. rust-analyzer stable).
 
-### Language servers (11 of 73 in upstream catalog)
+### Language servers (12 of 73 in upstream catalog)
 
 | Lang | Server | Status | Notes |
 |---|---|---|---|
@@ -57,8 +57,9 @@ vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent
 | JSON | vscode-json-languageserver | ready (npm) | schema-driven hover/diagnostics |
 | PowerShell | PowerShellEditorServices | ready (download) | requires `pwsh` 7+; bundled PSScriptAnalyzer diagnostics |
 | Vue | @vue/language-server | ready (npm, hybrid) | companion typescript-language-server with `@vue/typescript-plugin`; semantic hover/routing live, diagnostics via tsserver bridge pending |
+| Astro | @astrojs/language-server | ready (npm, hybrid) | companion typescript-language-server with `@astrojs/ts-plugin` (upstream `7a296833`); ts/js refs route to companion, `.astro` semantic hover live |
 
-All 11 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; bash, json, powershell, vue — 2026-09-25; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / per-adapter reports `local/report-*-adapter.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
+All 12 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; bash, json, powershell, vue — 2026-09-25; astro — 2026-09-28; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / per-adapter reports `local/report-*-adapter.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
 
 ## Install
 

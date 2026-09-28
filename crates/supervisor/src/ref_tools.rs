@@ -70,6 +70,15 @@ async fn fetch_references(
         .ensure_open(file)
         .await
         .map_err(|e| RefError::Core(format!("ensure_open: {e}")))?;
+    // 跨文件引用查询发请求前的 `$/progress` 索引等待（didOpen 之后、request 之前，
+    // 位次同上游基类 ReferencesLocationRequest.execute）。
+    // ↖ mirror: ls.py@43ae021 `_wait_for_cross_file_references_if_needed`
+    //           ↖ mirror: @cf54869a 修订 —— 后续查询也 drain 在飞索引。默认空实现，
+    // 仅跟踪 $/progress 的 adapter（typescript-language-server）真正等待；失败/超时
+    // 不阻断查询（hook 内部 warn 后放行）。
+    if let Some(adapter) = ls_registry::adapter_for(&session.language_id()) {
+        adapter.wait_for_cross_file_index(session).await;
+    }
     let uri = path_to_uri_str(file);
     let params = json!({
         "textDocument": { "uri": uri },
@@ -185,6 +194,27 @@ fn find_container_name(symbols: &[DocumentSymbol], line: u32, col: u32) -> Strin
     best.map(|s| s.name.clone()).unwrap_or_default()
 }
 
+/// ts/js 系扩展名 → hybrid 伴生语义会话（见 `find_referencing_symbols` 头注释）。
+/// 其余情况原会话返回 —— 无 hybrid 伴生 / 非 ts/js 文件时行为与改动前逐字节一致。
+fn semantic_session_for_file(
+    session: &std::sync::Arc<Session>,
+    root: &Path,
+    file: &str,
+) -> std::sync::Arc<Session> {
+    let is_ts_like = std::path::Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| matches!(e.as_str(), "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"));
+    if is_ts_like
+        && let Some(adapter) = ls_registry::adapter_for(&session.language_id())
+        && let Some(companion) = adapter.semantic_session(root)
+    {
+        return companion;
+    }
+    std::sync::Arc::clone(session)
+}
+
 pub async fn find_referencing_symbols(
     session: &Arc<Session>,
     root: &Path,
@@ -192,9 +222,15 @@ pub async fn find_referencing_symbols(
     line: u32,
     col: u32,
 ) -> RefResult<Vec<RefSymbolHit>> {
+    // hybrid 双服务器语言（astro）的 per-file 路由：ts/js 系文件的引用语义只在伴生
+    // TS LS（↖ mirror: astro_language_server.py@7a296833 `request_references` 对
+    // `_is_ts_file` 路由伴生；主 astro-ls 对 .ts 文件 references 恒空 —— 真机帧录制
+    // 实证）。`.astro` 与其余扩展名留主会话（主 LS 主业；上游主+伴生双查合并不做 ——
+    // ponytail: 单查已满足跨文件断言，合并召回等真需要 .astro 出发的全量引用再加）。
+    let session = semantic_session_for_file(session, root, file);
     let canon_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let abs_file = canon_root.join(file);
-    let refs = fetch_references(session, &abs_file, line, col).await?;
+    let refs = fetch_references(&session, &abs_file, line, col).await?;
 
     let mut by_file: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
     for loc in refs {
@@ -215,7 +251,7 @@ pub async fn find_referencing_symbols(
     let mut seen: HashSet<(String, String, u32, u32)> = HashSet::new();
     for (rel, positions) in by_file {
         let abs = canon_root.join(&rel);
-        let symbols = fetch_document_symbols(session, &abs)
+        let symbols = fetch_document_symbols(&session, &abs)
             .await
             .unwrap_or_default();
         for (line, col) in positions {
@@ -304,9 +340,10 @@ pub async fn find_referencing_code_snippets(
     context_lines: u32,
     max_results: usize,
 ) -> RefResult<Vec<RefSnippetHit>> {
+    let session = semantic_session_for_file(session, root, file);
     let canon_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let abs_file = canon_root.join(file);
-    let refs = fetch_references(session, &abs_file, line, col).await?;
+    let refs = fetch_references(&session, &abs_file, line, col).await?;
 
     let mut cache: HashMap<String, String> = HashMap::new();
     let mut out = Vec::new();

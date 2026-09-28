@@ -1013,6 +1013,30 @@ version = "4.10.0"
 bin_rel = "vscode-html-language-server"
 npm_args = ["--stdio"]
 
+[servers.astro]
+languages = ["astro"]
+install = "npm"
+source_commit = "7a296833"
+# 四包同装一目录（↖ mirror: astro_language_server.py@7a296833 DependencyProvider：
+# astro-ls + ts-plugin + typescript + typescript-language-server 同一 node_modules，
+# tsdk 与 @astrojs/ts-plugin 路径才能拼出；.installed_version 四元组幂等语义由
+# 目录名 pin 主包版本 + 本表钉死全部四版本承担）。手写 T2 适配器（astro.rs）接管
+# 会话；本条服务 `serena-cli install astro` 与 doctor 探测。
+[servers.astro.npm]
+package = "@astrojs/language-server"
+version = "2.17.0"
+bin_rel = "astro-ls"
+npm_args = ["--stdio"]
+[[servers.astro.npm.secondary_packages]]
+package = "@astrojs/ts-plugin"
+version = "1.10.10"
+[[servers.astro.npm.secondary_packages]]
+package = "typescript"
+version = "5.9.3"
+[[servers.astro.npm.secondary_packages]]
+package = "typescript-language-server"
+version = "5.1.3"
+
 [servers.typescript_ls]
 # typescript 语言路由被 deno 条目占用 + 手写 T2 适配器接管会话；本条为 npm 安装形态
 # 后备（避撞先例同 omnisharp）。上游 typescript_language_server.py 双包同装。

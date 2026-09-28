@@ -284,6 +284,7 @@ flowchart TB
 | `AtomicI64` | lsp-core `client.rs` | 请求 id 分配 | 无锁 |
 | `Mutex<HashMap<Id, oneshot::Sender>>` | lsp-core `client.rs` | pending 表 | 微秒，无 await |
 | `Mutex<HashMap<Uri, FileBuffer>>` | lsp-core `docsync.rs` | 打开文件表 | 微秒，无 await；didOpen/didChange 的实际发送在锁外 |
+| 索引跟踪 `IndexProgressTracker`（`Mutex<HashSet<String>>` active 表 + `watch` 计数广播） | lsp-core `session.rs`（cf54869a mirror） | `$/progress`/`window/workDoneProgress/create` 在飞索引 token | 微秒，无 await；等待侧仅 `watch::changed`，不持锁 |
 | 诊断缓存 `DiagCache`（`Mutex<HashMap<(root,uri), items>>`）+ `diag_generation: AtomicU64` | supervisor `lib.rs`（`Δ` 自 lsp-core 上移；`↖ mirror: _published_diagnostics_condition`） | 诊断缓存与代际（`diagnostics --wait-gen`） | 微秒；wait_gen 为 100ms 探询（5s 上限），不跨 await 持锁 |
 | 符号缓存 `symbol_cache`（`Mutex<HashMap<SymbolCacheKey, _>>`，mtime/指纹键控） | supervisor `lib.rs`（`Δ` 同上） | 文件指纹→符号缓存 | 微秒；磁盘 IO 在锁外 |
 | `tokio::sync::Mutex` ×N（per-key） | supervisor `lib.rs` | LS 冷启动去重 | 跨 await（秒级） |

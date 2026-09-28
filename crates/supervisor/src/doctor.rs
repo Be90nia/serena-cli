@@ -303,6 +303,12 @@ fn check_local_ls() -> Vec<Check> {
         "vue-language-server (Vue LS, hybrid with companion TS LS)",
         "serena-cli install vue",
     ));
+    out.push(check_npm_ls(
+        "astro-ls",
+        "astro",
+        "astro-ls (Astro LS, hybrid with companion TS LS)",
+        "serena-cli install astro",
+    ));
     out.push(check_download_ls(
         "powershell",
         "PowerShellEditorServices (PowerShell LS)",
@@ -743,6 +749,7 @@ mod tests {
             "bash-language-server",
             "vscode-json-languageserver",
             "powershell",
+            "astro-ls",
         ] {
             let c = r
                 .checks

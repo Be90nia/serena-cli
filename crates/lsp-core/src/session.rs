@@ -19,6 +19,7 @@
 //! - `Session::request<R>` 通过 `Client::request` 转发（lsp-core 错误命名空间，禁 anyhow）。
 //! - `Failed` 态由 supervisor（Task 13）消费 → 懒重试环。本模块只负责进入 Failed 态。
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -122,6 +123,112 @@ struct ProgressRegistry {
 /// 早到通知短窗口有效，窗口外 token 命中率极低 —— 淘汰旧 key 不影响当前 wait 链路。
 const RESOLVED_CAP: usize = 8192;
 
+/// 跨文件索引 `$/progress` 在飞 token 跟踪器。
+///
+/// ↖ mirror: ls.py@43ae021 TS 子类 `_active_progress_tokens` + `_indexing_complete`；
+///           ↖ mirror: @cf54869a 修订 —— drain 语义（后续跨文件查询也等在飞索引）。
+///
+/// 三路信号汇入（`Session::start` 注册的 handler 写入）：`$/progress` 通知
+/// （begin 插入 / end 移除）、`window/workDoneProgress/create` 请求（LS 预告即将
+/// 上报，先于首个 begin，同样插入）。active 为空 = 无在飞索引。
+///
+/// drain 等待走 `watch` channel（active 计数）而非 `Notify`：`notify_waiters` 只唤醒
+/// 已注册 waiter，stable 无 `Notified::enable`，「查空 → 注册」窗口内 end 到达会
+/// 永久丢唤醒；watch 保留最新值，`changed()` 前先 `borrow_and_update` 消费当前值，
+/// 无丢失窗口。
+pub(crate) struct IndexProgressTracker {
+    /// 在飞 token 集合（begin/create 插入、end 移除；同 token 重复 begin 幂等）。
+    active: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// active 计数变化广播。仅用 `subscribe()` 派生 receiver，构造时的 receiver 即弃。
+    count_tx: tokio::sync::watch::Sender<usize>,
+    /// 首查 latch（上游 `_has_waited_for_cross_file_references`）：首次跨文件查询走
+    /// start-grace 等待，后续查询只 drain 在飞 token（cf54869a 修订核心）。
+    first_query_done: std::sync::atomic::AtomicBool,
+}
+
+impl IndexProgressTracker {
+    pub(crate) fn new() -> Self {
+        let (count_tx, _) = tokio::sync::watch::channel(0);
+        Self {
+            active: std::sync::Mutex::new(std::collections::HashSet::new()),
+            count_tx,
+            first_query_done: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// `begin=true` 插入（begin/create），`begin=false` 移除（end）。计数变化即广播。
+    pub(crate) fn track(&self, token: &str, begin: bool) {
+        let count = {
+            let mut active = self.active.lock().unwrap();
+            if begin {
+                active.insert(token.to_string());
+            } else {
+                active.remove(token);
+            }
+            active.len()
+        };
+        self.count_tx.send_if_modified(|c| {
+            if *c == count {
+                false
+            } else {
+                *c = count;
+                true
+            }
+        });
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.active.lock().unwrap().len()
+    }
+
+    /// 首查 latch：首次调用 true 并置位，此后 false（CAS 语义）。
+    pub(crate) fn take_first_query(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.first_query_done
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// 等待在飞索引清空（上游 `wait_for_indexing`）。清空 → true；`timeout` 耗尽仍
+    /// 有在飞 → false（调用方 warn 后放行 —— 上游 permissive 行为）。
+    pub(crate) async fn wait_drain(&self, timeout: Duration) -> bool {
+        let mut rx = self.count_tx.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if *rx.borrow_and_update() == 0 {
+                return true;
+            }
+            match tokio::time::timeout_at(deadline, rx.changed()).await {
+                Ok(Ok(())) => continue,
+                // 超时 / 发送端已 drop（session 终态）：按当前快照判定。
+                _ => return *rx.borrow() == 0,
+            }
+        }
+    }
+
+    /// 等待「索引开始并 drain」或「grace 内证明无需索引」（上游
+    /// `_wait_for_indexing_start_or_completion`）：grace 窗口内观察到 begin/create
+    /// 即转 [`Self::wait_drain`]；窗口耗尽仍无活动 → true（该项目无需索引）。
+    pub(crate) async fn wait_start_or_completion(
+        &self,
+        timeout: Duration,
+        grace: Duration,
+    ) -> bool {
+        let mut rx = self.count_tx.subscribe();
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if *rx.borrow_and_update() > 0 {
+                return self.wait_drain(timeout).await;
+            }
+            match tokio::time::timeout_at(deadline, rx.changed()).await {
+                Ok(Ok(())) => continue,
+                // grace 内从未开始 = 无需索引（上游 return True）。
+                _ => return true,
+            }
+        }
+    }
+}
+
 /// 单 LS 进程的完整 LSP 会话。`Arc<Session>` 是 supervisor 实例池的最小单元。
 pub struct Session {
     pub(crate) state: Mutex<SessionState>,
@@ -168,6 +275,14 @@ pub struct Session {
     /// adapter 语言；默认 `"cpp"` 仅兜底 lsp-core 直连路径——硬编码错语言会让
     /// rust-analyzer 等严格 LS 拒收文档（语义层挂）。
     language_id: std::sync::Mutex<Box<str>>,
+    /// 扩展名 → didOpen languageId 覆盖表（默认空）。混合扩展名会话用（astro 伴生
+    /// 同一 TS LS 服务 .astro/.ts/.tsx —— ↖ mirror 上游 astro_language_server.py@7a296833
+    /// `_get_language_id_for_file` per-file languageId quirk：languageId 错了 plugin
+    /// 会把 .ts 当模板破解析）。空表 = 其余语言行为不变（单值 [`Self::language_id`]）。
+    language_by_ext: std::sync::Mutex<std::collections::HashMap<Box<str>, Box<str>>>,
+    /// 跨文件索引 `$/progress` 跟踪（cf54869a mirror；写入方见 [`IndexProgressTracker`]）。
+    /// TS adapter 跨文件引用查询前经 [`Session::wait_for_cross_file_index`] 消费。
+    index_progress: IndexProgressTracker,
 }
 
 /// Phase 4 基建 Task 22c：把 LSP `ProgressToken`（可能是 string 或 number）
@@ -265,6 +380,8 @@ impl Session {
             server_capabilities: std::sync::Arc::new(Mutex::new(None)),
             progress: std::sync::Mutex::new(ProgressRegistry::default()),
             language_id: std::sync::Mutex::new("cpp".into()),
+            language_by_ext: std::sync::Mutex::new(std::collections::HashMap::new()),
+            index_progress: IndexProgressTracker::new(),
         });
 
         // Phase 4 基建 Task 22c：注册唯一 `$/progress` handler。LS 触发进度时会发
@@ -296,6 +413,15 @@ impl Session {
                 let Some(token) = progress_token_to_string(params.get("token")) else {
                     return;
                 };
+                // cf54869a mirror：begin 插入 / end 移除在飞索引 token（report 不改
+                // 集合）。先于 registry 段执行；两把锁（active / progress）不嵌套持有。
+                if let Some(value) = params.get("value") {
+                    match value.get("kind").and_then(|k| k.as_str()) {
+                        Some("begin") => session.index_progress.track(&token, true),
+                        Some("end") => session.index_progress.track(&token, false),
+                        _ => {}
+                    }
+                }
                 let Ok(mut registry) = session.progress.lock() else {
                     return;
                 };
@@ -313,6 +439,24 @@ impl Session {
                     }
                     registry.resolved.insert(token, ());
                 }
+            }
+        });
+
+        // cf54869a mirror 配套：LS 预告进度（`window/workDoneProgress/create` 请求先于
+        // 首个 `$/progress` begin 到达）也计入在飞 token，否则 create→begin 窗口会被
+        // 首查 start-grace 轮询误判为「无需索引」提前放行。返回 None → 默认 null 成功
+        // （LSP 规范 result: null）。
+        session.client.on_server_request("window/workDoneProgress/create", {
+            let session = Arc::downgrade(&session);
+            move |msg| {
+                // `?`：Weak 升级失败（session 已终态）→ handler 返回 None，默认 null 成功。
+                let session = session.upgrade()?;
+                if let Some(params) = msg.params.as_ref()
+                    && let Some(token) = progress_token_to_string(params.get("token"))
+                {
+                    session.index_progress.track(&token, true);
+                }
+                None
             }
         });
 
@@ -454,6 +598,34 @@ impl Session {
         self.state.lock().unwrap().clone()
     }
 
+    // ---- 跨文件索引 $/progress 跟踪（cf54869a mirror；TS adapter 消费）----
+
+    /// 当前在飞索引 token 数（>0 即 tsserver 等正在后台索引）。
+    pub fn index_active_progress(&self) -> usize {
+        self.index_progress.active_count()
+    }
+
+    /// 首查 latch：首次跨文件查询 true（赢家做 start-grace 等待），此后 false。
+    pub fn take_cross_file_first_query(&self) -> bool {
+        self.index_progress.take_first_query()
+    }
+
+    /// 等待在飞索引清空；`timeout` 耗尽仍有在飞 → false（调用方 warn 后放行）。
+    pub async fn wait_indexing_drain(&self, timeout: Duration) -> bool {
+        self.index_progress.wait_drain(timeout).await
+    }
+
+    /// 等待「索引开始并 drain」或「grace 内证明无需索引」。
+    pub async fn wait_indexing_start_or_completion(
+        &self,
+        timeout: Duration,
+        grace: Duration,
+    ) -> bool {
+        self.index_progress
+            .wait_start_or_completion(timeout, grace)
+            .await
+    }
+
     /// `ProgressRegistry.resolved` 当前条目数（P2-y5u 容量上限测试用 / 诊断）。
     /// 早到通知表，超过 `RESOLVED_CAP` 时按 FIFO 淘汰最旧。
     pub fn resolved_len(&self) -> usize {
@@ -466,8 +638,27 @@ impl Session {
         *self.language_id.lock().unwrap() = lang.to_ascii_lowercase().into();
     }
 
-    /// 当前 `didOpen` languageId 快照（docsync 发 didOpen 时读）。
-    pub(crate) fn language_id(&self) -> String {
+    /// 装扩展名 → languageId 覆盖表（astro 伴生混合扩展名用；见字段注释）。
+    /// `(ext, lang)` 的 ext 不含点、大小写不敏感归一。
+    pub fn set_language_id_for_extensions(&self, map: &[(&str, &str)]) {
+        let mut slot = self.language_by_ext.lock().unwrap();
+        slot.clear();
+        for (ext, lang) in map {
+            slot.insert(
+                ext.to_ascii_lowercase().into(),
+                lang.to_ascii_lowercase().into(),
+            );
+        }
+    }
+
+    /// didOpen 应上送的 languageId：扩展名命中覆盖表用表值，否则会话单值。
+    pub(crate) fn language_id_for(&self, path: &Path) -> String {
+        resolve_language_id_for(&self.language_id(), &self.language_by_ext.lock().unwrap(), path)
+    }
+
+    /// 当前 `didOpen` languageId 快照（docsync 发 didOpen 时读；supervisor 另用于
+    /// 反查会话对应的 adapter —— references 类工具发请求前的索引等待）。
+    pub fn language_id(&self) -> String {
         self.language_id.lock().unwrap().to_string()
     }
 
@@ -650,6 +841,9 @@ impl Session {
         //   与 session.progress 残留永久不回收。同步清空 progress 表（resolved/waiters）
         //   避免长会话积累 Notify 实例。
         self.client.clear_notification("$/progress");
+        // cf54869a mirror 配套：create handler 同样占表，一并显式清（同上理由）。
+        self.client
+            .clear_server_request("window/workDoneProgress/create");
         {
             let mut registry = self.progress.lock().unwrap();
             registry.waiters.clear();
@@ -664,10 +858,49 @@ impl Session {
     }
 }
 
+/// [`Session::language_id_for`] 的纯逻辑（扩展名覆盖表优先，缺省会话单值兜底）。
+pub(crate) fn resolve_language_id_for(
+    default: &str,
+    overrides: &std::collections::HashMap<Box<str>, Box<str>>,
+    path: &Path,
+) -> String {
+    if let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        && let Some(lang) = overrides.get(ext.as_str())
+    {
+        return lang.to_string();
+    }
+    default.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn language_id_override_by_extension_falls_back_to_default() {
+        let mut table = std::collections::HashMap::new();
+        table.insert(Box::<str>::from("astro"), Box::<str>::from("astro"));
+        table.insert(Box::<str>::from("ts"), Box::<str>::from("typescript"));
+        // 命中表：.astro → astro、.ts → typescript（大小写不敏感）。
+        assert_eq!(
+            resolve_language_id_for("x", &table, Path::new("a/b/index.astro")),
+            "astro"
+        );
+        assert_eq!(
+            resolve_language_id_for("x", &table, Path::new("SRC/FMT.TS")),
+            "typescript"
+        );
+        // 未命中（无扩展名 / 表外扩展名）→ 会话默认。
+        assert_eq!(resolve_language_id_for("vue", &table, Path::new("App")), "vue");
+        assert_eq!(
+            resolve_language_id_for("vue", &table, Path::new("x.css")),
+            "vue"
+        );
+    }
 
     #[test]
     fn session_state_clone_eq() {
@@ -738,5 +971,72 @@ mod tests {
         let notify = Arc::new(Notify::new());
         let res = tokio::time::timeout(Duration::from_millis(200), notify.notified()).await;
         assert!(res.is_err(), "无通知时应 timeout");
+    }
+
+    // ---- 跨文件索引 $/progress 跟踪（cf54869a mirror）----
+
+    #[test]
+    fn cross_file_first_query_latch_fires_once() {
+        let t = IndexProgressTracker::new();
+        assert!(t.take_first_query(), "首查应是 latch 赢家");
+        assert!(!t.take_first_query(), "后续查询不再是首查");
+    }
+
+    #[tokio::test]
+    async fn cross_file_first_query_observes_start_then_drain_times_out() {
+        // 首查路径真实等待的两个证据：grace 内观察到 begin（否则 grace 耗尽即 true），
+        // 且 drain 超时返回 false（end 永不到来）。
+        let t = Arc::new(IndexProgressTracker::new());
+        t.track("idx-1", true);
+        assert!(
+            !t.wait_start_or_completion(Duration::from_millis(50), Duration::from_secs(1))
+                .await,
+            "begin 后无 end 应 drain 超时返 false"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_file_first_query_true_when_no_indexing_within_grace() {
+        let t = IndexProgressTracker::new();
+        assert!(
+            t.wait_start_or_completion(Duration::from_secs(30), Duration::from_millis(30))
+                .await,
+            "grace 内无活动应视为无需索引返 true"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_file_later_query_drains_active_token() {
+        // 后续查询（latch 已消耗）：有在飞 token → 等 end 到达才放行。
+        let t = Arc::new(IndexProgressTracker::new());
+        assert!(t.take_first_query(), "消耗首查 latch");
+        t.track("idx-1", true);
+        assert_eq!(t.active_count(), 1);
+        let t2 = t.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            t2.track("idx-1", false);
+        });
+        assert!(
+            t.wait_drain(Duration::from_secs(5)).await,
+            "end 到达后应 drain 完成"
+        );
+        assert_eq!(t.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cross_file_drain_immediate_when_no_active_token() {
+        let t = IndexProgressTracker::new();
+        assert!(t.wait_drain(Duration::from_secs(1)).await, "无在飞 token 立即放行");
+    }
+
+    #[tokio::test]
+    async fn cross_file_drain_times_out_when_end_never_arrives() {
+        let t = IndexProgressTracker::new();
+        t.track("idx-1", true);
+        assert!(
+            !t.wait_drain(Duration::from_millis(50)).await,
+            "end 不到应超时返 false"
+        );
     }
 }

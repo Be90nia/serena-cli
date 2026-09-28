@@ -165,8 +165,8 @@ fn legacy_entries_survive_batch_addition() {
     }
     assert_eq!(
         servers.len(),
-        62,
-        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24"
+        63,
+        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）"
     );
     let marksman = &servers["marksman"];
     assert_eq!(marksman.install, "download");
@@ -402,5 +402,35 @@ fn angular_tri_server_form_is_not_in_table() {
     assert!(
         !servers.contains_key("angular"),
         "angular 双/三进程编排不适配单进程 Launch（eclipse_jdtls 先例），不入本表"
+    );
+}
+
+/// astro 条目（上游 7a296833 新增）：四包 pin 锚 astro_language_server.py DependencyProvider
+/// 原值，防数据漂移（vue/svelte 同款 spot-check 形态）。
+#[test]
+fn astro_entry_pins_match_upstream_7a296833() {
+    let servers = parsed_servers();
+    let spec = servers
+        .get("astro")
+        .unwrap_or_else(|| panic!("[servers.astro] missing"));
+    assert_eq!(spec.install, "npm");
+    assert_eq!(spec.languages, vec!["astro"]);
+    let npm = spec.npm.as_ref().expect("astro: npm table");
+    assert_eq!(npm.package, "@astrojs/language-server");
+    assert_eq!(npm.version.as_deref(), Some("2.17.0"));
+    assert_eq!(npm.bin_rel, "astro-ls");
+    let sec: Vec<(&str, Option<&str>)> = npm
+        .secondary_packages
+        .iter()
+        .map(|s| (s.package.as_str(), s.version.as_deref()))
+        .collect();
+    assert_eq!(
+        sec,
+        vec![
+            ("@astrojs/ts-plugin", Some("1.10.10")),
+            ("typescript", Some("5.9.3")),
+            ("typescript-language-server", Some("5.1.3")),
+        ],
+        "astro 伴生三包 pin 漂移"
     );
 }
