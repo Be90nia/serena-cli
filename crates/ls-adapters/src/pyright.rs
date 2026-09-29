@@ -185,8 +185,7 @@ fn system_python_interpreter() -> Option<PathBuf> {
     if fixed.is_file() {
         return Some(fixed);
     }
-    crate::which_no_unc("python3")
-        .or_else(|| crate::which_no_unc("python"))
+    crate::which_no_unc("python3").or_else(|| crate::which_no_unc("python"))
 }
 
 /// 在 `root` 下探测 Python venv 解释器路径。命中优先级：
