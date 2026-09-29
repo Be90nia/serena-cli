@@ -182,8 +182,8 @@ fn legacy_entries_survive_batch_addition() {
     }
     assert_eq!(
         servers.len(),
-        68,
-        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）+ bd 56a 第一批 +2 docker/sql + 第二批 +2 pgls/sqls-mysql + 后续批 +1 css（html/yaml/marksman/kotlin/dart 为存量条目，本批零新增）"
+        73,
+        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）+ bd 56a 第一批 +2 docker/sql + 第二批 +2 pgls/sqls-mysql + 后续批 +1 css + W3 +1 scala + W5 +2 julia/wolfram（html/yaml/marksman/kotlin/dart/ansible 等为存量条目，多批零新增）——集成收口 PM 实测 73"
     );
     let marksman = &servers["marksman"];
     assert_eq!(marksman.install, "download");
@@ -1260,4 +1260,469 @@ fn w2_svelte_deno_sass_doors_wired() {
     let plugin = &svelte.secondary_packages[2];
     assert_eq!(plugin.package, "typescript-svelte-plugin");
     assert_eq!(plugin.version.as_deref(), Some("0.3.52"));
+}
+
+/// W3 批（php/lua/scala/swift）验收单测：四门均为 T0（adapter_for None，session_for
+/// 落 ensure_launch）；php 门按 entry id `intelephense` 显式路由（语言路由 `php` 归
+/// phpactor，phpantom 避撞先例），didOpen 官方口径 intelephense→php；lua（LuaLS
+/// download pin 对账）/scala（metals path_only，本批唯一新增条目）/swift（存量
+/// sourcekit_lsp path_only）pin 形态锁定；扩展名分流（.php/.lua/.scala/.swift
+/// 各归其门，luau 独立语言不别名）。
+#[test]
+fn w3_php_lua_scala_swift_doors_wired() {
+    use ls_registry::LanguageId;
+    use ls_registry::adapter_for;
+    use ls_registry::config::spec_for;
+
+    let servers = parsed_servers();
+
+    // T0 分流：--lang 透传值 → spec_for 命中条目；四门 adapter_for 全 None。
+    for (lang, want_id) in [
+        ("intelephense", "intelephense"),
+        ("lua", "lua"),
+        ("scala", "scala"),
+        ("swift", "sourcekit_lsp"),
+    ] {
+        let (id, _) =
+            spec_for(lang).unwrap_or_else(|| panic!("--lang {lang} must route to a spec"));
+        assert_eq!(id, want_id, "spec_for(\"{lang}\") routes to [servers.{id}]");
+        assert!(
+            adapter_for(lang).is_none(),
+            "{lang}: W3 四门全 T0，adapter_for 必须为 None"
+        );
+    }
+    // phpactor 仍占语言路由 `php`（存量条目本体不动）。
+    let (php_route_id, _) =
+        spec_for("php").unwrap_or_else(|| panic!("--lang php must route to a spec"));
+    assert_eq!(php_route_id, "phpactor", "语言路由 php 归 phpactor（存量）");
+
+    // LSP didOpen 官方口径：仅 intelephense→php 显式映射；lua/scala/swift 恒等。
+    assert_eq!(ls_registry::lsp_language_id("intelephense"), "php");
+    assert_eq!(ls_registry::lsp_language_id("lua"), "lua");
+    assert_eq!(ls_registry::lsp_language_id("scala"), "scala");
+    assert_eq!(ls_registry::lsp_language_id("swift"), "swift");
+
+    // 扩展名分流：四门独占，luau 独立语言门不别名。
+    assert_eq!(LanguageId::from_extension("php"), Some(LanguageId::Php));
+    assert_eq!(LanguageId::from_extension("lua"), Some(LanguageId::Lua));
+    assert_eq!(LanguageId::from_extension("scala"), Some(LanguageId::Scala));
+    assert_eq!(LanguageId::from_extension("swift"), Some(LanguageId::Swift));
+    assert_eq!(LanguageId::from_str_opt("luau"), None, "luau ≠ lua");
+    assert_eq!(
+        LanguageId::from_str_opt("intelephense"),
+        Some(LanguageId::Php),
+        "php 门 entry id 别名"
+    );
+
+    // php 门：intelephense npm 条目 pin 锚（phase3 NPM_IDS 已有，此处锁冒烟门消费面）。
+    let intel = servers
+        .get("intelephense")
+        .expect("[servers.intelephense] missing");
+    assert_eq!(intel.install, "npm");
+    let intel_npm = intel.npm.as_ref().expect("intelephense: npm table");
+    assert_eq!(intel_npm.package, "intelephense");
+    assert_eq!(intel_npm.version.as_deref(), Some("1.14.4"));
+    assert_eq!(
+        intel_npm.npm_args.as_deref(),
+        Some(["--stdio".to_string()].as_slice())
+    );
+
+    // lua 门：LuaLS download pin 对账（上游 lua_ls.py@43ae0211 release 3.15.0）。
+    let lua = servers.get("lua").expect("[servers.lua] missing");
+    assert_eq!(lua.languages, vec!["lua"]);
+    assert_eq!(lua.install, "download");
+    let lua_dl = lua.download.as_ref().expect("lua: download table");
+    assert_eq!(lua_dl.version, "3.15.0");
+    assert_eq!(lua_dl.archive, "tar.gz");
+    assert!(
+        lua_dl.url_per_platform.contains_key("linux-x86_64"),
+        "CI ubuntu 门必需平台"
+    );
+    assert_eq!(
+        lua_dl.sha256_per_platform.len(),
+        lua_dl.url_per_platform.len(),
+        "url/sha 1:1"
+    );
+
+    // scala 门：metals path_only（本批唯一新增条目；上游 DEFAULT_METALS_VERSION
+    // 1.6.4 锚写进 install_hint，path_only 无资产无版本字段）。
+    let scala = servers.get("scala").expect("[servers.scala] missing");
+    assert_eq!(scala.languages, vec!["scala"]);
+    assert_eq!(scala.install, "path_only");
+    let scala_po = scala.path_only.as_ref().expect("scala: path_only table");
+    assert_eq!(scala_po.binary_name, "metals");
+    assert!(
+        scala_po.install_hint.contains("metals_2.13:1.6.4"),
+        "install_hint 必须携带上游 pin 锚: {:?}",
+        scala_po.install_hint
+    );
+
+    // swift 门：存量 sourcekit_lsp path_only（Xcode 工具链形态，ubuntu 门 PLATFORM SKIP）。
+    let sk = servers
+        .get("sourcekit_lsp")
+        .expect("[servers.sourcekit_lsp] missing");
+    assert_eq!(sk.languages, vec!["swift"]);
+    assert_eq!(sk.install, "path_only");
+    assert_eq!(
+        sk.path_only
+            .as_ref()
+            .expect("swift: path_only table")
+            .binary_name,
+        "sourcekit-lsp"
+    );
+}
+
+/// W4 批（haskell/groovy/ocaml/erlang/perl/r/crystal/zig/fortran/pascal）验收单测：
+/// 九门 T0 分流（adapter_for None → ensure_launch），groovy 无条目（上游 H 类自备
+/// JAR，angular/java 不入表先例）；lsp_language_id 十门恒等；存量条目 exec 修复锁
+/// （haskell `--lsp` / erlang `--transport stdio`——裸启动分别是 usage 打印即退 /
+/// TCP 模式，terraform serve 同类坑）；zls path_only→download 升级六平台 pin 锚
+/// （GitHub API assets[].digest，2026-09-29）；perl/r 新条目 launch argv 逐字锁
+/// （↖ mirror @7a296833）；扩展名闭环 + resolve 大小写不敏感回归。
+#[test]
+fn w4_ten_doors_wired() {
+    use ls_registry::LanguageId;
+    use ls_registry::adapter_for;
+    use ls_registry::config::spec_for;
+
+    let servers = parsed_servers();
+
+    // T0 分流 + 显式路由闭环（fortran/pascal 为存量门接线闭合）。
+    for (lang, want_id) in [
+        ("fortran", "fortls"),
+        ("pascal", "pascal"),
+        ("haskell", "haskell_ls"),
+        ("ocaml", "ocamllsp"),
+        ("erlang", "erlang_ls"),
+        ("perl", "perl_ls"),
+        ("r", "r_ls"),
+        ("crystal", "crystalline"),
+        ("zig", "zls"),
+    ] {
+        let (id, _) =
+            spec_for(lang).unwrap_or_else(|| panic!("--lang {lang} must route to a spec"));
+        assert_eq!(id, want_id, "spec_for(\"{lang}\") routes to [servers.{id}]");
+        assert!(
+            adapter_for(lang).is_none(),
+            "{lang}: W4 门全 T0，adapter_for 必须为 None"
+        );
+    }
+    // groovy：上游 H 类用户自备 JAR（四路线全灭），无条目；LanguageId 占位 + 扩展名
+    // 路由使 resolve 落到明确 no-entry 报错（SKIP 候选待 PM 裁决）。
+    assert!(
+        spec_for("groovy").is_none(),
+        "groovy 无条目（上游 H 类自备 ls_jar_path，angular/java 先例）"
+    );
+    assert!(adapter_for("groovy").is_none());
+
+    // LSP didOpen 官方口径：十门恒等（上游 adapter 第四参逐一核实 = 内部名）。
+    for lang in [
+        "fortran", "pascal", "haskell", "groovy", "ocaml", "erlang", "perl", "r", "crystal", "zig",
+    ] {
+        assert_eq!(ls_registry::lsp_language_id(lang), lang);
+    }
+
+    // 扩展名闭环（from_extension 大小写不敏感：键统一小写 + to_lowercase 匹配）。
+    assert_eq!(LanguageId::from_extension("f90"), Some(LanguageId::Fortran));
+    assert_eq!(LanguageId::from_extension("F90"), Some(LanguageId::Fortran));
+    assert_eq!(LanguageId::from_extension("pas"), Some(LanguageId::Pascal));
+    assert_eq!(LanguageId::from_extension("hs"), Some(LanguageId::Haskell));
+    assert_eq!(LanguageId::from_extension("lhs"), Some(LanguageId::Haskell));
+    assert_eq!(
+        LanguageId::from_extension("groovy"),
+        Some(LanguageId::Groovy)
+    );
+    assert_eq!(LanguageId::from_extension("ml"), Some(LanguageId::Ocaml));
+    assert_eq!(LanguageId::from_extension("mli"), Some(LanguageId::Ocaml));
+    assert_eq!(LanguageId::from_extension("erl"), Some(LanguageId::Erlang));
+    assert_eq!(LanguageId::from_extension("pl"), Some(LanguageId::Perl));
+    assert_eq!(LanguageId::from_extension("t"), Some(LanguageId::Perl));
+    assert_eq!(LanguageId::from_extension("r"), Some(LanguageId::R));
+    assert_eq!(LanguageId::from_extension("RMD"), Some(LanguageId::R));
+    assert_eq!(LanguageId::from_extension("cr"), Some(LanguageId::Crystal));
+    assert_eq!(LanguageId::from_extension("zig"), Some(LanguageId::Zig));
+    assert_eq!(LanguageId::from_extension("zon"), Some(LanguageId::Zig));
+
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("main.f90")),
+        Some(LanguageId::Fortran)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("SMOKE.PP")),
+        Some(LanguageId::Pascal)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("Main.hs")),
+        Some(LanguageId::Haskell)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("main.erl")),
+        Some(LanguageId::Erlang)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("script.PL")),
+        Some(LanguageId::Perl)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("plot.r")),
+        Some(LanguageId::R)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("app.cr")),
+        Some(LanguageId::Crystal)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("build.zon")),
+        Some(LanguageId::Zig)
+    );
+
+    // haskell_ls exec 修复锁：↖ mirror haskell_language_server.py@7a296833
+    // [wrapper, "--lsp", "--cwd", workdir]（--cwd 省略 = 进程 cwd 即项目根）。
+    let hls = servers
+        .get("haskell_ls")
+        .expect("[servers.haskell_ls] missing");
+    assert_eq!(hls.install, "path_only");
+    assert_eq!(hls.exec, vec!["{bin}", "--lsp"]);
+
+    // erlang_ls exec 修复锁：↖ mirror erlang_language_server.py@7a296833
+    // ProcessLaunchInfo [erlang_ls, "--transport", "stdio"]（默认 transport TCP）。
+    let els = servers
+        .get("erlang_ls")
+        .expect("[servers.erlang_ls] missing");
+    assert_eq!(els.install, "path_only");
+    assert_eq!(els.exec, vec!["{bin}", "--transport", "stdio"]);
+
+    // perl_ls 新条目：launch argv 逐字（`perl -MPerl::LanguageServer -e ...`）。
+    let perl = servers.get("perl_ls").expect("[servers.perl_ls] missing");
+    assert_eq!(perl.languages, vec!["perl"]);
+    assert_eq!(perl.install, "path_only");
+    assert_eq!(
+        perl.exec,
+        vec![
+            "{bin}",
+            "-MPerl::LanguageServer",
+            "-e",
+            "Perl::LanguageServer::run"
+        ]
+    );
+    assert_eq!(
+        perl.path_only
+            .as_ref()
+            .expect("perl: path_only table")
+            .binary_name,
+        "perl"
+    );
+
+    // r_ls 新条目：launch 串逐字（`R --vanilla --quiet --slave -e ...`）。
+    let r = servers.get("r_ls").expect("[servers.r_ls] missing");
+    assert_eq!(r.languages, vec!["r"]);
+    assert_eq!(r.install, "path_only");
+    assert_eq!(
+        r.exec,
+        vec![
+            "{bin}",
+            "--vanilla",
+            "--quiet",
+            "--slave",
+            "-e",
+            "options(languageserver.debug_mode = FALSE); languageserver::run()"
+        ]
+    );
+    assert_eq!(
+        r.path_only
+            .as_ref()
+            .expect("r: path_only table")
+            .binary_name,
+        "R"
+    );
+
+    // zls download 升级锚（regal/deno 先例：存量条目独立锚定，不入 NEW_DOWNLOAD_IDS）。
+    let zls = servers.get("zls").expect("[servers.zls] missing");
+    assert_eq!(zls.install, "download");
+    assert_eq!(zls.source_commit.as_deref(), Some("7a296833"));
+    let zls_dl = zls.download.as_ref().expect("zls: download table");
+    assert_eq!(zls_dl.version, "0.16.0");
+    assert_eq!(zls_dl.archive, "tar.xz");
+    assert_eq!(zls_dl.url_per_platform.len(), 6, "六平台 pin");
+    assert_eq!(
+        zls_dl
+            .sha256_per_platform
+            .get("linux-x86_64")
+            .map(String::as_str),
+        Some("ded6d562a0b86ee878b1ddf70ffab2797ce3cdca3b02d6077548f9d56dff96b6"),
+        "GitHub API assets[].digest 2026-09-29 锚"
+    );
+    assert_eq!(
+        zls_dl
+            .bin_path_per_platform
+            .get("linux-x86_64")
+            .map(String::as_str),
+        Some("zls"),
+        "unix bin 无 .exe（deno 同款）"
+    );
+
+    // crystalline canary：legacy path_only 锚不被 download 化侵蚀（smoke 走 curl 钉 URL，
+    // 条目升级留待上游 crystalline 完整多平台资产 + PM 裁决）。
+    assert_eq!(
+        servers
+            .get("crystalline")
+            .expect("[servers.crystalline] missing")
+            .install,
+        "path_only"
+    );
+}
+
+/// W5 七门：真门 gleam/qml/lean4/julia + SKIP 候选 wolfram/gdscript/msl。
+/// gleam/qml/lean4 = 存量条目接线（G 类批量收录，本体不动）；julia/wolfram = 本批
+/// 新增条目（path_only + 运行时 exec argv / WolframKernel 探测面）；gdscript/msl
+/// 无条目（HOST SKIP 候选待 PM 裁决，angular/java/groovy 先例）。
+#[test]
+fn w5_seven_doors_wired() {
+    use ls_registry::LanguageId;
+    use ls_registry::adapter_for;
+    use ls_registry::config::spec_for;
+
+    let servers = parsed_servers();
+
+    // T0 路由闭环：四真门语言名 + lean4 条目 id 双语义命中；门本体无 adapter。
+    for (lang, want_id) in [
+        ("gleam", "gleam"),
+        ("qml", "qmlls"),
+        ("lean", "lean4"),
+        ("lean4", "lean4"),
+        ("julia", "julia"),
+        ("wolfram", "wolfram"),
+    ] {
+        let (id, _) =
+            spec_for(lang).unwrap_or_else(|| panic!("--lang {lang} must route to a spec"));
+        assert_eq!(id, want_id, "spec_for(\"{lang}\") routes to [servers.{id}]");
+        assert!(
+            adapter_for(lang).is_none(),
+            "{lang}: W5 门全 T0，adapter_for 必须为 None"
+        );
+    }
+    // gdscript/msl：HOST SKIP 候选无条目（--lang 落空报明确 no entry）。
+    assert!(
+        spec_for("gdscript").is_none(),
+        "gdscript 无条目（godot 编辑器 TCP 宿主，TransportKind 仅 Stdio）"
+    );
+    assert!(
+        spec_for("msl").is_none(),
+        "msl 无条目（上游 LS = serena 内嵌 pygls 脚本，非独立发行）"
+    );
+    assert!(adapter_for("gdscript").is_none());
+    assert!(adapter_for("msl").is_none());
+
+    // LSP didOpen 官方口径：七门恒等（lean = VS Code lean 扩展官方 languageId；
+    // lean4 仅条目 id 不进换算面）。
+    for lang in [
+        "gleam", "qml", "lean", "julia", "wolfram", "gdscript", "msl",
+    ] {
+        assert_eq!(ls_registry::lsp_language_id(lang), lang);
+    }
+
+    // 扩展名闭环（resolve 走 EXT_TABLE）。
+    assert_eq!(LanguageId::from_extension("gleam"), Some(LanguageId::Gleam));
+    assert_eq!(LanguageId::from_extension("qml"), Some(LanguageId::Qml));
+    assert_eq!(LanguageId::from_extension("lean"), Some(LanguageId::Lean));
+    assert_eq!(LanguageId::from_extension("jl"), Some(LanguageId::Julia));
+    assert_eq!(LanguageId::from_extension("wl"), Some(LanguageId::Wolfram));
+    assert_eq!(LanguageId::from_extension("nb"), Some(LanguageId::Wolfram));
+    assert_eq!(LanguageId::from_extension("gd"), Some(LanguageId::Godot));
+    assert_eq!(LanguageId::from_extension("mrc"), Some(LanguageId::Msl));
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("main.gleam")),
+        Some(LanguageId::Gleam)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("MAIN.QML")),
+        Some(LanguageId::Qml)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("Main.lean")),
+        Some(LanguageId::Lean)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("main.jl")),
+        Some(LanguageId::Julia)
+    );
+    assert_eq!(
+        ls_registry::resolve(std::path::Path::new("main.wl")),
+        Some(LanguageId::Wolfram)
+    );
+
+    // gleam/qml/lean4 存量条目接线锁（G 类本体不动）：入口形态 = 上游 launch 逐字。
+    let gleam = servers.get("gleam").expect("[servers.gleam] missing");
+    assert_eq!(gleam.languages, vec!["gleam"]);
+    assert_eq!(gleam.install, "path_only");
+    assert_eq!(
+        gleam.exec,
+        vec!["{bin}", "lsp"],
+        "gleam lsp 子命令（deno 先例）"
+    );
+    let qml = servers.get("qmlls").expect("[servers.qmlls] missing");
+    assert_eq!(qml.languages, vec!["qml"]);
+    assert_eq!(
+        qml.path_only
+            .as_ref()
+            .expect("qml: path_only table")
+            .binary_name,
+        "qmlls"
+    );
+    let lean4 = servers.get("lean4").expect("[servers.lean4] missing");
+    assert_eq!(lean4.languages, vec!["lean"]);
+    assert_eq!(
+        lean4.exec,
+        vec!["{bin}", "--server"],
+        "lean --server（上游 launch）"
+    );
+
+    // julia 新条目：launch argv 逐字（repo_root 尾参省略 = runserver choose_env
+    // pwd 回落，T0 spawn cwd = 项目根实锚 supervisor/src/lib.rs session_for）。
+    let julia = servers.get("julia").expect("[servers.julia] missing");
+    assert_eq!(julia.languages, vec!["julia"]);
+    assert_eq!(julia.extensions, vec![".jl"]);
+    assert_eq!(julia.install, "path_only");
+    assert_eq!(
+        julia.exec,
+        vec![
+            "{bin}",
+            "--startup-file=no",
+            "--history-file=no",
+            "-e",
+            "using LanguageServer; runserver()"
+        ]
+    );
+    assert_eq!(
+        julia
+            .path_only
+            .as_ref()
+            .expect("julia: path_only table")
+            .binary_name,
+        "julia"
+    );
+
+    // wolfram 新条目：WolframKernel 探测面 + LSPServer paclet 启动串逐字。
+    let wolfram = servers.get("wolfram").expect("[servers.wolfram] missing");
+    assert_eq!(wolfram.languages, vec!["wolfram"]);
+    assert_eq!(wolfram.extensions, vec![".wl", ".nb"]);
+    assert_eq!(wolfram.install, "path_only");
+    assert_eq!(
+        wolfram.exec,
+        vec![
+            "{bin}",
+            "-noprompt",
+            "-noinit",
+            "-run",
+            "Needs[\"LSPServer`\"];LSPServer`StartServer[]"
+        ]
+    );
+    assert_eq!(
+        wolfram
+            .path_only
+            .as_ref()
+            .expect("wolfram: path_only table")
+            .binary_name,
+        "WolframKernel"
+    );
 }

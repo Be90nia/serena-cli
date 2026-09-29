@@ -158,8 +158,9 @@ mod tests {
 
     #[test]
     fn unknown_extension_returns_none_without_panic() {
-        // 多字节路径也不应炸；这里只验 None。
-        assert_eq!(detect_language(&PathBuf::from("a.lua")), None);
+        // 多字节路径也不应炸；这里只验 None。（曾用 a.lua 当未知扩展名样本，
+        // W3 批收编 lua 后换 a.zzz——语义不变：真未知扩展名返回 None。）
+        assert_eq!(detect_language(&PathBuf::from("a.zzz")), None);
         assert_eq!(detect_language(&PathBuf::from("a.txt")), None);
         assert_eq!(detect_language(&PathBuf::from("a")), None);
     }

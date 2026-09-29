@@ -110,6 +110,53 @@ pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("svelte", LanguageId::Svelte),
     ("sass", LanguageId::Sass),
     ("scss", LanguageId::Sass),
+    // W3 批：php/lua/scala/swift 各自独占扩展名（上游 get_priority superset 无冲突：
+    // .php/.lua/.scala/.swift 此前无归属）。
+    ("php", LanguageId::Php),
+    ("lua", LanguageId::Lua),
+    ("scala", LanguageId::Scala),
+    ("swift", LanguageId::Swift),
+    // W4 批：fortran 大小写不敏感族 / pascal 主形态 / haskell / groovy / ocaml /
+    // erlang / perl / r 族 / crystal / zig。groovy 门本体 HOST SKIP 候选（上游 H 类
+    // 自备 JAR 无条目）——扩展名占位使 resolve 落到明确的 no-entry 报错而非静默未知。
+    // ocaml .ml/.mli 与泛用后缀（.config/.app/.inc 等）不冲突：MATLAB 的 .m 不在本表。
+    ("f90", LanguageId::Fortran),
+    ("f95", LanguageId::Fortran),
+    ("f03", LanguageId::Fortran),
+    ("f08", LanguageId::Fortran),
+    ("f", LanguageId::Fortran),
+    ("for", LanguageId::Fortran),
+    ("fpp", LanguageId::Fortran),
+    ("pas", LanguageId::Pascal),
+    ("pp", LanguageId::Pascal),
+    ("hs", LanguageId::Haskell),
+    ("lhs", LanguageId::Haskell),
+    ("groovy", LanguageId::Groovy),
+    ("gvy", LanguageId::Groovy),
+    ("ml", LanguageId::Ocaml),
+    ("mli", LanguageId::Ocaml),
+    ("erl", LanguageId::Erlang),
+    ("hrl", LanguageId::Erlang),
+    ("pl", LanguageId::Perl),
+    ("pm", LanguageId::Perl),
+    ("t", LanguageId::Perl),
+    ("r", LanguageId::R),
+    ("rmd", LanguageId::R),
+    ("rnw", LanguageId::R),
+    ("cr", LanguageId::Crystal),
+    ("zig", LanguageId::Zig),
+    ("zon", LanguageId::Zig),
+    // W5 批：七门各自独占扩展名，无存量冲突（.m 归 matlab、.ts 归 TypeScript 均不涉）。
+    // wolfram 双扩展 .wl + .nb；gdscript/msl 门本体 SKIP 候选——扩展名占位使 resolve
+    // 落到明确的 no-entry 报错而非静默未知（groovy 同款）。
+    ("gleam", LanguageId::Gleam),
+    ("qml", LanguageId::Qml),
+    ("lean", LanguageId::Lean),
+    ("jl", LanguageId::Julia),
+    ("wl", LanguageId::Wolfram),
+    ("nb", LanguageId::Wolfram),
+    ("gd", LanguageId::Godot),
+    ("mrc", LanguageId::Msl),
 ];
 
 /// 各 LanguageId 对应的 adapter 单例。
@@ -209,6 +256,41 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         LanguageId::Toml | LanguageId::Terraform | LanguageId::Cue | LanguageId::Nix => {
             return None;
         }
+        // T0 配置驱动（W3 批）：php(phpactor/intelephense 双条目，--lang intelephense
+        // 按 entry id 显式路由)/lua(LuaLS)/scala(metals path_only)/swift(sourcekit-lsp
+        // path_only) 走 servers.toml 条目，ensure_launch 接管。
+        LanguageId::Php | LanguageId::Lua | LanguageId::Scala | LanguageId::Swift => return None,
+        // T0 配置驱动（W4 批）：fortran(fortls uvx)/pascal(pasls download)/haskell
+        // (haskell_ls path_only)/ocaml(ocamllsp path_only)/erlang(erlang_ls
+        // path_only)/perl(perl_ls path_only)/r(r_ls path_only)/crystal(crystalline
+        // path_only)/zig(zls download) 走 servers.toml 条目，ensure_launch 接管。
+        // groovy 无条目（上游 H 类自备 ls_jar_path JAR，angular/java 不入表先例），
+        // --lang groovy 在 spec_for 落空报 no entry。
+        LanguageId::Fortran
+        | LanguageId::Pascal
+        | LanguageId::Haskell
+        | LanguageId::Groovy
+        | LanguageId::Ocaml
+        | LanguageId::Erlang
+        | LanguageId::Perl
+        | LanguageId::R
+        | LanguageId::Crystal
+        | LanguageId::Zig => return None,
+        // T0 配置驱动（W5 批）：gleam(`gleam lsp` 子命令)/qml(qmlls 裸启动)/lean
+        // (`lean --server`，条目 id lean4)/julia(julia -e runserver，解释器+LanguageServer.jl
+        // 包形态，perl/r 同款)/wolfram(WolframKernel LSPServer paclet，LICENSE SKIP
+        // 候选仍留条目——持有安装的用户可探测，haskell_ls 语义) 走 servers.toml 条目，
+        // ensure_launch 接管。gdscript/msl 无条目（godot=TCP 连已运行编辑器、msl=
+        // serena 内嵌 pygls 脚本，均 HOST SKIP 候选，angular/java/groovy 不入表先例），
+        // --lang gdscript|msl 在 spec_for 落空报 no entry。
+        LanguageId::Gleam
+        | LanguageId::Qml
+        | LanguageId::Lean
+        | LanguageId::Julia
+        | LanguageId::Wolfram => {
+            return None;
+        }
+        LanguageId::Godot | LanguageId::Msl => return None,
     })
 }
 
@@ -227,6 +309,10 @@ pub fn lsp_language_id(lang: &str) -> String {
         // sass.rs per-file 覆盖为 "sass"）。svelte 恒等走 default 臂。
         "deno" => "typescript".to_string(),
         "sass" => "scss".to_string(),
+        // W3 批：冒烟门 --lang intelephense 按 entry id 路由（语言 `php` 归
+        // phpactor），didOpen 官方口径是 "php"（docker→dockerfile 同款显式映射，
+        // 不赌 LS 对自名的宽容）。lua/scala/swift 恒等走 default 臂。
+        "intelephense" => "php".to_string(),
         other => other.to_string(),
     }
 }
@@ -283,7 +369,8 @@ mod tests {
         );
         assert_eq!(resolve(&PathBuf::from("a.cs")), Some(LanguageId::CSharp));
         assert_eq!(resolve(&PathBuf::from("a.java")), Some(LanguageId::Java));
-        assert_eq!(resolve(&PathBuf::from("a.lua")), None);
+        // lua 曾锁 None（未路由）；W3 批收编后移步 w3_php_lua_scala_swift_t0_routing
+        // 正向锁定，此处不再重复。
     }
 
     #[test]
@@ -460,5 +547,98 @@ mod tests {
             resolve(&PathBuf::from("app.dockerfile")),
             Some(LanguageId::Docker)
         );
+    }
+
+    /// W3 批：php/lua/scala/swift 全走 T0（无手写 adapter，session_for 落
+    /// ensure_launch）；php 门按 entry id `intelephense` 显式路由（语言 `php` 归
+    /// phpactor 条目，phpantom 避撞先例），didOpen 官方口径换算 intelephense→php；
+    /// lua/scala/swift 恒等（不加死映射）。
+    #[test]
+    fn w3_php_lua_scala_swift_t0_routing() {
+        // T0：四门语言名 + intelephense 别名都无手写 adapter。
+        for lang in ["php", "intelephense", "lua", "scala", "swift"] {
+            assert!(adapter_for(lang).is_none(), "{lang}: W3 四门全 T0");
+        }
+        // servers.toml 语言路由 / entry id 路由命中。
+        assert!(config::spec_for("lua").is_some());
+        assert!(config::spec_for("scala").is_some());
+        assert!(config::spec_for("swift").is_some());
+        assert!(config::spec_for("intelephense").is_some());
+        // LSP didOpen languageId：仅 intelephense→php 显式映射，其余恒等。
+        assert_eq!(lsp_language_id("intelephense"), "php");
+        assert_eq!(lsp_language_id("php"), "php");
+        assert_eq!(lsp_language_id("lua"), "lua");
+        assert_eq!(lsp_language_id("scala"), "scala");
+        assert_eq!(lsp_language_id("swift"), "swift");
+        // 扩展名解析（EXT_TABLE）：.php/.lua/.scala/.swift 各归其门；luau 是独立
+        // 语言门，"luau" 不别名到 Lua。
+        assert_eq!(resolve(&PathBuf::from("main.php")), Some(LanguageId::Php));
+        assert_eq!(resolve(&PathBuf::from("main.lua")), Some(LanguageId::Lua));
+        assert_eq!(
+            resolve(&PathBuf::from("Main.scala")),
+            Some(LanguageId::Scala)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("Main.swift")),
+            Some(LanguageId::Swift)
+        );
+        assert_eq!(LanguageId::from_str_opt("luau"), None);
+        assert_eq!(
+            LanguageId::from_str_opt("intelephense"),
+            Some(LanguageId::Php)
+        );
+    }
+
+    /// W5 七门：真门 gleam/qml/lean/julia + wolfram 有条目（LICENSE SKIP 候选），
+    /// gdscript/msl 无条目（HOST SKIP 候选）；lean4 是条目 id 非别名。
+    #[test]
+    fn w5_seven_doors_t0_routing() {
+        // 七门全无手写 adapter（T0 / SKIP）。
+        for lang in [
+            "gleam", "qml", "lean", "julia", "wolfram", "gdscript", "msl",
+        ] {
+            assert!(adapter_for(lang).is_none(), "{lang}: W5 七门全 T0/SKIP");
+        }
+        // servers.toml 路由：语言名 + entry id 双语义（lean4 = 条目 id，zls/zig 先例）。
+        for lang in ["gleam", "qml", "lean", "lean4", "julia", "wolfram"] {
+            assert!(
+                config::spec_for(lang).is_some(),
+                "--lang {lang} 必须命中 servers.toml 条目"
+            );
+        }
+        assert!(
+            config::spec_for("gdscript").is_none(),
+            "godot HOST SKIP 候选无条目"
+        );
+        assert!(
+            config::spec_for("msl").is_none(),
+            "msl HOST SKIP 候选无条目"
+        );
+        // LSP didOpen languageId：七门恒等（lean = 官方口径；lean4 仅条目 id，
+        // 不经 LanguageId/lsp_language_id 换算面）。
+        for lang in [
+            "gleam", "qml", "lean", "julia", "wolfram", "gdscript", "msl",
+        ] {
+            assert_eq!(lsp_language_id(lang), lang);
+        }
+        // 扩展名解析（EXT_TABLE）：七门各归其门。
+        assert_eq!(
+            resolve(&PathBuf::from("main.gleam")),
+            Some(LanguageId::Gleam)
+        );
+        assert_eq!(resolve(&PathBuf::from("Main.qml")), Some(LanguageId::Qml));
+        assert_eq!(resolve(&PathBuf::from("Main.lean")), Some(LanguageId::Lean));
+        assert_eq!(resolve(&PathBuf::from("main.jl")), Some(LanguageId::Julia));
+        assert_eq!(
+            resolve(&PathBuf::from("main.wl")),
+            Some(LanguageId::Wolfram)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("main.nb")),
+            Some(LanguageId::Wolfram)
+        );
+        assert_eq!(resolve(&PathBuf::from("main.gd")), Some(LanguageId::Godot));
+        assert_eq!(resolve(&PathBuf::from("main.mrc")), Some(LanguageId::Msl));
+        assert_eq!(LanguageId::from_str_opt("lean4"), None);
     }
 }

@@ -237,6 +237,60 @@ fn check_local_ls() -> Vec<Check> {
             "csharp-ls (C# LS)",
             "dotnet tool install --global csharp-ls  OR  use built-in Roslyn LS via serena",
         ),
+        // W3 批：scala/swift 为 path_only 形态（servers.toml 只声明 binary_name）。
+        (
+            "metals",
+            "metals (Scala LS)",
+            "bootstrap via coursier: cs bootstrap org.scalameta:metals_2.13:1.6.4 -o metals --java-opt -Xss4m (JDK 11+)",
+        ),
+        (
+            "sourcekit-lsp",
+            "sourcekit-lsp (Swift LS)",
+            "install Xcode / Swift toolchain (sourcekit-ls ships with it)",
+        ),
+        // W4 批：path_only 形态四门走 PATH 名探测（W3 metals/sourcekit-lsp 同款）。
+        // perl/r 不在此列——LS 是解释器模块/CRAN 包而非 PATH 二进制，which() 探测
+        // 会恒 Miss 撒谎（nixd 宁缺勿假先例）。
+        (
+            "haskell-language-server-wrapper",
+            "haskell-language-server-wrapper (Haskell LS, W4)",
+            "ghcup install hls  OR  download a bindist from https://github.com/haskell/haskell-language-server/releases (requires ghc on PATH)",
+        ),
+        (
+            "erlang_ls",
+            "erlang_ls (Erlang LS, W4)",
+            "download a prebuilt escript from https://github.com/erlang-ls/erlang_ls/releases matching your OTP version (requires erlang runtime)",
+        ),
+        (
+            "crystalline",
+            "crystalline (Crystal LS, W4)",
+            "download from https://github.com/elbywan/crystalline/releases and put on PATH",
+        ),
+        (
+            "ocamllsp",
+            "ocamllsp (OCaml LS, W4)",
+            "opam install ocaml-lsp-server (requires the opam toolchain)",
+        ),
+        // W5 批：gleam/qmlls/lean 三门 PATH 名探测（LS 本体 = 探测目标二进制，
+        // W4 haskell/erlang/crystal/ocaml 同款）。julia 不在此列——LS = julia runtime
+        // + LanguageServer.jl 包，which(julia) 命中不代表 LS 可用（perl/r 宁缺勿假
+        // 先例）。wolfram 不在此列——WolframKernel 探测对无 Wolfram 安装的机器恒
+        // Miss 撒谎（条目保留给持有安装的用户，LICENSE SKIP 候选）。
+        (
+            "gleam",
+            "gleam (Gleam LS, W5 — LS 内置于 gleam 编译器, `gleam lsp`)",
+            "install gleam (https://gleam.run) and ensure it is on PATH",
+        ),
+        (
+            "qmlls",
+            "qmlls (QML LS, W5 — ships with Qt 6)",
+            "install Qt 6 (apt: qt6-declarative-dev-tools provides qmlls6) and ensure `qmlls` is on PATH",
+        ),
+        (
+            "lean",
+            "lean (Lean 4 LS, W5 — `lean --server`, typically via elan)",
+            "install Lean 4 via elan (https://github.com/leanprover/elan) or a leanprover release tarball",
+        ),
     ];
     let mut out: Vec<Check> = ls_specs
         .iter()
@@ -417,6 +471,26 @@ fn check_local_ls() -> Vec<Check> {
         "scss",
         "some-sass-language-server (Sass/SCSS LS, W2 — spec id scss, language name sass)",
         "serena-cli install sass",
+    ));
+    // W3 批（php/lua/scala/swift）。php 门按 entry id 装 intelephense（语言路由
+    // `php` 归 phpactor）；lua 是 download 缓存探测；scala/swift 是 path_only
+    // 形态 → 走上方 ls_specs 的 PATH 名探测（metals / sourcekit-lsp 行）。
+    out.push(check_npm_ls(
+        "intelephense",
+        "intelephense",
+        "intelephense (PHP LS, W3 — smoke door routes --lang intelephense)",
+        "serena-cli install intelephense",
+    ));
+    out.push(check_download_ls(
+        "lua",
+        "lua-language-server (LuaLS, W3)",
+        "run `serena-cli install lua`",
+    ));
+    // W4 批：zig 走 [servers.zls] download 缓存探测（本批 path_only → download 升级）。
+    out.push(check_download_ls(
+        "zls",
+        "zls (Zig LS, W4 — entry id zls, language name zig)",
+        "run `serena-cli install zig` (requires a matching zig toolchain on PATH; zls 0.16.x pairs with zig 0.16.x)",
     ));
     out
 }
@@ -900,6 +974,22 @@ mod tests {
             "ansible-language-server",
             "regal",
             "nextflow",
+            "intelephense",
+            "lua",
+            "metals",
+            "sourcekit-lsp",
+            // W4 批：haskell/erlang/crystal/ocaml = PATH 名探测四行；zig = zls
+            // download 缓存探测（perl/r 的 LS 是模块/包而非 PATH 二进制，无行）。
+            "haskell-language-server-wrapper",
+            "erlang_ls",
+            "crystalline",
+            "ocamllsp",
+            "zls",
+            // W5 批：gleam/qmlls/lean PATH 名探测三行（julia 的 LS = runtime+包、
+            // wolfram 的 WolframKernel 探测对裸机器恒 Miss 撒谎，均无行）。
+            "gleam",
+            "qmlls",
+            "lean",
         ] {
             let c = r
                 .checks

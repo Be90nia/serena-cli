@@ -1261,7 +1261,10 @@ package = "@vue/language-server"
         let win = to_install_spec(spec, "pp", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
         match win.kind {
             InstallKind::Download { archive, .. } => {
-                assert!(matches!(archive, ArchiveKind::Zip), "key 未命中 → 回退单值 zip")
+                assert!(
+                    matches!(archive, ArchiveKind::Zip),
+                    "key 未命中 → 回退单值 zip"
+                )
             }
             other => panic!("expect Download, got {other:?}"),
         }

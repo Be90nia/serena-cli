@@ -125,6 +125,107 @@ pub enum LanguageId {
     ///（npm），扩展名 .sass/.scss（.css 归 css 门；servers.toml 条目 id 仍 scss，
     /// 路由语言名 = sass，didOpen 官方 languageId = "scss"）。
     Sass,
+    /// T0 配置驱动（W3 批，servers.toml phpactor/intelephense 条目）：语言路由
+    /// `php` 归 phpactor（download PHAR，存量避撞先例同 phpantom）；PM 拍板冒烟门
+    /// 走 intelephense（npm，`--lang intelephense` 按 entry id 显式路由，phpantom
+    /// 同款）。↖ mirror: intelephense.py@43ae021。
+    Php,
+    /// T0 配置驱动（W3 批，servers.toml lua 条目 = LuaLS lua-language-server）。
+    /// ↖ mirror: lua_ls.py@43ae021（GitHub release tar.gz 3.15.0 sha 内嵌）。
+    Lua,
+    /// T0 配置驱动（W3 批，servers.toml scala 条目 = metals，path_only 形态）。
+    /// ↖ mirror: scala_language_server.py@43ae021（上游 PATH 有 metals 则用之，
+    /// 否则 coursier bootstrap org.scalameta:metals_2.13；上游另应答 import 构建
+    /// 提示——我们 T0 不应答，无 build 工程的 fixture 走 metals standalone PC）。
+    Scala,
+    /// T0 配置驱动（W3 批，servers.toml sourcekit_lsp 条目，path_only）：macOS
+    /// Xcode/Swift 工具链自带，ubuntu runner 无工具链（冒烟门 PLATFORM SKIP）。
+    /// ↖ mirror: sourcekit_ls.py@43ae021。
+    Swift,
+    /// T0 配置驱动（W4 批，servers.toml fortls 条目 = uvx fortls 3.2.2）。
+    /// ↖ mirror: fortran_language_server.py@7a296833。矩阵门上轮已 PASS（--lang
+    /// fortran 走 spec_for 字符串路径可达），本批补 LanguageId/EXT_TABLE 接线闭合
+    /// （每门交付模板；扩展名大小写不敏感族 .f90/.F90 同命中——本表键统一小写）。
+    Fortran,
+    /// T0 配置驱动（W4 批，servers.toml pascal 条目 = pasls download v0.2.0）。
+    /// ↖ mirror: pascal_server.py@7a296833（FPC runtime 完整功能需 PP/FPCDIR；
+    /// 矩阵门为存量 BUDGET skip——apt fpc ~400MB 超单门预算，PM 裁决在案）。
+    Pascal,
+    /// T0 配置驱动（W4 批，servers.toml haskell_ls 条目 = wrapper `--lsp`，本批
+    /// exec 修复：裸 wrapper 打印 usage 即退）。
+    /// ↖ mirror: haskell_language_server.py@7a296833（PATH 探测 wrapper；bare 文件
+    /// 走 default cradle 调 ghc）。
+    Haskell,
+    /// W4 批：上游 H 类（groovy_language_server.py@7a296833 要求用户自备
+    /// ls_jar_path JAR；npm 无 LS 包、GroovyLanguageServer GitHub releases=[]、
+    /// apt 无 LS——无 T0 对应物，angular/java 不入表先例，矩阵门 HOST SKIP 候选
+    /// 待 PM 裁决）。仅 LanguageId/扩展名占位，--lang groovy 查表落空报 no entry。
+    Groovy,
+    /// T0 配置驱动（W4 批，servers.toml ocamllsp 条目 = PATH 探测裸启动）。
+    /// ↖ mirror: ocaml_lsp_server.py@7a296833（`opam exec -- which ocamllsp` 取
+    /// 路径后直启 = path_only 语义；安装 = opam install ocaml-lsp-server；
+    /// OCaml 5.1.0 不兼容为上游明示）。
+    Ocaml,
+    /// T0 配置驱动（W4 批，servers.toml erlang_ls 条目 = `--transport stdio`，
+    /// 本批 exec 修复：默认 transport 是 TCP）。
+    /// ↖ mirror: erlang_language_server.py@7a296833；运行另需 Erlang/OTP runtime。
+    Erlang,
+    /// T0 配置驱动（W4 批，servers.toml perl_ls 条目 = `perl -MPerl::LanguageServer
+    /// -e Perl::LanguageServer::run`，launch argv 逐字）。
+    /// ↖ mirror: perl_language_server.py@7a296833（上游另应答
+    /// workspace/configuration——T0 走 lsp-core 未注册请求默认 null 成功应答）。
+    Perl,
+    /// T0 配置驱动（W4 批，servers.toml r_ls 条目 = `R --vanilla --quiet --slave
+    /// -e ...languageserver::run()`，launch argv 逐字）。
+    /// ↖ mirror: r_language_server.py@7a296833（CRAN languageserver 包 + R runtime，
+    /// 均不托管安装）。
+    R,
+    /// T0 配置驱动（W4 批，servers.toml crystalline 条目 = PATH 探测裸启动）。
+    /// ↖ mirror: crystal_language_server.py@7a296833（shutil.which 裸启动；
+    /// documentSymbol 上游注释 "work reliably"；definition 每会话仅首个命中为上游
+    /// 已知缺陷，与本接线无关）。
+    Crystal,
+    /// T0 配置驱动（W4 批，servers.toml zls 条目 = 本批 path_only → download 升级
+    /// v0.16.0 六平台）。
+    /// ↖ mirror: zls.py@7a296833（裸 `zls`；上游 init options 注入 zig_exe_path，
+    /// 无值时 zls 自检 PATH 上的 zig——与 PATH 探测形态等价；zig 同 minor 配对）。
+    Zig,
+    /// T0 配置驱动（W5 批，servers.toml gleam 条目 = `gleam lsp` 子命令，deno/cue
+    /// 同款 CLI 内置 LS）。↖ mirror: gleam_language_server.py@7a296833（PATH 探测
+    /// gleam 编译器本体；无 init options；上游另等首批 $/progress 依赖解析——T0 无
+    /// 此等待门，LS 依赖下载窗口由工具层超时承担）。
+    Gleam,
+    /// T0 配置驱动（W5 批，servers.toml qmlls 条目 = Qt 6 官方 qmlls 裸启动）。
+    /// ↖ mirror: qml_language_server.py@7a296833（上游 which 顺序 qmlls6 → qmlls；
+    /// 我们条目单名 binary_name=qmlls——apt 装机 /usr/bin/qmlls6，smoke 门 ln -sf
+    /// 对齐，Debian install 清单实锚）。
+    Qml,
+    /// T0 配置驱动（W5 批，servers.toml lean4 条目 = `lean --server`，lean 是
+    /// LSP didOpen 官方 languageId，lean4 是条目 id——zls/zig 双名先例）。
+    /// ↖ mirror: lean4_language_server.py@7a296833（Δ 未抄上游 lake env 注入
+    /// LEAN_PATH/LEAN_SRC_PATH——跨文件语义需 lake 工程，standalone fixture 走
+    /// 基础符号）。
+    Lean,
+    /// T0 配置驱动（W5 批，servers.toml julia 条目 = `julia -e 'using LanguageServer;
+    /// runserver()'`）。↖ mirror: julia_server.py@7a296833（Δ 上游尾参 repo_root
+    /// 省略——runserver choose_env 回落链含 pwd 上溯，T0 spawn cwd = 项目根实锚；
+    /// Δ workspace/configuration 应答与 didChangeConfiguration 补发未抄——T0 走
+    /// lsp-core 未注册请求默认 null 成功应答，lint 设置回落 LS 默认）。
+    Julia,
+    /// LICENSE SKIP 候选（W5 批，待 PM 裁决）：LS = WolframKernel 捆绑的 LSPServer
+    /// paclet（Mathematica 13.0+ / Wolfram Engine 12.1+，无独立安装渠道），条目为
+    /// 持有 Wolfram 安装的用户保留探测面。↖ mirror: wolfram_language_server.py@7a296833。
+    Wolfram,
+    /// HOST SKIP 候选（W5 批，待 PM 裁决）：上游 adapter 是 TCP 客户端（连已运行的
+    /// Godot 编辑器 :6008，从不启动进程），我们 TransportKind 仅 Stdio——无 T0 形态，
+    /// servers.toml 不建条目（angular/java/groovy 不入表先例），扩展名占位使 resolve
+    /// 落到明确 no-entry 报错。↖ mirror: godot_language_server.py@7a296833。
+    Godot,
+    /// HOST SKIP 候选（W5 批，待 PM 裁决）：上游 LS = serena 仓库内嵌 pygls 脚本
+    ///（launch = [sys.executable, msl_lsp_server.py]，mIRC 脚本语言 .mrc——非 Metal），
+    /// 非独立发行、我们 Rust 端不随包脚本，无 T0 对应物，不建条目。↖ mirror:
+    /// msl_language_server.py@7a296833。
+    Msl,
 }
 
 impl LanguageId {
@@ -162,6 +263,30 @@ impl LanguageId {
             Self::Svelte => "svelte",
             Self::Deno => "deno",
             Self::Sass => "sass",
+            Self::Php => "php",
+            Self::Lua => "lua",
+            Self::Scala => "scala",
+            Self::Swift => "swift",
+            // W4 批：十门恒等（官方 LSP languageId 与内部名一致，覆盖测试锁死）。
+            Self::Fortran => "fortran",
+            Self::Pascal => "pascal",
+            Self::Haskell => "haskell",
+            Self::Groovy => "groovy",
+            Self::Ocaml => "ocaml",
+            Self::Erlang => "erlang",
+            Self::Perl => "perl",
+            Self::R => "r",
+            Self::Crystal => "crystal",
+            Self::Zig => "zig",
+            // W5 批：七门恒等（lean = 官方 languageId，lean4 留作条目 id；gdscript =
+            // 上游语言名——godot 编辑器宿主门）。
+            Self::Gleam => "gleam",
+            Self::Qml => "qml",
+            Self::Lean => "lean",
+            Self::Julia => "julia",
+            Self::Wolfram => "wolfram",
+            Self::Godot => "gdscript",
+            Self::Msl => "msl",
         }
     }
     /// 反向：lang 字符串 → LanguageId。未知返 None。
@@ -199,6 +324,32 @@ impl LanguageId {
             "svelte" => Some(Self::Svelte),
             "deno" => Some(Self::Deno),
             "sass" => Some(Self::Sass),
+            // W3 批：intelephense 别名（phpantom 同款按 entry id 显式路由——
+            // 语言路由 `php` 归 phpactor 条目，冒烟门 --lang intelephense）。
+            "php" | "intelephense" => Some(Self::Php),
+            "lua" => Some(Self::Lua),
+            "scala" => Some(Self::Scala),
+            "swift" => Some(Self::Swift),
+            // W4 批：十门恒等（上游 adapter 第四参 = 内部名，逐一核实）。
+            "fortran" => Some(Self::Fortran),
+            "pascal" => Some(Self::Pascal),
+            "haskell" => Some(Self::Haskell),
+            "groovy" => Some(Self::Groovy),
+            "ocaml" => Some(Self::Ocaml),
+            "erlang" => Some(Self::Erlang),
+            "perl" => Some(Self::Perl),
+            "r" => Some(Self::R),
+            "crystal" => Some(Self::Crystal),
+            "zig" => Some(Self::Zig),
+            // W5 批：七门恒等（lean4 是条目 id 非语言名，zls/zig 双名先例——
+            // `--lang lean4` 走 spec_for 按 id 命中 [servers.lean4]，不经此处）。
+            "gleam" => Some(Self::Gleam),
+            "qml" => Some(Self::Qml),
+            "lean" => Some(Self::Lean),
+            "julia" => Some(Self::Julia),
+            "wolfram" => Some(Self::Wolfram),
+            "gdscript" => Some(Self::Godot),
+            "msl" => Some(Self::Msl),
             _ => None,
         }
     }
@@ -244,6 +395,38 @@ impl LanguageId {
             "nix" => Some(Self::Nix),
             // pgsql/mysql（bd 56a）无专属扩展名：.sql 归 Sql 门（上游 get_priority
             // superset 的默认归属语义），本两门经 --lang pgsql|mysql 显式路由。
+            // W3 批：php/lua/scala/swift 各自独占扩展名（.phtml 等上游 intelephense
+            // 超集扩展暂不收——M3 主线口径同 cpp）。
+            "php" => Some(Self::Php),
+            "lua" => Some(Self::Lua),
+            "scala" => Some(Self::Scala),
+            "swift" => Some(Self::Swift),
+            // W4 批：fortran 大小写不敏感族（.F90 同命中——键统一小写 + to_lowercase
+            // 匹配）；pascal 主形态 .pas/.pp（.lpr/.dpr/.dpk/.inc 项目文件不收，
+            // W1a tfstate 同款子集语义）；ocaml .ml/.mli（.re/.rei Reason 变体不收）；
+            // erlang .erl/.hrl（.config/.app 泛用后缀不抢）；perl .pl/.pm/.t；
+            // r 族 .r/.rmd/.rnw（上游 .R/.Rmd 大小写不敏感同命中）；groovy .groovy/
+            // .gvy（门本体 HOST SKIP 候选，扩展名占位使 resolve 落到明确 no-entry 报错）。
+            "f90" | "f95" | "f03" | "f08" | "f" | "for" | "fpp" => Some(Self::Fortran),
+            "pas" | "pp" => Some(Self::Pascal),
+            "hs" | "lhs" => Some(Self::Haskell),
+            "groovy" | "gvy" => Some(Self::Groovy),
+            "ml" | "mli" => Some(Self::Ocaml),
+            "erl" | "hrl" => Some(Self::Erlang),
+            "pl" | "pm" | "t" => Some(Self::Perl),
+            "r" | "rmd" | "rnw" => Some(Self::R),
+            "cr" => Some(Self::Crystal),
+            "zig" | "zon" => Some(Self::Zig),
+            // W5 批：七门各自独占扩展名，无存量冲突（.m 归 matlab、.ts 归 TypeScript
+            // 均不涉）。wolfram 双扩展 .wl（纯源码）+ .nb（notebook）；gdscript/msl
+            // 门本体 SKIP 候选，扩展名占位使 resolve 落到明确 no-entry 报错（groovy 同款）。
+            "gleam" => Some(Self::Gleam),
+            "qml" => Some(Self::Qml),
+            "lean" => Some(Self::Lean),
+            "jl" => Some(Self::Julia),
+            "wl" | "nb" => Some(Self::Wolfram),
+            "gd" => Some(Self::Godot),
+            "mrc" => Some(Self::Msl),
             _ => None,
         }
     }
@@ -335,6 +518,32 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         // deno：TS 家族扩展名不抢 → 探针候选名单（.gitignore/README 等）兜底。
         LanguageId::Deno => &[],
         LanguageId::Sass => &["sass", "scss"],
+        // W3 批：四门均为真实 LS 可解析的源文件扩展名。
+        LanguageId::Php => &["php"],
+        LanguageId::Lua => &["lua"],
+        LanguageId::Scala => &["scala"],
+        LanguageId::Swift => &["swift"],
+        // W4 批：十门真实源文件扩展名（T0，wait_for_index 默认实现 root 扫描用；
+        // groovy 门本体 SKIP，扩展名表仍如实声明）。
+        LanguageId::Fortran => &["f90", "f95", "f03", "f08", "f", "for", "fpp"],
+        LanguageId::Pascal => &["pas", "pp"],
+        LanguageId::Haskell => &["hs", "lhs"],
+        LanguageId::Groovy => &["groovy", "gvy"],
+        LanguageId::Ocaml => &["ml", "mli"],
+        LanguageId::Erlang => &["erl", "hrl"],
+        LanguageId::Perl => &["pl", "pm", "t"],
+        LanguageId::R => &["r", "rmd", "rnw"],
+        LanguageId::Crystal => &["cr"],
+        LanguageId::Zig => &["zig", "zon"],
+        // W5 批：七门真实源文件扩展名（wolfram/gdscript/msl 门本体 SKIP 候选，
+        // 扩展名表仍如实声明——groovy 同款）。
+        LanguageId::Gleam => &["gleam"],
+        LanguageId::Qml => &["qml"],
+        LanguageId::Lean => &["lean"],
+        LanguageId::Julia => &["jl"],
+        LanguageId::Wolfram => &["wl", "nb"],
+        LanguageId::Godot => &["gd"],
+        LanguageId::Msl => &["mrc"],
     }
 }
 

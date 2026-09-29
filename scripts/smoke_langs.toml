@@ -1,9 +1,10 @@
 # smoke_langs.toml —— 45 门语言 CI 冒烟矩阵清单（Phase 0 基建，serena-rust）。
 #
 # 三栏对账锚（上游 73 门，详见 local/agent-reports/ci-infra-45lang.md）：
-#   已收 64（本矩阵 45 真门 + 未入矩阵的表内/变体门）+ documented SKIP（angular，
-#   PM 拍板三进程编排 T0 不支持）+ 剩余未收 8（perl/r/wolfram/gdscript/groovy/
-#   julia/msl/scala）。总账 73 闭合。
+#   已收 65（本矩阵 46 真门 + 未入矩阵的表内/变体门）+ documented SKIP（angular，
+#   PM 拍板三进程编排 T0 不支持）+ W3/W4/W5 已派账：scala/perl/r/julia 收编、
+#   groovy PM 裁决不入矩阵（angular 先例）、W5 候选 3（wolfram LICENSE/gdscript
+#   HOST/msl HOST——均待 PM 裁决，落盘仅为候选登记）。总账 73 闭合。
 #
 # ── W1-W5 接入模板（加一门 = 两步）──────────────────────────────────────
 # 1. 本清单加一个 [[lang]] 块（字段见下）；
@@ -14,8 +15,10 @@
 # id          serena 语言名（= LanguageId；install 与 --lang 同名，pgsql/mysql 等
 #             变体门照 pgsql/mysql 先例走显式 --lang，不破 language_routes_are_unique）
 # via         装法：serena-download | serena-npm | serena-uvx | serena-dotnet |
-#             serena-gem | serena-source | npm | apt | rustup | go_install
+#             serena-gem | serena-source | npm | apt | rustup | go_install | binary
 #             （serena-* = `serena-cli install <id>`，pin 内嵌 servers.toml；
+#             binary = release 单二进制/官方 tarball curl 落地 PATH，W4 批新增——
+#             非 serena-* via 统一走 install 完整 shell 命令分支，执行器零改动；
 #             其他 = install 列完整 shell 命令，`$SERENA_CLI` 可引用二进制）
 # install     完整 shell 命令；非空时优先于 via 默认装法执行（runtime apt 前置 +
 #             `$SERENA_CLI install <id>` 连写；曾只认 via 默认装法，前置被静默跳过
@@ -250,18 +253,18 @@ remark = "运行需 Haxe 编译器（apt suite 版）"
 
 [[lang]]
 id = "php"
-via = "serena-download"
-install = "sudo apt-get install -y -qq php-cli && $SERENA_CLI install php"
+via = "serena-npm"
+install = "$SERENA_CLI install intelephense"
 pin = "servers.toml"
 fixture = "main.php"
-lang_flag = "php"
-budget_secs = 600
-remark = "phpactor PHAR 需 PHP 8.1+（ubuntu-24.04 apt = 8.3）"
+lang_flag = "intelephense"
+budget_secs = 420
+remark = "PM 拍板 intelephense（npm，零运行时依赖）；语言路由 php 归 phpactor 条目（存量避撞），门走 --lang intelephense 按 entry id 显式路由（phpantom 同款），lsp_language_id 显式映射 intelephense→php（didOpen 官方口径）"
 
 [[lang]]
 id = "clojure"
 via = "serena-download"
-install = "sudo apt-get install -y -qq clojure && $SERENA_CLI install clojure"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq clojure && $SERENA_CLI install clojure"
 pin = "servers.toml"
 fixture = "core.clj"
 lang_flag = "clojure"
@@ -470,6 +473,78 @@ lang_flag = "solargraph"
 budget_secs = 420
 remark = "变体门：--lang solargraph；保持裸 .rb fixture（solargraph 直跑无需 bundle，ruby 门工程化引入 Gemfile 反会触发其 bundler 语境，不共 fixture 以免假红）"
 
+# ══ W4 批（七真门；groovy 走 angular 先例不入矩阵，见尾部对账节）════════════
+
+[[lang]]
+id = "haskell"
+via = "binary"
+install = "sudo apt-get install -y -qq ghc && curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.9.0.1/haskell-language-server-2.9.0.1-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && mkdir -p /tmp/hls && tar -xJf /tmp/hls.tar.xz -C /tmp/hls && sudo find /tmp/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && haskell-language-server-wrapper --version"
+pin = "HLS 2.9.0.1 (bindist deb11) + ghc suite (ubuntu-24.04 = 9.4.7)"
+fixture = "main.hs"
+lang_flag = "haskell"
+budget_secs = 900
+remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修——裸 wrapper 打印 usage 即退，terraform serve 同类坑）；2.9.0.1 选版因 2.15 弃 GHC 9.4（apt suite 上限）；bindist 解析布局未知故 find-install；bare main.hs 走 default cradle 调 ghc"
+
+[[lang]]
+id = "ocaml"
+via = "apt"
+install = "sudo apt-get install -y -qq ocaml-nox opam && opam init -a --disable-sandboxing --bare -y && opam switch create default ocaml-system && eval $(opam env) && opam install -y ocaml-lsp-server && echo \"$HOME/.opam/default/bin\" >> \"$GITHUB_PATH\" && ocamllsp --version"
+pin = "ocamllsp suite (opam) + ocaml-system (apt 4.14, 免编译器源码构建)"
+fixture = "main.ml"
+lang_flag = "ocaml"
+budget_secs = 1200
+remark = "↖ mirror ocaml_lsp_server.py@7a296833（opam exec -- which ocamllsp 取路径后裸直启 = path_only 语义）；ocamllsp 本体编译 ~3-6min 为预算主体；OCaml 5.1.0 不兼容上游明示——apt 4.14 避开"
+
+[[lang]]
+id = "erlang"
+via = "binary"
+install = "sudo apt-get install -y -qq erlang && curl -fsSL https://github.com/erlang-ls/erlang_ls/releases/download/1.1.0/erlang_ls-linux-25.tar.gz -o /tmp/els.tar.gz && mkdir -p /tmp/els && tar -xzf /tmp/els.tar.gz -C /tmp/els && sudo find /tmp/els -type f -name 'erlang_ls' -exec install -m 755 {} /usr/local/bin/ \\; && erlang_ls --version"
+pin = "erlang_ls 1.1.0 (OTP 25 build; release 无 digest 锚故钉 URL) + erlang suite (OTP 25.3)"
+fixture = "main.erl"
+lang_flag = "erlang"
+budget_secs = 600
+remark = "entry exec 修复 [--transport stdio]——裸启动 = TCP 模式，stdio pump 挂死（mirror erlang_language_server.py@7a296833 ProcessLaunchInfo）；资产按 OTP 配对（ubuntu-24.04 apt = OTP 25.3.2.8，launchpad 实锚）→ -25 tarball"
+
+[[lang]]
+id = "perl"
+via = "apt"
+install = "sudo apt-get install -y -qq perl cpanminus && sudo cpanm --notest Perl::LanguageServer && perl -MPerl::LanguageServer -e 'print $Perl::LanguageServer::VERSION'"
+pin = "Perl::LanguageServer suite (cpanm --notest)"
+fixture = "main.pl"
+lang_flag = "perl"
+budget_secs = 900
+remark = "↖ mirror perl_language_server.py@7a296833 launch 串逐字（entry perl_ls exec）；上游另应答 workspace/configuration + didChangeConfiguration——T0 走 lsp-core 未注册请求默认 null 成功应答（kotlin 条目注释同源实锚），文件过滤回落 LS 默认；cpanm 依赖自动解算为预算主体"
+
+[[lang]]
+id = "r"
+via = "apt"
+install = "sudo apt-get install -y -qq r-base-core && sudo R --vanilla --slave -e \"install.packages('languageserver', repos='https://cloud.r-project.org', Ncpus=4)\" && R --vanilla --slave -e \"cat(as.character(packageVersion('languageserver')))\""
+pin = "languageserver suite (CRAN 源码编译) + r-base-core suite"
+fixture = "main.r"
+lang_flag = "r"
+budget_secs = 900
+remark = "↖ mirror r_language_server.py@7a296833 launch 串逐字（entry r_ls exec）；languageserver CRAN 源码编译（runner 自带 gcc），deps 自动解算"
+
+[[lang]]
+id = "crystal"
+via = "binary"
+install = "curl -fsSL https://github.com/elbywan/crystalline/releases/download/v0.20.0/crystalline_x86_64-unknown-linux-musl.gz -o /tmp/crystalline.gz && echo \"0eb5647cec37029067b6c01c3a7bdd0b5c4e0dcc2cf2a8dc55d1297781e2a7fd  /tmp/crystalline.gz\" | sha256sum -c - && gunzip -f /tmp/crystalline.gz && chmod +x /tmp/crystalline && sudo mv /tmp/crystalline /usr/local/bin/crystalline && crystalline --version"
+pin = "crystalline v0.20.0 (musl 静态单二进制; sha256 = GitHub API assets[].digest 2026-09-29)"
+fixture = "main.cr"
+lang_flag = "crystal"
+budget_secs = 420
+remark = "↖ mirror crystal_language_server.py@7a296833（shutil.which 裸启动）；musl 静态免 crystal 工具链——documentSymbol 上游注释 'work reliably'（definition 每会话首个才命中为上游已知缺陷，与底线无关）；servers.toml crystalline 条目保持 path_only（legacy 锚 canary 断言在案），smoke 走 curl 钉 URL"
+
+[[lang]]
+id = "zig"
+via = "serena-download"
+install = "curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz && echo \"70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz\" | sha256sum -c - && sudo tar -xJf /tmp/zig.tar.xz -C /usr/local && sudo ln -sf /usr/local/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig && \"$SERENA_CLI\" install zig && zig version && zls --version"
+pin = "servers.toml"
+fixture = "main.zig"
+lang_flag = "zig"
+budget_secs = 600
+remark = "--lang zig → [servers.zls]（本批 path_only → download 升级，六平台 digest 锚；tarball 内 bin 布局扁平假设为 CI 首跑实锚点）；zig 0.16.0 工具链 ziglang.org 官方 tarball（sha = index.json 实锚）symlink 入 PATH——zls 与 zig 严格同 minor 配对（0.16.x）"
+
 # ══ SKIP 门（四类，预算上限 6 条，PM 裁决制）═════════════════════════════
 
 [[lang]]
@@ -546,9 +621,127 @@ skip_reason = "VSIX entry pins windows group only (bin extension/bin/win32/...);
 skip_evidence = "crates/ls-registry/servers.toml [servers.al.download] windows-only bin_path"
 verified = "never"
 
+# ── W3 批（php/lua/scala/swift；php 块在原位改 intelephense，lua 块在 download 段）──
+
+[[lang]]
+id = "scala"
+via = "coursier"
+install = "curl -fLo cs.gz https://github.com/coursier/coursier/releases/download/v2.1.25/cs-x86_64-pc-linux.gz && gunzip -f cs.gz && chmod +x cs && ./cs bootstrap org.scalameta:metals_2.13:1.6.4 -o metals --java-opt -Xss4m && sudo ln -sf \"$PWD/metals\" /usr/local/bin/metals"
+pin = "metals_2.13:1.6.4（上游 scala_language_server.py@43ae0211 DEFAULT_METALS_VERSION）+ coursier v2.1.25"
+fixture = "scala/Main.scala"
+lang_flag = "scala"
+budget_secs = 900
+fallback_assert = "hover:2:7"
+remark = "path_only 门：servers.toml [servers.scala] 只探 PATH，安装走 coursier bootstrap 到 /usr/local/bin（JDK 11+，runner 预装 17）；GitHub release 无预编译资产（v1.6.9 assets=[] 2026-09-29 实查）。fixture 无 build 文件——T0 不应答 import 构建提示（上游应答之），无 build 走 metals standalone PC；documentSymbol 若空降级 hover 探针"
+
+[[lang]]
+id = "swift"
+via = "path_only"
+pin = "servers.toml"
+fixture = "main.swift"
+lang_flag = "swift"
+budget_secs = 600
+skip_class = "PLATFORM"
+skip_reason = "sourcekit-lsp ships with the Xcode/Swift toolchain; servers.toml entry is path_only (no installable asset) and ubuntu-latest runners have no Swift toolchain"
+skip_evidence = "servers.toml [servers.sourcekit_lsp] path_only install_hint='install Xcode / Swift toolchain (sourcekit-ls ships with it)'; local/upstream-ls-catalog.md G-class swift = Xcode/Swift 工具链"
+verified = "never"
+remark = "W3 批：Rust 侧接线完备（LanguageId/EXT_TABLE/doctor/sourcekit_lsp 存量条目）；SKIP 账本第 8 条（PM 批准 7→8，硬顶 8）；若未来 runner 出 Swift 工具链或 sourcekit-ls 独立发行即转真门"
+
+# ══ W5 批（七门：四真门 + 三 SKIP 候选待 PM 裁决）═══════════════════════
+
+[[lang]]
+id = "gleam"
+via = "binary"
+install = "curl -fsSL https://github.com/gleam-lang/gleam/releases/download/v1.18.1/gleam-v1.18.1-x86_64-unknown-linux-musl.tar.gz -o /tmp/gleam.tar.gz && echo \"4955a38c2e8c99457458e2471472ccd5ee3c45bd7637a315ce33bccf0dd75d9e  /tmp/gleam.tar.gz\" | sha256sum -c - && mkdir -p /tmp/gleam && tar -xzf /tmp/gleam.tar.gz -C /tmp/gleam && sudo find /tmp/gleam -type f -name gleam -exec install -m 755 {} /usr/local/bin/ \\; && gleam --version"
+pin = "gleam v1.18.1 (musl 静态单二进制; sha256 = GitHub API assets[].digest 2026-09-29)"
+fixture = "main.gleam"
+lang_flag = "gleam"
+budget_secs = 300
+fallback_assert = "hover:2:7"
+remark = "↖ mirror gleam_language_server.py@7a296833（`gleam lsp` 子命令，deno/cue 同款 CLI 内置 LS，条目存量本体不动）；上游适配器等首批 $/progress 依赖解析——T0 无此等待门由工具层超时承担；bare fixture 无 gle.toml 走单文件分析，documentSymbol 若空降级 hover 探针；tarball 解包布局未知故 find-install（haskell/erlang 先例）"
+
+[[lang]]
+id = "qml"
+via = "apt"
+install = "sudo apt-get install -y -qq qt6-declarative-dev-tools && sudo ln -sf /usr/bin/qmlls6 /usr/local/bin/qmlls && test -x /usr/local/bin/qmlls"
+pin = "suite (ubuntu-24.04 = Qt 6.4.2；qmlls6 落 /usr/bin——Salsa debian/qt6-declarative install 清单实锚 2026-09-29)"
+fixture = "Main.qml"
+lang_flag = "qml"
+budget_secs = 600
+fallback_assert = "hover:2:7"
+remark = "↖ mirror qml_language_server.py@7a296833（qmlls 裸启动 stdio，条目存量本体不动）；条目 binary_name=qmlls 单名 vs 上游 which 顺序 qmlls6→qmlls——ln -sf 对齐（scala/metals 同款软链先例）；6.4.2 是 qmlls 初版 LSP（功能面窄），documentSymbol 若空降级 hover；Qt 更新版需 Qt 官方安装器（交互+账号，CI 不可脚本化）；install 行用 test -x 校验（--version 支持未核实，不赌旗标）"
+
+[[lang]]
+id = "lean4"
+via = "binary"
+install = "curl -fsSL https://github.com/leanprover/lean4/releases/download/v4.34.1/lean-4.34.1-linux.tar.zst -o /tmp/lean.tar.zst && echo \"47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4  /tmp/lean.tar.zst\" | sha256sum -c - && sudo tar --zstd -xf /tmp/lean.tar.zst -C /opt && sudo ln -sf /opt/lean/bin/lean /usr/local/bin/lean && lean --version"
+pin = "lean v4.34.1 (最新稳定版，rc 链 4.35.0 排除; sha256 = GitHub API assets[].digest 2026-09-29)"
+fixture = "Main.lean"
+lang_flag = "lean"
+budget_secs = 900
+remark = "↖ mirror lean4_language_server.py@7a296833（`lean --server`，条目存量本体不动）；580MB tar.zst 全工具链（免 elan，钉版确定性）——tarball 内解包前缀 lean/bin/lean 为 CI 首跑实锚点；Δ 未抄上游 lake env LEAN_PATH 注入——standalone fixture 走基础符号（def/theorem documentSymbol）；--lang lean 命中 [servers.lean4]（语言名=lean 官方口径，条目 id=lean4，zls/zig 双名先例）"
+
+[[lang]]
+id = "julia"
+via = "binary"
+install = "curl -fsSL https://julialang-s3.julialang.org/bin/linux/x64/1.13/julia-1.13.1-linux-x86_64.tar.gz -o /tmp/julia.tar.gz && echo \"0f2e18c8dea60a2c8711d089cd9612f7a8df394b89e5208096fe5867647e0908  /tmp/julia.tar.gz\" | sha256sum -c - && sudo tar -xzf /tmp/julia.tar.gz -C /opt && sudo ln -sf /opt/julia-1.13.1/bin/julia /usr/local/bin/julia && julia -e 'using Pkg; Pkg.add(\"LanguageServer\")' && julia -e 'using LanguageServer; println(\"ls-ok\")'"
+pin = "julia v1.13.1 (sha256 = julialang-s3 versions.json 官方锚 2026-09-29；二进制已不在 GitHub release——资产仅源码+full 包) + LanguageServer.jl latest (Pkg 解算)"
+fixture = "main.jl"
+lang_flag = "julia"
+budget_secs = 1200
+remark = "↖ mirror julia_server.py@7a296833（launch argv 逐字，条目本批新增 path_only）；Pkg.add LanguageServer 预装为预算主体（上游 _install_language_server 超时 300s，含 precompile）；T0 spawn cwd = 项目根 → runserver choose_env pwd 回落（上游尾参 repo_root 省略，语义等价）；workspace/configuration 走 lsp-core null 应答，lint 回落默认——底线 documentSymbol 不受影响；budget 1200 为上限估待 CI 实测校准"
+
+[[lang]]
+id = "wolfram"
+via = "path_only"
+pin = "servers.toml"
+fixture = "main.wl"
+lang_flag = "wolfram"
+budget_secs = 300
+skip_class = "LICENSE"
+skip_reason = "LS = WolframKernel bundled LSPServer paclet, ships only with Mathematica 13.0+ / Wolfram Engine 12.1+ (licensed install; free Engine requires Wolfram account + manual download — no package-manager/GitHub route)"
+skip_evidence = "upstream wolfram_language_server.py@7a296833 FileNotFoundError 实锚: 'Install Wolfram Mathematica (13.0+) or Wolfram Engine (12.1+) from https://www.wolfram.com'; 发现链 = WOLFRAM_PATH env/PATH/常见安装位 glob，全依赖本机 Wolfram 安装"
+verified = "never"
+remark = "W5 批：LICENSE SKIP 候选；SKIP 账本 8/8 硬顶已满——本条待 PM 裁决（置换/拒绝/特批/不入矩阵），落盘仅为候选登记（groovy 先例：候选登记后 PM 裁决定去向）；Rust 侧 LanguageId/EXT_TABLE 已接线（.wl/.nb），servers.toml 新增 [servers.wolfram] 探测面（WolframKernel，持有安装的用户可用，haskell_ls 运行时自备语义）；免许可可脚本化渠道出现即转真门"
+
+[[lang]]
+id = "gdscript"
+via = "path_only"
+pin = "none"
+fixture = "main.gd"
+lang_flag = "gdscript"
+budget_secs = 300
+skip_class = "HOST"
+skip_reason = "upstream adapter is a TCP client connecting to an already-running Godot editor on :6008 (never launches a process); our launch model is stdio-only (TransportKind::Stdio) — even `godot --headless --editor` cannot serve us without TCP transport"
+skip_evidence = "upstream godot_language_server.py@7a296833 实锚: 'The editor must already be running — this class connects to it rather than launching it' + TCPLanguageServer(connection_info); crates/ls-runtime/src/process.rs TransportKind 仅 Stdio 变体"
+verified = "never"
+remark = "W5 批：HOST SKIP 候选；SKIP 账本 8/8 硬顶已满——本条待 PM 裁决（置换/拒绝/特批/不入矩阵），落盘仅为候选登记；Rust 侧 LanguageId/EXT_TABLE 已接线（.gd），servers.toml 不建条目（angular/groovy 先例）；lsp-core 出 TCP transport + 编辑器宿主编排（angular 三进程同族）出现即转真门"
+
+[[lang]]
+id = "msl"
+via = "path_only"
+pin = "none"
+fixture = "main.mrc"
+lang_flag = "msl"
+budget_secs = 300
+skip_class = "HOST"
+skip_reason = "upstream LS = a pygls Python script shipped INSIDE the serena repo (launch = [sys.executable, msl_lsp_server.py]); not independently distributed (no npm/pip/GitHub release) and our Rust binary does not ship the script — mSL = mIRC Scripting Language (.mrc), NOT Metal"
+skip_evidence = "upstream msl_language_server.py@7a296833 实锚: ProcessLaunchInfo(cmd=[sys.executable, _MSL_LSP_SCRIPT])，脚本 = serena 仓库内 src/solidlsp/language_servers/msl_lsp_server.py；PM 契约 'metal = msl 绑 Xcode/macOS' 预判实证不成立（msl 与 Xcode/macOS 无关）"
+verified = "never"
+remark = "W5 批：HOST SKIP 候选；SKIP 账本 8/8 硬顶已满——本条待 PM 裁决（置换/拒绝/特批/不入矩阵），落盘仅为候选登记；Rust 侧 LanguageId/EXT_TABLE 已接线（.mrc），servers.toml 不建条目（angular/groovy 先例）；上游独立发行 msl_lsp（pip 包/独立仓库）即转真门；契约 'metal' 系 msl 误读——73 门对账无 metal 门"
+
 # ══ 不入矩阵（对账表栏 3，见报告）═══════════════════════════════════════
 # angular：PM 拍板 documented SKIP——三进程编排 T0 不支持，条目不进 servers.toml，
 #          coverage 标 never-verified。报告见 local/agent-reports/ci-infra-45lang.md。
+# groovy：PM 裁决（2026-09-29）不入矩阵（angular 先例）——无任何可安装 LS：上游
+#          groovy_language_server.py@7a296833 硬性要求用户自备 ls_jar_path JAR
+#          （_find_groovy_ls_jar RuntimeError 实锚）、npm 无 LS 包、
+#          GroovyLanguageServer GitHub releases=[]（per_page=3，2026-09-29 实查）、
+#          apt groovy = 语言 runtime 非 LS——四条安装路线全灭，「门不可能存在」
+#          非「门装不上」（SKIP 账本 8/8 不动）。coverage 标 install-verified /
+#          no-LS-exists (never-verified)；servers.toml 零条目维持；Rust 侧
+#          LanguageId/EXT_TABLE 已接线（.groovy/.gvy），真 LS 出现即秒接
+#          （真门形态 = java -jar，runner 预装 JDK 17 可用）。
 # sql / mysql：PM 追认 documented SKIP（2026-09-29 smoke 修红轮）——sqls 源码
 #          internal/handler/handler.go:148-168 实锚 capabilities 无
 #          DocumentSymbolProvider、无 diagnostics；无 DB 连接时 hover 内容恒空
@@ -557,5 +750,8 @@ verified = "never"
 #          单门私造）。coverage 标 install-verified / probe-infeasible(no DB)；
 #          servers.toml 条目保留（linux install 已修，install/doctor 可用）。若用户
 #          配置 sqls DB 连接，可手动 probe 解锁真门（未来可选增强，非 smoke scope）。
-# perl/r/wolfram/gdscript/groovy/julia/msl/scala：未收门（上游 G/H 类形态特殊），
-#          W 波次按需评估；julia 首启装包走 BUDGET 预算机制模板。
+# perl/r 已于 W4 批收编（真门 path_only+cpanm/CRAN）；groovy 于 W4 批按 angular
+# 先例不入矩阵（见上）；scala 已于 W3 批收编（path_only + coursier bootstrap 门，
+# 见上）；julia 已于 W5 批收编（path_only + julia tarball + Pkg 预装门，见上）；
+# wolfram/gdscript/msl 已于 W5 批落 SKIP 候选块（LICENSE/HOST/HOST，均待 PM 裁决，
+# 见 W5 批节）。

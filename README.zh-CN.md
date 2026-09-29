@@ -44,7 +44,7 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 对比上游 oraios/serena：19/19 高 ROI wrapper 全部覆盖（agent 实际会用的每个工具），外加长尾（`documentHighlight`、`codeLens`、`documentLink`、`foldingRange`、`call/type hierarchy`、`moniker`、`semanticTokens`、`inlayHint`）—— 全部落地并于 2026-09-23 验证；`document-link`/`moniker` 在不支持该能力的 LS 上返回空结果（如 rust-analyzer stable）。
 
-### Language server（上游目录 73 个中的 25 个）
+### Language server（上游目录 73 个中的 53 个，与 EN 表对齐）
 
 | 语言 | Server | 状态 | 备注 |
 |---|---|---|---|
@@ -73,6 +73,34 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 | Svelte | svelte-language-server（svelteserver） | wired（npm）；CI 冒烟待跑 | `*.svelte`；hybrid：主 svelteserver + 伴生 typescript-language-server 挂 `typescript-svelte-plugin`（上游 `7a296833`）；ts/js 语义路由到伴生；`.svelte` 预打开在伴生上使 plugin 见到完整 TS 图 |
 | Deno | `deno lsp`（Deno CLI 内置） | wired（下载）；CI 冒烟待跑 | 仅 `--lang deno` 显式路由——TS 家族扩展名归 typescript 门（上游正因该重叠标注 deno experimental）；GitHub release zip（钉 `2.9.7`，`assets[].digest` sha 校验）；入口是 `deno lsp` 子命令而非 `--stdio` flag；注入 init options `{enable, lint}`（裸 deno lsp 默认不启用） |
 | Sass | some-sass-language-server | wired（npm）；CI 冒烟待跑 | `--lang sass`（servers.toml 条目 id `scss` = 缓存目录键）；`*.sass`/`*.scss`（`.css` 归 css 门）；didOpen languageId `scss` + `.sass` per-file 覆盖；somesass init options + `workspace/configuration` 配置片照抄上游 `7a296833` |
+| PHP | intelephense（冒烟门）/ phpactor | wired（npm）；CI 冒烟待跑 | `*.php`；语言路由 `php` 归存量 phpactor download 条目（既有避撞设计），冒烟门按 entry id 装/路由 `--lang intelephense`（phpantom 先例）；didOpen languageId 显式映射 `intelephense`→`php`（官方口径）；intelephense 纯 npm 零运行时，phpactor PHAR 需 PHP 8.1+ |
+| Lua | lua-language-server（LuaLS） | wired（下载）；CI 冒烟待跑 | `*.lua`；GitHub release tar.gz 钉 `3.15.0`（sha 校验）；首轮 CI 已绿（run 36528495148）——本批补 Rust 侧路由闭环（LanguageId/EXT_TABLE） |
+| Scala | metals | wired（path_only）；CI 冒烟待跑 | `*.scala`；上游 PATH 有 metals 则用之，否则 coursier bootstrap（钉 `metals_2.13:1.6.4` = 上游 `DEFAULT_METALS_VERSION`）；servers.toml 条目为 path_only（GitHub release 无预编译资产，v1.6.9 2026-09-29 实查）；CI 门用 coursier bootstrap 装到 `/usr/local/bin`（JDK 11+，runner 预装 17）；fixture 不带 build 文件——T0 不应答 import 构建提示（上游应答），无 build 走 metals standalone PC；已登记 `fallback_assert` hover 探针 |
+| Swift | sourcekit-lsp | wired（path_only）；CI 冒烟 = PLATFORM SKIP | `*.swift`；随 Xcode/Swift 工具链分发（path_only 条目，无可装资产）——ubuntu runner 无 Swift 工具链，门记 PLATFORM SKIP（SKIP 账本第 8 条，PM 批准 7→8，硬顶 8）；若未来 runner 出 Swift 工具链或 sourcekit-ls 独立发行即转真门；Rust 侧接线完备（LanguageId/EXT_TABLE/doctor） |
+| Fortran | fortls | wired（uvx）；CI 冒烟已过 | `*.f90`/`*.f95`/`*.f03`/`*.f08`/`*.f`/`*.for`/`*.fpp`；pip `fortls` 3.2.2 经 uvx——矩阵门上轮已 PASS，本批补 Rust 侧路由闭环（LanguageId/EXT_TABLE，每门交付模板） |
+| Pascal | pasls | wired（下载）；CI 冒烟 = BUDGET SKIP | `*.pas`/`*.pp`；预编译 v0.2.0（条目 win/macOS 资产）；完整功能需 FPC 工具链（PP/FPCDIR）——apt fpc ≈400MB 超单门预算（存量 PM 裁决）；unix 接线 + FPC 前置归本批后续 |
+| Haskell | haskell-language-server-wrapper | wired（path_only）；CI 冒烟待跑 | `*.hs`/`*.lhs`；entry exec 修复 `--lsp`（裸 wrapper 打印 usage 即退——terraform `serve` 同类）；HLS 需配对 GHC——选 bindist 2.9.0.1 因 2.15 弃 GHC 9.4（ubuntu-24.04 apt 上限）；bare 文件走 default cradle 调 apt ghc |
+| Groovy | （无托管服务器——上游要求用户自备 JAR） | 不入矩阵（angular 先例——不存在可安装的 LS；接线保留随时秒接） | `*.groovy`/`*.gvy`；上游 `groovy_language_server.py` 硬性要求 `ls_jar_path`——npm 无 LS 包、GroovyLanguageServer GitHub releases 为 `[]`、apt 无 LS：四条安装路线穷尽；LanguageId/扩展名已接线，servers.toml 不建条目（angular/java 先例） |
+| OCaml | ocamllsp | wired（path_only）；CI 冒烟待跑 | `*.ml`/`*.mli`；opam `ocaml-lsp-server`（switch 挂系统编译器免工具链源码构建）；上游经 `opam exec` 取 ocamllsp 路径后裸直启 = path_only 语义；OCaml 5.1.0 不兼容（上游明示） |
+| Erlang | erlang_ls | wired（path_only）；CI 冒烟待跑 | `*.erl`/`*.hrl`；entry exec 修复 `--transport stdio`（默认 transport 是 TCP——stdio 客户端会挂死）；按 OTP 版本配对的预编译 escript（ubuntu-24.04 apt = OTP 25.3 → `-25` tarball）；需 erlang runtime 在 PATH |
+| Perl | Perl::LanguageServer（经 perl） | wired（path_only）；CI 冒烟待跑 | `*.pl`/`*.pm`/`*.t`；launch argv 逐字镜像（`perl -MPerl::LanguageServer -e Perl::LanguageServer::run`）；cpanm 安装；上游应答 `workspace/configuration`——T0 走 lsp-core 默认 null 成功应答，文件过滤回落 LS 默认值 |
+| R | languageserver（经 R） | wired（path_only）；CI 冒烟待跑 | `*.r`/`*.rmd`/`*.rnw`；launch argv 逐字镜像（`R --vanilla --quiet --slave -e ... languageserver::run()`）；CRAN 安装源码编译（runner 自带 gcc） |
+| Crystal | crystalline | wired（path_only）；CI 冒烟待跑 | `*.cr`；musl 静态单二进制（免 crystal 工具链）；documentSymbol 上游注释 "works reliably"；条目保持 path_only（legacy 锚 canary）——CI 门 curl 钉版 v0.20.0 release URL（sha 校验） |
+| Zig | zls | wired（下载）；CI 冒烟待跑 | `*.zig`/`*.zon`；条目 path_only → download 升级（六平台 pin，`assets[].digest` sha 校验，0.16.0）；zls 与同 minor zig 严格配对——门装 ziglang.org 0.16.0 工具链 tarball（官方 index.json sha 校验）并 symlink 入 PATH |
+| TOML | taplo | ready（下载） | `*.toml`；单文件 gzip 二进制（钉 `0.10.0`，sha 对上游内嵌校验和验证）；表/键 documentSymbols；存在 schema 关联时 schema 驱动 hover/诊断（taplo 特性） |
+| Terraform | terraform-ls | ready（下载） | `*.tf`/`*.tfvars`；块/资源 documentSymbols（钉 `0.36.5`，HashiCorp releases sha 校验；以 `terraform-ls serve` 启动）；上游要求 PATH 有 `terraform` CLI 才有模块特性—— |
+| Cue | `cue lsp`（cue CLI 内置） | ready（下载） | `*.cue`；cue CLI 把 LSP 藏在隐藏 `lsp` 子命令后（v0.16.1 实证）；字段/包 documentSymbols |
+| Nix | nixd | source build | `*.nix`；`git clone` + `nix build` 安装——需要 Nix 工具链（上游无预编译资产，与上游 adapter 同约束）；构建后 attribute documentSymbols |
+| Ansible | ansible-language-server | wired（npm）；CI 冒烟待跑 | `--lang ansible`（`.yaml`/`.yml` 归 YAML 门）；hover/补全/诊断可用；**无 documentSymbol**——上游拒绝（vscode-ansible#601 NOT_PLANNED），smoke 走 fallback |
+| Rego | regal | wired（下载）；CI 冒烟待跑 | `*.rego`；单文件二进制（钉 `0.42.0`，sha 对 GitHub release `assets[].digest` 校验）；`regal language-server` 启动；documentSymbol/hover/def/诊断 |
+| Nextflow | Nextflow language server | wired（下载）；CI 冒烟待跑 | `*.nf`；fat JAR（钉 `26.04.3`，sha 校验；需 PATH 有 JDK ≥17）；outline/def/refs/hover/诊断；无 npm 包（registry 404）——上游即 JAR 发行 |
+| Gleam | `gleam lsp`（Gleam CLI 内置） | wired（path_only）；CI 冒烟待跑 | `*.gleam`；LS 内置在自包含 gleam 编译器二进制里——门装钉版 v1.18.1 musl release（`assets[].digest` sha 校验）；条目 exec = `gleam lsp` 子命令（deno 先例）；上游等首批 `$/progress` 依赖解析——T0 无此等待门（工具层超时承担），bare fixture 无 `gle.toml` 走单文件分析，已登记 hover 降级探针 |
+| QML | qmlls（Qt 6 官方） | wired（path_only）；CI 冒烟待跑 | `*.qml`；随 Qt 6 分发——apt `qt6-declarative-dev-tools` 装 `/usr/bin/qmlls6`（Debian install 清单实锚），门 symlink 成 `qmlls` 对齐条目单名（上游 which 顺序 qmlls6→qmlls）；ubuntu-24.04 钉 Qt 6.4.2（qmlls 初版 LSP，功能面窄）——documentSymbol 降级 hover 已登记；更新版 Qt 需交互式官方安装器（CI 不可脚本化） |
+| Lean 4 | `lean --server`（Lean 工具链内置） | wired（path_only）；CI 冒烟待跑 | `*.lean`；语言名 `lean` 路由到条目 id `lean4`（zls/zig 双名先例）；门装钉版 v4.34.1 全工具链 tarball（580 MB tar.zst，`assets[].digest` sha 校验，免 elan）；standalone fixture 走基础符号（def/theorem documentSymbol）——上游 lake env LEAN_PATH 注入（跨文件语义）未镜像 |
+| Julia | LanguageServer.jl（经 julia） | wired（path_only）；CI 冒烟待跑 | `*.jl`；launch argv 逐字镜像（`julia --startup-file=no --history-file=no -e 'using LanguageServer; runserver()'`）——尾参 repo_root 省略：T0 spawn cwd = 项目根，runserver 的 env 回落链含 pwd；需 julia runtime + `Pkg.add("LanguageServer")`（门内预装；budget 1200s 上限估待 CI 实测校准）；`workspace/configuration` 回落 lsp-core null 应答（perl 先例），lint 设置保持 LS 默认 |
+| Wolfram | WolframKernel LSPServer paclet | LICENSE SKIP 候选；待 PM 裁决 | `*.wl`/`*.nb`；LS 仅随 Mathematica 13.0+ / Wolfram Engine 12.1+ 分发（许可安装，无可脚本化 CI 渠道——上游 `wolfram_language_server.py` 发现链全依赖本机 Wolfram 安装）；条目 `[servers.wolfram]` 保留为持有安装用户的 PATH 探测面（haskell_ls 运行时自备语义）；出现免许可可脚本化渠道即转真门 |
+| GDScript（Godot） | （无独立服务器——上游经 TCP 连已运行编辑器） | 不入矩阵（angular 先例——LS 是连已运行编辑器的 TCP 客户端，无 stdio T0 形态） | `*.gd`；上游 `godot_language_server.py` 是连已运行 Godot 编辑器 ：6008 的 TCP 客户端，从不启动进程——我们 transport 仅 stdio；LanguageId/扩展名已接线，servers.toml 不建条目（angular/groovy 先例）；lsp-core 出 TCP transport + 编辑器编排即转真门 |
+| mSL（mIRC） | （上游 LS = serena 仓库内嵌 pygls 脚本） | 不入矩阵（angular 先例——LS 是连已运行编辑器的 TCP 客户端，无 stdio T0 形态） | `*.mrc`；上游 launch `[python, msl_lsp_server.py]`——脚本随 serena 仓库分发，非独立发行、我们 Rust 二进制不随包；W5 契约的 "metal" 系本门误读（73 门对账无 metal 门——msl = mIRC 脚本语言）；LanguageId/扩展名已接线，servers.toml 不建条目；msl_lsp 独立发行（pip 包/独立仓库）即转真门 |
 
 20 门全部在真实 language server 上端到端冒烟验证（rust、typescript、c/cpp、python、go —— 2026-09-25；c#、java —— 2026-09-25；bash、json、powershell、vue —— 2026-09-25；astro —— 2026-09-28；docker、sql —— 2026-09-28；postgresql、mysql —— 2026-09-28；yaml、markdown —— 2026-09-28；kotlin、dart、html、css —— 2026-09-28；见 `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / 各 adapter 报告 `local/report-*-adapter.md`）。单语言 CI 冒烟脚本见 `scripts/smoke_one.sh`（矩阵清单 `scripts/smoke_langs.toml`，周任务 workflow `.github/workflows/ls-smoke.yml`）。
 

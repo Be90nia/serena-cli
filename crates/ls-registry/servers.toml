@@ -104,8 +104,13 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 "macos-aarch64" = "deno"
 
 [servers.erlang_ls]
+# W4 批接线：exec 修复——↖ mirror erlang_language_server.py@7a296833 launch
+# [erlang_ls, "--transport", "stdio"]：erlang_ls 默认 transport 是 TCP，裸启动时
+# stdio 客户端永无响应（terraform serve 同类坑）。运行另需 Erlang/OTP runtime
+# （apt erlang；ubuntu-24.04 = OTP 25.3.2.8，launchpad 实锚）。
 languages = ["erlang"]
 install = "path_only"
+exec = ["{bin}", "--transport", "stdio"]
 source_commit = "43ae0211"
 [servers.erlang_ls.path_only]
 binary_name = "erlang_ls"
@@ -121,8 +126,13 @@ binary_name = "gleam"
 install_hint = "install gleam (https://gleam.run) and ensure it is on PATH"
 
 [servers.haskell_ls]
+# W4 批接线：exec 修复——↖ mirror haskell_language_server.py@7a296833 launch
+# [wrapper, "--lsp", "--cwd", workdir]：裸 wrapper 打印 usage 即退出（terraform
+# serve 同类坑；--cwd 省略 = 进程 cwd 即项目根，语义等价）。完整功能需 GHC 工具链
+# （bare 文件走 default cradle 调 ghc）。
 languages = ["haskell"]
 install = "path_only"
+exec = ["{bin}", "--lsp"]
 source_commit = "43ae0211"
 [servers.haskell_ls.path_only]
 binary_name = "haskell-language-server-wrapper"
@@ -204,12 +214,45 @@ binary_name = "sourcekit-lsp"
 install_hint = "install Xcode / Swift toolchain (sourcekit-lsp ships with it)"
 
 [servers.zls]
+# W4 批接线：path_only → download 升级（deno 先例）。↖ mirror zls.py@7a296833
+# （裸 `zls` stdio 启动）。运行需匹配版本的 zig 在 PATH——zls 与 zig 严格同
+# minor 配对（0.16.x），zig 工具链走 ziglang.org release（非本条目托管）；裸
+# 启动时 zls 自检 zig（上游 init options zig_exe_path 注入在无值时回落自检）。
 languages = ["zig"]
-install = "path_only"
-source_commit = "43ae0211"
-[servers.zls.path_only]
-binary_name = "zls"
-install_hint = "install zls (https://github.com/zigtools/zls) and zig; ensure both are on PATH"
+install = "download"
+exec = ["{bin}"]
+source_commit = "7a296833"
+
+[servers.zls.download]
+version = "0.16.0"
+archive = "tar.xz"
+bin_path = "zls.exe"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.zls.download.url_per_platform]
+"windows-x86_64" = "https://github.com/zigtools/zls/releases/download/0.16.0/zls-x86_64-windows.zip"
+"windows-aarch64" = "https://github.com/zigtools/zls/releases/download/0.16.0/zls-aarch64-windows.zip"
+"linux-x86_64" = "https://github.com/zigtools/zls/releases/download/0.16.0/zls-x86_64-linux.tar.xz"
+"linux-aarch64" = "https://github.com/zigtools/zls/releases/download/0.16.0/zls-aarch64-linux.tar.xz"
+"macos-x86_64" = "https://github.com/zigtools/zls/releases/download/0.16.0/zls-x86_64-macos.tar.xz"
+"macos-aarch64" = "https://github.com/zigtools/zls/releases/download/0.16.0/zls-aarch64-macos.tar.xz"
+
+[servers.zls.download.sha256_per_platform]
+# sha256 真值锚：GitHub API zigtools/zls releases/tags/0.16.0 assets[].digest
+# （2026-09-29 查询）。
+"windows-x86_64" = "35cbb7163224e8cf92d21099c1b1391f2aba927f25d389f021b13a21d40b96dd"
+"windows-aarch64" = "ef4c5ccb93c80c9f023105c5f558ae8774ac6668d560ba6f92a2f87d95df2311"
+"linux-x86_64" = "ded6d562a0b86ee878b1ddf70ffab2797ce3cdca3b02d6077548f9d56dff96b6"
+"linux-aarch64" = "430cd293d201eb70ae2519dbc96c854bf8791b8df7fc9392e8d2dc9680a2bed7"
+"macos-x86_64" = "49f716ea96c1aadaecaa5d9c0a50874cbcf443dc42b825f1e7ee35499ad3eb96"
+"macos-aarch64" = "b93ec549f8558a7e85984a840e9276d274f1059b54ade4254296ef4982958359"
+
+[servers.zls.download.bin_path_per_platform]
+# unix 组 bin 覆盖：tar.xz 内二进制无 .exe（deno 同款单值仅容 windows 组）。
+"linux-x86_64" = "zls"
+"linux-aarch64" = "zls"
+"macos-x86_64" = "zls"
+"macos-aarch64" = "zls"
 
 # ---- npm / uvx 类别（机制已落地；真实条目数据由另一任务路由收录，此处仅格式示例）----
 # 两类条目均不适用 exec/{bin} 模板：最终 cmd 由安装器/启动器返回。
@@ -1467,3 +1510,88 @@ package = "vscode-langservers-extracted"
 version = "4.10.0"
 bin_rel = "vscode-css-language-server"
 npm_args = ["--stdio"]
+
+# ---- W3 批：scala（T0 接线，path_only 形态）。↖ mirror:
+# scala_language_server.py@43ae021（上游 PATH 有 metals 则用之，否则 coursier
+# bootstrap org.scalameta:metals_2.13；DEFAULT_METALS_VERSION = 1.6.4）。GitHub
+# release 无预编译资产（v1.6.9 assets=[]，2026-09-29 查证）→ 与 G 类同类：只探测
+# PATH，不自带安装器。CI 冒烟门用 coursier bootstrap 装到 /usr/local/bin（JDK 11+，
+# runner 预装 17）。上游另应答 window/showMessageRequest 的 import 构建提示完成
+# bloop 导入——我们 T0 不应答提示，无 build 工程的 fixture 走 metals standalone PC。
+
+[servers.scala]
+languages = ["scala"]
+install = "path_only"
+source_commit = "43ae0211"
+[servers.scala.path_only]
+binary_name = "metals"
+install_hint = "bootstrap via coursier: cs bootstrap org.scalameta:metals_2.13:1.6.4 -o metals --java-opt -Xss4m (JDK 11+; upstream scala_language_server.py@43ae0211 DEFAULT_METALS_VERSION)"
+
+# ---- W4 批：perl / r（G 类"exec 特殊待调研"两门收口：path_only + 运行时参数 exec）。
+# 上游 G 类不托管安装（catalog §G61/§G63），T0 = 探测 PATH 解释器 + 镜像 launch argv；
+# groovy 不入本表（上游 H 类用户自备 ls_jar_path JAR，无托管渠道，angular/java 先例）。
+
+[servers.perl_ls]
+# ↖ mirror perl_language_server.py@7a296833：launch 串
+# `perl -MPerl::LanguageServer -e 'Perl::LanguageServer::run'`。Δ 上游适配器另应答
+# workspace/configuration（perlInc/fileFilter）并补发 didChangeConfiguration——T0 走
+# lsp-core 未注册请求默认 null 成功应答（kotlin 条目注释同源实锚），文件过滤回落
+# LS 默认值。安装 = cpanm Perl::LanguageServer（apt cpanminus，--notest 跳测试套）。
+languages = ["perl"]
+extensions = [".pl", ".pm", ".t"]
+install = "path_only"
+exec = ["{bin}", "-MPerl::LanguageServer", "-e", "Perl::LanguageServer::run"]
+[servers.perl_ls.path_only]
+binary_name = "perl"
+install_hint = "cpanm Perl::LanguageServer (apt install cpanminus; mirror perl_language_server.py@7a296833)"
+
+[servers.r_ls]
+# ↖ mirror r_language_server.py@7a296833：launch 串逐字
+# `R --vanilla --quiet --slave -e "options(languageserver.debug_mode = FALSE); languageserver::run()"`。
+# 安装 = CRAN languageserver 包（R 源码编译，runner 自带 gcc）；R runtime 不托管。
+languages = ["r"]
+extensions = [".r", ".rmd", ".rnw"]
+install = "path_only"
+exec = ["{bin}", "--vanilla", "--quiet", "--slave", "-e", "options(languageserver.debug_mode = FALSE); languageserver::run()"]
+[servers.r_ls.path_only]
+binary_name = "R"
+install_hint = "R -e \"install.packages('languageserver')\" (apt install r-base-core; mirror r_language_server.py@7a296833)"
+
+# ---- W5 批：julia（G 类"启动形态特殊"最后一门收口）+ wolfram（LICENSE SKIP 候选，
+# 条目保留探测面）。gdscript/msl 不入本表（HOST SKIP 候选待 PM 裁决：godot 上游
+# adapter 是 TCP 客户端连已运行编辑器 :6008、我们 TransportKind 仅 Stdio；msl 上游
+# LS = serena 内嵌 pygls 脚本 [sys.executable, msl_lsp_server.py]，非独立发行）。
+
+[servers.julia]
+# ↖ mirror julia_server.py@7a296833：launch 串
+# `julia --startup-file=no --history-file=no -e "using LanguageServer; runserver()" <repo_root>`。
+# Δ 我们省略尾参 repo_root——runserver choose_env 回落链含 pwd 上溯（T0 spawn cwd =
+# 项目根），无工程 fixture 回落默认全局 env，语义等价。Δ 上游另应答
+# workspace/configuration（julia.lint.* 逐项 None）+ 补发 didChangeConfiguration——
+# T0 走 lsp-core 未注册请求默认 null 成功应答（perl 条目注释同源实锚），lint 设置
+# 回落 LS 默认，documentSymbol 底线不受影响。
+# 首启依赖：julia runtime + LanguageServer.jl（手动
+# `julia -e 'using Pkg; Pkg.add("LanguageServer")'` 一次；上游 _install_language_server
+# 同款 300s 超时；CI 冒烟门在 install 行预装）。
+languages = ["julia"]
+extensions = [".jl"]
+install = "path_only"
+exec = ["{bin}", "--startup-file=no", "--history-file=no", "-e", "using LanguageServer; runserver()"]
+[servers.julia.path_only]
+binary_name = "julia"
+install_hint = "install julia (https://julialang.org/downloads) then: julia -e 'using Pkg; Pkg.add(\"LanguageServer\")' (mirror julia_server.py@7a296833)"
+
+[servers.wolfram]
+# ↖ mirror wolfram_language_server.py@7a296833：launch
+# [WolframKernel, "-noprompt", "-noinit", "-run", 'Needs["LSPServer`"];LSPServer`StartServer[]']。
+# LS = WolframKernel 捆绑的 LSPServer paclet（Mathematica 13.0+ / Wolfram Engine
+# 12.1+，无独立安装渠道——LICENSE SKIP 候选待 PM 裁决）；条目为持有 Wolfram 安装的
+# 用户提供 PATH 探测 + 安装面（haskell_ls "运行时依赖自备"同款语义）。
+# 上游发现顺序 WOLFRAM_PATH env → PATH → 常见安装位 glob——T0 只探 PATH（binary_name）。
+languages = ["wolfram"]
+extensions = [".wl", ".nb"]
+install = "path_only"
+exec = ["{bin}", "-noprompt", "-noinit", "-run", "Needs[\"LSPServer`\"];LSPServer`StartServer[]"]
+[servers.wolfram.path_only]
+binary_name = "WolframKernel"
+install_hint = "install Wolfram Mathematica 13.0+ or Wolfram Engine 12.1+ (https://www.wolfram.com); the LSPServer paclet ships with it (mirror wolfram_language_server.py@7a296833)"

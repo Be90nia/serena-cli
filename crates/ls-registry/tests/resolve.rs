@@ -5,7 +5,7 @@
 //! 2. resolve(.rs/.py/.go/.ts/.cs/.java 等) → 对应 LanguageId。
 //! 3. 大小写不敏感：resolve("x.CPP") → Cpp。
 //! 4. adapter_for("cpp"/"rust"/"python"/"go"/"typescript"/"csharp"/"java") → 对应 adapter id。
-//! 5. adapter_for("lua"/"") → None。
+//! 5. adapter_for("lua"(T0，W3 收编)/"") → None。
 //! 6. 无扩展名 / 空路径 / 目录 / 真未知后缀都不爆，返回 None。
 
 use std::path::Path;
@@ -71,10 +71,12 @@ fn resolve_all_m3_languages() {
 
 #[test]
 fn resolve_unknown_extension_is_none() {
-    // 真正未知后缀（不在 M3 表里）。
-    assert_eq!(ls_registry::resolve(Path::new("foo.lua")), None);
+    // 真正未知后缀（不在 EXT_TABLE 里）。（曾用 foo.lua 当未知样本，W3 批收编
+    // lua 后换 foo.rkt——rb/zig 无 LanguageId 值仍走 None，语义不变。W4 批收编
+    // zig/zon 后 zig 样本再迁 foo.nim——迁移轨迹即语言收编史。）
+    assert_eq!(ls_registry::resolve(Path::new("foo.rkt")), None);
     assert_eq!(ls_registry::resolve(Path::new("foo.rb")), None);
-    assert_eq!(ls_registry::resolve(Path::new("foo.zig")), None);
+    assert_eq!(ls_registry::resolve(Path::new("foo.nim")), None);
 }
 
 #[test]
@@ -124,7 +126,8 @@ fn adapter_for_each_m3_language() {
 
 #[test]
 fn adapter_for_unknown_language_is_none() {
-    // 真正未知语言。
+    // 真正未知语言 + T0 配置驱动语言（lua 于 W3 批收编为 T0，走
+    // config::ensure_launch，本函数语义 = 无手写 adapter）。
     assert!(ls_registry::adapter_for("lua").is_none());
     assert!(ls_registry::adapter_for("ruby").is_none());
     assert!(ls_registry::adapter_for("").is_none());
