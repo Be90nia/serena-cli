@@ -5,8 +5,10 @@
   smoke_shard.py --matrix [LANGS]   # stdout: GitHub matrix JSON {"shard":[1..N]}
   smoke_shard.py --ids N [LANGS]    # stdout: 第 N 片的 id 列表（每行一个）
 
-装箱：LPT（budget_secs 降序，逐个放入当前总预算最轻的片）。SKIP 门不占片。
-片数 SHARDS 环境变量（默认 6）。同清单 → 同分片（稳定）。
+装箱：LPT（budget_secs 降序，逐个放入当前总预算最轻的片）。SKIP 门以 0 预算
+参与装箱（不占预算，但必须落到某一片输出裁决行——曾被排除在计划外，7 门零
+裁决行 = "FAIL=0" 假绿，S9 P0）。片数 SHARDS 环境变量（默认 6）。同清单 →
+同分片（稳定）。--selfcheck 离线自检：全部门恰落在一片、无遗漏无重复。
 """
 
 import json
@@ -17,16 +19,18 @@ DEFAULT_LANGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smoke_
 ACTIVE_FIELDS = ("id", "budget_secs", "skip_class")
 
 
-def load_active(langs_path):
-    """返回非 SKIP 门 [(budget, id)]（budget 降序稳定排序）。"""
+def load_doors(langs_path):
+    """返回全部门 [(budget, id)]（budget 降序稳定排序）。
+
+    SKIP 门 budget 取 0 参与 LPT：排序自然落在所有真门之后，装箱不占预算，
+    但保证分片计划覆盖清单里每一门（smoke_one.sh 据此输出 SKIP 裁决行）。
+    """
     import tomllib
 
     with open(langs_path, "rb") as f:
         data = tomllib.load(f)
-    active = [
-        (int(e["budget_secs"]), e["id"]) for e in data["lang"] if not e.get("skip_class")
-    ]
-    return sorted(active, key=lambda t: (-t[0], t[1]))
+    doors = [(int(e.get("budget_secs", 0)), e["id"]) for e in data["lang"]]
+    return sorted(doors, key=lambda t: (-t[0], t[1]))
 
 
 def assign(active, shards):
@@ -42,7 +46,7 @@ def assign(active, shards):
 
 def main():
     args = sys.argv[1:]
-    if not args or args[0] not in ("--matrix", "--ids"):
+    if not args or args[0] not in ("--matrix", "--ids", "--selfcheck"):
         sys.exit(__doc__)
     mode = args[0]
     if mode == "--ids" and len(args) < 2:
@@ -52,9 +56,22 @@ def main():
     langs = args[2] if len(args) > 2 else DEFAULT_LANGS
     shards = int(os.environ.get("SHARDS", "6"))
 
-    active = load_active(langs)
-    bins = assign(active, shards)
+    doors = load_doors(langs)
+    bins = assign(doors, shards)
 
+    if mode == "--selfcheck":
+        from collections import Counter
+
+        expected = Counter(lid for _, lid in doors)
+        placed = Counter(lid for b in bins for lid in b)
+        if placed != expected:
+            missing = expected - placed
+            extra = placed - expected
+            sys.exit(f"selfcheck FAILED: missing={dict(missing)} extra={dict(extra)}")
+        print(
+            f"selfcheck ok: {sum(expected.values())} doors across {shards} shards, partition exact"
+        )
+        return
     if mode == "--matrix":
         print(json.dumps({"shard": list(range(1, shards + 1))}))
     else:

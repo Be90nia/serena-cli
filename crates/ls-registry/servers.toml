@@ -1399,19 +1399,24 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 
 [servers.pgls.download.url_per_platform]
 "windows-x86_64" = "https://github.com/supabase-community/postgres-language-server/releases/download/0.25.7/postgres-language-server_x86_64-pc-windows-msvc.exe"
+"linux-x86_64" = "https://github.com/supabase-community/postgres-language-server/releases/download/0.25.7/postgres-language-server_x86_64-unknown-linux-gnu"
 
 [servers.pgls.download.sha256_per_platform]
 "windows-x86_64" = "9b67d59032275810e76e3557ad06c700c7b6cd71a8e3fac7656b926cc5603248"
-# 其余平台资产（raw 裸文件无 .exe 后缀，单值字段仅容 windows 组）：
-#   linux-x86_64: postgres-language-server_x86_64-unknown-linux-gnu
-#     sha256 d48346664b55b396dbc1aca4fcb0308d6e6c311803d6e4c57da2d9fc547466c4
+"linux-x86_64" = "d48346664b55b396dbc1aca4fcb0308d6e6c311803d6e4c57da2d9fc547466c4"
+
+[servers.pgls.download.bin_path_per_platform]
+"linux-x86_64" = "postgres-language-server_x86_64-unknown-linux-gnu"
+# 其余平台资产（raw 裸文件无 .exe 后缀，单值字段仅容 windows 组；bin_path_per_platform
+# 同名 raw 落盘文件名）：
 #   linux-aarch64: postgres-language-server_aarch64-unknown-linux-gnu
 #     sha256 b176bea67ce666045fc1697ac4a867516e4ac2847e6c1d3d7f356c2e2b541162
 #   macos-x86_64: postgres-language-server_x86_64-apple-darwin
 #     sha256 d133f1c32232f781855137cec75b64230a5340161351a4e9afc5e3cfb566cb93
 #   macos-aarch64: postgres-language-server_aarch64-apple-darwin
 #     sha256 f153d1f4a3f903e3cc3fa5999b66dce39e37fc3b84000bb88935a1794d20bf17
-# sha256 锚 = release 页 expanded_assets 官方标注（0.25.7），本机下载实测一致。
+# sha256 锚 = GitHub API assets[].digest（0.25.7，2026-09-29 复核 linux-x86_64 一致；
+# 最初锚 = release 页 expanded_assets 官方标注，本机下载实测一致）。
 
 [servers.sqls-mysql]
 # 与 sql 门（[servers.sql]）同一 sqls 二进制（v0.2.48 同 zip 同 sha256），仅语言名

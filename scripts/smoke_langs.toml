@@ -88,11 +88,11 @@ remark = "T2 手写适配器；apt 元包无 /usr/bin/clangd 时软链 clangd-18
 [[lang]]
 id = "csharp"
 via = "npm"
-install = "dotnet tool install --global csharp-ls --version 0.15.0 && echo \"$HOME/.dotnet/tools\" >> \"$GITHUB_PATH\""
+install = "dotnet tool install --global csharp-ls --version 0.15.0 && echo \"$HOME/.dotnet/tools\" >> \"$GITHUB_PATH\" && dotnet restore \"$SERENA_FXDIR/main.csproj\" --verbosity quiet"
 pin = "csharp-ls@0.15.0"
 fixture = "csharp/main.cs"
 budget_secs = 420
-remark = "T2 手写适配器；0.15.0 = 真机实测版（local/report-ls-smoke-7of7.md）；fixture 带 main.csproj——csharp-ls project-based，裸 .cs 无工程加载 documentSymbol 恒空（CI 首跑实锤）"
+remark = "T2 手写适配器；0.15.0 = 真机实测版（local/report-ls-smoke-7of7.md）；fixture 带 main.csproj + install 期 dotnet restore——csharp-ls project-based，裸 .cs / 未 restore 时 project 载入不完 documentSymbol 恒空（run 36528495148 wait-ready 全窗 symbol-pending 实锚）；$SERENA_FXDIR = fixture 工作目录（smoke_one.sh 注入）"
 
 [[lang]]
 id = "markdown"
@@ -212,7 +212,7 @@ budget_secs = 420
 [[lang]]
 id = "bsl"
 via = "serena-download"
-install = "sudo apt-get install -y -qq openjdk-21-jre-headless && $SERENA_CLI install bsl"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq openjdk-21-jre-headless && $SERENA_CLI install bsl"
 pin = "servers.toml"
 fixture = "module.bsl"
 lang_flag = "bsl"
@@ -231,17 +231,17 @@ remark = "fat JAR，JDK ≥17 = runner 预装档；装法纠偏（Main 追认 20
 [[lang]]
 id = "elixir"
 via = "serena-download"
-install = "sudo apt-get install -y -qq elixir && $SERENA_CLI install elixir"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq elixir && $SERENA_CLI install elixir"
 pin = "servers.toml"
-fixture = "elixir/smoke.ex"
+fixture = "elixir/lib/smoke.ex"
 lang_flag = "elixir"
 budget_secs = 600
-remark = "运行需 Elixir runtime（apt suite 版）；fixture 带 mix.exs——expert（NextLS 系）mix-project-based，裸 .ex 不进工程 documentSymbol 恒空（CI 首跑实锤）"
+remark = "运行需 Elixir runtime（apt suite 版）；fixture 带 mix.exs + lib/smoke.ex（标准 mix 布局）——expert（NextLS 系）mix-project-based，裸 .ex 不进工程 documentSymbol 恒空（CI 首跑实锚）"
 
 [[lang]]
 id = "haxe"
 via = "serena-download"
-install = "sudo apt-get install -y -qq haxe && $SERENA_CLI install haxe"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq haxe && $SERENA_CLI install haxe"
 pin = "servers.toml"
 fixture = "Main.hx"
 lang_flag = "haxe"
@@ -250,18 +250,18 @@ remark = "运行需 Haxe 编译器（apt suite 版）"
 
 [[lang]]
 id = "php"
-via = "serena-download"
-install = "sudo apt-get install -y -qq php-cli && $SERENA_CLI install php"
+via = "serena-npm"
+install = "$SERENA_CLI install intelephense"
 pin = "servers.toml"
 fixture = "main.php"
-lang_flag = "php"
-budget_secs = 600
-remark = "phpactor PHAR 需 PHP 8.1+（ubuntu-24.04 apt = 8.3）"
+lang_flag = "intelephense"
+budget_secs = 420
+remark = "PM 拍板 intelephense（npm，零运行时依赖）；语言路由 php 归 phpactor 条目（存量避撞），门走 --lang intelephense 按 entry id 显式路由（phpantom 同款），lsp_language_id 显式映射 intelephense→php（didOpen 官方口径）"
 
 [[lang]]
 id = "clojure"
 via = "serena-download"
-install = "sudo apt-get install -y -qq clojure && $SERENA_CLI install clojure"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq clojure && $SERENA_CLI install clojure"
 pin = "servers.toml"
 fixture = "core.clj"
 lang_flag = "clojure"
@@ -380,10 +380,10 @@ remark = "regal 单文件 v0.42.0（GitHub release assets[].digest 锚）；exec
 id = "elm"
 via = "serena-npm"
 pin = "servers.toml"
-fixture = "elm/Main.elm"
+fixture = "elm/src/Main.elm"
 lang_flag = "elm"
 budget_secs = 420
-remark = "fixture 带 elm.json——elm-language-server 工作区必须含 elm.json，否则多数 handler 报 Unhandled method -32601（CI 首跑实锚）"
+remark = "fixture = elm.json + src/Main.elm（标准 elm 布局）——source-directories [\".\"] 实锤不过（run 36528495148: No Elm workspace contains Main.elm），elm-language-server 工作区必须 elm.json 且文件须落 source-directories 内"
 
 [[lang]]
 id = "typescript_vts"
@@ -392,7 +392,8 @@ pin = "servers.toml"
 fixture = "main.ts"
 lang_flag = "typescript_vts"
 budget_secs = 300
-remark = "变体门：@vtsls 与 typescript 共用 .ts fixture，--lang 显式路由"
+fallback_assert = "hover:1:17"
+remark = "变体门：@vtsls 与 typescript 共用 .ts fixture，--lang 显式路由；fallback 登记因 vtsls 0.2.9 对裸 workspace 拒 documentSymbol（rpc -32603 Cannot find provider，run 36528495148 实锚），降级验 hover（main.ts:1:17 = greet 标识符）"
 
 [[lang]]
 id = "pyright"
@@ -442,20 +443,21 @@ remark = "fortls 经 uvx；uv 由 smoke_one.sh 自动安装"
 [[lang]]
 id = "fsharp"
 via = "serena-dotnet"
+install = "$SERENA_CLI install fsharp && dotnet restore \"$SERENA_FXDIR/main.fsproj\" --verbosity quiet"
 pin = "servers.toml"
 fixture = "fsharp/main.fs"
 lang_flag = "fsharp"
 budget_secs = 600
-remark = "需 dotnet SDK（ubuntu-latest runner 预装）；fixture 带 main.fsproj——fsautocomplete project-based，裸 .fs 报 -32603 LoadedProjects（CI 首跑实锚）"
+remark = "需 dotnet SDK（ubuntu-latest runner 预装）；fixture 带 main.fsproj + install 期 dotnet restore——fsautocomplete project-based，裸 .fs / 未 restore 报 -32603 LoadedProjects（run 36528495148 实锚）；$SERENA_FXDIR = fixture 工作目录（smoke_one.sh 注入）"
 
 [[lang]]
 id = "ruby"
 via = "serena-gem"
 pin = "servers.toml"
-fixture = "smoke.rb"
+fixture = "ruby/smoke.rb"
 lang_flag = "ruby"
 budget_secs = 420
-remark = "需 ruby + gem（ubuntu-latest runner 预装）"
+remark = "需 ruby + gem（ubuntu-latest runner 预装）；fixture = Gemfile + smoke.rb——ruby-lsp 需 bundle 上下文，无 Gemfile 启动即 LS_TERMINATED（stdout pump EOF，run 36528495148 实锚），有 Gemfile 时 ruby-lsp 自组 composed bundle（需 rubygems 网络，首启装包吃预算）"
 
 [[lang]]
 id = "solargraph"
@@ -464,7 +466,7 @@ pin = "servers.toml"
 fixture = "smoke.rb"
 lang_flag = "solargraph"
 budget_secs = 420
-remark = "变体门：与 ruby 共用 .rb fixture，--lang solargraph"
+remark = "变体门：--lang solargraph；保持裸 .rb fixture（solargraph 直跑无需 bundle，ruby 门工程化引入 Gemfile 反会触发其 bundler 语境，不共 fixture 以免假红）"
 
 # ══ SKIP 门（四类，预算上限 6 条，PM 裁决制）═════════════════════════════
 
@@ -516,6 +518,7 @@ skip_class = "BUDGET"
 skip_reason = "pasls needs FPC toolchain (apt fpc ~400MB + PP/FPCDIR config), exceeds per-door budget"
 skip_evidence = "local/upstream-ls-catalog.md A20 (Runtime: FPC)"
 verified = "never"
+remark = "W4 接线单 owner：pasls unix 接线 + FPC 前置归 W4 批（本轮 SKIP 占位，Main 裁决 2026-09-29）；FPC 就绪后转真门并复核预算"
 
 [[lang]]
 id = "omnisharp"

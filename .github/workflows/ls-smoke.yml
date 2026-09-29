@@ -57,6 +57,7 @@ jobs:
       - uses: actions/checkout@v4
       - id: shard
         run: |
+          python3 scripts/smoke_shard.py --selfcheck
           matrix=$(python3 scripts/smoke_shard.py --matrix)
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
 
