@@ -309,7 +309,7 @@ pub fn to_install_spec(
                 .get(&key)
                 .cloned()
                 .unwrap_or_default();
-            let archive = match dl.archive.as_str() {
+            let archive = match dl.resolved_archive(&key) {
                 "zip" => ArchiveKind::Zip,
                 "tar.gz" => ArchiveKind::TarGz,
                 "tar.xz" => ArchiveKind::TarXz,
@@ -1217,6 +1217,8 @@ package = "@vue/language-server"
         "linux-x86_64" = "bb"
         [servers.pp.download.bin_path_per_platform]
         "linux-x86_64" = "bin/linux/ls"
+        [servers.pp.download.archive_per_platform]
+        "linux-x86_64" = "tar.gz"
     "#;
 
     /// per-OS 覆盖核心契约：无覆盖（windows 组）= 单值现状；有覆盖 = 按 target_os
@@ -1237,6 +1239,30 @@ package = "@vue/language-server"
         let win = to_install_spec(spec, "pp", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
         match win.kind {
             InstallKind::Download { bin_path, .. } => assert_eq!(bin_path, "bin/win/ls.exe"),
+            other => panic!("expect Download, got {other:?}"),
+        }
+    }
+
+    /// per-platform archive 覆盖（首例 kotlin：win=zip / linux=tar.gz）：命中优先、
+    /// miss 回退单值。
+    #[test]
+    fn to_install_spec_resolves_per_platform_archive_override() {
+        let parsed = parse(BIN_PATH_OVERRIDE_TOML).unwrap();
+        let spec = &parsed.servers["pp"];
+
+        let linux = to_install_spec(spec, "pp", Os::Linux, ls_runtime::deps::Arch::X86_64).unwrap();
+        match linux.kind {
+            InstallKind::Download { archive, .. } => {
+                assert!(matches!(archive, ArchiveKind::TarGz), "命中覆盖表 → tar.gz")
+            }
+            other => panic!("expect Download, got {other:?}"),
+        }
+
+        let win = to_install_spec(spec, "pp", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        match win.kind {
+            InstallKind::Download { archive, .. } => {
+                assert!(matches!(archive, ArchiveKind::Zip), "key 未命中 → 回退单值 zip")
+            }
             other => panic!("expect Download, got {other:?}"),
         }
     }

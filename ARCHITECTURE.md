@@ -429,6 +429,8 @@ allowed_hosts       = ["github.com", "release-assets.githubusercontent.com"]  # 
 url_per_platform    = { "windows-x86_64" = "…", "linux-x86_64" = "…", "macos-aarch64" = "…" }
 sha256_per_platform = { "windows-x86_64" = "<64hex>", "linux-x86_64" = "<64hex>" }
 # sha 空/缺平台 = 未知 → UnsignedRefused 拒装（--allow-unsigned-sha 人工通道除外）
+# 平台互异覆盖表（key 同 url_per_platform；命中优先、miss 回退单值）：bin_path_per_platform、
+# archive_per_platform（首例 kotlin：win=zip / linux=tar.gz）
 
 [servers.crystalline]               # F 类 path_only 实例
 install = "path_only"

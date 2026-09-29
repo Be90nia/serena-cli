@@ -479,6 +479,19 @@ pub fn entry_is_safe(name: &str) -> bool {
     !name.split(['/', '\\']).any(|c| c == "..")
 }
 
+/// §5.2 预检列清单：zip 在 Linux GNU tar 上不可读（"This does not look like a tar
+/// archive"）→ bsdtar 平台（win/mac 内置）走 `tar -tf`，失败回退 `unzip -Z1`（纯
+/// 文件名行）；tar 族单走 `tar -tf`。
+fn list_archive_entries(pkg: &Path, kind: ArchiveKind) -> Result<Vec<u8>, String> {
+    if kind == ArchiveKind::Zip {
+        if let Ok(list) = run_tool_stdout("tar", &["-tf", &pkg.to_string_lossy()]) {
+            return Ok(list);
+        }
+        return run_tool_stdout("unzip", &["-Z1", &pkg.to_string_lossy()]);
+    }
+    run_tool_stdout("tar", &["-tf", &pkg.to_string_lossy()])
+}
+
 /// 解压到 `dest`。策略（设计 §1/§2.2）：系统 tar（bsdtar 支持 zip/tar.gz/tar.xz 与裸 gz；
 /// Windows 10+ 内置，macOS 默认 bsdtar）；Linux GNU tar 不解 zip → fallback `unzip`，
 /// 不解裸 gz → fallback `gunzip`。缺工具 → 带 MissingRuntime 语义的错误串。
@@ -491,9 +504,12 @@ fn extract(
     std::fs::create_dir_all(dest).map_err(|e| format!("create dest: {e}"))?;
     // §5.2 预检：解压前列清单逐条目消毒（裸 gz 无清单，单文件无路径语义）。
     if kind != ArchiveKind::SingleGz {
-        let list = run_tool_stdout("tar", &["-tf", &pkg.to_string_lossy()])
+        let list = list_archive_entries(pkg, kind)
             .map_err(|e| format!("archive list (zip-slip precheck): {e}"))?;
         for name in String::from_utf8_lossy(&list).lines() {
+            if name.is_empty() {
+                continue; // 列表尾空行等产物，非条目
+            }
             if !entry_is_safe(name) {
                 return Err(format!("unsafe archive entry: {name:?}"));
             }
@@ -877,5 +893,63 @@ mod tests {
             half.join("residue.txt").is_file(),
             "未授权路径不得清用户缓存"
         );
+    }
+
+    /// §5.2 zip 全链（列清单预检 + 解压）：真 zip（zip crate 造，不依赖下载）。
+    /// 回归锚：Linux GNU tar 不识 zip，预检曾对 zip 直接 `tar -tf` → install 全炸
+    /// （CI 首跑 clojure/deno/terraform/powershell 四门 install failed）。
+    #[test]
+    fn extract_zip_precheck_and_unpack() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg.zip");
+
+        let make_zip = |path: &std::path::Path, names: &[&str]| {
+            let f = std::fs::File::create(path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            for name in names {
+                zw.start_file(name.to_string(), zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zw, b"exe-bytes").unwrap();
+            }
+            zw.finish().unwrap();
+        };
+
+        // 干净 zip：预检放行 + 解压落地。
+        make_zip(&pkg, &["bin/ls"]);
+        let dest = dir.path().join("out-clean");
+        extract(&pkg, ArchiveKind::Zip, 0, &dest).expect("干净 zip 应解压成功");
+        assert!(dest.join("bin/ls").is_file());
+
+        // zip-slip 条目：预检拒绝，未落地。
+        make_zip(&pkg, &["../evil"]);
+        let dest = dir.path().join("out-evil");
+        let err = extract(&pkg, ArchiveKind::Zip, 0, &dest).unwrap_err();
+        assert!(err.contains("unsafe archive entry"), "实际错误: {err}");
+    }
+
+    /// §5.2 tar 全链（列清单预检 + 解压）：系统 tar 造 tar.gz（win bsdtar/linux GNU tar 通吃）。
+    #[test]
+    fn extract_tar_precheck_and_unpack() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        std::fs::write(src.join("bin/ls"), b"exe-bytes").unwrap();
+        let pkg = dir.path().join("pkg.tar.gz");
+        let ok = std::process::Command::new("tar")
+            .args([
+                "-czf",
+                &pkg.to_string_lossy(),
+                "-C",
+                &src.to_string_lossy(),
+                "bin",
+            ])
+            .status()
+            .expect("tar 应存在")
+            .success();
+        assert!(ok, "tar 造包失败");
+
+        let dest = dir.path().join("out");
+        extract(&pkg, ArchiveKind::TarGz, 0, &dest).expect("干净 tar.gz 应解压成功");
+        assert!(dest.join("bin/ls").is_file());
     }
 }

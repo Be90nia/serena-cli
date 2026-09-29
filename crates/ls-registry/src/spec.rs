@@ -62,6 +62,11 @@ pub struct DownloadSpec {
     pub version: String,
     /// zip | tar.gz | tar.xz | gz | raw
     pub archive: String,
+    /// per-platform `archive` 覆盖（key 词汇表同 `url_per_platform`）。平台间压缩
+    /// 形态互异时使用（首例 kotlin：win=zip / linux=tar.gz）；miss 回退单值
+    /// `archive`，解析统一走 [`Self::resolved_archive`]。
+    #[serde(default)]
+    pub archive_per_platform: HashMap<String, String>,
     #[serde(default)]
     pub strip_components: usize,
     /// 压缩包内可执行相对路径（raw 形态 = 落盘文件名）。
@@ -88,6 +93,14 @@ impl DownloadSpec {
             .get(platform_key)
             .map(String::as_str)
             .unwrap_or(&self.bin_path)
+    }
+
+    /// per-platform `archive` 解析统一入口：命中优先，miss 回退单值 `archive`。
+    pub fn resolved_archive<'a>(&'a self, platform_key: &str) -> &'a str {
+        self.archive_per_platform
+            .get(platform_key)
+            .map(String::as_str)
+            .unwrap_or(&self.archive)
     }
 }
 
@@ -232,6 +245,13 @@ fn validate(id: &str, spec: &ServerSpec) -> Result<(), String> {
                 if bin.is_empty() {
                     return Err(format!(
                         "[servers.{id}].download.bin_path_per_platform.{plat} must not be empty"
+                    ));
+                }
+            }
+            for (plat, archive) in &dl.archive_per_platform {
+                if archive.is_empty() {
+                    return Err(format!(
+                        "[servers.{id}].download.archive_per_platform.{plat} must not be empty"
                     ));
                 }
             }

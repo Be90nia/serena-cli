@@ -17,6 +17,9 @@
 #             serena-gem | serena-source | npm | apt | rustup | go_install
 #             （serena-* = `serena-cli install <id>`，pin 内嵌 servers.toml；
 #             其他 = install 列完整 shell 命令，`$SERENA_CLI` 可引用二进制）
+# install     完整 shell 命令；非空时优先于 via 默认装法执行（runtime apt 前置 +
+#             `$SERENA_CLI install <id>` 连写；曾只认 via 默认装法，前置被静默跳过
+#             —— bsl JVM 17 跑 21 的 LS 即此坑）
 # pin         版本钉。apt 类一律 "suite"（禁版本号断言——suite 定版）；
 #             serena-* 类写 "servers.toml"（唯一事实源，改表即改钉）
 # fixture     scripts/smoke_fixtures/ 下文件名（rust 门为目录，带最小 Cargo.toml）
@@ -87,9 +90,9 @@ id = "csharp"
 via = "npm"
 install = "dotnet tool install --global csharp-ls --version 0.15.0 && echo \"$HOME/.dotnet/tools\" >> \"$GITHUB_PATH\""
 pin = "csharp-ls@0.15.0"
-fixture = "main.cs"
+fixture = "csharp/main.cs"
 budget_secs = 420
-remark = "T2 手写适配器；0.15.0 = 真机实测版（local/report-ls-smoke-7of7.md）"
+remark = "T2 手写适配器；0.15.0 = 真机实测版（local/report-ls-smoke-7of7.md）；fixture 带 main.csproj——csharp-ls project-based，裸 .cs 无工程加载 documentSymbol 恒空（CI 首跑实锤）"
 
 [[lang]]
 id = "markdown"
@@ -157,30 +160,14 @@ budget_secs = 300
 remark = "Dockerfile 主形态无扩展名，探测走文件名（file_detect Dockerfile* 惯例）"
 
 [[lang]]
-id = "sql"
-via = "serena-download"
-pin = "servers.toml"
-fixture = "schema.sql"
-budget_secs = 420
-remark = ".sql 扩展名归属本门；pgsql/mysql 走 --lang 不经扩展名"
-
-[[lang]]
 id = "pgsql"
 via = "serena-download"
 pin = "servers.toml"
 fixture = "pg.sql"
 lang_flag = "pgsql"
 budget_secs = 420
-remark = "--lang pgsql 显式路由（.sql 归 sql 门，pgsql/mysql 先例）"
-
-[[lang]]
-id = "mysql"
-via = "serena-download"
-pin = "servers.toml"
-fixture = "my.sql"
-lang_flag = "mysql"
-budget_secs = 420
-remark = "--lang mysql 显式路由（同 pgsql）"
+fallback_assert = "diagnostics"
+remark = "--lang pgsql 显式路由（.sql 归 ls-registry EXT_TABLE sql 语言，sql 门见不入矩阵节）；pgls 无 DB 连接时 documentSymbol 无 capability（条目注释真机实锚），降级验语法诊断——libpg_query 本地 parser 无 DB 可用（同注释 2 条语法错实锚）"
 
 [[lang]]
 id = "powershell"
@@ -246,10 +233,10 @@ id = "elixir"
 via = "serena-download"
 install = "sudo apt-get install -y -qq elixir && $SERENA_CLI install elixir"
 pin = "servers.toml"
-fixture = "smoke.ex"
+fixture = "elixir/smoke.ex"
 lang_flag = "elixir"
 budget_secs = 600
-remark = "运行需 Elixir runtime（apt suite 版）"
+remark = "运行需 Elixir runtime（apt suite 版）；fixture 带 mix.exs——expert（NextLS 系）mix-project-based，裸 .ex 不进工程 documentSymbol 恒空（CI 首跑实锤）"
 
 [[lang]]
 id = "haxe"
@@ -393,9 +380,10 @@ remark = "regal 单文件 v0.42.0（GitHub release assets[].digest 锚）；exec
 id = "elm"
 via = "serena-npm"
 pin = "servers.toml"
-fixture = "Main.elm"
+fixture = "elm/Main.elm"
 lang_flag = "elm"
 budget_secs = 420
+remark = "fixture 带 elm.json——elm-language-server 工作区必须含 elm.json，否则多数 handler 报 Unhandled method -32601（CI 首跑实锚）"
 
 [[lang]]
 id = "typescript_vts"
@@ -425,13 +413,13 @@ budget_secs = 420
 remark = "变体门：--lang basedpyright"
 
 [[lang]]
-id = "ty"
+id = "python_ty"
 via = "serena-uvx"
 pin = "servers.toml"
 fixture = "main.py"
 lang_flag = "python_ty"
 budget_secs = 420
-remark = "变体门：条目 id python_ty，--lang 走 languages[0]"
+remark = "变体门：id 与 servers.toml 条目同名（install 按 id 查表，曾写 ty 致 no entry）；--lang python_ty 走 languages[0]"
 
 [[lang]]
 id = "python_pyrefly"
@@ -455,10 +443,10 @@ remark = "fortls 经 uvx；uv 由 smoke_one.sh 自动安装"
 id = "fsharp"
 via = "serena-dotnet"
 pin = "servers.toml"
-fixture = "main.fs"
+fixture = "fsharp/main.fs"
 lang_flag = "fsharp"
 budget_secs = 600
-remark = "需 dotnet SDK（ubuntu-latest runner 预装）"
+remark = "需 dotnet SDK（ubuntu-latest runner 预装）；fixture 带 main.fsproj——fsautocomplete project-based，裸 .fs 报 -32603 LoadedProjects（CI 首跑实锚）"
 
 [[lang]]
 id = "ruby"
@@ -556,5 +544,13 @@ verified = "never"
 # ══ 不入矩阵（对账表栏 3，见报告）═══════════════════════════════════════
 # angular：PM 拍板 documented SKIP——三进程编排 T0 不支持，条目不进 servers.toml，
 #          coverage 标 never-verified。报告见 local/agent-reports/ci-infra-45lang.md。
+# sql / mysql：PM 追认 documented SKIP（2026-09-29 smoke 修红轮）——sqls 源码
+#          internal/handler/handler.go:148-168 实锚 capabilities 无
+#          DocumentSymbolProvider、无 diagnostics；无 DB 连接时 hover 内容恒空
+#          （[servers.sql] 条目注释 2026-09-28 真机实测同源）。底线三断言全依赖
+#          "无 DB 也有内容"假设，唯一真输出 formatting 不在探针词表（契约 #3 禁
+#          单门私造）。coverage 标 install-verified / probe-infeasible(no DB)；
+#          servers.toml 条目保留（linux install 已修，install/doctor 可用）。若用户
+#          配置 sqls DB 连接，可手动 probe 解锁真门（未来可选增强，非 smoke scope）。
 # perl/r/wolfram/gdscript/groovy/julia/msl/scala：未收门（上游 G/H 类形态特殊），
 #          W 波次按需评估；julia 首启装包走 BUDGET 预算机制模板。

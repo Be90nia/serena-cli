@@ -454,15 +454,17 @@ allowed_hosts = ["storage.googleapis.com"]
 
 [servers.dart.download.url_per_platform]
 "windows-x86_64" = "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-windows-x64-release.zip"
+"linux-x86_64" = "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-linux-x64-release.zip"
 
 [servers.dart.download.sha256_per_platform]
 "windows-x86_64" = "f56c03122e17abe5be1429eee0a975fb8ed511b6731ec90c6475992d3dee4ea5"
+"linux-x86_64" = "2813959e7d9650334015b927cc533f5beadfbf7fa48248beec471f8942a0ee71"
+
+[servers.dart.download.bin_path_per_platform]
+"linux-x86_64" = "dart-sdk/bin/dart"
 # 整 Dart SDK zip（压缩 ~300MB / 解压 ~1.6GB）；sha256 锚 = 上游
 # dart_language_server.py DEFAULT_DART_SDK_SHA256_BY_PLATFORM。平台组策略同 A 类
 # 先例（单值 bin_path 仅容 windows 组：win=dart.exe / unix=dart）：
-#   linux-x86_64: dartsdk-linux-x64-release.zip
-#     sha256 2813959e7d9650334015b927cc533f5beadfbf7fa48248beec471f8942a0ee71
-#     bin dart-sdk/bin/dart
 #   macos-x86_64: dartsdk-macos-x64-release.zip
 #     sha256 a2765917b6ae49d1ac119553df9584989f9c441a46e8f18c129ba52489658d2e
 #     bin dart-sdk/bin/dart
@@ -512,7 +514,9 @@ source_commit = "43ae0211"
 version = "2.34.2"
 archive = "zip"
 bin_path = "extension/bin/server.js"
-allowed_hosts = ["open-vsx.org"]
+# open-vsx /file/ 端点 302 → Eclipse CDN（openvsx.eclipsecontent.org，2026-09-29 实测
+# Location 头）；白名单必须双 host，缺 CDN 域 = reqwest "error following redirect"。
+allowed_hosts = ["open-vsx.org", "openvsx.eclipsecontent.org"]
 
 [servers.haxe.download.url_per_platform]
 "windows-x86_64" = "https://open-vsx.org/api/nadako/vshaxe/2.34.2/file/nadako.vshaxe-2.34.2.vsix"
@@ -546,14 +550,15 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 [servers.hlsl.download.url_per_platform]
 "windows-x86_64" = "https://github.com/antaalt/shader-sense/releases/download/v1.3.1/shader-language-server-x86_64-pc-windows-msvc.zip"
 "windows-aarch64" = "https://github.com/antaalt/shader-sense/releases/download/v1.3.1/shader-language-server-aarch64-pc-windows-msvc.zip"
+"linux-x86_64" = "https://github.com/antaalt/shader-sense/releases/download/v1.3.1/shader-language-server-x86_64-unknown-linux-gnu.zip"
 
 [servers.hlsl.download.sha256_per_platform]
 "windows-x86_64" = "49081c5547ddde1b8b3b17295282a80ddacbca1d6f5dcd834e2788c02baba997"
 "windows-aarch64" = "a3b3799affe2cad27652e788376b46fe76e1a6c2ce45946a486dcb26c9091412"
-# linux 组（包内无 .exe 后缀）待扩展：
-#   linux-x86_64: shader-language-server-x86_64-unknown-linux-gnu.zip
-#     sha256 61710df7ca17a2d063b598936c57c56c49fbf837707a1aa886f9b0193a35be3c
-#     bin shader-language-server
+"linux-x86_64" = "61710df7ca17a2d063b598936c57c56c49fbf837707a1aa886f9b0193a35be3c"
+
+[servers.hlsl.download.bin_path_per_platform]
+"linux-x86_64" = "shader-language-server"
 # 注：M/Ma 上游无预编译资产（serena 走 cargo install shader_language_server --locked，
 # 非单二进制下载形态，不入本表）。
 
@@ -578,10 +583,25 @@ allowed_hosts = ["download-cdn.jetbrains.com"]
 [servers.kotlin.download.url_per_platform]
 "windows-x86_64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0.win.zip"
 "windows-aarch64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0-aarch64.win.zip"
+"linux-x86_64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0.tar.gz"
+"linux-aarch64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0-aarch64.tar.gz"
 
 [servers.kotlin.download.sha256_per_platform]
 "windows-x86_64" = "a9b471b16025b1bfb3b0a097862580abb40e3c35406c44242c18b1d70f5d0e44"
 "windows-aarch64" = "3bf008d8c94fa70eb13fc998eaa42f29b9d13f368984d4cec46277808f94e1de"
+"linux-x86_64" = "1e11d2e5fefbf9ea215ad8dd6be95f2222897cd086e8cb7a661a52084a590405"
+"linux-aarch64" = "ec7cb254a6662a07fff9f10e4365226afab6c40008f8a974c10ac5e785d6510f"
+
+# 首个平台间压缩形态互异条目（win=zip / linux=tar.gz / macos=.sit 即 zip 格式）：
+# archive_per_platform 命中优先、miss 回退单值 archive（resolved_archive）。macos .sit
+# 走 zip 解压器待验证，暂不启用 M 组（sha 锚保留在注释）。
+[servers.kotlin.download.archive_per_platform]
+"linux-x86_64" = "tar.gz"
+"linux-aarch64" = "tar.gz"
+
+[servers.kotlin.download.bin_path_per_platform]
+"linux-x86_64" = "kotlin-server-263.4702.0/bin/intellij-server"
+"linux-aarch64" = "kotlin-server-263.4702.0-aarch64/bin/intellij-server"
 # 包内路径/压缩形态随平台变化，单值字段仅容 win 组：
 #   macos-x86_64: kotlin-server-263.4702.0.sit（zip 格式）
 #     sha256 62ab735947b1c855b505f64f5db8fbd7ff0b52a35ab1897938c6dbfc7b24c8a3
@@ -589,12 +609,6 @@ allowed_hosts = ["download-cdn.jetbrains.com"]
 #   macos-aarch64: kotlin-server-263.4702.0-aarch64.sit
 #     sha256 95da3fc6d3b9092c7616345044a05edb85e5408dc648d081e4e433595c892bec
 #     bin bin/intellij-server
-#   linux-x86_64: kotlin-server-263.4702.0.tar.gz（包内多一层 kotlin-server-{v}/）
-#     sha256 1e11d2e5fefbf9ea215ad8dd6be95f2222897cd086e8cb7a661a52084a590405
-#     bin kotlin-server-263.4702.0/bin/intellij-server
-#   linux-aarch64: kotlin-server-263.4702.0-aarch64.tar.gz
-#     sha256 ec7cb254a6662a07fff9f10e4365226afab6c40008f8a974c10ac5e785d6510f
-#     bin kotlin-server-263.4702.0/bin/intellij-server
 # exec：{bin_dir} = {bin} 所在目录（config::expand_exec 占位符）；system-path 指向安装
 # 缓存内可写目录（上游语义 = per-project 索引存储，静态模板只能给共享目录 —— 并发多
 # 项目会话有索引争用风险，oraios/serena#1966 上游同款边界）。JetBrains CDN 无版本列表
@@ -1149,7 +1163,10 @@ package = "typescript"
 version = "5.9.3"
 
 [servers.typescript_vts]
-# @vtsls/language-server；上游 vts_language_server.py 裸启动（vtsls 默认 stdio）。
+# @vtsls/language-server；上游 vts_language_server.py@7a296833 _setup_runtime_dependencies
+# 返回 "{path} --stdio"——vtsls 必须显式 --stdio（裸启动 = CLI 帮助即退 → stdout pump
+# EOF，CI 首跑实锤）。typescript 由依赖 @vtsls/language-service 内置（0.2.9 deps 实锚），
+# 裸 workspace 无需 typescript.tsdk。
 languages = ["typescript_vts"]
 install = "npm"
 source_commit = "43ae0211"
@@ -1157,6 +1174,7 @@ source_commit = "43ae0211"
 package = "@vtsls/language-server"
 version = "0.2.9"
 bin_rel = "vtsls"
+npm_args = ["--stdio"]
 
 [servers.vue]
 languages = ["vue"]
@@ -1347,13 +1365,15 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 
 [servers.sql.download.url_per_platform]
 "windows-x86_64" = "https://github.com/sqls-server/sqls/releases/download/v0.2.48/sqls-windows-0.2.48.zip"
+"linux-x86_64" = "https://github.com/sqls-server/sqls/releases/download/v0.2.48/sqls-linux-0.2.48.zip"
 
 [servers.sql.download.sha256_per_platform]
 "windows-x86_64" = "df6453b2ddcb4e748547d0288b826251a24af099749dc7a9ddea587aac3d4365"
+"linux-x86_64" = "30047b92c41658c821b7803d2c2a3a1ce4e17ee769ceff6f24bb9e3daaf5d4dc"
+
+[servers.sql.download.bin_path_per_platform]
+"linux-x86_64" = "sqls"
 # 其余平台资产（bin_path 互异：unix zip 根为 sqls 无 .exe，单值字段仅容一组）：
-#   linux-x86_64: sqls-linux-0.2.48.zip
-#     sha256 30047b92c41658c821b7803d2c2a3a1ce4e17ee769ceff6f24bb9e3daaf5d4dc
-#     bin sqls
 #   macos（darwin 未分 arch，保守不启用）: sqls-darwin-0.2.48.zip
 #     sha256 b44165ca597a4b4298d56657bc911aa3ca8a591befefde4e29566923c6229f3d
 #     bin sqls
@@ -1410,9 +1430,14 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 
 [servers.sqls-mysql.download.url_per_platform]
 "windows-x86_64" = "https://github.com/sqls-server/sqls/releases/download/v0.2.48/sqls-windows-0.2.48.zip"
+"linux-x86_64" = "https://github.com/sqls-server/sqls/releases/download/v0.2.48/sqls-linux-0.2.48.zip"
 
 [servers.sqls-mysql.download.sha256_per_platform]
 "windows-x86_64" = "df6453b2ddcb4e748547d0288b826251a24af099749dc7a9ddea587aac3d4365"
+"linux-x86_64" = "30047b92c41658c821b7803d2c2a3a1ce4e17ee769ceff6f24bb9e3daaf5d4dc"
+
+[servers.sqls-mysql.download.bin_path_per_platform]
+"linux-x86_64" = "sqls"
 # 其余平台资产同 [servers.sql] 注释（同一组 zip，bin_path 互异 unix 无 .exe）。
 
 # ---- bd 56a 后续批：css（T2 接线）。同包 [servers.html]（vscode-langservers-extracted）

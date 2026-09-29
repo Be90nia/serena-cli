@@ -119,6 +119,16 @@ fn new_download_entries_parse_with_complete_fields() {
                 "{id}/{plat}: sha256 without matching url"
             );
         }
+        for (plat, archive) in &dl.archive_per_platform {
+            assert!(
+                VALID_PLATFORM_KEYS.contains(&plat.as_str()),
+                "{id}/{plat}: archive_per_platform key outside platform_key() vocabulary"
+            );
+            assert!(
+                VALID_ARCHIVES.contains(&archive.as_str()),
+                "{id}/{plat}: archive_per_platform `{archive}` outside vocabulary"
+            );
+        }
         assert!(
             VALID_ARCHIVES.contains(&dl.archive.as_str()),
             "{id}: archive `{}` outside vocabulary",

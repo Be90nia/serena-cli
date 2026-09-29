@@ -136,6 +136,10 @@ if not (isinstance(obj, list) and len(obj) > 0):
         log "LOG $id overview exit=$rc (see LOG stderr above)"
     fi
     if [ -z "$fallback" ]; then
+        # daemon 的 lsp_stderr 行晚于本次读取落盘（tracing 异步 + 探测失败即返回），
+        # 短暂回捞一次再判死——没有这条，LS 崩因（如 JVM 版本不符）永远不可见。
+        sleep 2
+        log_stderr_if_any "$id (late)" "$errf"
         if [ "$rc" -ne 0 ]; then
             log "FAIL $id probe: overview exit=$rc (see LOG stderr above)"
         else
@@ -225,7 +229,14 @@ one_door() {
             case "$via" in
                 serena-uvx) ensure_uv || { log "FAIL $id install: uv bootstrap"; rm -rf "$work"; return 1; } ;;
             esac
-            run_with_timeout "$budget" "$SERENA_CLI" install "$id" >"$work/install.out" 2>"$errf" || rc=$?
+            if [ -n "$install" ]; then
+                # 清单 install 行优先（apt runtime 前置 + $SERENA_CLI install 连写）。
+                # 曾无条件走 `install <id>`，前置被静默跳过 —— bsl 跑在 runner 预装
+                # JVM 17（条目要求 21）启动即死 LS_TERMINATED，即此坑。
+                run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$install" >"$work/install.out" 2>"$errf" || rc=$?
+            else
+                run_with_timeout "$budget" "$SERENA_CLI" install "$id" >"$work/install.out" 2>"$errf" || rc=$?
+            fi
             ;;
         *)
             run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$install" >"$work/install.out" 2>"$errf" || rc=$?
@@ -238,6 +249,19 @@ one_door() {
         rm -rf "$work"
         [ "$rc" = 124 ] && return 0
         return 1
+    fi
+
+    # 冷启动等待：wait-ready --stage symbol = 底线同判据（overview 首符号非空）的
+    # 轮询档，预算吃该门 budget_secs——runner 冷启动链可超 lsp-core 单请求 30s
+    # （python/pyright LS_TIMEOUT 实锤）。fallback 门跳过（其底线是登记探针，
+    # overview 恒空，等 symbol 无意义——ansible 型）。不用 semantic 档：那是 hover
+    # 判据（强于底线），hover 恒空的 LS 会白烧预算。
+    if [ -z "$fallback" ]; then
+        local remaining=$((budget - (SECONDS - t0) - 30))
+        [ "$remaining" -lt 60 ] && remaining=60
+        run_with_timeout $((remaining + 30)) "$SERENA_CLI" wait-ready --file "$fx" \
+            --lang "${lang_flag:-$id}" --stage symbol --timeout "$remaining" \
+            >/dev/null 2>"$errf" || log_stderr_if_any "$id (wait-ready)" "$errf"
     fi
 
     # 底线断言（--lang 恒显式：变体门不经扩展名抢占，pgsql/mysql 先例）
@@ -290,6 +314,9 @@ shard_run() {
 
 main() {
     find_py || return 1
+    # 工具链 bin 补齐：GITHUB_PATH 追加对同 step 不生效（仅跨 step），go 门 gopls
+    # 落 $HOME/go/bin 而 runner 默认 PATH 无它 → LS_NOT_INSTALLED（CI 首跑实锤）。
+    export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.dotnet/tools:$PATH"
     case "${1:-}" in
         _one) one_door "$2" ;;
         --shard)
