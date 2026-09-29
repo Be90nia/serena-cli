@@ -1,0 +1,89 @@
+# LS Smoke Matrix —— 45 门语言真机冒烟（Phase 0 基建）。
+#
+# CI 政策（PM 楔约）：
+#   1. smoke 只认 smoke 自装的钉版 LS（清单 scripts/smoke_langs.toml 的 via/pin），
+#      永不消费 runner 预装 LS；工具链（node/go/dotnet/pwsh）用 runner 预装，
+#      LS 本体一律 smoke 自装。
+#   2. 既有 fixture e2e 的 SERENA_SKIP_LS_E2E 门禁维持不动：m0-ci.yml 的
+#      cargo test job 继续 SERENA_SKIP_LS_E2E=1（第三方 LS 版本漂移不做门禁）；
+#      本 workflow 是真机冒烟专用，显式 SERENA_SKIP_LS_E2E=0。
+#   3. 单门失败只红所在分片 job（fail-fast: false + 片内跑完再判）；超预算
+#      （budget_secs，片内 watchdog）→ SKIP BUDGET 不红。
+#   4. 分片按装门预算加权（LPT），由 scripts/smoke_shard.py 统一装箱，
+#      workflow 与 smoke_one.sh 共享同一算法，不存在第二份分片逻辑。
+#
+# 触发：每周一定时 + 手动。全量 45+ 门真装真跑太重，不做 push/PR 门禁
+#（push/PR 门禁 = m0-ci.yml 的 cargo test，SERENA_SKIP_LS_E2E=1）。
+
+name: LS Smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 2 * * 1" # 周一 02:37 UTC，错开整点高峰
+
+permissions:
+  contents: read
+
+jobs:
+  build-cli:
+    # serena-cli 只构建一次（debug profile），artifact 分发各分片——
+    # 不让每个 smoke job 冷 cargo build（PM 楔约 #5）。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-cargo-smoke-${{ hashFiles('Cargo.lock') }}
+      - name: build serena-cli (debug)
+        run: cargo build --bin serena-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: serena-cli-linux
+          path: target/debug/serena-cli
+          retention-days: 3
+
+  plan:
+    # 预算加权分片（LPT）→ matrix；与 smoke_one.sh 共享 smoke_shard.py 单一事实源。
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.shard.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: shard
+        run: |
+          matrix=$(python3 scripts/smoke_shard.py --matrix)
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    needs: [build-cli, plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # 目标 ≤25min/片 + 余量
+    strategy:
+      fail-fast: false # 单门失败只红所在片，不连坐
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      # 本 job 是真机冒烟本体：显式开 LS e2e（与 m0-ci 的 =1 门禁语义互补）。
+      SERENA_SKIP_LS_E2E: "0"
+      SERENA_CLI: ${{ github.workspace }}/serena-cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: serena-cli-linux
+          path: ${{ github.workspace }}
+      - name: prepare cli
+        run: |
+          chmod +x "$SERENA_CLI"
+          "$SERENA_CLI" --version
+      - name: smoke shard ${{ matrix.shard }}
+        run: scripts/smoke_one.sh --shard ${{ matrix.shard }}
+      - name: hygiene stop-all
+        if: always()
+        run: |
+          "$SERENA_CLI" stop-all || true

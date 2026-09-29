@@ -1,0 +1,3 @@
+program Smoke;
+begin
+end.

@@ -215,13 +215,15 @@ fn semantic_session_for_file(
     std::sync::Arc::clone(session)
 }
 
-/// astro `.astro` 出发的双查合并是否适用：宿主语言是 astro 且目标文件是 `.astro`。
-/// ts/js 系文件已由 `semantic_session_for_file` 纯伴生路由覆盖，不进双查。
-fn astro_companion_applicable(language_id: &str, file: &Path) -> bool {
-    language_id == "astro"
-        && file
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("astro"))
+/// hybrid 双服务器语言 `.宿主` 出发的双查合并是否适用：宿主语言是 astro 且目标是
+/// `.astro`，或宿主是 svelte 且目标是 `.svelte`（ts/js 系文件已由
+/// `semantic_session_for_file` 纯伴生路由覆盖，不进双查）。
+fn hybrid_companion_applicable(language_id: &str, file: &Path) -> bool {
+    match language_id {
+        "astro" => file.extension().is_some_and(|e| e.eq_ignore_ascii_case("astro")),
+        "svelte" => file.extension().is_some_and(|e| e.eq_ignore_ascii_case("svelte")),
+        _ => false,
+    }
 }
 
 /// 主+伴生两路 `Location` 按 (uri, line, col) 去重合并，主路优先。
@@ -242,11 +244,15 @@ fn merge_reference_locations(primary: Vec<Location>, companion: Vec<Location>) -
     out
 }
 
-/// astro `.astro` 出发的 references 主+伴生双查合并：主 astro-ls 对 .ts 文件侧
-/// 引用恒空（真机帧录制实证），伴生 TS LS 补齐（↖ mirror: 同上 `request_references`
-/// `_is_astro_file` 分支）。伴生缺失/查询失败降级主查结果（上游 try/except 同款，
-/// 不新增失败模式）；不适用场景原样返回 primary（其余语言逐字节不变）。
-async fn fetch_references_with_astro_companion(
+/// hybrid 双服务器语言 `.宿主` 出发的 references 主+伴生双查合并：astro `.astro`
+/// 主+伴生去重合并（↖ mirror: astro_language_server.py@7a296833 `request_references`
+/// `_is_astro_file` 分支）；svelte `.svelte` 同构——伴生 TS LS 挂
+/// typescript-svelte-plugin，对 .svelte 消费者持有完整 TS program 图（↖ mirror:
+/// svelte_language_server.py@7a296833 `SvelteTypeScriptServer` 类文档；上游另配的
+/// `$/getComponentReferences` 增补为增量召回，未抄，见 svelte.rs 头部 Δ 记录）。
+/// 伴生缺失/查询失败降级主查结果（上游 try/except 同款，不新增失败模式）；
+/// 不适用场景原样返回 primary（其余语言逐字节不变）。
+async fn fetch_references_with_hybrid_companion(
     session: &Arc<Session>,
     root: &Path,
     abs_file: &Path,
@@ -254,7 +260,7 @@ async fn fetch_references_with_astro_companion(
     col: u32,
     primary: Vec<Location>,
 ) -> Vec<Location> {
-    if !astro_companion_applicable(&session.language_id(), abs_file) {
+    if !hybrid_companion_applicable(&session.language_id(), abs_file) {
         return primary;
     }
     let Some(companion) = ls_registry::adapter_for(&session.language_id())
@@ -262,7 +268,7 @@ async fn fetch_references_with_astro_companion(
     else {
         tracing::warn!(
             root = %root.display(),
-            "astro companion semantic session unavailable; using primary only"
+            "hybrid companion semantic session unavailable; using primary only"
         );
         return primary;
     };
@@ -272,7 +278,7 @@ async fn fetch_references_with_astro_companion(
             tracing::warn!(
                 file = %abs_file.display(),
                 error = %e,
-                "astro companion TS references failed; falling back to primary only"
+                "hybrid companion TS references failed; falling back to primary only"
             );
             primary
         }
@@ -289,7 +295,7 @@ pub async fn find_referencing_symbols(
     // hybrid 双服务器语言（astro）的 per-file 路由：ts/js 系文件的引用语义只在伴生
     // TS LS（↖ mirror: astro_language_server.py@7a296833 `request_references` 对
     // `_is_ts_file` 路由伴生；主 astro-ls 对 .ts 文件 references 恒空 —— 真机帧录制
-    // 实证）。`.astro` 留主会话查一次，再由 `fetch_references_with_astro_companion`
+    // 实证）。`.astro` 留主会话查一次，再由 `fetch_references_with_hybrid_companion`
     // 补伴生 TS 侧引用并去重合并（上游 `_is_astro_file` 分支主+伴生双查语义）。
     // 伴生查找用 canon_root：COMPANION 槽的 key 是 `Supervisor::key` 的 canonical
     // 形态，CLI 原始 root 形态不等时 `r == root` 失配 → 伴生永远查不到。
@@ -298,7 +304,7 @@ pub async fn find_referencing_symbols(
     let abs_file = canon_root.join(file);
     let refs = fetch_references(&session, &abs_file, line, col).await?;
     let refs =
-        fetch_references_with_astro_companion(&session, &canon_root, &abs_file, line, col, refs)
+        fetch_references_with_hybrid_companion(&session, &canon_root, &abs_file, line, col, refs)
             .await;
 
     let mut by_file: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
@@ -414,7 +420,7 @@ pub async fn find_referencing_code_snippets(
     let abs_file = canon_root.join(file);
     let refs = fetch_references(&session, &abs_file, line, col).await?;
     let refs =
-        fetch_references_with_astro_companion(&session, &canon_root, &abs_file, line, col, refs)
+        fetch_references_with_hybrid_companion(&session, &canon_root, &abs_file, line, col, refs)
             .await;
 
     let mut cache: HashMap<String, String> = HashMap::new();
@@ -591,26 +597,43 @@ mod tests {
     }
 
     #[test]
-    fn astro_companion_applicable_only_for_astro_astro_files() {
-        assert!(astro_companion_applicable(
+    fn hybrid_companion_applicable_gates_host_language_and_extension() {
+        assert!(hybrid_companion_applicable(
             "astro",
             Path::new("src/pages/index.astro")
         ));
         // 扩展名大小写不敏感（Windows 常见）
-        assert!(astro_companion_applicable(
+        assert!(hybrid_companion_applicable(
             "astro",
             Path::new("src/pages/index.ASTRO")
         ));
         // ts/js 系文件走纯伴生路由，不进双查
-        assert!(!astro_companion_applicable("astro", Path::new("src/utils/fmt.ts")));
+        assert!(!hybrid_companion_applicable("astro", Path::new("src/utils/fmt.ts")));
         // 非 astro 宿主语言不动
-        assert!(!astro_companion_applicable(
+        assert!(!hybrid_companion_applicable(
             "typescript",
             Path::new("src/pages/index.astro")
         ));
-        assert!(!astro_companion_applicable(
+        assert!(!hybrid_companion_applicable(
             "rust",
             Path::new("src/lib.rs")
+        ));
+        // W2 批：svelte 宿主语言 + .svelte 目标文件进双查；.scss/.ts 不进。
+        assert!(hybrid_companion_applicable(
+            "svelte",
+            Path::new("src/routes/about.svelte")
+        ));
+        assert!(hybrid_companion_applicable(
+            "svelte",
+            Path::new("App.SVELTE")
+        ));
+        assert!(!hybrid_companion_applicable(
+            "svelte",
+            Path::new("style.scss")
+        ));
+        assert!(!hybrid_companion_applicable(
+            "svelte",
+            Path::new("src/utils/fmt.ts")
         ));
     }
 }

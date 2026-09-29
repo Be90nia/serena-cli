@@ -1,0 +1,560 @@
+# smoke_langs.toml —— 45 门语言 CI 冒烟矩阵清单（Phase 0 基建，serena-rust）。
+#
+# 三栏对账锚（上游 73 门，详见 local/agent-reports/ci-infra-45lang.md）：
+#   已收 64（本矩阵 45 真门 + 未入矩阵的表内/变体门）+ documented SKIP（angular，
+#   PM 拍板三进程编排 T0 不支持）+ 剩余未收 8（perl/r/wolfram/gdscript/groovy/
+#   julia/msl/scala）。总账 73 闭合。
+#
+# ── W1-W5 接入模板（加一门 = 两步）──────────────────────────────────────
+# 1. 本清单加一个 [[lang]] 块（字段见下）；
+# 2. scripts/smoke_fixtures/ 放一个最小 fixture（1 个具名符号，底线= documentSymbol 非空）。
+# 分片/预算由 scripts/smoke_shard.py 按 budget_secs 自动加权装箱，无需手工排片。
+#
+# ── 字段 ──────────────────────────────────────────────────────────────
+# id          serena 语言名（= LanguageId；install 与 --lang 同名，pgsql/mysql 等
+#             变体门照 pgsql/mysql 先例走显式 --lang，不破 language_routes_are_unique）
+# via         装法：serena-download | serena-npm | serena-uvx | serena-dotnet |
+#             serena-gem | serena-source | npm | apt | rustup | go_install
+#             （serena-* = `serena-cli install <id>`，pin 内嵌 servers.toml；
+#             其他 = install 列完整 shell 命令，`$SERENA_CLI` 可引用二进制）
+# pin         版本钉。apt 类一律 "suite"（禁版本号断言——suite 定版）；
+#             serena-* 类写 "servers.toml"（唯一事实源，改表即改钉）
+# fixture     scripts/smoke_fixtures/ 下文件名（rust 门为目录，带最小 Cargo.toml）
+# budget_secs 单门预算（install+首启+探针全含）。超预算 → SKIP BUDGET（不红 CI，
+#             打日志）；分片按此字段加权装箱
+# extra_assert 加息探针（可选，登记制）：hover:LINE:COL | diagnostics。
+#             底线（initialize+didOpen+documentSymbol 非空）恒跑，全门统一，
+#             禁止为单门私造断言（PM 契约 #3）
+# fallback_assert capability 边界降级探针（可选，登记制，Main 裁决 2026-09-29）：
+#             LS 不实现 documentSymbol 的门才登记（diagnostics | hover:LINE:COL）；
+#             触发降级 PASS 行标 (fallback:<kind>)，且跳过 extra_assert
+# skip_*      SKIP 四类：LICENSE | PLATFORM | HOST | BUDGET；skip_evidence 必填
+#             （一行证据：日志/平台事实/表条目位置）；SKIP 门强制 verified="never"
+# remark      备注（扩展名冲突归属等）
+#
+# ── 扩展名冲突归属（PM 契约 #10）────────────────────────────────────────
+# .yml/.yaml 归 yaml 门（ansible 走 --lang ansible）；.m 归 matlab（wolfram 仅
+# .wl/.nb，wolfram 未入矩阵）；python 变体（pyright/basedpyright/ty/pyrefly）
+# 共用 .py fixture + --lang 显式路由（pgsql/mysql 模式）。
+
+[[lang]]
+id = "rust"
+via = "rustup"
+install = "rustup component add rust-analyzer"
+pin = "suite"
+fixture = "rust/main.rs"
+budget_secs = 600
+remark = "T2 手写适配器；rust-analyzer 版本随 toolchain（suite 定版）"
+
+[[lang]]
+id = "typescript"
+via = "npm"
+install = "npm install -g typescript-language-server@5.1.3 typescript@5.9.3"
+pin = "typescript-language-server@5.1.3 + typescript@5.9.3"
+fixture = "main.ts"
+budget_secs = 420
+remark = "T2 手写适配器；pin = servers.toml [servers.typescript_ls] 同源"
+
+[[lang]]
+id = "python"
+via = "npm"
+install = "npm install -g pyright@1.1.403"
+pin = "pyright@1.1.403"
+fixture = "main.py"
+budget_secs = 420
+remark = "T2 手写适配器；pin 与 [servers.pyright] uvx 条目同版本"
+
+[[lang]]
+id = "go"
+via = "go_install"
+install = "go install golang.org/x/tools/gopls@v0.23.0"
+pin = "gopls@v0.23.0"
+fixture = "main.go"
+budget_secs = 600
+remark = "T2 手写适配器；v0.23.0 = 2026-09-25 真机冒烟版（local/report-ls-smoke-5of7.md）"
+
+[[lang]]
+id = "cpp"
+via = "apt"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq clangd || (sudo apt-get install -y -qq clangd-18 && sudo ln -sf \"$(command -v clangd-18)\" /usr/local/bin/clangd)"
+pin = "suite"
+fixture = "main.cpp"
+budget_secs = 420
+remark = "T2 手写适配器；apt 元包无 /usr/bin/clangd 时软链 clangd-18"
+
+[[lang]]
+id = "csharp"
+via = "npm"
+install = "dotnet tool install --global csharp-ls --version 0.15.0 && echo \"$HOME/.dotnet/tools\" >> \"$GITHUB_PATH\""
+pin = "csharp-ls@0.15.0"
+fixture = "main.cs"
+budget_secs = 420
+remark = "T2 手写适配器；0.15.0 = 真机实测版（local/report-ls-smoke-7of7.md）"
+
+[[lang]]
+id = "markdown"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "notes.md"
+budget_secs = 300
+
+[[lang]]
+id = "yaml"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "conf.yaml"
+budget_secs = 300
+remark = ".yml/.yaml 扩展名归属本门；ansible 走 --lang ansible 不经扩展名"
+
+[[lang]]
+id = "bash"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "lib.sh"
+budget_secs = 300
+
+[[lang]]
+id = "json"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "data.json"
+budget_secs = 300
+
+[[lang]]
+id = "html"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "index.html"
+budget_secs = 300
+
+[[lang]]
+id = "css"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "style.css"
+budget_secs = 300
+
+[[lang]]
+id = "vue"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "app.vue"
+budget_secs = 420
+
+[[lang]]
+id = "astro"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "index.astro"
+budget_secs = 420
+
+[[lang]]
+id = "docker"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "Dockerfile"
+budget_secs = 300
+remark = "Dockerfile 主形态无扩展名，探测走文件名（file_detect Dockerfile* 惯例）"
+
+[[lang]]
+id = "sql"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "schema.sql"
+budget_secs = 420
+remark = ".sql 扩展名归属本门；pgsql/mysql 走 --lang 不经扩展名"
+
+[[lang]]
+id = "pgsql"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "pg.sql"
+lang_flag = "pgsql"
+budget_secs = 420
+remark = "--lang pgsql 显式路由（.sql 归 sql 门，pgsql/mysql 先例）"
+
+[[lang]]
+id = "mysql"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "my.sql"
+lang_flag = "mysql"
+budget_secs = 420
+remark = "--lang mysql 显式路由（同 pgsql）"
+
+[[lang]]
+id = "powershell"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "module.ps1"
+budget_secs = 420
+remark = "需 pwsh 7+（ubuntu-latest runner 预装）"
+
+[[lang]]
+id = "toml"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "app.toml"
+budget_secs = 300
+
+[[lang]]
+id = "kotlin"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.kt"
+lang_flag = "kotlin"
+budget_secs = 600
+
+[[lang]]
+id = "dart"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.dart"
+lang_flag = "dart"
+budget_secs = 900
+remark = "整 Dart SDK 下载（~250MB），预算最重档"
+
+[[lang]]
+id = "lua"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.lua"
+lang_flag = "lua"
+budget_secs = 420
+
+[[lang]]
+id = "bsl"
+via = "serena-download"
+install = "sudo apt-get install -y -qq openjdk-21-jre-headless && $SERENA_CLI install bsl"
+pin = "servers.toml"
+fixture = "module.bsl"
+lang_flag = "bsl"
+budget_secs = 600
+remark = "JVM ≥21：runner 预装 17，apt 显式装 21"
+
+[[lang]]
+id = "nextflow"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.nf"
+lang_flag = "nextflow"
+budget_secs = 420
+remark = "fat JAR，JDK ≥17 = runner 预装档；装法纠偏（Main 追认 2026-09-29）：npm 无 nextflow LS 包（registry 404），维持上游同款 JAR download，v26.04.3 sha = GitHub API digest 实锚"
+
+[[lang]]
+id = "elixir"
+via = "serena-download"
+install = "sudo apt-get install -y -qq elixir && $SERENA_CLI install elixir"
+pin = "servers.toml"
+fixture = "smoke.ex"
+lang_flag = "elixir"
+budget_secs = 600
+remark = "运行需 Elixir runtime（apt suite 版）"
+
+[[lang]]
+id = "haxe"
+via = "serena-download"
+install = "sudo apt-get install -y -qq haxe && $SERENA_CLI install haxe"
+pin = "servers.toml"
+fixture = "Main.hx"
+lang_flag = "haxe"
+budget_secs = 600
+remark = "运行需 Haxe 编译器（apt suite 版）"
+
+[[lang]]
+id = "php"
+via = "serena-download"
+install = "sudo apt-get install -y -qq php-cli && $SERENA_CLI install php"
+pin = "servers.toml"
+fixture = "main.php"
+lang_flag = "php"
+budget_secs = 600
+remark = "phpactor PHAR 需 PHP 8.1+（ubuntu-24.04 apt = 8.3）"
+
+[[lang]]
+id = "clojure"
+via = "serena-download"
+install = "sudo apt-get install -y -qq clojure && $SERENA_CLI install clojure"
+pin = "servers.toml"
+fixture = "core.clj"
+lang_flag = "clojure"
+budget_secs = 600
+remark = "clojure-lsp native 二进制 + Clojure CLI runtime（apt suite 版）"
+
+[[lang]]
+id = "ada"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "smoke.adb"
+lang_flag = "ada"
+budget_secs = 600
+remark = "per-platform bin_path 首个全覆盖条目（Phase 0 schema 扩展验证锚）"
+
+[[lang]]
+id = "systemverilog"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "smoke.sv"
+lang_flag = "systemverilog"
+budget_secs = 420
+
+[[lang]]
+id = "hlsl"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "shader.hlsl"
+lang_flag = "hlsl"
+budget_secs = 420
+
+[[lang]]
+id = "terraform"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.tf"
+lang_flag = "terraform"
+budget_secs = 420
+remark = "上游适配器要求 terraform CLI 在 PATH（模块特性）；底线 documentSymbol 纯语法层不依赖，runner 未装 terraform CLI 属预期"
+
+[[lang]]
+id = "cue"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.cue"
+lang_flag = "cue"
+budget_secs = 420
+
+[[lang]]
+id = "nix"
+via = "serena-source"
+pin = "servers.toml"
+fixture = "main.nix"
+lang_flag = "nix"
+budget_secs = 420
+skip_class = "HOST"
+skip_reason = "nixd needs the Nix toolchain (servers.toml source form `nix build`); no prebuilt assets on GitHub releases; ubuntu-latest runner has no nix"
+skip_evidence = "servers.toml [servers.nixd.source] build_cmd=[nix build]; api.github.com/repos/nix-community/nixd/releases assets=[] (2.8.1-2.9.3, checked 2026-09-29); upstream nixd_ls.py@7a296833 requires nix"
+verified = "never"
+remark = "PM 裁决（2026-09-29）：维持 HOST skip——runner 自举 Nix=每次 CI 永久 +4-5min 税，低使用率门不值；SKIP 预算 6→7 特批此条。上游 nixd 出预编译资产即转真门（届时改 download 形态 + assets[].digest sha 锚）"
+
+[[lang]]
+id = "solidity"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "token.sol"
+lang_flag = "solidity"
+budget_secs = 420
+
+[[lang]]
+id = "svelte"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "app.svelte"
+lang_flag = "svelte"
+budget_secs = 420
+
+[[lang]]
+id = "deno"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.ts"
+lang_flag = "deno"
+budget_secs = 420
+remark = "--lang deno 显式路由（TS 家族扩展名归 typescript 门，deno 不抢；pgsql 先例）；与 typescript 门共用 main.ts fixture；init options enable/lint 由 deno.rs 注入（裸 deno lsp enable=false 是死服务器）；`deno lsp` 子命令入口（非 --stdio flag）"
+
+[[lang]]
+id = "sass"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "style.scss"
+lang_flag = "sass"
+budget_secs = 300
+remark = "W2 路由改名：原 id scss（旧语言名无 LanguageId 入口、从不可达）；servers.toml 条目 id 仍 scss（npm 缓存目录键），--lang sass 走 languages=[\"sass\"]；.css 归 css 门"
+
+[[lang]]
+id = "ansible"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "play.yaml"
+lang_flag = "ansible"
+budget_secs = 300
+extra_assert = "hover:5:7"
+fallback_assert = "diagnostics"
+remark = "playbook 用 .yaml fixture + --lang ansible（.yml/.yaml 归 yaml 门）；capability 边界门：ansible-language-server 无 documentSymbol（vscode-ansible#601 NOT_PLANNED，上游 adapter _request_raw_document_symbols 恒 None@7a296833），降级验 diagnostics；hover:5:7 = ansible.builtin.debug 模块名（npm 包内置文档）"
+
+[[lang]]
+id = "rego"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.rego"
+budget_secs = 300
+remark = "regal 单文件 v0.42.0（GitHub release assets[].digest 锚）；exec = `regal language-server`（上游 regal_server.py@7a296833 同款）"
+
+[[lang]]
+id = "elm"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "Main.elm"
+lang_flag = "elm"
+budget_secs = 420
+
+[[lang]]
+id = "typescript_vts"
+via = "serena-npm"
+pin = "servers.toml"
+fixture = "main.ts"
+lang_flag = "typescript_vts"
+budget_secs = 300
+remark = "变体门：@vtsls 与 typescript 共用 .ts fixture，--lang 显式路由"
+
+[[lang]]
+id = "pyright"
+via = "serena-uvx"
+pin = "servers.toml"
+fixture = "main.py"
+lang_flag = "pyright"
+budget_secs = 420
+remark = "变体门：--lang pyright（python 门独立）；uv 由 smoke_one.sh 自动安装"
+
+[[lang]]
+id = "basedpyright"
+via = "serena-uvx"
+pin = "servers.toml"
+fixture = "main.py"
+lang_flag = "basedpyright"
+budget_secs = 420
+remark = "变体门：--lang basedpyright"
+
+[[lang]]
+id = "ty"
+via = "serena-uvx"
+pin = "servers.toml"
+fixture = "main.py"
+lang_flag = "python_ty"
+budget_secs = 420
+remark = "变体门：条目 id python_ty，--lang 走 languages[0]"
+
+[[lang]]
+id = "python_pyrefly"
+via = "serena-uvx"
+pin = "servers.toml"
+fixture = "main.py"
+lang_flag = "python_pyrefly"
+budget_secs = 420
+remark = "变体门：--lang python_pyrefly"
+
+[[lang]]
+id = "fortran"
+via = "serena-uvx"
+pin = "servers.toml"
+fixture = "main.f90"
+lang_flag = "fortran"
+budget_secs = 420
+remark = "fortls 经 uvx；uv 由 smoke_one.sh 自动安装"
+
+[[lang]]
+id = "fsharp"
+via = "serena-dotnet"
+pin = "servers.toml"
+fixture = "main.fs"
+lang_flag = "fsharp"
+budget_secs = 600
+remark = "需 dotnet SDK（ubuntu-latest runner 预装）"
+
+[[lang]]
+id = "ruby"
+via = "serena-gem"
+pin = "servers.toml"
+fixture = "smoke.rb"
+lang_flag = "ruby"
+budget_secs = 420
+remark = "需 ruby + gem（ubuntu-latest runner 预装）"
+
+[[lang]]
+id = "solargraph"
+via = "serena-gem"
+pin = "servers.toml"
+fixture = "smoke.rb"
+lang_flag = "solargraph"
+budget_secs = 420
+remark = "变体门：与 ruby 共用 .rb fixture，--lang solargraph"
+
+# ══ SKIP 门（四类，预算上限 6 条，PM 裁决制）═════════════════════════════
+
+[[lang]]
+id = "java"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "Main.java"
+lang_flag = "java"
+budget_secs = 900
+skip_class = "HOST"
+skip_reason = "jdtls requires JRE 25+, ubuntu-24.04 apt caps at openjdk-21"
+skip_evidence = "local/report-jdtls-autowire.md (JRE 25+ documented); ubuntu-24.04 suite has no openjdk-25"
+verified = "never"
+
+[[lang]]
+id = "matlab"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "smoke.m"
+lang_flag = "matlab"
+budget_secs = 600
+skip_class = "LICENSE"
+skip_reason = "MATLAB R2021b+ proprietary license, unobtainable on CI"
+skip_evidence = "local/upstream-ls-catalog.md A17 (Runtime: MATLAB R2021b+ + Node.js)"
+verified = "never"
+remark = ".m 扩展名归本门（wolfram 仅 .wl/.nb，wolfram 未入矩阵）"
+
+[[lang]]
+id = "latex"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.tex"
+lang_flag = "latex"
+budget_secs = 900
+skip_class = "BUDGET"
+skip_reason = "texlab installs but functional coverage needs LaTeX toolchain (texlive ~2GB), exceeds per-door budget"
+skip_evidence = "local/upstream-ls-catalog.md A27 (Runtime: LaTeX toolchain)"
+verified = "never"
+
+[[lang]]
+id = "pascal"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "smoke.pp"
+lang_flag = "pascal"
+budget_secs = 900
+skip_class = "BUDGET"
+skip_reason = "pasls needs FPC toolchain (apt fpc ~400MB + PP/FPCDIR config), exceeds per-door budget"
+skip_evidence = "local/upstream-ls-catalog.md A20 (Runtime: FPC)"
+verified = "never"
+
+[[lang]]
+id = "omnisharp"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "smoke.cs"
+lang_flag = "omnisharp"
+budget_secs = 600
+skip_class = "PLATFORM"
+skip_reason = "servers.toml entry pins windows-only group (OmniSharp.exe; upstream runtime_dependencies enables L,W only)"
+skip_evidence = "crates/ls-registry/servers.toml [servers.omnisharp.download] bin_path=OmniSharp.exe win-only"
+verified = "never"
+
+[[lang]]
+id = "al"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "smoke.al"
+lang_flag = "al"
+budget_secs = 600
+skip_class = "PLATFORM"
+skip_reason = "VSIX entry pins windows group only (bin extension/bin/win32/...); unix paths left in entry comment pending W-wave"
+skip_evidence = "crates/ls-registry/servers.toml [servers.al.download] windows-only bin_path"
+verified = "never"
+
+# ══ 不入矩阵（对账表栏 3，见报告）═══════════════════════════════════════
+# angular：PM 拍板 documented SKIP——三进程编排 T0 不支持，条目不进 servers.toml，
+#          coverage 标 never-verified。报告见 local/agent-reports/ci-infra-45lang.md。
+# perl/r/wolfram/gdscript/groovy/julia/msl/scala：未收门（上游 G/H 类形态特殊），
+#          W 波次按需评估；julia 首启装包走 BUDGET 预算机制模板。

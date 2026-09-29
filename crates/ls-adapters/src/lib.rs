@@ -30,6 +30,7 @@ pub mod bash;
 pub mod clangd;
 pub mod csharp_ls;
 pub mod css;
+pub mod deno;
 pub mod gopls;
 pub mod html;
 pub mod jdtls;
@@ -39,6 +40,8 @@ pub mod powershell;
 pub mod pyre_server;
 pub mod pyright;
 pub mod rust_analyzer;
+pub mod sass;
+pub mod svelte;
 pub mod ty_server;
 pub mod typescript;
 pub mod vue;
@@ -84,6 +87,44 @@ pub enum LanguageId {
     /// T0 配置驱动（servers.toml dart 条目，bd 56a 后续批）：Dart SDK 内置
     /// analysis server（`dart language-server`），扩展名 .dart。
     Dart,
+    /// T0 配置驱动（W1b 批，servers.toml ansible/regal/nextflow 条目）。
+    /// ↖ mirror: oraios/serena@7a296833 ansible_language_server.py（npm
+    /// @ansible/ansible-language-server `--stdio`；无 documentSymbol，
+    /// vscode-ansible#601 NOT_PLANNED）。
+    Ansible,
+    /// T0 配置驱动（W1b 批）：↖ mirror: regal_server.py@7a296833（单文件二进制
+    /// `regal language-server`）。
+    Rego,
+    /// T0 配置驱动（W1b 批）：↖ mirror: nextflow_language_server.py@7a296833
+    /// （fat JAR `java -jar`，JDK ≥17；npm 无此包）。
+    Nextflow,
+    /// T0 配置驱动（W1a 批，servers.toml toml 条目 = taplo）。
+    /// ↖ mirror: taplo_server.py@43ae0211（GitHub release 单文件 gz/zip，0.10.0
+    /// sha 内嵌；`taplo lsp stdio`）。
+    Toml,
+    /// T0 配置驱动（W1a 批，servers.toml terraform 条目 = terraform-ls）。
+    /// ↖ mirror: terraform_ls.py@43ae0211（hashicorp release zip 0.36.5 sha 内嵌；
+    /// `terraform-ls serve`——无 serve 子命令只打印帮助即退出）。
+    Terraform,
+    /// T0 配置驱动（W1a 批，servers.toml cue 条目 = cue CLI 内置 LSP，Δ 收录：
+    /// 上游无独立 cue 适配器，v0.16.1 cmd/cue/cmd/lsp.go 实锚 `cue lsp`）。
+    Cue,
+    /// T0 配置驱动（W1a 批，servers.toml nixd 条目 = source 构建形态）。
+    /// ↖ mirror: nixd_ls.py@43ae0211（上游同样要求 Nix 工具链；release 无预编译
+    /// 资产，CI 冒烟 HOST skip）。
+    Nix,
+    /// T2 手写 hybrid 双服务器适配器（W2 批，svelte.rs，上游 7a296833）：主
+    /// svelteserver + 伴生 typescript-language-server 挂 typescript-svelte-plugin，
+    /// 扩展名 .svelte。
+    Svelte,
+    /// T2 手写适配器（W2 批，deno.rs，上游 7a296833）：`deno lsp` 子命令入口。
+    /// TS 家族扩展名不抢——仅 `--lang deno` 显式路由可达（pgsql/mysql 先例），
+    /// probe_extensions 空表，by_shebang 的 deno 解释器仍归 TypeScript。
+    Deno,
+    /// T2 手写适配器（W2 批，sass.rs，上游 7a296833）：some-sass-language-server
+    ///（npm），扩展名 .sass/.scss（.css 归 css 门；servers.toml 条目 id 仍 scss，
+    /// 路由语言名 = sass，didOpen 官方 languageId = "scss"）。
+    Sass,
 }
 
 impl LanguageId {
@@ -111,6 +152,16 @@ impl LanguageId {
             Self::Yaml => "yaml",
             Self::Kotlin => "kotlin",
             Self::Dart => "dart",
+            Self::Ansible => "ansible",
+            Self::Rego => "rego",
+            Self::Nextflow => "nextflow",
+            Self::Toml => "toml",
+            Self::Terraform => "terraform",
+            Self::Cue => "cue",
+            Self::Nix => "nix",
+            Self::Svelte => "svelte",
+            Self::Deno => "deno",
+            Self::Sass => "sass",
         }
     }
     /// 反向：lang 字符串 → LanguageId。未知返 None。
@@ -138,6 +189,16 @@ impl LanguageId {
             "yaml" => Some(Self::Yaml),
             "kotlin" => Some(Self::Kotlin),
             "dart" => Some(Self::Dart),
+            "ansible" => Some(Self::Ansible),
+            "rego" => Some(Self::Rego),
+            "nextflow" => Some(Self::Nextflow),
+            "toml" => Some(Self::Toml),
+            "terraform" => Some(Self::Terraform),
+            "cue" => Some(Self::Cue),
+            "nix" => Some(Self::Nix),
+            "svelte" => Some(Self::Svelte),
+            "deno" => Some(Self::Deno),
+            "sass" => Some(Self::Sass),
             _ => None,
         }
     }
@@ -167,6 +228,20 @@ impl LanguageId {
             "yaml" | "yml" => Some(Self::Yaml),
             "kt" | "kts" => Some(Self::Kotlin),
             "dart" => Some(Self::Dart),
+            // W2 批：svelte 单文件组件；sass 双扩展（.css 留在 css 门）。
+            // deno 无扩展名映射——TS 家族归 TypeScript 门，仅 --lang deno 显式路由。
+            "svelte" => Some(Self::Svelte),
+            "sass" | "scss" => Some(Self::Sass),
+            // W1b 批：rego/nextflow 各自独占扩展名；ansible 无扩展名映射——.yaml/.yml
+            // 归 Yaml 门（momus 裁决的冲突归属），ansible 仅 --lang 显式路由可达。
+            "rego" => Some(Self::Rego),
+            "nf" => Some(Self::Nextflow),
+            // W1a 批：.toml/.cue/.nix 各自独占；.tf/.tfvars 归 Terraform（taplo 只吃
+            // .toml；terraform-ls 官方扩展对）。
+            "toml" => Some(Self::Toml),
+            "tf" | "tfvars" => Some(Self::Terraform),
+            "cue" => Some(Self::Cue),
+            "nix" => Some(Self::Nix),
             // pgsql/mysql（bd 56a）无专属扩展名：.sql 归 Sql 门（上游 get_priority
             // superset 的默认归属语义），本两门经 --lang pgsql|mysql 显式路由。
             _ => None,
@@ -246,6 +321,20 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::Pgsql | LanguageId::Mysql => &[],
         LanguageId::Kotlin => &["kt", "kts"],
         LanguageId::Dart => &["dart"],
+        // W1b 批：ansible 仅 --lang 显式路由（.yaml/.yml 归 Yaml 门），探针走工程
+        // 标记名单——与 Markdown/Yaml/Pgsql|Mysql 同款空表语义。
+        LanguageId::Ansible => &[],
+        LanguageId::Rego => &["rego"],
+        LanguageId::Nextflow => &["nf"],
+        // W1a 批：.toml/.tf/.tfvars/.cue/.nix 均为真实 LS 可解析的源文件扩展名。
+        LanguageId::Toml => &["toml"],
+        LanguageId::Terraform => &["tf", "tfvars"],
+        LanguageId::Cue => &["cue"],
+        LanguageId::Nix => &["nix"],
+        LanguageId::Svelte => &["svelte"],
+        // deno：TS 家族扩展名不抢 → 探针候选名单（.gitignore/README 等）兜底。
+        LanguageId::Deno => &[],
+        LanguageId::Sass => &["sass", "scss"],
     }
 }
 
@@ -601,6 +690,15 @@ mod tests {
         // 空 langs → 语言扫描跳过 → 纯名单路径（README.md 胜出）。
         let uri = probe_uri_for_root(dir.path(), &[], "file:///__fallback__");
         assert!(uri.ends_with("README.md"), "按候选序取首个存在者: {uri}");
+    }
+
+    #[test]
+    fn probe_extensions_w1b_gates() {
+        // ansible 仅 --lang 显式路由（.yaml/.yml 归 Yaml 门，momus 裁决）→ 空表
+        // 走工程标记名单，与 Markdown/Yaml 同语义；rego/nextflow 各自独占扩展名。
+        assert!(probe_extensions(&LanguageId::Ansible).is_empty());
+        assert_eq!(probe_extensions(&LanguageId::Rego), &["rego"]);
+        assert_eq!(probe_extensions(&LanguageId::Nextflow), &["nf"]);
     }
 
     #[test]

@@ -22,10 +22,11 @@ pub mod spec;
 pub use ls_adapters::LanguageId;
 use ls_adapters::{
     LanguageServerAdapter, astro::AstroAdapter, bash::BashAdapter,
-    clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter, css::CssAdapter, gopls::GoplsAdapter,
-    html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter, powershell::PowerShellAdapter,
-    pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter,
-    typescript::TypescriptLanguageServerAdapter, vue::VueAdapter,
+    clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter, css::CssAdapter, deno::DenoAdapter,
+    gopls::GoplsAdapter, html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter,
+    powershell::PowerShellAdapter, pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter,
+    sass::SassAdapter, svelte::SvelteAdapter, typescript::TypescriptLanguageServerAdapter,
+    vue::VueAdapter,
 };
 
 /// 扩展名 → LanguageId 静态表（小写键）。
@@ -92,6 +93,24 @@ pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("html", LanguageId::Html),
     ("htm", LanguageId::Html),
     ("css", LanguageId::Css),
+    // Rego / Nextflow（W1b 批，T0 配置驱动：servers.toml regal/nextflow 条目）。
+    // ansible 不进本表：.yaml/.yml 归 Yaml 门（momus 裁决的冲突归属），
+    // ansible 仅 --lang 显式路由可达。
+    ("rego", LanguageId::Rego),
+    ("nf", LanguageId::Nextflow),
+    // TOML / Terraform / Cue / Nix（W1a 批，T0 配置驱动：servers.toml
+    // toml/terraform/cue/nixd 条目）。
+    ("toml", LanguageId::Toml),
+    ("tf", LanguageId::Terraform),
+    ("tfvars", LanguageId::Terraform),
+    ("cue", LanguageId::Cue),
+    ("nix", LanguageId::Nix),
+    // W2 批：svelte 单文件组件；sass 双扩展（.css 留在 css 门，上游把 .css 也给
+    // some-sass 的路由我们不抄）。deno 不进本表——TS 家族归 TypeScript 门，
+    // 仅 --lang deno 显式路由可达（pgsql/mysql 先例）。
+    ("svelte", LanguageId::Svelte),
+    ("sass", LanguageId::Sass),
+    ("scss", LanguageId::Sass),
 ];
 
 /// 各 LanguageId 对应的 adapter 单例。
@@ -115,6 +134,9 @@ singleton!(VUE, VueAdapter);
 singleton!(ASTRO, AstroAdapter);
 singleton!(HTML, HtmlAdapter);
 singleton!(CSS, CssAdapter);
+singleton!(SVELTE, SvelteAdapter);
+singleton!(DENO, DenoAdapter);
+singleton!(SASS, SassAdapter);
 
 /// 路径 → 语言。扩展名小写后查表，命中即返回；其余 None。
 ///
@@ -165,6 +187,12 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         // bd 56a 后续批：html/css 手写 T2（同包 vscode-langservers-extracted 双入口）。
         LanguageId::Html => HTML.clone(),
         LanguageId::Css => CSS.clone(),
+        // W2 批：svelte/deno/sass 手写 T2（svelte = hybrid 双服务器，astro 同构；
+        // deno 注入 enable/lint 初始化选项并处理 lsp 子命令入口；sass 注入 somesass
+        // 配置片 + somesass configuration 应答）。
+        LanguageId::Svelte => SVELTE.clone(),
+        LanguageId::Deno => DENO.clone(),
+        LanguageId::Sass => SASS.clone(),
         // T0 配置驱动语言（markdown/yaml）：无手写 adapter（见 config::ensure_launch）。
         LanguageId::Markdown | LanguageId::Yaml => return None,
         // T0 配置驱动（bd 56a 第一批）：docker/sql 走 servers.toml docker/sql 条目。
@@ -174,6 +202,14 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         // T0 配置驱动（bd 56a 后续批）：kotlin/dart 走 servers.toml kotlin/dart 条目
         // （download 形态，ensure_launch 接管）。
         LanguageId::Kotlin | LanguageId::Dart => return None,
+        // T0 配置驱动（W1b 批）：ansible/regal/nextflow 条目（npm/download 形态，
+        // ensure_launch 接管）；ansible 仅 --lang 显式路由可达。
+        LanguageId::Ansible | LanguageId::Rego | LanguageId::Nextflow => return None,
+        // T0 配置驱动（W1a 批）：toml(taplo)/terraform(terraform-ls)/cue(cue lsp
+        // 内置)/nixd(source 构建形态) 条目，ensure_launch 接管。
+        LanguageId::Toml | LanguageId::Terraform | LanguageId::Cue | LanguageId::Nix => {
+            return None;
+        }
     })
 }
 
@@ -187,6 +223,11 @@ pub fn lsp_language_id(lang: &str) -> String {
         // bd 56a 第二批：LSP 官方 SQL languageId 是 "sql"（VS Code 口径）；pgls/sqls
         // 实测对任意值宽容，但同 docker 原则显式映射而非赌 LS 行为。
         "pgsql" | "mysql" => "sql".to_string(),
+        // W2 批：deno lsp 的 didOpen 基础 languageId 用官方 "typescript"（per-file
+        // 覆盖在 deno.rs on_session_ready）；sass 的官方口径是 "scss"（.sass 文件由
+        // sass.rs per-file 覆盖为 "sass"）。svelte 恒等走 default 臂。
+        "deno" => "typescript".to_string(),
+        "sass" => "scss".to_string(),
         other => other.to_string(),
     }
 }
@@ -318,6 +359,54 @@ mod tests {
         assert_eq!(resolve(&PathBuf::from("index.html")), Some(LanguageId::Html));
         assert_eq!(resolve(&PathBuf::from("page.htm")), Some(LanguageId::Html));
         assert_eq!(resolve(&PathBuf::from("style.css")), Some(LanguageId::Css));
+    }
+
+    /// W2 批：--lang svelte/deno/sass 必须路由到手写 T2 adapter；deno 显式路由门
+    /// （TS 家族扩展名不进 EXT_TABLE）；lsp_language_id 官方口径换算。
+    #[test]
+    fn adapter_for_routes_w2_languages() {
+        for lang in ["svelte", "deno", "sass"] {
+            let a =
+                adapter_for(lang).unwrap_or_else(|| panic!("--lang {lang} 必须路由到 T2 adapter"));
+            let b = adapter_for(lang).unwrap();
+            assert!(Arc::ptr_eq(&a, &b), "singleton broken for {lang}");
+        }
+        assert_eq!(
+            adapter_for("svelte").unwrap().languages(),
+            &[LanguageId::Svelte]
+        );
+        assert_eq!(
+            adapter_for("deno").unwrap().languages(),
+            &[LanguageId::Deno]
+        );
+        assert_eq!(
+            adapter_for("sass").unwrap().languages(),
+            &[LanguageId::Sass]
+        );
+        // lsp_language_id 官方口径：deno→"typescript"、sass→"scss"、svelte 恒等。
+        assert_eq!(lsp_language_id("deno"), "typescript");
+        assert_eq!(lsp_language_id("sass"), "scss");
+        assert_eq!(lsp_language_id("svelte"), "svelte");
+        // 扩展名解析：.svelte/.sass/.scss；deno 无扩展名路由（显式路由门）。
+        assert_eq!(
+            resolve(&PathBuf::from("app.svelte")),
+            Some(LanguageId::Svelte)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("style.sass")),
+            Some(LanguageId::Sass)
+        );
+        assert_eq!(
+            resolve(&PathBuf::from("style.scss")),
+            Some(LanguageId::Sass)
+        );
+        for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs"] {
+            assert_ne!(
+                resolve(&PathBuf::from(format!("main.{ext}"))),
+                Some(LanguageId::Deno),
+                "{ext}: deno 不抢 TS 家族扩展名"
+            );
+        }
     }
 
     /// Wave 1 扩展名解析：sh/bash/json/jsonc/ps1/psm1/psd1/vue（resolve 锁定）。

@@ -65,12 +65,30 @@ pub struct DownloadSpec {
     #[serde(default)]
     pub strip_components: usize,
     /// 压缩包内可执行相对路径（raw 形态 = 落盘文件名）。
+    ///
+    /// 默认值（windows 组语义不变）；平台互异路径用 [`Self::bin_path_per_platform`]
+    /// 覆盖，解析统一走 [`Self::resolved_bin_path`]。
     pub bin_path: String,
+    /// per-platform `bin_path` 覆盖（key 词汇表同 `url_per_platform` = platform_key
+    /// 输出全集）。命中该平台优先；miss 回退单值 `bin_path`。省略 = 全平台同单值。
+    #[serde(default)]
+    pub bin_path_per_platform: HashMap<String, String>,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     pub url_per_platform: HashMap<String, String>,
     /// 空串/缺平台 = sha 未知（§2.9 → UnsignedRefused）。
     pub sha256_per_platform: HashMap<String, String>,
+}
+
+impl DownloadSpec {
+    /// per-platform `bin_path` 解析统一入口（映射/缓存命中/doctor 探测共用）：
+    /// `bin_path_per_platform[platform_key]` 命中优先，miss 回退单值 `bin_path`。
+    pub fn resolved_bin_path<'a>(&'a self, platform_key: &str) -> &'a str {
+        self.bin_path_per_platform
+            .get(platform_key)
+            .map(String::as_str)
+            .unwrap_or(&self.bin_path)
+    }
 }
 
 /// §2.7 F 类 path_only 子表。
@@ -209,6 +227,13 @@ fn validate(id: &str, spec: &ServerSpec) -> Result<(), String> {
                 return Err(format!(
                     "[servers.{id}].download.bin_path must not be empty"
                 ));
+            }
+            for (plat, bin) in &dl.bin_path_per_platform {
+                if bin.is_empty() {
+                    return Err(format!(
+                        "[servers.{id}].download.bin_path_per_platform.{plat} must not be empty"
+                    ));
+                }
             }
         }
         "path_only" => {

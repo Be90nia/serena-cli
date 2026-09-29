@@ -42,7 +42,7 @@ Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `
 
 vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses), plus the long tail (`documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint`) — all landed and verified 2026-09-23; `document-link`/`moniker` return empty on LS without the capability (e.g. rust-analyzer stable).
 
-### Language servers (20 of 73 in upstream catalog)
+### Language servers (29 of 73 in upstream catalog)
 
 | Lang | Server | Status | Notes |
 |---|---|---|---|
@@ -68,8 +68,18 @@ vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent
 | CSS | vscode-css-language-server | ready (npm) | `*.css`; mdn-driven hover/completion for properties/selectors; same npm package as the html entry (separate cache dir) |
 | YAML | yaml-language-server | ready (npm) | `*.yaml`/`*.yml`; schema-driven hover/completion/diagnostics (schemastore); syntax diagnostics live without a schema |
 | Markdown | marksman | ready (download) | `*.md`/`*.markdown`; heading documentSymbols/workspace symbols; link def/refs/hover live when the project root is detectable (git repo or `.marksman.toml`) — marksman-side project detection, marker-less scratch dirs degrade to per-file assist |
+| TOML | taplo | ready (download) | `*.toml`; single-file gzip binary (pinned `0.10.0`, sha-verified against upstream's embedded checksums); table/key documentSymbols; schema-driven hover/diagnostics when a schema association exists (taplo feature) |
+| Terraform | terraform-ls | ready (download) | `*.tf`/`*.tfvars`; block/resource documentSymbols (pinned `0.36.5`, HashiCorp releases, sha-verified; launched as `terraform-ls serve`); upstream requires a `terraform` CLI on PATH for module features — documentSymbol is parser-only and works without |
+| Cue | `cue lsp` (built into the cue CLI) | ready (download) | `*.cue`; the cue CLI embeds its LSP behind a hidden `lsp` subcommand (v0.16.1 verified); field/package documentSymbols |
+| Nix | nixd | source build | `*.nix`; installed via `git clone` + `nix build` — requires the Nix toolchain (upstream ships no prebuilt release assets, same constraint as upstream's adapter); attribute documentSymbols once built |
+| Ansible | ansible-language-server | wired (npm); CI smoke pending | `--lang ansible` (`.yaml`/`.yml` stay with the YAML gate); hover/completion/diagnostics live; **no documentSymbol** — upstream declined (vscode-ansible#601 NOT_PLANNED), the smoke gate degrades to diagnostics via `fallback_assert` |
+| Rego | regal | wired (download); CI smoke pending | `*.rego`; single-file binary (pinned `0.42.0`, sha-verified against GitHub release `assets[].digest`); `regal language-server` launch; documentSymbol/hover/def/diagnostics per Regal docs |
+| Nextflow | Nextflow language server | wired (download); CI smoke pending | `*.nf`; fat JAR (pinned `26.04.3`, sha-verified; requires JDK ≥17 on PATH); outline/def/refs/hover/diagnostics; no npm package exists (registry 404) — upstream's JAR distribution is the only install form |
+| Svelte | svelte-language-server (svelteserver) | wired (npm); CI smoke pending | `*.svelte`; hybrid: main svelteserver + companion typescript-language-server with `typescript-svelte-plugin` (upstream `7a296833`); ts/js semantics route to the companion; `.svelte` files pre-opened on the companion so the plugin sees the full TS graph |
+| Deno | `deno lsp` (Deno CLI built-in) | wired (download); CI smoke pending | `--lang deno` explicit routing only — TS-family extensions stay with the typescript gate (upstream marks deno experimental for exactly this overlap); zip from GitHub releases (pinned `2.9.7`, sha-verified against `assets[].digest`); entry is the `deno lsp` subcommand, not a `--stdio` flag; init options `{enable, lint}` injected (bare deno lsp starts disabled) |
+| Sass | some-sass-language-server | wired (npm); CI smoke pending | `--lang sass` (servers.toml entry id `scss` = cache-dir key); `*.sass`/`*.scss` (`.css` stays with the css gate); didOpen languageId `scss` with per-file `.sass` override; somesass init options + `workspace/configuration` slice mirrored from upstream `7a296833` |
 
-All 20 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; bash, json, powershell, vue — 2026-09-25; astro — 2026-09-28; docker, sql — 2026-09-28; postgresql, mysql — 2026-09-28; yaml, markdown — 2026-09-28; kotlin, dart, html, css — 2026-09-28; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / per-adapter reports `local/report-*-adapter.md`). CI 7-language smoke script lives in `scripts/ci_smoke.sh`.
+All 20 end-to-end smoke verified on real language servers (rust, typescript, c/cpp, python, go — 2026-09-25; c#, java — 2026-09-25; bash, json, powershell, vue — 2026-09-25; astro — 2026-09-28; docker, sql — 2026-09-28; postgresql, mysql — 2026-09-28; yaml, markdown — 2026-09-28; kotlin, dart, html, css — 2026-09-28; `local/report-ls-smoke-5of7.md` / `local/report-ls-smoke-7of7.md` / per-adapter reports `local/report-*-adapter.md`). Per-language CI smoke lives in `scripts/smoke_one.sh` (matrix manifest `scripts/smoke_langs.toml`, weekly workflow `.github/workflows/ls-smoke.yml`).
 
 ## Install
 

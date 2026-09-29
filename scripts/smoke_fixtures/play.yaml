@@ -1,0 +1,6 @@
+- name: smoke play
+  hosts: localhost
+  tasks:
+    - name: smoke task
+      ansible.builtin.debug:
+        msg: hello

@@ -61,13 +61,47 @@ binary_name = "ccls"
 install_hint = "install ccls via system package manager (apt/dnf/pacman/brew/choco) and ensure it is on PATH"
 
 [servers.deno]
+# W2 批接线：path_only → download 升级（deno 官方二进制，GitHub release 钉版）。
+# **入口是 `deno lsp` 子命令，非 --stdio flag**——裸跑 `deno` = CLI 帮助即退
+# （pgls `lsp-proxy` 同款形态先例）。手写 T2 适配器（deno.rs）接管会话并注入
+# initializationOptions {enable:true, lint:true}（裸 deno lsp enable=false 是死服务器；
+# ↖ mirror deno_language_server.py@7a296833）；本条服务 `serena-cli install deno`
+# 与 doctor 探测。languages 的 "typescript" 为 G 类收录原状（typescript 会话由手写
+# T2 适配器接管，路由归属见 [servers.typescript_ls] 注释）。
 languages = ["deno", "typescript"]
-install = "path_only"
+install = "download"
 exec = ["{bin}", "lsp"]
-source_commit = "43ae0211"
-[servers.deno.path_only]
-binary_name = "deno"
-install_hint = "install deno CLI (https://deno.com) and ensure it is on PATH"
+source_commit = "7a296833"
+
+[servers.deno.download]
+version = "2.9.7"
+archive = "zip"
+bin_path = "deno.exe"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.deno.download.url_per_platform]
+"windows-x86_64" = "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-pc-windows-msvc.zip"
+"windows-aarch64" = "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-pc-windows-msvc.zip"
+"linux-x86_64" = "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-unknown-linux-gnu.zip"
+"linux-aarch64" = "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-unknown-linux-gnu.zip"
+"macos-x86_64" = "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-apple-darwin.zip"
+"macos-aarch64" = "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-apple-darwin.zip"
+
+[servers.deno.download.sha256_per_platform]
+# sha256 真值锚：GitHub API denoland/deno releases/latest (v2.9.7) assets[].digest
+# （2026-09-29 查询）；zip 包内二进制平台互异（unix 无 .exe），bin_path 单值仅容 windows 组。
+"windows-x86_64" = "a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238"
+"windows-aarch64" = "c4c4ac8bfdaa37814bda5c05fc9cdf2154904e2ef8277673a30bdceaaa649807"
+"linux-x86_64" = "c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490"
+"linux-aarch64" = "c832298b1ad4422481334855f6003e0f54145762c5a134f20a489511d2f65bbf"
+"macos-x86_64" = "95daaff11c116a52ad54785e7914c8e9c9cdcaba793c5ed929c74ca2d8e6259a"
+"macos-aarch64" = "5cd46d6268f6f78f5d88bdc7159d20bd44cdaa4b3303474839f87ec6fe7ae25c"
+
+[servers.deno.download.bin_path_per_platform]
+"linux-x86_64" = "deno"
+"linux-aarch64" = "deno"
+"macos-x86_64" = "deno"
+"macos-aarch64" = "deno"
 
 [servers.erlang_ls]
 languages = ["erlang"]
@@ -129,12 +163,37 @@ install_hint = "install Qt 6 (qmlls ships with Qt) and ensure it is on PATH"
 
 [servers.regal]
 languages = ["rego"]
-install = "path_only"
-exec = ["{bin}", "workspace", "lsp"]
+install = "download"
+exec = ["{bin}", "language-server"]
 source_commit = "43ae0211"
-[servers.regal.path_only]
-binary_name = "regal"
-install_hint = "install regal (https://docs.styra.com/regal) and ensure it is on PATH"
+
+# W1b 升级：path_only → GitHub release 单文件（PM 拍板）。v0.42.0 五平台 sha256 真值锚
+# = GitHub API releases/tags/v0.42.0 assets[].digest（open-policy-agent/regal，原
+# styrainc org 迁移后重定向，digest 两 org 一致）。exec 修正：cobra Use =
+# "language-server"（regal 仓库 cmd/languageserver.go），旧 "workspace lsp" 为误配；
+# ↖ mirror: regal_server.py@7a296833。windows-aarch64 上游无对应资产（平台缺席）。
+[servers.regal.download]
+version = "0.42.0"
+archive = "raw"
+bin_path = "regal"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+
+[servers.regal.download.url_per_platform]
+"windows-x86_64" = "https://github.com/open-policy-agent/regal/releases/download/v0.42.0/regal_Windows_x86_64.exe"
+"linux-x86_64" = "https://github.com/open-policy-agent/regal/releases/download/v0.42.0/regal_Linux_x86_64"
+"linux-aarch64" = "https://github.com/open-policy-agent/regal/releases/download/v0.42.0/regal_Linux_arm64"
+"macos-x86_64" = "https://github.com/open-policy-agent/regal/releases/download/v0.42.0/regal_Darwin_x86_64"
+"macos-aarch64" = "https://github.com/open-policy-agent/regal/releases/download/v0.42.0/regal_Darwin_arm64"
+
+[servers.regal.download.sha256_per_platform]
+"windows-x86_64" = "d113463872746511276983575322c5b6706479fd231e865d3584ed98e777c50f"
+"linux-x86_64" = "2ebd3c93e4b325b735dbc4851a033e4d7830e88a79c47c8d087ea75c061cec67"
+"linux-aarch64" = "13a2ba4a049fa8f3f64ed602a56bad1378eec253d36a977799ff51e694e47c77"
+"macos-x86_64" = "b8fe86028a9730ab6c6fbdf2ef292596b1a0037c3c1accbd0dd00a8724935ff7"
+"macos-aarch64" = "c3ee16c956b8cd5b3aeb53414afbd2a11b0dff1aa1e726fc91e33e7adef31845"
+
+[servers.regal.download.bin_path_per_platform]
+"windows-x86_64" = "regal.exe"
 
 [servers.sourcekit_lsp]
 languages = ["swift"]
@@ -185,10 +244,12 @@ install_hint = "install zls (https://github.com/zigtools/zls) and zig; ensure bo
 # 全部条目 = 上游 serena DEFAULT_*/INITIAL_* 钉住版本（pin），sha256 = 矩阵 [embed] 真值
 # （GitHub 资产锚 assets[].digest，调研日期 2026-09-20）；source_commit 锚上游 43ae0211。
 #
-# 平台组策略（schema 局限，per-platform 扩展前有效）：DownloadSpec.archive / bin_path
-# 为单值字段，而多数 LS 的包内路径带 [.exe] / 平台段差异。每条只填 archive+bin_path
-# 完全自洽的平台组（多组同大取含 windows-x86_64 的组，marksman 先例同形态），其余平台
-# 的 URL/sha256/包内路径全量保留在条目注释中，schema 扩展后可直接搬运。
+# 平台组策略（per-platform bin_path 扩展后）：url/sha256 走 *_per_platform 子表；
+# 包内路径 bin_path 单值 = 默认（windows 组语义不变），平台互异路径填
+# bin_path_per_platform 覆盖子表（key 同 url_per_platform；命中优先、miss 回退单值，
+# 解析统一走 DownloadSpec::resolved_bin_path）。archive 仍单值——平台间压缩形态互异
+# 的条目暂不存在；出现时按 bin_path_per_platform 同款扩展。既有条目其余平台的
+# URL/sha256/包内路径保留在条目注释中，可直接搬运（ada 先例）。
 # platform key：windows-x86_64 / windows-aarch64 / linux-x86_64 / linux-aarch64 /
 # macos-x86_64 / macos-aarch64（= config::platform_key 输出全集）。
 
@@ -206,24 +267,27 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 
 [servers.ada.download.url_per_platform]
 "windows-x86_64" = "https://github.com/AdaCore/ada_language_server/releases/download/2026.2.202604091/als-2026.2.202604091-win32-x64.tar.gz"
+"linux-x86_64" = "https://github.com/AdaCore/ada_language_server/releases/download/2026.2.202604091/als-2026.2.202604091-linux-x64.tar.gz"
+"linux-aarch64" = "https://github.com/AdaCore/ada_language_server/releases/download/2026.2.202604091/als-2026.2.202604091-linux-arm64.tar.gz"
+"macos-x86_64" = "https://github.com/AdaCore/ada_language_server/releases/download/2026.2.202604091/als-2026.2.202604091-darwin-x64.tar.gz"
+"macos-aarch64" = "https://github.com/AdaCore/ada_language_server/releases/download/2026.2.202604091/als-2026.2.202604091-darwin-arm64.tar.gz"
 
 [servers.ada.download.sha256_per_platform]
 "windows-x86_64" = "bca024dc3643b2d91aebbb747398e2e6f183ad8cb2f149e24fe7a38cdb16ed8d"
-# bin_path 每平台路径互异（{x64|arm64}/{win32|linux|darwin}/ada_language_server[.exe]），
-# 单值字段仅容一组；其余平台待 per-platform bin_path 扩展：
-#   linux-x86_64: als-2026.2.202604091-linux-x64.tar.gz
-#     sha256 2eb436a7c0e3740128cceaa15da9ff856fa75ef3fbb3e2e9d3a1bd17e15cb949
-#     bin integration/vscode/ada/x64/linux/ada_language_server
-#   linux-aarch64: als-2026.2.202604091-linux-arm64.tar.gz
-#     sha256 65c57df715df90f7581ecd6a1d1884663376baaf38cedbab80d10060ff91b03d
-#     bin integration/vscode/ada/arm64/linux/ada_language_server
-#   macos-x86_64: als-2026.2.202604091-darwin-x64.tar.gz
-#     sha256 18d3277a25a6e08ce3ee7230c3e5ac20419d573cb8d8c883e7983f387a67d223
-#     bin integration/vscode/ada/x64/darwin/ada_language_server
-#   macos-aarch64: als-2026.2.202604091-darwin-arm64.tar.gz
-#     sha256 1d25ded29b6beafcb34c9d0084d52809d84577356e467bf92e8fef32fc4216c4
-#     bin integration/vscode/ada/arm64/darwin/ada_language_server
+"linux-x86_64" = "2eb436a7c0e3740128cceaa15da9ff856fa75ef3fbb3e2e9d3a1bd17e15cb949"
+"linux-aarch64" = "65c57df715df90f7581ecd6a1d1884663376baaf38cedbab80d10060ff91b03d"
+"macos-x86_64" = "18d3277a25a6e08ce3ee7230c3e5ac20419d573cb8d8c883e7983f387a67d223"
+"macos-aarch64" = "1d25ded29b6beafcb34c9d0084d52809d84577356e467bf92e8fef32fc4216c4"
+
+# 包内路径每平台互异（{x64|arm64}/{win32|linux|darwin}/ada_language_server[.exe]），
+# bin_path 单值仅容 windows 组；per-platform bin_path 覆盖（bin_path_per_platform，
+# key 同 url_per_platform）命中优先、miss 回退单值。
 # 注：Wa（win32-arm64）上游无资产。
+[servers.ada.download.bin_path_per_platform]
+"linux-x86_64" = "integration/vscode/ada/x64/linux/ada_language_server"
+"linux-aarch64" = "integration/vscode/ada/arm64/linux/ada_language_server"
+"macos-x86_64" = "integration/vscode/ada/x64/darwin/ada_language_server"
+"macos-aarch64" = "integration/vscode/ada/arm64/darwin/ada_language_server"
 
 [servers.al]
 languages = ["al"]
@@ -344,6 +408,7 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 
 [servers.cue]
 languages = ["cue"]
+extensions = [".cue"]
 install = "download"
 exec = ["{bin}", "lsp"]
 source_commit = "43ae0211"
@@ -822,6 +887,7 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 # taplo。unix 资产为 single-gz（非 tar.gz），解压落盘名由安装器固定（pkg 名去 .gz），
 # bin_path 依 install.rs SingleGz 语义填 `download`。
 languages = ["toml"]
+extensions = [".toml"]
 install = "download"
 exec = ["{bin}", "lsp", "stdio"]
 source_commit = "43ae0211"
@@ -851,8 +917,12 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 
 [servers.terraform]
 languages = ["terraform"]
+extensions = [".tf", ".tfvars"]
 install = "download"
-exec = ["{bin}"]
+# ↖ mirror: terraform_ls.py@43ae0211 ProcessLaunchInfo cmd = "{path} serve"（7a296833
+# 同值）——terraform-ls CLI 仅 serve/version 两子命令（v0.36.5 main.go 实锚），裸二进制
+# 只打印帮助即退出，`serve` 缺不得。
+exec = ["{bin}", "serve"]
 source_commit = "43ae0211"
 
 [servers.terraform.download]
@@ -990,9 +1060,14 @@ package = "@foundry-rs/forge"
 version = "1.5.1"
 
 [servers.scss]
-languages = ["scss"]
+# W2 批接线：路由语言名 scss → sass（LanguageId::Sass / --lang sass / didOpen 官方
+# "scss" 经 lsp_language_id 换算；条目 id 保持 scss = npm 缓存目录键）。手写 T2 适配器
+# （sass.rs）接管会话（somesass 配置片 + configuration 应答，↖ mirror
+# some_sass_language_server.py@7a296833）；本条服务 `serena-cli install sass` 与 doctor。
+# 旧语言名 "scss" 此前无 LanguageId 入口（--lang scss 从不可达），改名无用户可见破坏。
+languages = ["sass"]
 install = "npm"
-source_commit = "43ae0211"
+source_commit = "7a296833"
 [servers.scss.npm]
 package = "some-sass-language-server"
 version = "2.3.8"
@@ -1000,6 +1075,10 @@ bin_rel = "some-sass-language-server"
 npm_args = ["--stdio"]
 
 [servers.svelte]
+# W2 批接线：手写 T2 hybrid 适配器（svelte.rs）接管会话——主 svelteserver + 伴生
+# typescript-language-server 挂 typescript-svelte-plugin（↖ mirror
+# svelte_language_server.py@7a296833；四包 pin 与下方 secondary_packages 同源）；
+# 本条服务 `serena-cli install svelte` 与 doctor 探测。
 languages = ["svelte"]
 install = "npm"
 source_commit = "43ae0211"
@@ -1211,6 +1290,7 @@ args = ["stdio"]
 # 上游 nixd_ls.py 安装面 = nix-env/nix profile；本表以 flake 源码构建形态收录
 # （clone + nix build 单步）。Windows 无 Nix 支持（上游同）。
 languages = ["nix"]
+extensions = [".nix"]
 install = "source"
 source_commit = "43ae0211"
 [servers.nixd.source]

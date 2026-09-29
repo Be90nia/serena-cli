@@ -1,0 +1,6 @@
+.box {
+    color: red;
+    &.big {
+        font-size: 2rem;
+    }
+}

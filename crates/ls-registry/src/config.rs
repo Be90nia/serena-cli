@@ -325,7 +325,7 @@ pub fn to_install_spec(
                     sha256,
                     archive,
                     strip_components: dl.strip_components,
-                    bin_path: dl.bin_path.clone(),
+                    bin_path: dl.resolved_bin_path(&key).to_string(),
                     allowed_hosts: dl.allowed_hosts.clone(),
                 },
                 exec: spec.exec.clone(),
@@ -618,7 +618,10 @@ pub fn ensure_launch(
             let install_spec = to_install_spec(spec, id, os, arch)?;
             let cache_root = dirs_cache_root();
             // 安装目录缓存命中（未触网）：{cache_root}/{id}/{version}/{bin_path}。
-            let exe = cache_root.join(id).join(&dl.version).join(&dl.bin_path);
+            let exe = cache_root
+                .join(id)
+                .join(&dl.version)
+                .join(dl.resolved_bin_path(&platform_key(os, arch)));
             if exe.is_file() {
                 let expanded = expand_exec(&spec.exec, &exe);
                 return Ok((exe, expanded));
@@ -1195,5 +1198,108 @@ package = "@vue/language-server"
             "无点前缀也命中"
         );
         assert_eq!(match_external_ext(&t, "other"), None);
+    }
+
+    const BIN_PATH_OVERRIDE_TOML: &str = r#"
+        [servers.pp]
+        languages = ["pp"]
+        install = "download"
+        exec = ["{bin}"]
+        [servers.pp.download]
+        version = "1.0.0"
+        archive = "zip"
+        bin_path = "bin/win/ls.exe"
+        allowed_hosts = ["github.com"]
+        [servers.pp.download.url_per_platform]
+        "windows-x86_64" = "https://github.com/x/win.zip"
+        "linux-x86_64" = "https://github.com/x/linux.tar.gz"
+        [servers.pp.download.sha256_per_platform]
+        "windows-x86_64" = "aa"
+        "linux-x86_64" = "bb"
+        [servers.pp.download.bin_path_per_platform]
+        "linux-x86_64" = "bin/linux/ls"
+    "#;
+
+    /// per-OS 覆盖核心契约：无覆盖（windows 组）= 单值现状；有覆盖 = 按 target_os
+    /// 取值（linux 组取 bin_path_per_platform）。
+    #[test]
+    fn to_install_spec_resolves_per_platform_bin_path_override() {
+        let parsed = parse(BIN_PATH_OVERRIDE_TOML).unwrap();
+        let spec = &parsed.servers["pp"];
+
+        // 有覆盖：linux-x86_64 命中覆盖表 → 取 linux 值（ubuntu runner 用形态）。
+        let linux = to_install_spec(spec, "pp", Os::Linux, ls_runtime::deps::Arch::X86_64).unwrap();
+        match linux.kind {
+            InstallKind::Download { bin_path, .. } => assert_eq!(bin_path, "bin/linux/ls"),
+            other => panic!("expect Download, got {other:?}"),
+        }
+
+        // 无覆盖：windows-x86_64 不在覆盖表 → 回退单值（既有 windows 语义不变）。
+        let win = to_install_spec(spec, "pp", Os::Windows, ls_runtime::deps::Arch::X86_64).unwrap();
+        match win.kind {
+            InstallKind::Download { bin_path, .. } => assert_eq!(bin_path, "bin/win/ls.exe"),
+            other => panic!("expect Download, got {other:?}"),
+        }
+    }
+
+    /// resolved_bin_path 回退矩阵：覆盖命中 / 覆盖表存在但 key 未命中 / 无覆盖表。
+    #[test]
+    fn resolved_bin_path_falls_back_to_single_value_on_miss() {
+        let parsed = parse(BIN_PATH_OVERRIDE_TOML).unwrap();
+        let dl = parsed.servers["pp"].download.as_ref().unwrap();
+        assert_eq!(dl.resolved_bin_path("linux-x86_64"), "bin/linux/ls");
+        assert_eq!(
+            dl.resolved_bin_path("macos-aarch64"),
+            "bin/win/ls.exe",
+            "覆盖表 key 未命中 → 回退单值"
+        );
+
+        let no_override = parse(
+            r#"
+            [servers.np]
+            languages = ["np"]
+            install = "download"
+            [servers.np.download]
+            version = "1"
+            archive = "raw"
+            bin_path = "ls.exe"
+            [servers.np.download.url_per_platform]
+            "windows-x86_64" = "https://github.com/x/ls.exe"
+            [servers.np.download.sha256_per_platform]
+            "windows-x86_64" = "cc"
+            "#,
+        )
+        .unwrap();
+        let dl = no_override.servers["np"].download.as_ref().unwrap();
+        assert_eq!(
+            dl.resolved_bin_path("linux-x86_64"),
+            "ls.exe",
+            "无覆盖表 = 全平台单值（现状）"
+        );
+    }
+
+    /// 覆盖表值非空校验：空串拒绝（与单值 bin_path 同纪律）。
+    #[test]
+    fn empty_bin_path_override_is_invalid() {
+        let toml_str = r#"
+            [servers.bad]
+            languages = ["bad"]
+            install = "download"
+            [servers.bad.download]
+            version = "1"
+            archive = "raw"
+            bin_path = "ls.exe"
+            [servers.bad.download.url_per_platform]
+            "windows-x86_64" = "https://github.com/x/ls.exe"
+            [servers.bad.download.sha256_per_platform]
+            "windows-x86_64" = "cc"
+            [servers.bad.download.bin_path_per_platform]
+            "linux-x86_64" = ""
+            "#;
+        let err = parse(toml_str).unwrap_err();
+        assert!(
+            err.contains("bin_path_per_platform.linux-x86_64 must not be empty"),
+            "want override-empty error, got: {err}"
+        );
     }
 }

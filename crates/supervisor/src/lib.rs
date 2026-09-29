@@ -9866,8 +9866,20 @@ mod find_symbol_ls_error_tests {
             hits.iter().any(|h| h.name == "alpha_main"),
             "rust hits must survive python LS failure; hits={hits:?} warnings={warnings:?}"
         );
-        assert_eq!(warnings.len(), 1, "warnings={warnings:?}");
-        assert!(warnings[0].starts_with("python: "), "warnings={warnings:?}");
+        // W1a 起 .toml 归 taplo 门（EXT_TABLE 路由）：fixture 的 Cargo.toml（RA workspace
+        // 模式必需）使 toml 成为第三语言——本机无 taplo → 与 python 同进 failures/warnings
+        // （InvalidSpec=表缺该平台组 / NotInstalled=已解析未安装，视平台而定）。
+        // 断言收窄为「python 警告在场 + 警告全集已知」，不再锁死总数。
+        assert!(
+            warnings.iter().any(|w| w.starts_with("python: ")),
+            "python failure must be warned; warnings={warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.starts_with("python: ") || w.starts_with("toml: ")),
+            "unexpected warning surfaced; warnings={warnings:?}"
+        );
 
         // 分支 3：同 root 仅查 rust（session 已 warm、索引已就绪）→ 全成功无 warning。
         let (hits, warnings) = sup

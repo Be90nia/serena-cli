@@ -359,6 +359,21 @@ fn check_local_ls() -> Vec<Check> {
         "run `serena-cli install dart`",
     ));
     out.push(check_download_ls(
+        "toml",
+        "taplo (TOML LS, W1a)",
+        "run `serena-cli install toml`",
+    ));
+    out.push(check_download_ls(
+        "terraform",
+        "terraform-ls (Terraform LS, W1a)",
+        "run `serena-cli install terraform`",
+    ));
+    out.push(check_download_ls(
+        "cue",
+        "cue lsp (built into the cue CLI, W1a)",
+        "run `serena-cli install cue`",
+    ));
+    out.push(check_download_ls(
         "marksman",
         "marksman (Markdown LS)",
         "run `serena-cli install markdown`",
@@ -367,6 +382,41 @@ fn check_local_ls() -> Vec<Check> {
         "powershell",
         "PowerShellEditorServices (PowerShell LS)",
         "run `serena-cli install powershell` (requires `pwsh` 7+ on PATH; see the runtime checks above)",
+    ));
+    // W1b 批（ansible/rego/nextflow）。
+    out.push(check_npm_ls(
+        "ansible-language-server",
+        "ansible",
+        "ansible-language-server (Ansible LS, W1b)",
+        "serena-cli install ansible",
+    ));
+    out.push(check_download_ls(
+        "regal",
+        "regal (Rego/OPA language server, W1b)",
+        "run `serena-cli install regal`",
+    ));
+    out.push(check_download_ls(
+        "nextflow",
+        "Nextflow language server (fat JAR, W1b)",
+        "run `serena-cli install nextflow` (requires JDK 17+ on PATH)",
+    ));
+    // W2 批（svelte/deno/sass）。
+    out.push(check_npm_ls(
+        "svelteserver",
+        "svelte",
+        "svelteserver (Svelte LS, hybrid with companion TS LS, W2)",
+        "serena-cli install svelte",
+    ));
+    out.push(check_download_ls(
+        "deno",
+        "deno lsp (Deno LS, W2)",
+        "run `serena-cli install deno`",
+    ));
+    out.push(check_npm_ls(
+        "some-sass-language-server",
+        "scss",
+        "some-sass-language-server (Sass/SCSS LS, W2 — spec id scss, language name sass)",
+        "serena-cli install sass",
     ));
     out
 }
@@ -443,13 +493,18 @@ fn probe_cached_npm_ls_at(
 }
 
 /// serena download 缓存装态（spec 驱动）：`{cache}/{id}/{version}/{bin_path}`。
+/// bin_path 走 per-platform 解析（与 ensure_launch 缓存命中同源）。
 fn probe_cached_download_ls(spec_id: &str) -> Option<PathBuf> {
     let (_, spec) = ls_registry::config::spec_for(spec_id)?;
     let dl = spec.download.as_ref()?;
+    let key = ls_registry::config::platform_key(
+        ls_runtime::deps::Os::current(),
+        ls_runtime::deps::Arch::current(),
+    );
     let p = dirs_cache_root()
         .join(spec_id)
         .join(&dl.version)
-        .join(&dl.bin_path);
+        .join(dl.resolved_bin_path(&key));
     p.is_file().then_some(p)
 }
 
@@ -835,10 +890,16 @@ mod tests {
             "sql",
             "kotlin",
             "dart",
+            "toml",
+            "terraform",
+            "cue",
             "vscode-html-language-server",
             "vscode-css-language-server",
             "yaml-language-server",
             "marksman",
+            "ansible-language-server",
+            "regal",
+            "nextflow",
         ] {
             let c = r
                 .checks
