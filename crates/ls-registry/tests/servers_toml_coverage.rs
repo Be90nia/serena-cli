@@ -314,7 +314,7 @@ fn phase3_pkg_entries_parse_with_upstream_pins() {
     }
     assert_eq!(
         servers["pyright"].uvx.as_ref().unwrap().version.as_deref(),
-        Some("1.1.403")
+        Some("1.1.414")
     );
     assert_eq!(
         servers["pyright"].uvx.as_ref().unwrap().entrypoint,

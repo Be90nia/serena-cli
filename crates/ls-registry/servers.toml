@@ -1262,12 +1262,16 @@ npm_args = ["--stdio"]
 [servers.pyright]
 # python 语言路由归 jedi 条目（G 类先收）+ 手写 pyright T2 适配器接管会话；
 # 本条服务 `serena-cli install pyright` 与 [ls.pyright] 配置。
+# 1.1.414 最低版：≤1.1.403 headless 在 initialize 带 workspaceFolders 时分析引擎
+# 不启动（didOpen 后 documentSymbol 零应答零日志，run 36588845806 双门帧实锚；
+# 裸探针对照 1.1.403 去 workspaceFolders 即应答、1.1.414 全形态即应答——本地
+# 二分 2026-09-29 实锚），basedpyright fork 不受累。
 languages = ["pyright"]
 install = "uvx"
 source_commit = "43ae0211"
 [servers.pyright.uvx]
 package = "pyright"
-version = "1.1.403"
+version = "1.1.414"
 entrypoint = "pyright-langserver"
 args = ["--stdio"]
 

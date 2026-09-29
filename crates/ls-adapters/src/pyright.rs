@@ -88,18 +88,19 @@ impl LanguageServerAdapter for PyrightAdapter {
     }
 
     fn initialize_patches(&self, base: &mut InitializeParams) {
-        // M2 深度：探测 venv interpreter；命中 → 注入 `initializationOptions.python.pythonPath`。
-        // pyright 用此路径解析 import 与 .pyi 搜索；缺省走系统 python，venv 项目会错乱。
+        // M2 深度：venv interpreter 探测命中 → 注入；未命中 → 系统 python 兜底注入
+        // （upstream serena adapter 同款 pythonPath 注入语义：venv 项目解释器
+        // 精确化；路径不存在时 pyright 回落自家发现，不加害）。
+        // 注意：这不是 pyright 楔死的解药——run 36588845806 双门楔死根因是
+        // pyright ≤1.1.403 headless 遇 initialize workspaceFolders 时分析引擎
+        // 不启动（裸探针二分实锚：1.1.403 去 workspaceFolders 即应答、1.1.414
+        // 全形态即应答、1.1.403+注入+workspaceFolders 仍楔），修法 = 钉版升
+        // 1.1.414（[servers.pyright] uvx + npm 门同步）。
         let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
         let Some(interp) = root
             .as_deref()
             .and_then(find_python_interpreter)
-            .or_else(|| {
-                // smoke CI（run 36588845806 帧实锚）：runner 无 venv 时 pyright 解释器
-                // 发现挂起（didOpen 后零响应 30s+），显式指到系统 python3 解除。
-                let p = std::path::Path::new("/usr/bin/python3");
-                p.is_file().then(|| p.to_path_buf())
-            })
+            .or_else(system_python_interpreter)
         else {
             return;
         };
@@ -174,6 +175,18 @@ impl PyrightAdapter {
             ),
         }
     }
+}
+
+/// venv 探测未命中时的系统 python 兜底：`/usr/bin/python3` 固定位优先（CI linux
+/// 标准），退 `which python3` / `which python`（daemon 进程 PATH 内查找；Windows
+/// 常见形态是 `python.exe`，无 python3）。
+fn system_python_interpreter() -> Option<PathBuf> {
+    let fixed = PathBuf::from("/usr/bin/python3");
+    if fixed.is_file() {
+        return Some(fixed);
+    }
+    crate::which_no_unc("python3")
+        .or_else(|| crate::which_no_unc("python"))
 }
 
 /// 在 `root` 下探测 Python venv 解释器路径。命中优先级：

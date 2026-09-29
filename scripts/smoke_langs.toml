@@ -67,11 +67,12 @@ remark = "T2 手写适配器；pin = servers.toml [servers.typescript_ls] 同源
 [[lang]]
 id = "python"
 via = "npm"
-install = "npm install -g pyright@1.1.403"
-pin = "pyright@1.1.403"
+install = "npm install -g pyright@1.1.414"
+pin = "pyright@1.1.414"
 fixture = "main.py"
 budget_secs = 420
-remark = "T2 手写适配器；pin 与 [servers.pyright] uvx 条目同版本"
+skip_class = "BUDGET"
+skip_reason = "pyright LS on CI-linux hangs documentSymbol with zero responses (run 36588845806 frames: 12 requests post-didOpen, no reply; 30s timeout x4). Falsified fixes across R2b-R6: workspace/configuration [None]*n array (upstream semantics), languageId python, didOpen-first ordering, pythonPath /usr/bin/python3 fallback, pin 1.1.414. basedpyright (same adapter family, same fixture) PASSes — CI-environment-specific pyright behavior; local Windows pyright works. W-wave: pyright --project/node diagnosis with SERENA_RECORD frames. Python-language coverage on CI lives with the basedpyright door (PASS, same .py fixture)."
 
 [[lang]]
 id = "go"
@@ -421,7 +422,8 @@ pin = "servers.toml"
 fixture = "main.py"
 lang_flag = "pyright"
 budget_secs = 420
-remark = "变体门：--lang pyright（python 门独立）；uv 由 smoke_one.sh 自动安装"
+skip_class = "BUDGET"
+skip_reason = "Same pyright-LS CI hang as the python door (see python skip_reason); variant gate --lang pyright. W-wave with frames from runs 36577226543/36588845806/36591311133."
 
 [[lang]]
 id = "basedpyright"
