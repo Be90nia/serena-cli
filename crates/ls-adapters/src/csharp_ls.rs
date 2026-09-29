@@ -182,7 +182,9 @@ fn find_unique_sln(root: &Path) -> Option<PathBuf> {
     let mut found = Vec::new();
     walk(root, 4, &mut found);
     match found.len() {
-        1 => found.pop().and_then(|p| p.strip_prefix(root).ok().map(Path::to_path_buf)),
+        1 => found
+            .pop()
+            .and_then(|p| p.strip_prefix(root).ok().map(Path::to_path_buf)),
         _ => None,
     }
 }
@@ -241,7 +243,10 @@ mod tests {
         std::fs::create_dir_all(&vendored).unwrap();
         std::fs::write(dir.path().join("App.sln"), "").unwrap();
         std::fs::write(vendored.join("Vendored.sln"), "").unwrap();
-        assert_eq!(find_unique_sln(dir.path()).unwrap(), std::path::PathBuf::from("App.sln"));
+        assert_eq!(
+            find_unique_sln(dir.path()).unwrap(),
+            std::path::PathBuf::from("App.sln")
+        );
     }
 
     /// ≥2 个非忽略 .sln：意图不明 → None，保持 csharp-ls 自动发现（零回归）。

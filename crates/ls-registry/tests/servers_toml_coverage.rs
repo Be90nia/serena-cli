@@ -478,8 +478,12 @@ fn batch56a_docker_sql_entries_pins_match_research() {
     assert_eq!(dl.archive, "zip");
     assert_eq!(dl.bin_path, "sqls.exe");
     assert_eq!(
-        dl.url_per_platform.get("windows-x86_64").map(String::as_str),
-        Some("https://github.com/sqls-server/sqls/releases/download/v0.2.48/sqls-windows-0.2.48.zip")
+        dl.url_per_platform
+            .get("windows-x86_64")
+            .map(String::as_str),
+        Some(
+            "https://github.com/sqls-server/sqls/releases/download/v0.2.48/sqls-windows-0.2.48.zip"
+        )
     );
     assert_eq!(
         dl.sha256_per_platform
@@ -564,8 +568,12 @@ fn kotlin_dart_entries_pins_match_upstream_7a296833() {
         vec!["download-cdn.jetbrains.com".to_string()]
     );
     assert_eq!(
-        kdl.url_per_platform.get("windows-x86_64").map(String::as_str),
-        Some("https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0.win.zip")
+        kdl.url_per_platform
+            .get("windows-x86_64")
+            .map(String::as_str),
+        Some(
+            "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0.win.zip"
+        )
     );
     assert_eq!(
         kdl.sha256_per_platform
@@ -585,8 +593,12 @@ fn kotlin_dart_entries_pins_match_upstream_7a296833() {
     assert_eq!(ddl.archive, "zip");
     assert_eq!(ddl.bin_path, "dart-sdk/bin/dart.exe");
     assert_eq!(
-        ddl.url_per_platform.get("windows-x86_64").map(String::as_str),
-        Some("https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-windows-x64-release.zip")
+        ddl.url_per_platform
+            .get("windows-x86_64")
+            .map(String::as_str),
+        Some(
+            "https://storage.googleapis.com/dart-archive/channels/stable/release/3.7.1/sdk/dartsdk-windows-x64-release.zip"
+        )
     );
     assert_eq!(
         ddl.sha256_per_platform
@@ -618,8 +630,12 @@ fn batch56a2_pgls_sqls_mysql_entries_pins_match_research() {
     assert_eq!(dl.archive, "raw");
     assert_eq!(dl.bin_path, "postgres-language-server.exe");
     assert_eq!(
-        dl.url_per_platform.get("windows-x86_64").map(String::as_str),
-        Some("https://github.com/supabase-community/postgres-language-server/releases/download/0.25.7/postgres-language-server_x86_64-pc-windows-msvc.exe")
+        dl.url_per_platform
+            .get("windows-x86_64")
+            .map(String::as_str),
+        Some(
+            "https://github.com/supabase-community/postgres-language-server/releases/download/0.25.7/postgres-language-server_x86_64-pc-windows-msvc.exe"
+        )
     );
     assert_eq!(
         dl.sha256_per_platform
@@ -655,9 +671,9 @@ fn batch56a2_pgls_sqls_mysql_entries_pins_match_research() {
 /// 默认归属承诺：.sql 扩展名归 sql 门，pgsql/mysql 不经扩展名抢占（--lang 才可达）。
 #[test]
 fn lang_override_routes_pgsql_mysql_to_batch2_entries() {
+    use ls_registry::LanguageId;
     use ls_registry::adapter_for;
     use ls_registry::config::spec_for;
-    use ls_registry::LanguageId;
 
     for (lang, want_id) in [("pgsql", "pgls"), ("mysql", "sqls-mysql")] {
         // --lang 透传值 → spec_for 命中本批条目（install 链 / doctor hint 同源）。
@@ -673,19 +689,13 @@ fn lang_override_routes_pgsql_mysql_to_batch2_entries() {
     }
 
     // LanguageId 反查（doctor / install 按语言名工作所需的入口面）。
-    assert_eq!(
-        LanguageId::from_str_opt("pgsql"),
-        Some(LanguageId::Pgsql)
-    );
+    assert_eq!(LanguageId::from_str_opt("pgsql"), Some(LanguageId::Pgsql));
     assert_eq!(
         LanguageId::from_str_opt("postgres"),
         Some(LanguageId::Pgsql),
         "postgres 别名同归 Pgsql"
     );
-    assert_eq!(
-        LanguageId::from_str_opt("mysql"),
-        Some(LanguageId::Mysql)
-    );
+    assert_eq!(LanguageId::from_str_opt("mysql"), Some(LanguageId::Mysql));
     // 优先级语义：.sql 默认归 sql 门（兄弟批 EXT_TABLE 落地），pgsql/mysql 门
     // 不经扩展名路由——from_extension 任何情况下不得返回本批语言。
     for ext in ["sql", "SQL", "ddl"] {
@@ -708,9 +718,9 @@ fn lang_override_routes_pgsql_mysql_to_batch2_entries() {
 /// （.md/.markdown/.yaml/.yml）；yaml npm 条目 pin 锚（上游 DEFAULT_YAML_LANGUAGE_SERVER_VERSION）。
 #[test]
 fn lang_yaml_markdown_routes_and_ext_roundtrip() {
+    use ls_registry::LanguageId;
     use ls_registry::adapter_for;
     use ls_registry::config::spec_for;
-    use ls_registry::LanguageId;
 
     for (lang, want_id) in [("yaml", "yaml"), ("markdown", "marksman")] {
         // --lang 透传值 → spec_for 命中条目（install 链 / doctor hint 同源）。
@@ -730,10 +740,7 @@ fn lang_yaml_markdown_routes_and_ext_roundtrip() {
     assert_eq!(LanguageId::from_str_opt("yaml"), Some(LanguageId::Yaml));
     assert_eq!(LanguageId::from_extension("yaml"), Some(LanguageId::Yaml));
     assert_eq!(LanguageId::from_extension("yml"), Some(LanguageId::Yaml));
-    assert_eq!(
-        LanguageId::from_extension("md"),
-        Some(LanguageId::Markdown)
-    );
+    assert_eq!(LanguageId::from_extension("md"), Some(LanguageId::Markdown));
     assert_eq!(
         LanguageId::from_extension("markdown"),
         Some(LanguageId::Markdown)
@@ -788,9 +795,9 @@ fn yaml_entry_pins_match_upstream() {
 /// from_extension('yml') 回归（ansible 条目不得影响 yaml 路由）。
 #[test]
 fn w1b_ansible_rego_nextflow_routes_and_ext_roundtrip() {
+    use ls_registry::LanguageId;
     use ls_registry::adapter_for;
     use ls_registry::config::spec_for;
-    use ls_registry::LanguageId;
 
     for (lang, want_id) in [
         ("ansible", "ansible"),
@@ -903,10 +910,10 @@ fn regal_entry_download_upgrade_pins() {
     }
     // 真值 spot-check（转写防错：linux-x86_64 全值 + windows 资产名）。
     assert_eq!(
-        dl.url_per_platform
-            .get("linux-x86_64")
-            .map(String::as_str),
-        Some("https://github.com/open-policy-agent/regal/releases/download/v0.42.0/regal_Linux_x86_64")
+        dl.url_per_platform.get("linux-x86_64").map(String::as_str),
+        Some(
+            "https://github.com/open-policy-agent/regal/releases/download/v0.42.0/regal_Linux_x86_64"
+        )
     );
     assert_eq!(
         dl.sha256_per_platform
@@ -970,11 +977,9 @@ fn ansible_nextflow_entry_pins_match_upstream() {
     assert_eq!(dl.bin_path, "language-server-all.jar");
     assert_eq!(dl.sha256_per_platform.len(), 5);
     assert!(
-        dl.url_per_platform
-            .values()
-            .all(|u| u.starts_with(
-                "https://github.com/nextflow-io/language-server/releases/download/v26.04.3/"
-            )),
+        dl.url_per_platform.values().all(|u| u.starts_with(
+            "https://github.com/nextflow-io/language-server/releases/download/v26.04.3/"
+        )),
         "nextflow: url org/tag"
     );
     assert_eq!(
@@ -1047,7 +1052,9 @@ fn w1a_config_entries_pins_match_upstream() {
     );
     assert_eq!(
         fdl.url_per_platform.get("linux-x86_64").map(String::as_str),
-        Some("https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_linux_amd64.zip")
+        Some(
+            "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_linux_amd64.zip"
+        )
     );
     assert_eq!(
         fdl.sha256_per_platform
@@ -1095,9 +1102,9 @@ fn w1a_config_entries_pins_match_upstream() {
 /// "terraform" / cue "cue" / nixd "nix"，上游适配器第四参原值）。
 #[test]
 fn lang_w1a_routes_and_ext_roundtrip() {
+    use ls_registry::LanguageId;
     use ls_registry::adapter_for;
     use ls_registry::config::spec_for;
-    use ls_registry::LanguageId;
 
     for (lang, want_id) in [
         ("toml", "toml"),
@@ -1123,10 +1130,7 @@ fn lang_w1a_routes_and_ext_roundtrip() {
     assert_eq!(LanguageId::from_str_opt("cue"), Some(LanguageId::Cue));
     assert_eq!(LanguageId::from_str_opt("nix"), Some(LanguageId::Nix));
 
-    assert_eq!(
-        LanguageId::from_extension("toml"),
-        Some(LanguageId::Toml)
-    );
+    assert_eq!(LanguageId::from_extension("toml"), Some(LanguageId::Toml));
     assert_eq!(
         LanguageId::from_extension("tf"),
         Some(LanguageId::Terraform)
@@ -1169,18 +1173,14 @@ fn lang_w1a_routes_and_ext_roundtrip() {
 /// 镜像锚，hybrid 语义核心）。
 #[test]
 fn w2_svelte_deno_sass_doors_wired() {
+    use ls_registry::LanguageId;
     use ls_registry::adapter_for;
     use ls_registry::config::spec_for;
-    use ls_registry::LanguageId;
 
     let servers = parsed_servers();
 
     // --lang 透传值 → spec_for 命中条目；三门 T2 分流（session_for 走手写 adapter）。
-    for (lang, want_id) in [
-        ("svelte", "svelte"),
-        ("deno", "deno"),
-        ("sass", "scss"),
-    ] {
+    for (lang, want_id) in [("svelte", "svelte"), ("deno", "deno"), ("sass", "scss")] {
         let (id, _) =
             spec_for(lang).unwrap_or_else(|| panic!("--lang {lang} must route to a spec"));
         assert_eq!(id, want_id, "spec_for(\"{lang}\") routes to [servers.{id}]");

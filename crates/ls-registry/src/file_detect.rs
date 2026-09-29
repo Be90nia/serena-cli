@@ -28,7 +28,10 @@ fn by_filename(name: &str) -> Option<LanguageId> {
         // Dockerfile 及点后缀变体（Dockerfile.dev / Dockerfile.prod 等，vscode-docker
         // 同款 `Dockerfile*` 惯例；大小写不敏感）。"dockerfile2" 这类无点粘连不命中。
         _ if name.eq_ignore_ascii_case("dockerfile") => Some(LanguageId::Docker),
-        _ if name.get(..11).is_some_and(|p| p.eq_ignore_ascii_case("dockerfile.")) => {
+        _ if name
+            .get(..11)
+            .is_some_and(|p| p.eq_ignore_ascii_case("dockerfile.")) =>
+        {
             Some(LanguageId::Docker)
         }
         _ => None,

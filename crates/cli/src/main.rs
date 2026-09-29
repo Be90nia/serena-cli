@@ -1117,7 +1117,12 @@ const SEMANTIC_PROBE_SYMBOLS: usize = 3;
 /// 行内定位符号名的 UTF-16 列（LSP Position.character 契约）；行内无该名 → None。
 fn name_column_in_line(line_text: &str, name: &str) -> Option<u32> {
     let byte_col = line_text.find(name)?;
-    Some(line_text[..byte_col].chars().map(char::len_utf16).sum::<usize>() as u32)
+    Some(
+        line_text[..byte_col]
+            .chars()
+            .map(char::len_utf16)
+            .sum::<usize>() as u32,
+    )
 }
 
 /// semantic 档 hover 探针候选位置（bd serena-rust-7m8）：overview 符号数组 →
@@ -2182,8 +2187,7 @@ fn cmd_uninstall(lang: &str, json: bool) -> ExitCode {
     };
     if matches!(
         spec.kind_table(),
-        Some(ls_registry::spec::KindRef::PathOnly(_))
-            | Some(ls_registry::spec::KindRef::Uvx(_))
+        Some(ls_registry::spec::KindRef::PathOnly(_)) | Some(ls_registry::spec::KindRef::Uvx(_))
     ) {
         eprintln!("uninstall: `{id}` is not serena-managed (no cache dir); nothing removed");
         return ExitCode::from(1);
@@ -2445,7 +2449,9 @@ fn reap_residual_listener(port: u16) {
             }
         }
         Some(other) => {
-            eprintln!("warning: port {port} held by non-daemon process {other} (pid {pid}); not killing")
+            eprintln!(
+                "warning: port {port} held by non-daemon process {other} (pid {pid}); not killing"
+            )
         }
         None => eprintln!("{}", residual_warn_msg(Some(pid), port)),
     }
@@ -2513,7 +2519,10 @@ fn pid_process_name(pid: u32) -> Option<String> {
     if !line.starts_with('"') {
         return None;
     }
-    line.trim_matches('"').split("\",\"").next().map(str::to_string)
+    line.trim_matches('"')
+        .split("\",\"")
+        .next()
+        .map(str::to_string)
 }
 
 #[cfg(not(windows))]
@@ -2522,7 +2531,11 @@ fn pid_process_name(pid: u32) -> Option<String> {
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .output()
         .ok()?;
-    let name = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    let name = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
     (!name.is_empty()).then_some(name)
 }
 
@@ -2556,7 +2569,9 @@ fn kill_process(pid: u32) -> bool {
 fn residual_warn_msg(pid: Option<u32>, port: u16) -> String {
     match pid {
         Some(p) => format!("残留 daemon pid={p} 仍占端口 {port}，请手动 taskkill /F /PID {p}"),
-        None => format!("端口 {port} 仍有 listener 但反查 PID 失败，请手动 netstat -ano 查占并 taskkill"),
+        None => format!(
+            "端口 {port} 仍有 listener 但反查 PID 失败，请手动 netstat -ano 查占并 taskkill"
+        ),
     }
 }
 

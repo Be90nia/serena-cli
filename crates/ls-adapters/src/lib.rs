@@ -24,8 +24,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lsp_types::InitializeParams;
 
-pub mod basedpyright_server;
 pub mod astro;
+pub mod basedpyright_server;
 pub mod bash;
 pub mod clangd;
 pub mod csharp_ls;

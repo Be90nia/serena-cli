@@ -132,7 +132,10 @@ fn patch_main_options(base: &mut InitializeParams) {
 /// 未知）回空对象（↖ mirror `_handle_workspace_configuration`）。
 fn configuration_reply(msg: JsonRpc) -> Option<Value> {
     let section_slice = somesass_section();
-    let somesass = section_slice.get("somesass").cloned().expect("somesass key");
+    let somesass = section_slice
+        .get("somesass")
+        .cloned()
+        .expect("somesass key");
     let items = msg
         .params
         .as_ref()?
@@ -234,7 +237,10 @@ mod tests {
         let mut p = InitializeParams::default();
         patch_main_options(&mut p);
         let opts = p.initialization_options.expect("options written");
-        assert_eq!(opts["somesass"]["suggest"]["suggestFromUseOnly"], json!(false));
+        assert_eq!(
+            opts["somesass"]["suggest"]["suggestFromUseOnly"],
+            json!(false)
+        );
         assert_eq!(opts["somesass"]["css"]["hover"]["enabled"], json!(true));
         // lint 关（上游刻意）：诊断开着但主观 lint 规则不上。
         assert_eq!(
@@ -254,10 +260,7 @@ mod tests {
             ] }),
         );
         let somesass = somesass_section()["somesass"].clone();
-        assert_eq!(
-            configuration_reply(msg),
-            Some(json!([somesass, {}, {}]))
-        );
+        assert_eq!(configuration_reply(msg), Some(json!([somesass, {}, {}])));
         // 缺 items → None（默认 null 成功应答路径在 client 层）。
         let msg = JsonRpc::notification("workspace/configuration", json!({}));
         assert_eq!(configuration_reply(msg), None);
@@ -285,7 +288,11 @@ mod tests {
             Ok(info) => {
                 // 本机恰有 node + 缓存：断言 stdio 形态兜底。
                 assert!(matches!(info.transport, TransportKind::Stdio));
-                assert!(info.cmd.iter().any(|a| a.to_string_lossy().ends_with("--stdio")));
+                assert!(
+                    info.cmd
+                        .iter()
+                        .any(|a| a.to_string_lossy().ends_with("--stdio"))
+                );
             }
         }
     }

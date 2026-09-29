@@ -446,19 +446,21 @@ impl Session {
         // 首个 `$/progress` begin 到达）也计入在飞 token，否则 create→begin 窗口会被
         // 首查 start-grace 轮询误判为「无需索引」提前放行。返回 None → 默认 null 成功
         // （LSP 规范 result: null）。
-        session.client.on_server_request("window/workDoneProgress/create", {
-            let session = Arc::downgrade(&session);
-            move |msg| {
-                // `?`：Weak 升级失败（session 已终态）→ handler 返回 None，默认 null 成功。
-                let session = session.upgrade()?;
-                if let Some(params) = msg.params.as_ref()
-                    && let Some(token) = progress_token_to_string(params.get("token"))
-                {
-                    session.index_progress.track(&token, true);
+        session
+            .client
+            .on_server_request("window/workDoneProgress/create", {
+                let session = Arc::downgrade(&session);
+                move |msg| {
+                    // `?`：Weak 升级失败（session 已终态）→ handler 返回 None，默认 null 成功。
+                    let session = session.upgrade()?;
+                    if let Some(params) = msg.params.as_ref()
+                        && let Some(token) = progress_token_to_string(params.get("token"))
+                    {
+                        session.index_progress.track(&token, true);
+                    }
+                    None
                 }
-                None
-            }
-        });
+            });
 
         // 握手：发 initialize → 等响应（最多 HANDSHAKE_TIMEOUT）→ 发 initialized 通知。
         // 拿到 initialize 响应的 `capabilities` 子对象存入 Session（PLAN Phase 2.5，
@@ -653,7 +655,11 @@ impl Session {
 
     /// didOpen 应上送的 languageId：扩展名命中覆盖表用表值，否则会话单值。
     pub(crate) fn language_id_for(&self, path: &Path) -> String {
-        resolve_language_id_for(&self.language_id(), &self.language_by_ext.lock().unwrap(), path)
+        resolve_language_id_for(
+            &self.language_id(),
+            &self.language_by_ext.lock().unwrap(),
+            path,
+        )
     }
 
     /// 当前 `didOpen` languageId 快照（docsync 发 didOpen 时读；supervisor 另用于
@@ -895,7 +901,10 @@ mod tests {
             "typescript"
         );
         // 未命中（无扩展名 / 表外扩展名）→ 会话默认。
-        assert_eq!(resolve_language_id_for("vue", &table, Path::new("App")), "vue");
+        assert_eq!(
+            resolve_language_id_for("vue", &table, Path::new("App")),
+            "vue"
+        );
         assert_eq!(
             resolve_language_id_for("vue", &table, Path::new("x.css")),
             "vue"
@@ -1027,7 +1036,10 @@ mod tests {
     #[tokio::test]
     async fn cross_file_drain_immediate_when_no_active_token() {
         let t = IndexProgressTracker::new();
-        assert!(t.wait_drain(Duration::from_secs(1)).await, "无在飞 token 立即放行");
+        assert!(
+            t.wait_drain(Duration::from_secs(1)).await,
+            "无在飞 token 立即放行"
+        );
     }
 
     #[tokio::test]

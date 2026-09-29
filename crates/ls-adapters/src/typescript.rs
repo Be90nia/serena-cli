@@ -155,10 +155,7 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
         let completed = if session.take_cross_file_first_query() {
             // 首查：等索引开始并 drain，或 grace 内证明无需索引。
             session
-                .wait_indexing_start_or_completion(
-                    INDEXING_PROGRESS_TIMEOUT,
-                    INDEXING_START_GRACE,
-                )
+                .wait_indexing_start_or_completion(INDEXING_PROGRESS_TIMEOUT, INDEXING_START_GRACE)
                 .await
         } else if session.index_active_progress() > 0 {
             // 后续查询：cf54869a 修订核心 —— 有在飞 token 就 drain。

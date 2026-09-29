@@ -21,12 +21,11 @@ pub mod spec;
 
 pub use ls_adapters::LanguageId;
 use ls_adapters::{
-    LanguageServerAdapter, astro::AstroAdapter, bash::BashAdapter,
-    clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter, css::CssAdapter, deno::DenoAdapter,
-    gopls::GoplsAdapter, html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter,
-    powershell::PowerShellAdapter, pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter,
-    sass::SassAdapter, svelte::SvelteAdapter, typescript::TypescriptLanguageServerAdapter,
-    vue::VueAdapter,
+    LanguageServerAdapter, astro::AstroAdapter, bash::BashAdapter, clangd::ClangdAdapter,
+    csharp_ls::CsharpLsAdapter, css::CssAdapter, deno::DenoAdapter, gopls::GoplsAdapter,
+    html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter, powershell::PowerShellAdapter,
+    pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter, sass::SassAdapter,
+    svelte::SvelteAdapter, typescript::TypescriptLanguageServerAdapter, vue::VueAdapter,
 };
 
 /// 扩展名 → LanguageId 静态表（小写键）。
@@ -350,13 +349,19 @@ mod tests {
             let b = adapter_for(lang).unwrap();
             assert!(Arc::ptr_eq(&a, &b), "singleton broken for {lang}");
         }
-        assert_eq!(adapter_for("html").unwrap().languages(), &[LanguageId::Html]);
+        assert_eq!(
+            adapter_for("html").unwrap().languages(),
+            &[LanguageId::Html]
+        );
         assert_eq!(adapter_for("css").unwrap().languages(), &[LanguageId::Css]);
         // lsp_language_id 恒等（LSP 官方口径同内部名）。
         assert_eq!(lsp_language_id("html"), "html");
         assert_eq!(lsp_language_id("css"), "css");
         // 扩展名解析（EXT_TABLE）：html/htm 归 Html 门，css 归 Css 门。
-        assert_eq!(resolve(&PathBuf::from("index.html")), Some(LanguageId::Html));
+        assert_eq!(
+            resolve(&PathBuf::from("index.html")),
+            Some(LanguageId::Html)
+        );
         assert_eq!(resolve(&PathBuf::from("page.htm")), Some(LanguageId::Html));
         assert_eq!(resolve(&PathBuf::from("style.css")), Some(LanguageId::Css));
     }

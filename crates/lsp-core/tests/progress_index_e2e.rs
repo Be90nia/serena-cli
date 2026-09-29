@@ -30,10 +30,13 @@ fn spawn_mock_ls_with_delayed_end() -> ChildHandle {
 
 async fn start_session() -> std::sync::Arc<Session> {
     let child = spawn_mock_ls_with_delayed_end();
-    tokio::time::timeout(Duration::from_secs(10), Session::start(Some(child), base_initialize_params()))
-        .await
-        .expect("session start within 10s")
-        .expect("session start Ok")
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        Session::start(Some(child), base_initialize_params()),
+    )
+    .await
+    .expect("session start within 10s")
+    .expect("session start Ok")
 }
 
 /// 全链路：`$/progress` begin 通知（initialize 后）→ handler track → active=1；
@@ -52,7 +55,10 @@ async fn index_progress_tracks_begin_and_drains_on_did_open_end() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(saw_active, "mock_ls 的 begin 应在 2s 内被 handler 计入在飞 token");
+    assert!(
+        saw_active,
+        "mock_ls 的 begin 应在 2s 内被 handler 计入在飞 token"
+    );
 
     // didOpen → mock_ls 补发 end → drain 完成。
     session

@@ -783,9 +783,10 @@ impl Supervisor {
         // 禁在 if-let scrutinee 的块内再拿同一把锁：无 else 的 if-let 临时 guard
         // 活到块尾（edition 2024），同锁重入 = 自死锁（判据源 launch_exe_valid）。
         let cached = self.instances.lock().unwrap().get(&key).cloned();
-        let reuse = cached.as_ref().is_some_and(|s| {
-            !matches!(s.state(), lsp_core::session::SessionState::Failed(_))
-        }) && self.launch_exe_valid(&key);
+        let reuse = cached
+            .as_ref()
+            .is_some_and(|s| !matches!(s.state(), lsp_core::session::SessionState::Failed(_)))
+            && self.launch_exe_valid(&key);
         if reuse {
             let session = cached.expect("reuse implies cached");
             self.touch(&key);
@@ -799,9 +800,10 @@ impl Supervisor {
         let gate = self.load_gate_for(root, lang);
         let _guard = gate.lock().await;
         let cached = self.instances.lock().unwrap().get(&key).cloned();
-        let reuse = cached.as_ref().is_some_and(|s| {
-            !matches!(s.state(), lsp_core::session::SessionState::Failed(_))
-        }) && self.launch_exe_valid(&key);
+        let reuse = cached
+            .as_ref()
+            .is_some_and(|s| !matches!(s.state(), lsp_core::session::SessionState::Failed(_)))
+            && self.launch_exe_valid(&key);
         if reuse {
             let session = cached.expect("reuse implies cached");
             self.touch(&key);
@@ -1307,7 +1309,10 @@ impl Supervisor {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .is_some_and(|e| {
-                matches!(e.as_str(), "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+                matches!(
+                    e.as_str(),
+                    "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"
+                )
             });
         if is_ts_like
             && let Some(adapter) = ls_registry::adapter_for(lang)
@@ -2878,7 +2883,9 @@ impl Supervisor {
         // 伴生 TS LS（↖ mirror: astro_language_server.py@7a296833 `request_references`
         // 对 `_is_ts_file` 路由伴生；主 astro-ls 对 .ts references 恒空 —— 帧录制
         // 实证）。.astro 与非 hybrid 语言回落主会话（semantic_session_or_main）。
-        let session = self.semantic_session_for_file(root, file, lang.as_str()).await?;
+        let session = self
+            .semantic_session_for_file(root, file, lang.as_str())
+            .await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
@@ -5084,9 +5091,7 @@ fn resolve_lang_for_file(file: &str, lang_override: Option<&str>) -> ToolResult<
         return Ok(l.to_ascii_lowercase());
     }
     ls_registry::resolve_lang_name(Path::new(file))
-        .or_else(|| {
-            ls_registry::file_detect::detect_language(Path::new(file)).map(|l| l.as_str())
-        })
+        .or_else(|| ls_registry::file_detect::detect_language(Path::new(file)).map(|l| l.as_str()))
         .map(str::to_string)
         .ok_or_else(|| ToolError::BadArgs {
             detail: format!("file not supported: {file}"),
@@ -10137,6 +10142,9 @@ mod semantic_readiness_and_args_tests {
             .unwrap()
             .insert(key.clone(), exe.clone());
         sup.evict(&key).await.expect("evict");
-        assert!(sup.launch_exe_valid(&key), "evict 必须同步清 launch_exe 登记");
+        assert!(
+            sup.launch_exe_valid(&key),
+            "evict 必须同步清 launch_exe 登记"
+        );
     }
 }

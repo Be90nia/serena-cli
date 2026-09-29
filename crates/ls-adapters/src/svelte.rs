@@ -376,9 +376,7 @@ impl LanguageServerAdapter for SvelteAdapter {
             });
         session
             .client()
-            .on_server_request("workspace/applyEdit", |_| {
-                Some(json!({ "applied": false }))
-            });
+            .on_server_request("workspace/applyEdit", |_| Some(json!({ "applied": false })));
 
         // 3. 登记伴生为语义会话（supervisor 语义类请求路由到这里）。覆盖旧条目：
         //    旧 Arc 归零 → 旧伴生 Job 关句柄灭树，重启场景自动清场。
@@ -442,10 +440,7 @@ impl LanguageServerAdapter for SvelteAdapter {
     async fn wait_for_cross_file_index(&self, session: &lsp_core::session::Session) {
         let completed = if session.take_cross_file_first_query() {
             session
-                .wait_indexing_start_or_completion(
-                    INDEXING_PROGRESS_TIMEOUT,
-                    INDEXING_START_GRACE,
-                )
+                .wait_indexing_start_or_completion(INDEXING_PROGRESS_TIMEOUT, INDEXING_START_GRACE)
                 .await
         } else if session.index_active_progress() > 0 {
             session.wait_indexing_drain(INDEXING_PROGRESS_TIMEOUT).await
@@ -559,7 +554,10 @@ mod tests {
         std::fs::write(root.join("src/routes/about.svelte"), "").expect("src svelte");
         assert_eq!(
             find_svelte_files(root),
-            vec![root.join("app.svelte"), root.join("src/routes/about.svelte")]
+            vec![
+                root.join("app.svelte"),
+                root.join("src/routes/about.svelte")
+            ]
         );
     }
 }

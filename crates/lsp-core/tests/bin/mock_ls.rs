@@ -203,9 +203,7 @@ async fn main() {
             track_event(&config.track_file_events, &msg).await;
 
             // cf54869a mirror 钩子：首个 didOpen 到达时补发 `$/progress` end。
-            if progress_end_on_open
-                && msg.method.as_deref() == Some("textDocument/didOpen")
-            {
+            if progress_end_on_open && msg.method.as_deref() == Some("textDocument/didOpen") {
                 progress_end_on_open = false;
                 if let Some(token) = &config.progress_token {
                     let progress = JsonRpc::notification(
@@ -307,7 +305,11 @@ async fn main() {
                 if let Some(token) = &config.progress_token {
                     // cf54869a mirror 钩子：end_on_open 时 initialize 后只发 begin，
                     // end 推迟到首个 didOpen（下方分支）—— 模拟 didOpen 触发的索引。
-                    let kind = if config.progress_end_on_open { "begin" } else { "end" };
+                    let kind = if config.progress_end_on_open {
+                        "begin"
+                    } else {
+                        "end"
+                    };
                     let progress = JsonRpc::notification(
                         "$/progress",
                         json!({

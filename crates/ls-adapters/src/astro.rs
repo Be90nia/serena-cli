@@ -226,10 +226,7 @@ fn find_astro_files(root: &Path) -> Vec<PathBuf> {
             };
             if p.is_dir() {
                 let skip = name.starts_with('.')
-                    || matches!(
-                        name,
-                        "node_modules" | "dist" | "build" | "coverage"
-                    );
+                    || matches!(name, "node_modules" | "dist" | "build" | "coverage");
                 if !skip {
                     walk(&p, depth + 1, out);
                 }
@@ -347,9 +344,7 @@ impl LanguageServerAdapter for AstroAdapter {
             .on_server_request("workspace/configuration", main_configuration_reply);
         session
             .client()
-            .on_server_request("workspace/applyEdit", |_| {
-                Some(json!({ "applied": false }))
-            });
+            .on_server_request("workspace/applyEdit", |_| Some(json!({ "applied": false })));
 
         // 3. 登记伴生为语义会话（supervisor 语义类请求路由到这里）。覆盖旧条目：
         // 旧 Arc 归零 → 旧伴生 Job 关句柄灭树，重启场景自动清场。
@@ -424,10 +419,7 @@ impl LanguageServerAdapter for AstroAdapter {
         let completed = if session.take_cross_file_first_query() {
             // 首查：等索引开始并 drain，或 grace 内证明无需索引。
             session
-                .wait_indexing_start_or_completion(
-                    INDEXING_PROGRESS_TIMEOUT,
-                    INDEXING_START_GRACE,
-                )
+                .wait_indexing_start_or_completion(INDEXING_PROGRESS_TIMEOUT, INDEXING_START_GRACE)
                 .await
         } else if session.index_active_progress() > 0 {
             // 后续查询：有在飞 token 就 drain。
@@ -515,10 +507,7 @@ mod tests {
                 { "section": "astro" },
             ] }),
         );
-        assert_eq!(
-            main_configuration_reply(msg),
-            Some(json!([{}, [], {}]))
-        );
+        assert_eq!(main_configuration_reply(msg), Some(json!([{}, [], {}])));
         // 缺 items → None（默认 null 成功应答路径在 client 层）。
         let msg = JsonRpc::notification("workspace/configuration", json!({}));
         assert_eq!(main_configuration_reply(msg), None);
@@ -530,10 +519,7 @@ mod tests {
             "workspace/configuration",
             json!({ "items": [{ "section": "typescript" }, {}] }),
         );
-        assert_eq!(
-            companion_configuration_reply(msg),
-            Some(json!([{}, {}]))
-        );
+        assert_eq!(companion_configuration_reply(msg), Some(json!([{}, {}])));
         let msg = JsonRpc::notification("workspace/configuration", json!({}));
         assert_eq!(companion_configuration_reply(msg), None);
     }

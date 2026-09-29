@@ -575,10 +575,9 @@ pub fn ensure_launch(
                 cache_root,
             };
             match NpmInstaller.install(&ictx, &install_spec) {
-                Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process {
-                    exe,
-                    args,
-                })) => Ok((exe.clone(), full_argv(&exe, args))),
+                Ok(InstallOutcome::Ready(ls_runtime::install::Launch::Process { exe, args })) => {
+                    Ok((exe.clone(), full_argv(&exe, args)))
+                }
                 Ok(InstallOutcome::Ready(ls_runtime::install::Launch::External { host, port })) => {
                     Err(format!(
                         "external LS not supported by CLI launch: {host}:{port}"

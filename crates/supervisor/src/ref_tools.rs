@@ -205,7 +205,12 @@ fn semantic_session_for_file(
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
-        .is_some_and(|e| matches!(e.as_str(), "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"));
+        .is_some_and(|e| {
+            matches!(
+                e.as_str(),
+                "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"
+            )
+        });
     if is_ts_like
         && let Some(adapter) = ls_registry::adapter_for(&session.language_id())
         && let Some(companion) = adapter.semantic_session(root)
@@ -220,8 +225,12 @@ fn semantic_session_for_file(
 /// `semantic_session_for_file` 纯伴生路由覆盖，不进双查）。
 fn hybrid_companion_applicable(language_id: &str, file: &Path) -> bool {
     match language_id {
-        "astro" => file.extension().is_some_and(|e| e.eq_ignore_ascii_case("astro")),
-        "svelte" => file.extension().is_some_and(|e| e.eq_ignore_ascii_case("svelte")),
+        "astro" => file
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("astro")),
+        "svelte" => file
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("svelte")),
         _ => false,
     }
 }
@@ -263,8 +272,8 @@ async fn fetch_references_with_hybrid_companion(
     if !hybrid_companion_applicable(&session.language_id(), abs_file) {
         return primary;
     }
-    let Some(companion) = ls_registry::adapter_for(&session.language_id())
-        .and_then(|a| a.semantic_session(root))
+    let Some(companion) =
+        ls_registry::adapter_for(&session.language_id()).and_then(|a| a.semantic_session(root))
     else {
         tracing::warn!(
             root = %root.display(),
@@ -608,7 +617,10 @@ mod tests {
             Path::new("src/pages/index.ASTRO")
         ));
         // ts/js 系文件走纯伴生路由，不进双查
-        assert!(!hybrid_companion_applicable("astro", Path::new("src/utils/fmt.ts")));
+        assert!(!hybrid_companion_applicable(
+            "astro",
+            Path::new("src/utils/fmt.ts")
+        ));
         // 非 astro 宿主语言不动
         assert!(!hybrid_companion_applicable(
             "typescript",
