@@ -1527,7 +1527,11 @@ fn spawn_daemon_child() -> Result<u16, String> {
 /// 未设或打开失败返 None（后者先打 warn 到本进程 stderr——调用方可见，不静默吞）。
 fn daemon_log_file() -> Option<std::fs::File> {
     let path = std::env::var("SERENA_DAEMON_LOG").ok()?;
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         Ok(f) => Some(f),
         Err(e) => {
             eprintln!("[warn] SERENA_DAEMON_LOG={path} open failed: {e}; daemon stderr -> null");

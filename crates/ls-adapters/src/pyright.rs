@@ -91,7 +91,16 @@ impl LanguageServerAdapter for PyrightAdapter {
         // M2 深度：探测 venv interpreter；命中 → 注入 `initializationOptions.python.pythonPath`。
         // pyright 用此路径解析 import 与 .pyi 搜索；缺省走系统 python，venv 项目会错乱。
         let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
-        let Some(interp) = root.as_deref().and_then(find_python_interpreter) else {
+        let Some(interp) = root
+            .as_deref()
+            .and_then(find_python_interpreter)
+            .or_else(|| {
+                // smoke CI（run 36588845806 帧实锚）：runner 无 venv 时 pyright 解释器
+                // 发现挂起（didOpen 后零响应 30s+），显式指到系统 python3 解除。
+                let p = std::path::Path::new("/usr/bin/python3");
+                p.is_file().then(|| p.to_path_buf())
+            })
+        else {
             return;
         };
         let opts = base
@@ -212,7 +221,10 @@ mod tests {
         let (uri, open_target) = adapter.probe_target();
         assert!(uri.starts_with("file:///"), "必须是 file URI: {uri}");
         assert!(uri.ends_with(".gitignore"), "应指向真实文件: {uri}");
-        assert!(open_target.is_none(), "工程标记不可 didOpen: {open_target:?}");
+        assert!(
+            open_target.is_none(),
+            "工程标记不可 didOpen: {open_target:?}"
+        );
 
         // 语言源文件：didOpen 目标 = 该文件（未打开文档的探针楔死 pyright）。
         let dir = tempfile::tempdir().unwrap();

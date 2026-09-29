@@ -25,8 +25,8 @@ use ls_adapters::{
     csharp_ls::CsharpLsAdapter, css::CssAdapter, deno::DenoAdapter, gopls::GoplsAdapter,
     html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter, powershell::PowerShellAdapter,
     pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter, sass::SassAdapter,
-    svelte::SvelteAdapter, typescript::TypescriptLanguageServerAdapter, vue::VueAdapter,
-    vts::VtsAdapter,
+    svelte::SvelteAdapter, typescript::TypescriptLanguageServerAdapter, vts::VtsAdapter,
+    vue::VueAdapter,
 };
 
 /// 扩展名 → LanguageId 静态表（小写键）。
