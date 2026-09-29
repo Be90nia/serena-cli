@@ -1,10 +1,13 @@
 # smoke_langs.toml —— 45 门语言 CI 冒烟矩阵清单（Phase 0 基建，serena-rust）。
 #
 # 三栏对账锚（上游 73 门，详见 local/agent-reports/ci-infra-45lang.md）：
-#   本矩阵（R4 账本 2026-09-29）：69 门 = 60 真门 + 9 SKIP 冻结（nix/java/matlab/
-#   latex/pascal/omnisharp/al/swift/wolfram）+ W3/W4/W5 已派账（scala/perl/r/julia
+#   本矩阵（R6 终账 2026-09-29）：69 门 = 53 真门 + 16 SKIP 冻结（nix/java/matlab/
+#   latex/pascal/omnisharp/al/swift/wolfram 存量 9 + R6 证据 SKIP 7：bsl/crystal/
+#   elixir/nextflow/fsharp/haskell/qml）+ W3/W4/W5 已派账（scala/perl/r/julia
 #   收编、groovy 不入矩阵——angular 先例、wolfram LICENSE 批准冻结、gdscript HOST/
 #   msl HOST 于 R4 账本迁出不入矩阵——angular/groovy 先例）。总账 73 闭合。
+#   R6 = smoke 终轮（run 36577226543 12 红门处置：5 门修绿 python/pyright/r/
+#   lean4/ruby，7 门证据 SKIP 迁冻结；逐门证据见 local/agent-reports/smoke-round6-final.md）。
 #
 # ── W1-W5 接入模板（加一门 = 两步）──────────────────────────────────────
 # 1. 本清单加一个 [[lang]] 块（字段见下）；
@@ -220,7 +223,11 @@ pin = "servers.toml"
 fixture = "module.bsl"
 lang_flag = "bsl"
 budget_secs = 600
-remark = "JVM ≥21：runner 预装 17，apt 显式装 21；install 期向 stderr 打 java 版本（LS 瞬死零 stderr，run 36561318948 上游同款 java -jar 启动仍 stdout pump EOF——先验 JVM 版本归属再排障）"
+skip_class = "HOST"
+skip_reason = "BSL LS JAR is built for Java 21 (class file 65.0) but the LS process resolves a Java 17 runtime (61.0) on the runner — apt openjdk-21 install prefix does not reach the lazy-spawned daemon's LS spawn; distribution and runner JRE stay unpaired"
+skip_evidence = "run 36577226543 daemon.log lsp_stderr: UnsupportedClassVersionError: BSLLSPLauncher 'has been compiled by a more recent version of the Java Runtime (class file version 65.0), this version of the Java Runtime only recognizes class file versions up to 61.0'（JAR 启动即死，Spring Boot JarLauncher 栈同源；daemon.log 3270 行全为该栈重试）"
+verified = "never"
+remark = "R6 起证据 SKIP（PM 裁决 2026-09-29，run 36577226543 帧级实锚）；此前 R4 观测为 JVM 版本归属先验；LS 进程侧 java 解析为何落在 17（alternatives 已装 21）未定——daemon/LS spawn 的 PATH 传导 W-wave 可查后转真门"
 
 [[lang]]
 id = "nextflow"
@@ -229,7 +236,11 @@ pin = "servers.toml"
 fixture = "main.nf"
 lang_flag = "nextflow"
 budget_secs = 420
-remark = "fat JAR，JDK ≥17 = runner 预装档；装法纠偏（Main 追认 2026-09-29）：npm 无 nextflow LS 包（registry 404），维持上游同款 JAR download，v26.04.3 sha = GitHub API digest 实锚"
+skip_class = "BUDGET"
+skip_reason = "nextflow LS answers documentSymbol with [] / null for standalone fixtures — outline output requires nextflow project context (pipeline scripts/config), not smoke-layer fixable"
+skip_evidence = "run 36577226543 record.jsonl: 130 发 documentSymbol → 65 [] + 65 null，0 error（LS 活着应答但恒空，非瞬态）"
+verified = "never"
+remark = "R6 起证据 SKIP（PM 裁决 2026-09-29）；装法已纠偏（npm 无 nextflow LS 包 registry 404，维持上游同款 JAR download，v26.04.3 sha = GitHub API digest 实锚）；配 nextflow 工程上下文 fixture（nextflow.config 等）即转真门"
 
 [[lang]]
 id = "elixir"
@@ -239,7 +250,11 @@ pin = "servers.toml"
 fixture = "elixir/lib/smoke.ex"
 lang_flag = "elixir"
 budget_secs = 600
-remark = "运行需 Elixir runtime（apt suite 版）；fixture 带 mix.exs + lib/smoke.ex（标准 mix 布局）——expert（NextLS 系）mix-project-based，裸 .ex 不进工程 documentSymbol 恒空（CI 首跑实锚）"
+skip_class = "BUDGET"
+skip_reason = "expert (NextLS-family) starts its engine asynchronously: documentSymbol arriving before engine init is logged-and-ignored (empty result) — needs an engine-ready sync quirk (upstream elixir_tools adapter has it); adapter W-wave, not smoke-layer fixable"
+skip_evidence = "run 36577226543 window/logMessage: 'Received request textDocument/documentSymbol before engine for fixture was initialized. Ignoring.'（每个 documentSymbol 同款空应答，协议活但零内容）"
+verified = "never"
+remark = "R6 起证据 SKIP（PM 裁决 2026-09-29）；fixture 已是标准 mix 布局（mix.exs + lib/smoke.ex），卡点在 engine-ready 同步而非工程定位；W-wave 适配器批收编即转真门"
 
 [[lang]]
 id = "haxe"
@@ -452,17 +467,21 @@ pin = "servers.toml"
 fixture = "fsharp/main.fs"
 lang_flag = "fsharp"
 budget_secs = 600
-remark = "需 dotnet SDK（ubuntu-latest runner 预装）；fixture 带 main.fsproj + install 期 dotnet restore——fsautocomplete project-based，裸 .fs / 未 restore 报 -32603 LoadedProjects（run 36528495148 实锚）；$SERENA_FXDIR = fixture 工作目录（smoke_one.sh 注入）"
+skip_class = "BUDGET"
+skip_reason = "FSAC requires its project-loading command protocol (upstream adapter registers extra handlers to drive .fsproj loading); dotnet restore alone never completes the FSAC project load, so every documentSymbol errors -32603 — adapter W-wave, not smoke-layer fixable"
+skip_evidence = "run 36577226543 stderr: rpc -32603 \"Couldn't find /tmp/.../fixture/main.fs in LoadedProjects. Have the projects loaded yet or have you tried restoring your project/solution?\"（restore 已跑仍报，工程加载不走 restore）"
+verified = "never"
+remark = "R6 起证据 SKIP（PM 裁决 2026-09-29）；fixture main.fsproj + install 期 dotnet restore 维持（FSAC 侧工程命令协议 W-wave 收编即转真门）"
 
 [[lang]]
 id = "ruby"
 via = "serena-gem"
-install = "$SERENA_CLI install ruby && gem install bundler --no-document && cd \"$SERENA_FXDIR\" && bundle install --jobs 4 --quiet"
+install = "$SERENA_CLI install ruby && sudo gem install bundler --no-document && cd \"$SERENA_FXDIR\" && bundle config set --local path vendor/bundle && bundle install --jobs 4 --quiet"
 pin = "servers.toml"
 fixture = "ruby/smoke.rb"
 lang_flag = "ruby"
 budget_secs = 420
-remark = "需 ruby + gem（ubuntu-latest runner 预装，无 bundler——gem install 显式补，run 36567771452 `bundle: command not found` 实锚）；fixture = Gemfile + smoke.rb + install 期 bundle install（SERENA_FXDIR 指向 fixture 目录）——ruby-lsp 裸启动无 bundle 上下文即 LS_TERMINATED（run 36528495148 实锚），有 Gemfile 还须 bundle 可解析（run 36561318948：仅 Gemfile 未 install 仍 EOF），smoke_one.sh 另向 LS 进程链 export BUNDLE_GEMFILE"
+remark = "需 ruby + gem（ubuntu-latest runner 预装，无 bundler——gem install 显式补，run 36567771452 `bundle: command not found` 实锚）；bundler 必须 sudo（apt ruby 的系统 gem home /var/lib/gems 不通写，run 36577226543 Gem::FilePermissionError 实锚——serena install ruby 本体走 --user-install 不受影响，ok:true）；bundle install 走 fixture 本地 vendor/bundle（bundle config set --local path 落 .bundle/config，ruby-lsp SetupBundler 经 BUNDLE_GEMFILE 自动读到，无需 env 传导）——ruby-lsp 裸启动无 bundle 上下文即 LS_TERMINATED（run 36528495148 实锚），有 Gemfile 还须 bundle 可解析（run 36561318948：仅 Gemfile 未 install 仍 EOF），smoke_one.sh 另向 LS 进程链 export BUNDLE_GEMFILE"
 
 [[lang]]
 id = "solargraph"
@@ -473,7 +492,7 @@ lang_flag = "solargraph"
 budget_secs = 420
 remark = "变体门：--lang solargraph；保持裸 .rb fixture（solargraph 直跑无需 bundle，ruby 门工程化引入 Gemfile 反会触发其 bundler 语境，不共 fixture 以免假红）"
 
-# ══ W4 批（七真门；groovy 走 angular 先例不入矩阵，见尾部对账节）════════════
+# ══ W4 批（haskell 于 R6 转证据 SKIP，余六真门；groovy 走 angular 先例不入矩阵，见尾部对账节）════════════
 
 [[lang]]
 id = "haskell"
@@ -483,8 +502,11 @@ pin = "HLS 2.9.0.1 (bindist deb11) + GHC 9.4.8 (downloads.haskell.org bindist; s
 fixture = "main.hs"
 lang_flag = "haskell"
 budget_secs = 900
-fallback_assert = "hover:4:1"
-remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修——裸 wrapper 打印 usage 即退，terraform serve 同类坑）；HLS bindist 二进制按 GHC 精确版本配对——2.9.0.1 release notes 支持集 {9.2.8, 9.4.8, 9.6.6, 9.8.2, 9.10.1}，apt noble ghc 9.4.7 不在集 → wrapper 找不到匹配 HLS 二进制 → cradle 永不建立 → documentSymbol 恒 -32601 No handler（run 36567771452 全窗 11min 实锚）→ 弃 apt ghc 改 GHC 9.4.8 bindist 精确对齐（ghcup 免自举，extract+symlink 即用）；2.15 弃 GHC 9.4 系故维持 2.9.0.1；bindist 解析布局未知故 find-install；bare main.hs 走 default cradle 调 ghc；fallback hover:4:1 登记（smoke R4，ansible/-32603 同框架）作 overview 晚就绪保险——根因修复后预期 PASS direct"
+skip_class = "HOST"
+skip_reason = "runner preimage ships GHC 9.14.1 on PATH (cabal/stack/ghc preinstalled) and it shadows the bindist pairing; HLS 2.9.0.1 bindist carries binaries only for {9.2.8, 9.4.8, 9.6.6, 9.8.2, 9.10.1} — wrapper finds no match, server starts with no document handlers"
+skip_evidence = "run 36577226543: install 行 `ghc --version` 实印 9.14.1（非 bindist 9.4.8）；lsp_stderr 'Failed to find a HLS version for GHC 9.14.1' → 'no handler for: textDocument/didOpen|documentSymbol|hover'"
+verified = "never"
+remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；R6 起证据 SKIP（PM 裁决 2026-09-29）——R4 假设的『apt ghc 9.4.7』不对，实况是 runner 预装 GHC 9.14.1 活在 PATH（我们 /usr/local/bin 前缀链为何未盖过它待查：bindist 前缀/软链传导嫌疑，同 lean4 dangling 前缀一族）；runner 镜像 GHC 集变化或 wrapper 版本配对解决即转真门"
 
 [[lang]]
 id = "ocaml"
@@ -519,12 +541,12 @@ remark = "↖ mirror perl_language_server.py@7a296833 launch 串逐字（entry p
 [[lang]]
 id = "r"
 via = "apt"
-install = "sudo apt-get update -qq && sudo apt-get install -y -qq r-base-core && sudo R --vanilla --slave -e \"install.packages('languageserver', repos='https://p3m.dev/cran/__linux__/noble/latest', Ncpus=4)\" && R --vanilla --slave -e \"cat(as.character(packageVersion('languageserver')))\""
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq r-base-core libuv1-dev && sudo R --vanilla --slave -e \"install.packages('languageserver', repos='https://p3m.dev/cran/__linux__/noble/latest', Ncpus=4)\" && R --vanilla --slave -e \"cat(as.character(packageVersion('languageserver')))\""
 pin = "languageserver suite (P3M noble 预编译) + r-base-core suite"
 fixture = "main.r"
 lang_flag = "r"
 budget_secs = 900
-remark = "↖ mirror r_language_server.py@7a296833 launch 串逐字（entry r_ls exec）；CRAN 源码编译依赖链在 runner 挂（run 36567771452 deps 中途断，日志截断不可回溯）——改 P3M（Posit Package Manager）noble 预编译二进制仓，免整链编译，缺二进制的包自动回落源码"
+remark = "↖ mirror r_language_server.py@7a296833 launch 串逐字（entry r_ls exec）；CRAN 源码编译依赖链在 runner 挂（run 36567771452 deps 中途断，日志截断不可回溯）——改 P3M（Posit Package Manager）noble 预编译二进制仓，免整链编译，缺二进制的包自动回落源码；回落源码的 fs 需 libuv 头（run 36577226543 错误消息自报 deb 名 libuv1-dev：'uv.h: No such file or directory'），apt 显式补"
 
 [[lang]]
 id = "crystal"
@@ -534,7 +556,11 @@ pin = "crystalline v0.20.0 (musl 静态单二进制; sha256 = GitHub API assets[
 fixture = "main.cr"
 lang_flag = "crystal"
 budget_secs = 420
-remark = "↖ mirror crystal_language_server.py@7a296833（shutil.which 裸启动）；musl 静态免 crystal 工具链——documentSymbol 上游注释 'work reliably'（definition 每会话首个才命中为上游已知缺陷，与底线无关）；servers.toml crystalline 条目保持 path_only（legacy 锚 canary 断言在案），smoke 走 curl 钉 URL"
+skip_class = "HOST"
+skip_reason = "crystalline binary installs and --version runs, but the LS process dies at spawn (stdout pump EOF) with zero stderr — runner-host specific (install verified, spawn unverifiable on ubuntu-latest); no LSP traffic ever occurs"
+skip_evidence = "run 36577226543: install.out '0.20.0+a5f6f1b' OK；stderr LS_TERMINATED 'stdout pump EOF'；daemon.log 107 行零 lsp_stderr（spawn 即死，无协议帧）"
+verified = "never"
+remark = "↖ mirror crystal_language_server.py@7a296833（shutil.which 裸启动）；R6 起证据 SKIP（PM 裁决 2026-09-29）；servers.toml crystalline 条目保持 path_only（legacy 锚 canary 断言在案）；本机或有 crystal 工具链的宿主可用，runner 主场即转真门待 spawn 根因（零 stderr 疑静态二进制 io_uring/内核组）排查"
 
 [[lang]]
 id = "zig"
@@ -648,7 +674,7 @@ skip_evidence = "servers.toml [servers.sourcekit_lsp] path_only install_hint='in
 verified = "never"
 remark = "W3 批：Rust 侧接线完备（LanguageId/EXT_TABLE/doctor/sourcekit_lsp 存量条目）；SKIP 账本第 8 条（PM 批准 7→8，硬顶 8）；若未来 runner 出 Swift 工具链或 sourcekit-ls 独立发行即转真门"
 
-# ══ W5 批（七门：四真门 + wolfram SKIP 批准冻结；gdscript/msl 已迁出不入矩阵，见尾部对账节）═══
+# ══ W5 批（gleam/lean4/julia 三真门 + qml R6 证据 SKIP + wolfram SKIP 批准冻结；gdscript/msl 已迁出不入矩阵，见尾部对账节）═══
 
 [[lang]]
 id = "gleam"
@@ -669,18 +695,21 @@ pin = "suite (ubuntu-24.04 = Qt 6.4.2；qmlls 落 /usr/lib/qt6/bin——packages
 fixture = "Main.qml"
 lang_flag = "qml"
 budget_secs = 600
-fallback_assert = "hover:2:7"
-remark = "↖ mirror qml_language_server.py@7a296833（qmlls 裸启动 stdio，条目存量本体不动）；条目 binary_name=qmlls 单名 vs 上游 which 顺序 qmlls6→qmlls——ln -sf 对齐（scala/metals 同款软链先例）；6.4.2 是 qmlls 初版 LSP（功能面窄），documentSymbol 若空降级 hover；Qt 更新版需 Qt 官方安装器（交互+账号，CI 不可脚本化）；install 行用 test -x 校验（--version 支持未核实，不赌旗标）"
+skip_class = "PLATFORM"
+skip_reason = "qmlls 6.4.2 (noble apt ceiling) predates the documentSymbol/hover LSP handlers — needs Qt 6.8+ qmlls, only distributable via Qt official installer (interactive + account, not CI-scriptable)"
+skip_evidence = "run 36577226543 lsp_stderr 双 -32601: 'There was no handler registered with registerDocumentSymbolHandler' / 'registerHoverHandler'（qmlls 错误消息自述无 handler）"
+verified = "never"
+remark = "↖ mirror qml_language_server.py@7a296833（qmlls 裸启动 stdio，条目存量本体不动）；条目 binary_name=qmlls 单名 vs 上游 which 顺序 qmlls6→qmlls——ln -sf 对齐维持；R6 起证据 SKIP（PM 裁决 2026-09-29；R4 的 hover fallback 登记随之撤销——6.4.2 hover 同样无 handler，降级探针无出路）；Qt 新版渠道出现即转真门"
 
 [[lang]]
 id = "lean4"
 via = "binary"
-install = "sudo apt-get update -qq && sudo apt-get install -y -qq zstd && curl -fsSL https://github.com/leanprover/lean4/releases/download/v4.34.1/lean-4.34.1-linux.tar.zst -o /tmp/lean.tar.zst && echo \"47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4  /tmp/lean.tar.zst\" | sha256sum -c - && sudo tar --zstd -xf /tmp/lean.tar.zst -C /opt && sudo ln -sf /opt/lean/bin/lean /usr/local/bin/lean && lean --version"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq zstd && curl -fsSL https://github.com/leanprover/lean4/releases/download/v4.34.1/lean-4.34.1-linux.tar.zst -o /tmp/lean.tar.zst && echo \"47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4  /tmp/lean.tar.zst\" | sha256sum -c - && sudo tar --zstd -xf /tmp/lean.tar.zst -C /opt && sudo ln -sf /opt/lean-4.34.1-linux/bin/lean /usr/local/bin/lean && lean --version"
 pin = "lean v4.34.1 (最新稳定版，rc 链 4.35.0 排除; sha256 = GitHub API assets[].digest 2026-09-29)"
 fixture = "Main.lean"
 lang_flag = "lean"
 budget_secs = 900
-remark = "↖ mirror lean4_language_server.py@7a296833（`lean --server`，条目存量本体不动）；580MB tar.zst 全工具链（免 elan，钉版确定性）——tar.zst 解压需 zstd（runner 无，apt 显式补，run 36567771452 `tar --zstd` exit 127 实锚），tarball 内解包前缀 lean/bin/lean 为 CI 首跑实锚点；Δ 未抄上游 lake env LEAN_PATH 注入——standalone fixture 走基础符号（def/theorem documentSymbol）；--lang lean 命中 [servers.lean4]（语言名=lean 官方口径，条目 id=lean4，zls/zig 双名先例）"
+remark = "↖ mirror lean4_language_server.py@7a296833（`lean --server`，条目存量本体不动）；580MB tar.zst 全工具链（免 elan，钉版确定性）——tar.zst 解压需 zstd（runner 无，apt 显式补，run 36567771452 `tar --zstd` exit 127 实锚），tarball 内解包前缀 lean-4.34.1-linux/（run 36577226543 range 拉头部解流实锚：首条目 `lean-4.34.1-linux/`；旧锚 lean/bin/lean 有误——ln 落 dangling symlink，bash PATH 搜索跳过即报 `lean: command not found` exit 127）；Δ 未抄上游 lake env LEAN_PATH 注入——standalone fixture 走基础符号（def/theorem documentSymbol）；--lang lean 命中 [servers.lean4]（语言名=lean 官方口径，条目 id=lean4，zls/zig 双名先例）"
 
 [[lang]]
 id = "julia"

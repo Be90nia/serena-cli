@@ -108,15 +108,26 @@ impl LanguageServerAdapter for PyrightAdapter {
         *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
     }
 
-    async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
-        // 探针必须用 root 下真实文件：虚拟 URI 不触发 pyright 的 workspace lazy-load，
-        // 首个真实工具请求就得独自承担全量分析（cold-start hang 同根因，
-        // 见 local/cold-start-hang-diagnosis.md）。失败也返回 Ok 让 supervisor 放行。
+    /// smoke R6（run 36577226543 python 门帧实锚）：探针 documentSymbol 先于
+    /// didOpen 到达时，pyright 对未打开文档不应答，且 didOpen 补上后后续请求
+    /// 仍全被楔死 —— 命中语言源文件必须 ensure_open（didOpen，languageId 走
+    /// 会话官方口径映射）后再发探针。无语言源文件退 probe_uri_for_root 旧行为
+    /// （虚拟 URI 无文件可开，维持 R5 前形态）。
+    /// 覆写 `on_session_ready`（Arc 变体）而非 `on_server_ready`：ensure_open
+    /// 接收 `&Arc<Self>`，&Session 引用调不到 —— 编排型覆写通道（vue hybrid 先例）。
+    async fn on_session_ready(
+        &self,
+        session: &std::sync::Arc<lsp_core::session::Session>,
+    ) -> anyhow::Result<()> {
         use serde_json::json;
+        let (uri, open_target) = self.probe_target();
+        if let Some(path) = open_target {
+            let _ = session.ensure_open(&path).await; // 放行契约：打开失败不阻断就绪
+        }
         let probe = session
             .request::<serde_json::Value>(
                 "textDocument/documentSymbol",
-                json!({ "textDocument": { "uri": self.probe_uri() } }),
+                json!({ "textDocument": { "uri": uri } }),
                 READY_PROBE_TIMEOUT,
             )
             .await;
@@ -134,13 +145,24 @@ impl LanguageServerAdapter for PyrightAdapter {
 }
 
 impl PyrightAdapter {
-    /// `on_server_ready` 将发出的探针 URI：root 下真实小文件的 file URI；root 未设置
-    /// 或无候选文件时退虚拟 URI。
-    fn probe_uri(&self) -> String {
+    /// 就绪探针目标：`(uri, didOpen 目标路径)`。uri 选择语义同 probe_uri_for_root
+    /// （语言源文件 → 工程标记 → 虚拟兜底）；仅「语言源文件」命中时返回 didOpen
+    /// 目标 —— 未打开文档的探针请求会楔死 pyright（smoke R6 python 门帧实锚：
+    /// run 36577226543 探针 documentSymbol 先于 didOpen，此后全部请求零应答）；
+    /// 标记文件 / 虚拟 URI 无文件可开，维持裸探针旧行为。
+    fn probe_target(&self) -> (String, Option<PathBuf>) {
         let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
-        match root {
-            Some(root) => crate::probe_uri_for_root(&root, self.languages(), PROBE_FALLBACK),
-            None => PROBE_FALLBACK.to_string(),
+        let source = root
+            .as_deref()
+            .and_then(|r| crate::find_language_source_file(r, self.languages(), 4));
+        match source {
+            Some(path) => (lsp_core::docsync::path_to_uri_str(&path), Some(path)),
+            None => (
+                root.as_deref()
+                    .map(|r| crate::probe_uri_for_root(r, self.languages(), PROBE_FALLBACK))
+                    .unwrap_or_else(|| PROBE_FALLBACK.to_string()),
+                None,
+            ),
         }
     }
 }
@@ -177,21 +199,36 @@ pub(crate) fn find_python_interpreter(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// 探针选 root 下真实文件（触发项目索引）；无候选文件退虚拟 URI（向后兼容）。
+    /// 探针目标选择：语言源文件命中 → (uri, didOpen=该文件，smoke R6 didOpen-first
+    /// 契约)；仅工程标记 → (uri, None——标记文件不 didOpen)；全空 → 虚拟 URI 兜底。
     #[test]
-    fn probe_uri_real_file_then_fallback() {
+    fn probe_target_real_file_then_fallback() {
         let adapter = PyrightAdapter;
 
+        // 仅工程标记（.gitignore）：URI 命中标记文件，不返回 didOpen 目标。
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
         adapter.set_project_root(dir.path());
-        let uri = adapter.probe_uri();
+        let (uri, open_target) = adapter.probe_target();
         assert!(uri.starts_with("file:///"), "必须是 file URI: {uri}");
         assert!(uri.ends_with(".gitignore"), "应指向真实文件: {uri}");
+        assert!(open_target.is_none(), "工程标记不可 didOpen: {open_target:?}");
 
+        // 语言源文件：didOpen 目标 = 该文件（未打开文档的探针楔死 pyright）。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "x = 1\n").unwrap();
+        adapter.set_project_root(dir.path());
+        let (uri, open_target) = adapter.probe_target();
+        assert!(uri.ends_with("main.py"), "语言源文件优先于工程标记: {uri}");
+        let open_path = open_target.expect("语言源文件必须返回 didOpen 目标");
+        assert!(open_path.ends_with("main.py"));
+
+        // 全空：虚拟 URI 兜底（向后兼容），无 didOpen 目标。
         let empty = tempfile::tempdir().unwrap();
         adapter.set_project_root(empty.path());
-        assert_eq!(adapter.probe_uri(), PROBE_FALLBACK);
+        let (uri, open_target) = adapter.probe_target();
+        assert_eq!(uri, PROBE_FALLBACK);
+        assert!(open_target.is_none());
     }
 
     /// venv 探测：.venv/bin/python(.exe) 命中 → 返该路径。

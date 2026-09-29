@@ -1262,6 +1262,28 @@ fn w2_svelte_deno_sass_doors_wired() {
     assert_eq!(plugin.version.as_deref(), Some("0.3.52"));
 }
 
+/// smoke R6（run 36577226543）pyright 变体门锁：--lang pyright 按 entry id 显式路由
+/// [servers.pyright]（uvx pin 对账见 UVX_IDS 块），didOpen 官方口径显式映射
+/// pyright→python——pyright 对自名 languageId 不识别（didOpen 被吞 → 12 连发
+/// documentSymbol 零应答，帧实锚），intelephense→php 先例；同族 basedpyright 宽容
+/// 照过，不加死映射。
+#[test]
+fn pyright_variant_door_didopen_language_id() {
+    use ls_registry::adapter_for;
+    use ls_registry::config::spec_for;
+
+    // T0 分流：--lang pyright → [servers.pyright] 条目；无手写 adapter
+    // （语言路由 python = PyrightAdapter T2，变体门走条目 id）。
+    let (id, _) = spec_for("pyright").expect("--lang pyright must route to a spec");
+    assert_eq!(id, "pyright");
+    assert!(adapter_for("pyright").is_none(), "pyright 变体门 T0");
+
+    // didOpen 官方口径：仅 pyright 显式映射；python 门本体与 basedpyright 恒等。
+    assert_eq!(ls_registry::lsp_language_id("pyright"), "python");
+    assert_eq!(ls_registry::lsp_language_id("python"), "python");
+    assert_eq!(ls_registry::lsp_language_id("basedpyright"), "basedpyright");
+}
+
 /// W3 批（php/lua/scala/swift）验收单测：四门均为 T0（adapter_for None，session_for
 /// 落 ensure_launch）；php 门按 entry id `intelephense` 显式路由（语言路由 `php` 归
 /// phpactor，phpantom 避撞先例），didOpen 官方口径 intelephense→php；lua（LuaLS

@@ -320,6 +320,11 @@ pub fn lsp_language_id(lang: &str) -> String {
         // phpactor），didOpen 官方口径是 "php"（docker→dockerfile 同款显式映射，
         // 不赌 LS 对自名的宽容）。lua/scala/swift 恒等走 default 臂。
         "intelephense" => "php".to_string(),
+        // smoke R6：python 变体门 --lang pyright 按 entry id 显式路由（pgsql/mysql
+        // 先例），didOpen 官方口径是 "python"——pyright 对自名 languageId 不识别，
+        // didOpen 被吞后全部请求零应答（run 36577226543 帧实锚；intelephense→php
+        // 同款显式映射，不赌 LS 对自名的宽容）。
+        "pyright" => "python".to_string(),
         // smoke R4：typescript_vts 变体门的 didOpen 官方口径是 "typescript"
         // （vtsls 消费 TS 文档；变体门 pgsql→sql 同款换算）。
         "typescript_vts" => "typescript".to_string(),
@@ -332,6 +337,20 @@ mod tests {
     //! 单元测试覆盖"表内 vs 表外"语义；集成行为（Arc 单例、adapter trait）放 `tests/resolve.rs`。
     use super::*;
     use std::path::PathBuf;
+
+    /// smoke R6（run 36577226543）：pyright 变体门 didOpen 官方口径锁——pyright 对
+    /// 自名 languageId 不识别（didOpen 被吞 → 12 连发 documentSymbol 零应答），
+    /// 显式映射 pyright→python（intelephense→php 先例）；basedpyright 门宽容照过，
+    /// 不加死映射。改映射必同步改此断言。
+    #[test]
+    fn pyright_variant_didopen_language_id() {
+        assert_eq!(lsp_language_id("pyright"), "python");
+        // python 门本体与其余变体恒等（不加多余映射）。
+        assert_eq!(lsp_language_id("python"), "python");
+        assert_eq!(lsp_language_id("basedpyright"), "basedpyright");
+        assert_eq!(lsp_language_id("python_ty"), "python_ty");
+        assert_eq!(lsp_language_id("python_pyrefly"), "python_pyrefly");
+    }
 
     #[test]
     fn table_includes_cpp_variants() {

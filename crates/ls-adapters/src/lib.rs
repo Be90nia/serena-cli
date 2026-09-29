@@ -563,7 +563,7 @@ pub(crate) const PROBE_SKIP_DIRS: &[&str] = &[
 
 /// root 下找 adapter 语言的首个真实源文件（限深 4 层），触发 LS 的项目 lazy-load。
 /// 找不到 → `None`（调用方回退工程标记名单）。
-fn find_language_source_file(root: &Path, langs: &[LanguageId], depth: u8) -> Option<PathBuf> {
+pub(crate) fn find_language_source_file(root: &Path, langs: &[LanguageId], depth: u8) -> Option<PathBuf> {
     if depth == 0 {
         return None;
     }
