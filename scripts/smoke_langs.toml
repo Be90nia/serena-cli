@@ -212,12 +212,12 @@ budget_secs = 420
 [[lang]]
 id = "bsl"
 via = "serena-download"
-install = "sudo apt-get update -qq && sudo apt-get install -y -qq openjdk-21-jre-headless && $SERENA_CLI install bsl"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq openjdk-21-jre-headless && java -version 2>&1 | head -1 >&2 && $SERENA_CLI install bsl"
 pin = "servers.toml"
 fixture = "module.bsl"
 lang_flag = "bsl"
 budget_secs = 600
-remark = "JVM ≥21：runner 预装 17，apt 显式装 21"
+remark = "JVM ≥21：runner 预装 17，apt 显式装 21；install 期向 stderr 打 java 版本（LS 瞬死零 stderr，run 36561318948 上游同款 java -jar 启动仍 stdout pump EOF——先验 JVM 版本归属再排障）"
 
 [[lang]]
 id = "nextflow"
@@ -250,18 +250,18 @@ remark = "运行需 Haxe 编译器（apt suite 版）"
 
 [[lang]]
 id = "php"
-via = "serena-npm"
-install = "$SERENA_CLI install intelephense"
+via = "serena-download"
+install = "sudo apt-get install -y -qq php-cli && $SERENA_CLI install php"
 pin = "servers.toml"
 fixture = "main.php"
-lang_flag = "intelephense"
-budget_secs = 420
-remark = "PM 拍板 intelephense（npm，零运行时依赖）；语言路由 php 归 phpactor 条目（存量避撞），门走 --lang intelephense 按 entry id 显式路由（phpantom 同款），lsp_language_id 显式映射 intelephense→php（didOpen 官方口径）"
+lang_flag = "php"
+budget_secs = 600
+remark = "phpactor PHAR 需 PHP 8.1+（ubuntu-24.04 apt = 8.3）"
 
 [[lang]]
 id = "clojure"
 via = "serena-download"
-install = "sudo apt-get update -qq && sudo apt-get install -y -qq clojure && $SERENA_CLI install clojure"
+install = "sudo apt-get install -y -qq clojure && $SERENA_CLI install clojure"
 pin = "servers.toml"
 fixture = "core.clj"
 lang_flag = "clojure"
@@ -383,7 +383,8 @@ pin = "servers.toml"
 fixture = "elm/src/Main.elm"
 lang_flag = "elm"
 budget_secs = 420
-remark = "fixture = elm.json + src/Main.elm（标准 elm 布局）——source-directories [\".\"] 实锤不过（run 36528495148: No Elm workspace contains Main.elm），elm-language-server 工作区必须 elm.json 且文件须落 source-directories 内"
+fallback_assert = "diagnostics"
+remark = "fixture = elm.json + src/Main.elm（标准 elm 布局）+ --project 指向 fixture 根后 workspace 已可定位（run 36561318948：报错从 No Elm workspace 变为 -32601 Unhandled method documentSymbol）——本 elm-language-server 形态无 documentSymbol capability，降级验 diagnostics（elm-ls 核心能力），ansible 先例"
 
 [[lang]]
 id = "typescript_vts"
@@ -453,11 +454,12 @@ remark = "需 dotnet SDK（ubuntu-latest runner 预装）；fixture 带 main.fsp
 [[lang]]
 id = "ruby"
 via = "serena-gem"
+install = "$SERENA_CLI install ruby && cd \"$SERENA_FXDIR\" && bundle install --jobs 4 --quiet"
 pin = "servers.toml"
 fixture = "ruby/smoke.rb"
 lang_flag = "ruby"
 budget_secs = 420
-remark = "需 ruby + gem（ubuntu-latest runner 预装）；fixture = Gemfile + smoke.rb——ruby-lsp 需 bundle 上下文，无 Gemfile 启动即 LS_TERMINATED（stdout pump EOF，run 36528495148 实锚），有 Gemfile 时 ruby-lsp 自组 composed bundle（需 rubygems 网络，首启装包吃预算）"
+remark = "需 ruby + gem（ubuntu-latest runner 预装）；fixture = Gemfile + smoke.rb + install 期 bundle install（SERENA_FXDIR 指向 fixture 目录）——ruby-lsp 裸启动无 bundle 上下文即 LS_TERMINATED（run 36528495148 实锚），有 Gemfile 还须 bundle 可解析（run 36561318948：仅 Gemfile 未 install 仍 EOF），smoke_one.sh 另向 LS 进程链 export BUNDLE_GEMFILE"
 
 [[lang]]
 id = "solargraph"

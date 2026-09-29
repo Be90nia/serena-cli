@@ -172,6 +172,28 @@ async fn server_to_client_request_gets_default_null_reply() {
 }
 
 #[tokio::test]
+async fn workspace_configuration_default_replies_items_length_array() {
+    let (out_tx, _out_rx) = mpsc::channel::<OutboundItem>(8);
+    let client = Client::with_name("mock_ls".into(), out_tx);
+    let srv_req = JsonRpc {
+        jsonrpc: "2.0".into(),
+        id: Some(Value::Number(7.into())),
+        method: Some("workspace/configuration".into()),
+        params: Some(json!({"items": [{"section": "python"}, {"section": "pyright"}]})),
+        result: None,
+        error: None,
+    };
+    let reply = client
+        .handle_message(srv_req)
+        .expect("configuration 请求必须得到回执");
+    assert_eq!(
+        reply.result,
+        Some(json!([null, null])),
+        "configuration 默认应答回 items 等长 null 数组（严格客户端 pyright/FSAC 对 null 整体失效，run 36561318948 实锤）"
+    );
+}
+
+#[tokio::test]
 async fn server_to_client_request_e2e_with_mock_ls() {
     let (capture_tx, mut capture_rx) = mpsc::channel::<JsonRpc>(4);
     let count = Arc::new(AtomicUsize::new(0));

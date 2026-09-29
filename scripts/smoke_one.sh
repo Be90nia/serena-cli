@@ -284,6 +284,12 @@ one_door() {
     # install 行可用 $SERENA_FXDIR（fixture 工作目录）：工程型前置（csharp/fsharp
     # dotnet restore）在 install 阶段对它执行——copy 先于 install，次序即契约。
     export SERENA_FXDIR="$fxdir"
+    # ruby-lsp 系 LS 必须有 bundle 上下文才肯活（裸启动即 stdout pump EOF，
+    # run 36528495148/36561318948 实锤）：有 Gemfile 就把 bundler 指过去——env 随
+    # CLI → lazy-spawn daemon → LS 进程继承。
+    if [ -f "$fxdir/Gemfile" ]; then
+        export BUNDLE_GEMFILE="$fxdir/Gemfile"
+    fi
 
     # install（budget_secs 包住 install+拉起+探针的 install 侧；超预算 → SKIP BUDGET）
     local rc=0
@@ -381,7 +387,8 @@ shard_run() {
     # 两者都认；每个 id 仍必须恰一条。
     local bad="" n flag pat
     for id in $ids; do
-        flag=$(manifest_row "$id" | awk -F'\x1f' '{print $5}')
+        # manifest_row 字段序：id(1) via(2) install(3) pin(4) fixture(5) lang_flag(6)。
+        flag=$(manifest_row "$id" | awk -F'\x1f' '{print $6}')
         pat="${flag:-$id}"
         n=$(grep -cE "^(PASS|FAIL|SKIP) (${id}|${pat})( |$)" "$logf")
         [ "$n" -eq 1 ] || bad="$bad ${id}x${n}"

@@ -15,8 +15,10 @@
 //!   返回 `CoreError::Rpc{code:-32801, ...}`（ARCHITECTURE §6.1）。
 //! - 泵 EOF → `abort_all()` 把 pending 表 drain 干净，全体回 `CoreError::Terminated`。
 //!   ↖ mirror: ls_process.py@43ae021 `_cancel_pending_requests`。
-//! - server→client 请求默认回 `null` 成功响应（vscode-languageserver-node 系把
-//!   registerCapability 错误响应当致命，ARCHITECTURE §3.2 ↖ 形态同 helix transport.rs）。
+//! - server→client 请求默认回成功响应：`workspace/configuration` 回与 items 等长的
+//!   null 数组（严格客户端 pyright/fsautocomplete 对 null 整体失效，见函数文档）；
+//!   其余方法回 `null`（vscode-languageserver-node 系把 registerCapability 错误
+//!   响应当致命，ARCHITECTURE §3.2 ↖ 形态同 helix transport.rs）。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -30,6 +32,25 @@ use tokio::time;
 
 use crate::error::{CoreError, Result};
 use crate::framing::{JsonRpc, RpcError};
+
+/// server→client 请求的默认应答。`workspace/configuration` 必须回与 items 等长的
+/// 数组（元素 null = 该项无配置）——回 null 会让严格客户端的配置链路整体失效：
+/// pyright 表现为 initialize 后请求交替 30s 超时/空结果（run 36561318948 实锤），
+/// fsautocomplete 表现为工程不加载（LoadedProjects 恒空，同 run 实锤）。宽容客户端
+/// （gopls / vscode-languageserver-node 系）对两种形态等价，行为零变化。
+fn default_server_request_result(method: &str, msg: &JsonRpc) -> Value {
+    if method != "workspace/configuration" {
+        return Value::Null;
+    }
+    let n = msg
+        .params
+        .as_ref()
+        .and_then(|p| p.get("items"))
+        .and_then(|v| v.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    Value::Array(vec![Value::Null; n])
+}
 
 /// P0B：出站帧分类优先级。三级队列：High 永不排队等 Normal，Normal 累积 50ms
 /// 降级 Background，Background 走 TokenBucket 限流（30/s、burst 2s）。
@@ -513,8 +534,8 @@ impl Client {
                     let handlers = self.inner.server_request_handlers.lock().unwrap();
                     handlers
                         .get(method.as_str())
-                        .and_then(|h| (h)(msg))
-                        .unwrap_or(Value::Null)
+                        .and_then(|h| (h)(msg.clone()))
+                        .unwrap_or_else(|| default_server_request_result(method, &msg))
                 };
                 Some(JsonRpc::response_ok(id.to_value(), result))
             }

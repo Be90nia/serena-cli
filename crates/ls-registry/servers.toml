@@ -1172,12 +1172,14 @@ install = "npm"
 source_commit = "43ae0211"
 [servers.typescript_vts.npm]
 package = "@vtsls/language-server"
-version = "0.2.9"
+version = "0.3.0"
 bin_rel = "vtsls"
 npm_args = ["--stdio"]
 # CI 实锤（run 36558034167）："Cannot find provider for documentSymbol"、hover 同死
-# ——0.2.9 的 language-service 并不携带 tsserver lib，裸 workspace 必须同 node_modules
-# 有 typescript（vue 三包同装先例），否则 tsserver 桥整体不挂。
+# ——裸 workspace 必须同 node_modules 有 typescript（vue 三包同装先例），否则 tsserver
+# 桥整体不挂。0.2.9 → 0.3.0 同时是缓存键破冰：npm 缓存目录按 id+version 分落，
+# 补 secondary_packages 不换键会把 0.2.9 时代的无 typescript 缓存原样复用
+# （run 36561318948 实锤：装了 secondary 仍 provider 缺失）。
 [[servers.typescript_vts.npm.secondary_packages]]
 package = "typescript"
 version = "5.9.3"
