@@ -1,11 +1,14 @@
 # smoke_langs.toml —— 45 门语言 CI 冒烟矩阵清单（Phase 0 基建，serena-rust）。
 #
 # 三栏对账锚（上游 73 门，详见 local/agent-reports/ci-infra-45lang.md）：
-#   本矩阵（R6 终账 2026-09-29）：69 门 = 53 真门 + 16 SKIP 冻结（nix/java/matlab/
+#   本矩阵（R7 终账 2026-09-29）：69 门 = 53 真门 + 16 SKIP 冻结（nix/java/matlab/
 #   latex/pascal/omnisharp/al/swift/wolfram 存量 9 + R6 证据 SKIP 7：bsl/crystal/
-#   elixir/nextflow/fsharp/haskell/qml）+ W3/W4/W5 已派账（scala/perl/r/julia
-#   收编、groovy 不入矩阵——angular 先例、wolfram LICENSE 批准冻结、gdscript HOST/
-#   msl HOST 于 R4 账本迁出不入矩阵——angular/groovy 先例）。总账 73 闭合。
+#   elixir/nextflow/fsharp/haskell/qml；R7 微轮 python/pyright 双门曾短暂 SKIP、
+#   经根因实锚撤 SKIP 回真门——pyright ≤1.1.403 workspaceFolders 楔死，钉版
+#   1.1.414 解药，见 local/agent-reports/smoke-round6-final.md §六）+ W3/W4/W5 已派账
+#   （scala/perl/r/julia 收编、groovy 不入矩阵——angular 先例、wolfram LICENSE 批准
+#   冻结、gdscript HOST/msl HOST 于 R4 账本迁出不入矩阵——angular/groovy 先例）。
+#   总账 73 闭合。
 #   R6 = smoke 终轮（run 36577226543 12 红门处置：5 门修绿 python/pyright/r/
 #   lean4/ruby，7 门证据 SKIP 迁冻结；逐门证据见 local/agent-reports/smoke-round6-final.md）。
 #
@@ -71,8 +74,7 @@ install = "npm install -g pyright@1.1.414"
 pin = "pyright@1.1.414"
 fixture = "main.py"
 budget_secs = 420
-skip_class = "BUDGET"
-skip_reason = "pyright LS on CI-linux hangs documentSymbol with zero responses (run 36588845806 frames: 12 requests post-didOpen, no reply; 30s timeout x4). Falsified fixes across R2b-R6: workspace/configuration [None]*n array (upstream semantics), languageId python, didOpen-first ordering, pythonPath /usr/bin/python3 fallback, pin 1.1.414. basedpyright (same adapter family, same fixture) PASSes — CI-environment-specific pyright behavior; local Windows pyright works. W-wave: pyright --project/node diagnosis with SERENA_RECORD frames. Python-language coverage on CI lives with the basedpyright door (PASS, same .py fixture)."
+remark = "T2 手写适配器；pin 与 [servers.pyright] uvx 条目同版本；1.1.414 最低版（≤1.1.403 headless 遇 initialize workspaceFolders 分析引擎不启动——run 36588845806/36591311133 双门帧实锚 + 本地裸探针二分，见 servers.toml 条目注释；R7 短暂 SKIP 后经根因实锚撤除，CI 未测过 414——36591311133 实际仍是 403）"
 
 [[lang]]
 id = "go"
@@ -422,8 +424,7 @@ pin = "servers.toml"
 fixture = "main.py"
 lang_flag = "pyright"
 budget_secs = 420
-skip_class = "BUDGET"
-skip_reason = "Same pyright-LS CI hang as the python door (see python skip_reason); variant gate --lang pyright. W-wave with frames from runs 36577226543/36588845806/36591311133."
+remark = "变体门：--lang pyright（python 门独立）；uv 由 smoke_one.sh 自动安装；[servers.pyright] 钉 1.1.414 版地板（≤1.1.403 workspaceFolders 楔死，R7 根因实锚撤 SKIP——T0 无 initializationOptions 通道，解药只有钉版；CI 未测过 414，36591311133 实际仍是 403）"
 
 [[lang]]
 id = "basedpyright"
