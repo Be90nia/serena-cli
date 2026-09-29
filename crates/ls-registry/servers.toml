@@ -1175,6 +1175,12 @@ package = "@vtsls/language-server"
 version = "0.2.9"
 bin_rel = "vtsls"
 npm_args = ["--stdio"]
+# CI 实锤（run 36558034167）："Cannot find provider for documentSymbol"、hover 同死
+# ——0.2.9 的 language-service 并不携带 tsserver lib，裸 workspace 必须同 node_modules
+# 有 typescript（vue 三包同装先例），否则 tsserver 桥整体不挂。
+[[servers.typescript_vts.npm.secondary_packages]]
+package = "typescript"
+version = "5.9.3"
 
 [servers.vue]
 languages = ["vue"]

@@ -137,8 +137,13 @@ BOTTOMLINE_MODE="direct"
 assert_overview() {
     local id="$1" fx="$2" errf="$3" fallback="$4" t0="$5" budget="$6"
     local out rc ev attempt=1 transient
+    # --project 恒显式：CLI 缺省 root = CWD（CI = 仓库检出根）——project-based LS
+    # （csharp-ls/fsautocomplete/expert/elm-ls/ruby-ls）会在错误的 rootUri 上找工程，
+    # documentSymbol 恒空/LoadedProjects 报错（run 36558034167 十门实锤）。
+    local fxdir
+    fxdir="$(dirname "$fx")"
     while :; do
-        out=$(run_with_timeout "$PROBE_TIMEOUT" "$SERENA_CLI" overview "$fx" --lang "$id" 2>"$errf")
+        out=$(run_with_timeout "$PROBE_TIMEOUT" "$SERENA_CLI" --project "$fxdir" overview "$fx" --lang "$id" 2>"$errf")
         rc=$?
         # 失败证据恒留 LOG 行（CiInfra heads-up：降级路径不得吞 overview 失败现场）。
         log_stderr_if_any "$id" "$errf"
@@ -207,17 +212,18 @@ if not (isinstance(obj, list) and len(obj) > 0):
 # ---- 加息探针（清单 extra_assert 登记制）----
 run_extra_assert() {
     local id="$1" fx="$2" spec="$3" errf="$4"
-    local rc
+    local rc fxdir
+    fxdir="$(dirname "$fx")"
     case "$spec" in
         hover:*)
             local loc="${spec#hover:}" line col
             line="${loc%%:*}"
             col="${loc#*:}"
-            run_with_timeout "$PROBE_TIMEOUT" "$SERENA_CLI" hover "$fx" "$line" "$col" --lang "$id" >/dev/null 2>"$errf"
+            run_with_timeout "$PROBE_TIMEOUT" "$SERENA_CLI" --project "$fxdir" hover "$fx" "$line" "$col" --lang "$id" >/dev/null 2>"$errf"
             rc=$?
             ;;
         diagnostics)
-            run_with_timeout "$PROBE_TIMEOUT" "$SERENA_CLI" diagnostics "$fx" --wait-gen 1 --lang "$id" >/dev/null 2>"$errf"
+            run_with_timeout "$PROBE_TIMEOUT" "$SERENA_CLI" --project "$fxdir" diagnostics "$fx" --wait-gen 1 --lang "$id" >/dev/null 2>"$errf"
             rc=$?
             ;;
         *)
@@ -227,7 +233,9 @@ run_extra_assert() {
     esac
     log_stderr_if_any "$id" "$errf"
     if [ "$rc" -ne 0 ]; then
-        log "FAIL $id extra_assert: $spec exit=$rc"
+        # LOG 而非 FAIL：裁决行由调用方统一发一条（fallback 路径失败时本函数
+        # 被 assert_overview 调用，FAIL+FAIL 会造成一门两行，审计必红）。
+        log "LOG $id extra_assert: $spec exit=$rc"
         return 1
     fi
 }
@@ -316,7 +324,7 @@ one_door() {
         # ——曾只留 30s，重试链溢进片看门狗会把真 FAIL 伪装成 SKIP BUDGET。
         local remaining=$((budget - (SECONDS - t0) - 210))
         [ "$remaining" -lt 60 ] && remaining=60
-        run_with_timeout $((remaining + 30)) "$SERENA_CLI" wait-ready --file "$fx" \
+        run_with_timeout $((remaining + 30)) "$SERENA_CLI" --project "$fxdir" wait-ready --file "$fx" \
             --lang "${lang_flag:-$id}" --stage symbol --timeout "$remaining" \
             >/dev/null 2>"$errf" || log_stderr_if_any "$id (wait-ready)" "$errf"
     fi
@@ -327,7 +335,7 @@ one_door() {
 
     # 加息（登记制，默认无；降级触发的门已验过登记探针，跳过防双份噪音）
     if [ -n "$extra" ] && [ "$BOTTOMLINE_MODE" = "direct" ]; then
-        run_extra_assert "${lang_flag:-$id}" "$fx" "$extra" "$errf" || { rm -rf "$work"; return 1; }
+        run_extra_assert "${lang_flag:-$id}" "$fx" "$extra" "$errf" || { rm -rf "$work"; log "FAIL $id extra_assert: $extra"; return 1; }
     fi
 
     "$SERENA_CLI" stop-all >/dev/null 2>&1 || true
@@ -369,9 +377,13 @@ shard_run() {
     # ── 裁决自检（S9 P0）：片内每门恰一条裁决行（PASS|FAIL|SKIP <id> ...）──
     # 历史缺陷：SKIP 门不进分片计划 → 7 门零裁决行，"FAIL=0" 假绿。行数 != 门数
     # 或某门 0/多行 = 片红（缺行最常见于看门狗掐死在裁决行输出前）。
-    local bad="" n
+    # 探针行 id 可为 manifest id 或 lang_flag（php 门 verdict 记 intelephense），
+    # 两者都认；每个 id 仍必须恰一条。
+    local bad="" n flag pat
     for id in $ids; do
-        n=$(grep -cE "^(PASS|FAIL|SKIP) ${id}( |$)" "$logf")
+        flag=$(manifest_row "$id" | awk -F'\x1f' '{print $5}')
+        pat="${flag:-$id}"
+        n=$(grep -cE "^(PASS|FAIL|SKIP) (${id}|${pat})( |$)" "$logf")
         [ "$n" -eq 1 ] || bad="$bad ${id}x${n}"
     done
     rm -f "$logf"
