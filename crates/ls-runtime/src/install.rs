@@ -147,6 +147,20 @@ pub enum InstallOutcome {
 /// 本结构先实现 A 类 Download 的核心流程。
 pub struct DownloadInstaller;
 
+/// 半包收口（装态统一语义）：「目录在 + 解析出的 exe 不在」= 前次安装中断残留（半包），
+/// 视同未装 —— 重装前整目录清掉，保证 npm/extract 从干净状态开始（增量覆盖不保证
+/// 删净旧残留）。exe 落盘在（已装）或目录不在 → 不动，返回 false。
+/// 只清 installer 自拼的 `{cache_root}/{id}/{version}`（无用户输入，不涉 uninstall
+/// 的 ensure_within_cache_root 安全门）；删除失败不阻塞安装（同下方 `remove_file(&pkg)`
+/// 先例：清理非关键路径，真问题由后续 npm/extract 步骤暴露）。
+pub(crate) fn clear_half_installed(install_dir: &Path, exe: Option<&Path>) -> bool {
+    if exe.is_some_and(Path::is_file) || !install_dir.is_dir() {
+        return false;
+    }
+    let _ = std::fs::remove_dir_all(install_dir);
+    true
+}
+
 impl DownloadInstaller {
     /// A 类安装主流程：已装短路 → sha 门 → 锁 → 下载 → 校验 → 预检 → 解压 → Ready。
     pub fn install(
@@ -209,6 +223,8 @@ impl DownloadInstaller {
             }
         }
 
+        // 真要装了才清半包（sha 门后）：未授权路径不碰用户缓存目录。
+        clear_half_installed(&install_dir, Some(&exe));
         // 锁（§5.3）：{install_dir}/install.lock —— 同 id 同 version 唯一。
         std::fs::create_dir_all(&install_dir)
             .map_err(|e| download_err(url, &format!("create install dir: {e}")))?;
@@ -820,6 +836,46 @@ mod tests {
         assert!(
             matches!(out2, InstallOutcome::Ready(Launch::Process { .. })),
             "二调应走已装短路，实际 {out2:?}"
+        );
+    }
+
+    /// 半包 + 未授权（sha 未知 + 未越狱）→ UnsignedRefused 且半包目录保留。
+    /// 时序锁：清半包（clear_half_installed）只发生在授权安装路径（sha 门之后），
+    /// 未授权路径不得碰用户缓存。
+    #[test]
+    fn download_half_installed_preserved_when_unsigned_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let half = dir.path().join("my-ls/1.0.0");
+        std::fs::create_dir_all(&half).unwrap();
+        std::fs::write(half.join("residue.txt"), "").unwrap();
+        let ctx = InstallCtx {
+            os: Os::Windows,
+            arch: Arch::X86_64,
+            auto_install: true,
+            allow_unsigned_sha: false,
+            cache_root: dir.path().to_path_buf(),
+        };
+        let spec = InstallSpec {
+            id: "my-ls".into(),
+            kind: InstallKind::Download {
+                version: "1.0.0".into(),
+                url: "https://github.com/x/y".into(),
+                sha256: String::new(),
+                archive: ArchiveKind::Raw,
+                strip_components: 0,
+                bin_path: "ls.exe".into(),
+                allowed_hosts: vec!["github.com".into()],
+            },
+            exec: vec![],
+        };
+        let out = DownloadInstaller.install(&ctx, &spec).expect("不应 Err");
+        assert!(
+            matches!(out, InstallOutcome::UnsignedRefused { .. }),
+            "半包不得当 Ready，实际 {out:?}"
+        );
+        assert!(
+            half.join("residue.txt").is_file(),
+            "未授权路径不得清用户缓存"
         );
     }
 }

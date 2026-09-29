@@ -7,7 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::install::{
-    InstallCtx, InstallKind, InstallOutcome, InstallSpec, Launch, acquire_install_lock, wrong_kind,
+    InstallCtx, InstallKind, InstallOutcome, InstallSpec, Launch, acquire_install_lock,
+    clear_half_installed, wrong_kind,
 };
 use crate::install_pkg::run_pkg_cmd;
 use crate::process::RuntimeError;
@@ -33,7 +34,8 @@ impl DotnetInstaller {
         };
         let dir_name = version.clone().unwrap_or_else(|| "latest".to_string());
         let install_dir = ctx.cache_root.join(&spec.id).join(dir_name);
-        if let Some(exe) = dotnet_tool_bin_path(&install_dir, tool) {
+        let exe = dotnet_tool_bin_path(&install_dir, tool);
+        if let Some(exe) = exe {
             return Ok(InstallOutcome::Ready(Launch::Process {
                 exe,
                 args: args.clone().unwrap_or_default(),
@@ -48,6 +50,7 @@ impl DotnetInstaller {
                 install_cmd: Some(dotnet_install_cmd(tool, version.as_deref(), &install_dir)),
             });
         }
+        clear_half_installed(&install_dir, exe.as_deref());
         std::fs::create_dir_all(&install_dir).map_err(|e| {
             toolchain_err(&format!(
                 "dotnet tool install: create install dir {}: {e}",
@@ -134,7 +137,8 @@ impl GemInstaller {
         let dir_name = version.clone().unwrap_or_else(|| "latest".to_string());
         let install_dir = ctx.cache_root.join(&spec.id).join(dir_name);
         let bindir = install_dir.join("bin");
-        if let Some(exe) = gem_bin_path(&bindir, bin_rel) {
+        let exe = gem_bin_path(&bindir, bin_rel);
+        if let Some(exe) = exe {
             return Ok(InstallOutcome::Ready(Launch::Process {
                 exe,
                 args: args.clone().unwrap_or_default(),
@@ -146,6 +150,7 @@ impl GemInstaller {
                 install_cmd: Some(gem_install_cmd(gem, version.as_deref(), &bindir)),
             });
         }
+        clear_half_installed(&install_dir, exe.as_deref());
         std::fs::create_dir_all(&bindir).map_err(|e| {
             toolchain_err(&format!(
                 "gem install: create bindir {}: {e}",
@@ -257,6 +262,7 @@ impl SourceInstaller {
                 )),
             });
         }
+        clear_half_installed(&install_dir, exe.is_file().then_some(exe.as_path()));
         std::fs::create_dir_all(&install_dir).map_err(|e| {
             toolchain_err(&format!(
                 "source build: create install dir {}: {e}",

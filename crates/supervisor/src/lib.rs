@@ -340,6 +340,10 @@ pub struct Supervisor {
     instances: Mutex<HashMap<Key, Arc<Session>>>,
     load_gates: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
     last_used: Mutex<HashMap<Key, std::time::Instant>>,
+    /// spawn 成功时登记的 LS exe 路径（launch.cmd 首元素）。缓存命中前复验其仍在盘上：
+    /// 卸载/半包（目录在 exe 不在）后活 session 不得继续被复用——PM 对拍实锤
+    /// （uninstall + 空壳 → hover 仍返语义结果）。evict 时同步清理。
+    launch_exe: Mutex<HashMap<Key, PathBuf>>,
     direct_mode: bool,
     /// publishDiagnostics 通知缓存：key = (root, uri)，value = items 数组。
     diag_cache: DiagCache,
@@ -553,6 +557,7 @@ impl Supervisor {
             instances: Mutex::new(HashMap::new()),
             load_gates: Mutex::new(HashMap::new()),
             last_used: Mutex::new(HashMap::new()),
+            launch_exe: Mutex::new(HashMap::new()),
             direct_mode: true,
             diag_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             diag_generation: std::sync::Arc::new(AtomicU64::new(0)),
@@ -695,6 +700,7 @@ impl Supervisor {
         self.last_used.lock().unwrap().remove(key);
         self.load_gates.lock().unwrap().remove(key);
         self.pull_diag_supported.lock().unwrap().remove(key);
+        self.launch_exe.lock().unwrap().remove(key);
         match session {
             Some(s) => {
                 s.shutdown().await;
@@ -759,26 +765,49 @@ impl Supervisor {
         }
     }
 
+    /// 缓存命中前的装态复验:登记的 LS exe 已不在盘上(被卸载/半包)→ 会话失效,
+    /// 驱逐后走冷启动重新探测(未装则报 LS_NOT_INSTALLED)。无登记条目(防御:
+    /// 理论上 spawn 必登记)→ 视为有效不拦。
+    fn launch_exe_valid(&self, key: &Key) -> bool {
+        match self.launch_exe.lock().unwrap().get(key) {
+            Some(exe) => exe.is_file(),
+            None => true,
+        }
+    }
+
     /// 拿到/创建 (root, lang) 对应的 Session，同 key 只允许一次冷启动。
     async fn session_for(&self, root: &Path, lang: &str) -> ToolResult<Arc<Session>> {
         let key = Self::key(root, lang);
-        // 快路径：缓存命中（Failed 状态视为 miss 触发懒重启）。
-        if let Some(session) = self.instances.lock().unwrap().get(&key).cloned() {
-            if !matches!(session.state(), lsp_core::session::SessionState::Failed(_)) {
-                self.touch(&key);
-                return Ok(session);
-            }
+        // 快路径：缓存命中且（未 Failed 且 exe 仍在盘——卸载/半包后活 session 失效）
+        // → 复用；命中但失效 → 驱逐后走慢路径重新探测装态。
+        // 禁在 if-let scrutinee 的块内再拿同一把锁：无 else 的 if-let 临时 guard
+        // 活到块尾（edition 2024），同锁重入 = 自死锁（判据源 launch_exe_valid）。
+        let cached = self.instances.lock().unwrap().get(&key).cloned();
+        let reuse = cached.as_ref().is_some_and(|s| {
+            !matches!(s.state(), lsp_core::session::SessionState::Failed(_))
+        }) && self.launch_exe_valid(&key);
+        if reuse {
+            let session = cached.expect("reuse implies cached");
+            self.touch(&key);
+            return Ok(session);
+        }
+        if cached.is_some() {
             self.instances.lock().unwrap().remove(&key);
         }
 
         // 慢路径：per-key 加载门（防同 key 并发双 spawn）+ 双检锁。
         let gate = self.load_gate_for(root, lang);
         let _guard = gate.lock().await;
-        if let Some(session) = self.instances.lock().unwrap().get(&key).cloned() {
-            if !matches!(session.state(), lsp_core::session::SessionState::Failed(_)) {
-                self.touch(&key);
-                return Ok(session);
-            }
+        let cached = self.instances.lock().unwrap().get(&key).cloned();
+        let reuse = cached.as_ref().is_some_and(|s| {
+            !matches!(s.state(), lsp_core::session::SessionState::Failed(_))
+        }) && self.launch_exe_valid(&key);
+        if reuse {
+            let session = cached.expect("reuse implies cached");
+            self.touch(&key);
+            return Ok(session);
+        }
+        if cached.is_some() {
             self.instances.lock().unwrap().remove(&key);
         }
 
@@ -789,6 +818,7 @@ impl Supervisor {
             project_root: key.root.clone(),
         };
         let t2 = ls_registry::adapter_for(lang);
+        eprintln!("[HANGPROBE] probing t2={}", t2.is_some());
         let launch = match &t2 {
             Some(adapter) => adapter.launch_info(&ctx).await.map_err(|e| {
                 let msg = format!("{e:#}");
@@ -821,6 +851,13 @@ impl Supervisor {
                 }
             }
         };
+        // 登记本次 spawn 的 LS exe（launch.cmd 首元素）——缓存命中复验的判据源。
+        if let Some(exe) = launch.cmd.first() {
+            self.launch_exe
+                .lock()
+                .unwrap()
+                .insert(key.clone(), PathBuf::from(exe));
+        }
         let child = ls_runtime::process::Child::spawn(launch)
             .map_err(|e| ToolError::Launch(anyhow::anyhow!("runtime spawn error: {e}")))?;
         let mut params = base_initialize_params();
@@ -10056,5 +10093,38 @@ mod semantic_readiness_and_args_tests {
             sup.workspace_error_for(dir.path()).is_none(),
             "no Cargo.toml → nothing to probe, no record"
         );
+    }
+
+    /// 装态复验三态:登记 exe 在盘 → 有效;登记 exe 消失(卸载/半包语义)→ 失效;
+    /// 无登记 → 有效(防御,不让缺登记炸掉复用路径)。evict 必须同步清登记。
+    /// session 级全链(命中→失效→LS_NOT_INSTALLED)由真机 e2e 覆盖(PM 复验命令)。
+    #[tokio::test]
+    async fn launch_exe_valid_rejects_vanished_exe() {
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let key = Supervisor::key(Path::new("Z:/no/such/project"), "rust");
+        // 无登记 → 有效。
+        assert!(sup.launch_exe_valid(&key));
+        // 登记的 exe 在盘 → 有效。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("ls.exe");
+        std::fs::write(&exe, "").expect("write fake exe");
+        sup.launch_exe
+            .lock()
+            .unwrap()
+            .insert(key.clone(), exe.clone());
+        assert!(sup.launch_exe_valid(&key));
+        // 登记的 exe 消失(卸载/半包:目录在 exe 不在)→ 失效。
+        std::fs::remove_file(&exe).expect("remove fake exe");
+        assert!(
+            !sup.launch_exe_valid(&key),
+            "登记 exe 消失必须判失效,活 session 不得复用"
+        );
+        // evict 同步清登记 → 回到无登记=有效。
+        sup.launch_exe
+            .lock()
+            .unwrap()
+            .insert(key.clone(), exe.clone());
+        sup.evict(&key).await.expect("evict");
+        assert!(sup.launch_exe_valid(&key), "evict 必须同步清 launch_exe 登记");
     }
 }

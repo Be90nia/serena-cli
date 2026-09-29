@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::install::{
-    InstallCtx, InstallKind, InstallOutcome, InstallSpec, Launch, acquire_install_lock, wrong_kind,
+    InstallCtx, InstallKind, InstallOutcome, InstallSpec, Launch, acquire_install_lock,
+    clear_half_installed, wrong_kind,
 };
 use crate::process::RuntimeError;
 
@@ -34,7 +35,8 @@ impl NpmInstaller {
         };
         let dir_name = version.clone().unwrap_or_else(|| "latest".to_string());
         let install_dir = ctx.cache_root.join(&spec.id).join(dir_name);
-        if let Some(exe) = npm_bin_path(&install_dir, bin_rel) {
+        let exe = npm_bin_path(&install_dir, bin_rel);
+        if let Some(exe) = exe {
             return Ok(InstallOutcome::Ready(Launch::Process {
                 exe,
                 args: npm_args.clone().unwrap_or_default(),
@@ -53,6 +55,7 @@ impl NpmInstaller {
                 )),
             });
         }
+        clear_half_installed(&install_dir, exe.as_deref());
         std::fs::create_dir_all(&install_dir).map_err(|e| RuntimeError::Download {
             url: String::new(),
             expected_sha: None,
@@ -437,5 +440,95 @@ mod tests {
             }
             other => panic!("意外 outcome: {other:?}"),
         }
+    }
+
+    /// npm 型 InstallSpec 测试构造（id = 缓存目录名，package = npm 包引用）。
+    fn npm_spec(id: &str, version: Option<&str>, bin_rel: &str) -> InstallSpec {
+        InstallSpec {
+            id: id.to_string(),
+            kind: InstallKind::Npm {
+                package: format!("@fake/{id}"),
+                version: version.map(str::to_string),
+                bin_rel: bin_rel.to_string(),
+                npm_args: None,
+                secondary: Vec::new(),
+            },
+            exec: vec![],
+        }
+    }
+
+    /// 半包态（目录在 + exe 不在）装态探测：视同未装，不误报 Ready。
+    #[test]
+    fn npm_half_installed_dir_reports_not_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let half = dir.path().join("my-ls/latest");
+        std::fs::create_dir_all(half.join("node_modules/.bin")).unwrap();
+        let ctx = InstallCtx {
+            os: Os::Windows,
+            arch: Arch::X86_64,
+            auto_install: false,
+            allow_unsigned_sha: false,
+            cache_root: dir.path().to_path_buf(),
+        };
+        let out = NpmInstaller
+            .install(&ctx, &npm_spec("my-ls", None, "my-bin"))
+            .expect("探测不触网，不应 Err");
+        assert!(
+            matches!(out, InstallOutcome::NotInstalled { .. }),
+            "半包必须判未装，实际 {out:?}"
+        );
+        // 半包目录保留：探测路径（auto_install=false）不清缓存，清掉归安装路径。
+        assert!(half.is_dir(), "探测路径不得删半包目录");
+    }
+
+    /// install 遇半包：清掉重装（不是幂等命中）——半包标志物必须消失。
+    /// PATH 注入空目录让 npm 不可达：重装路径 spawn 即败，目录保持「已清」状态，
+    /// 无 npm 重建干扰。
+    #[test]
+    fn npm_install_clears_half_installed_dir_before_reinstall() {
+        static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _env = PATH_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let empty_path = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("my-ls/latest/half-install-marker.txt");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "").unwrap();
+        let path_original = std::env::var_os("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", empty_path.path()) };
+        let ctx = InstallCtx {
+            os: Os::Windows,
+            arch: Arch::X86_64,
+            auto_install: true,
+            allow_unsigned_sha: false,
+            cache_root: dir.path().to_path_buf(),
+        };
+        let result = NpmInstaller.install(&ctx, &npm_spec("my-ls", None, "my-bin"));
+        unsafe { std::env::set_var("PATH", path_original) };
+        assert!(result.is_err(), "npm 不可达必须 Err: {result:?}");
+        assert!(
+            !marker.exists(),
+            "半包标志物必须被清掉（走了清掉重装，不是幂等命中）"
+        );
+    }
+
+    /// clear_half_installed 三态：半包清 / 已装不动 / 无目录不动。
+    #[test]
+    fn clear_half_installed_tristate() {
+        use crate::install::clear_half_installed;
+        let dir = tempfile::tempdir().unwrap();
+        // 半包：目录在 + exe 不在 → 清掉。
+        let half = dir.path().join("half");
+        std::fs::create_dir_all(&half).unwrap();
+        assert!(clear_half_installed(&half, None));
+        assert!(!half.exists(), "半包目录应被清");
+        // 已装：exe 在 → 不动。
+        let full = dir.path().join("full");
+        std::fs::create_dir_all(&full).unwrap();
+        let exe = full.join("ls.exe");
+        std::fs::write(&exe, "").unwrap();
+        assert!(!clear_half_installed(&full, Some(&exe)));
+        assert!(full.is_dir(), "已装目录不得误清");
+        // 无目录 → 不动。
+        assert!(!clear_half_installed(&dir.path().join("nope"), None));
     }
 }
