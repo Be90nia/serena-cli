@@ -45,6 +45,7 @@ pub mod svelte;
 pub mod ty_server;
 pub mod typescript;
 pub mod vue;
+pub mod vts;
 
 /// 语言标识：与 `servers.toml` `languages` 字段、claude 端 ProjectCtx.language 一一对应。
 ///

@@ -84,6 +84,14 @@ jobs:
           "$SERENA_CLI" --version
       - name: smoke shard ${{ matrix.shard }}
         run: scripts/smoke_one.sh --shard ${{ matrix.shard }}
+      - name: upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-${{ matrix.shard }}
+          path: smoke-logs/
+          retention-days: 5
+          if-no-files-found: ignore
       - name: hygiene stop-all
         if: always()
         run: |

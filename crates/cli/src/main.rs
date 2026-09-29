@@ -1497,8 +1497,15 @@ fn spawn_daemon_child() -> Result<u16, String> {
     let mut cmd = Command::new(exe);
     cmd.arg("--daemon")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
+    // stderr：默认 NULL（后台守护零输出语义不变）；SERENA_DAEMON_LOG=路径 → daemon
+    // tracing（含 lsp_stderr 中继——LS 瞬死死因此前落 NULL 不可见，smoke R4 观测契约）
+    // 落该文件（append）。smoke 每门 export 一次实现 per-door 归属。
+    if let Some(file) = daemon_log_file() {
+        cmd.stderr(Stdio::from(file));
+    } else {
+        cmd.stderr(Stdio::null());
+    }
 
     #[cfg(windows)]
     {
@@ -1514,6 +1521,19 @@ fn spawn_daemon_child() -> Result<u16, String> {
     }
     cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
     Ok(7860) // M1 固定端口；M2 起 OS 分配 + lock 回填
+}
+
+/// SERENA_DAEMON_LOG 排障钩子：设了 env 就打开该文件（append）供 daemon stderr 落盘；
+/// 未设或打开失败返 None（后者先打 warn 到本进程 stderr——调用方可见，不静默吞）。
+fn daemon_log_file() -> Option<std::fs::File> {
+    let path = std::env::var("SERENA_DAEMON_LOG").ok()?;
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("[warn] SERENA_DAEMON_LOG={path} open failed: {e}; daemon stderr -> null");
+            None
+        }
+    }
 }
 
 /// lazy-spawn daemon 的进程创建 flags（独立成纯函数便于单测断言配置）。

@@ -18,6 +18,11 @@
 #   SMOKE_LANGS  清单路径（默认 scripts/smoke_langs.toml）
 #   SHARDS       片数（默认 6，须与 workflow plan job 一致）
 #   PROBE_TIMEOUT 单次探针超时秒（默认 240）
+#   SMOKE_LOG_DIR per-door 观测产物目录（默认 $PWD/smoke-logs；CI = checkout 根，
+#                 workflow 作 artifact 上传）。每门四件：<id>.stderr.log（CLI stderr）、
+#                 <id>.install.out（install stdout）、<id>.daemon.log（daemon tracing，
+#                 含 lsp_stderr 中继——经 SERENA_DAEMON_LOG 钩子）、<id>.record.jsonl
+#                 （LSP 帧录制，经 SERENA_RECORD）。
 # 输出（每门一行）：PASS <id> (...) | FAIL <id> <stage>: <reason> | SKIP <id> <class>: ...
 # 卫生（PM 契约）：每门结束 + 片收尾各一次 stop-all + 等端口真释放（≤10s 轮询，
 # 非 sleep）；stderr 非空打 LOG 行（daemon 残留是"恒 pending"第一嫌疑，日志留给排障）。
@@ -32,6 +37,7 @@ SERENA_CLI="${SERENA_CLI:-serena-cli}"
 LANGS_FILE="${SMOKE_LANGS:-$SELF_DIR/smoke_langs.toml}"
 SHARDS="${SHARDS:-6}"
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"
+SMOKE_LOG_DIR="${SMOKE_LOG_DIR:-$PWD/smoke-logs}"
 
 log() { printf '%s\n' "$*" >&2; }
 
@@ -260,7 +266,16 @@ one_door() {
     local t0=$SECONDS
     local work errf
     work=$(mktemp -d) || { log "FAIL $id mktemp"; return 1; }
-    errf="$work/stderr.log"
+    # per-door 观测产物落持久目录（CI 作 artifact 上传，本地调试留 smoke-logs/）：
+    #   <id>.stderr.log   CLI 侧 stderr（含 daemon stderr 行 + 探针/安装错误）
+    #   <id>.install.out  install 步骤 stdout（apt/cpanm 断点全文，此前 400 字符截断）
+    #   <id>.daemon.log   lazy-spawn daemon tracing（含 lsp_stderr 中继——LS 瞬死
+    #                     死因此前落 NULL 不可见，经 SERENA_DAEMON_LOG 钩子落盘）
+    #   <id>.record.jsonl LSP 帧录制（SERENA_RECORD，空符号/超时门的协议级证据）
+    errf="$SMOKE_LOG_DIR/$id.stderr.log"
+    : >"$errf"
+    export SERENA_DAEMON_LOG="$SMOKE_LOG_DIR/$id.daemon.log"
+    export SERENA_RECORD="$SMOKE_LOG_DIR/$id.record.jsonl"
 
     # fixture → workspace 外（serena 纪律：workspace 内散文件语义层静默返空）。
     local src="$SELF_DIR/smoke_fixtures/$fixture"
@@ -302,19 +317,19 @@ one_door() {
                 # 清单 install 行优先（apt runtime 前置 + $SERENA_CLI install 连写）。
                 # 曾无条件走 `install <id>`，前置被静默跳过 —— bsl 跑在 runner 预装
                 # JVM 17（条目要求 21）启动即死 LS_TERMINATED，即此坑。
-                run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$install" >"$work/install.out" 2>"$errf" || rc=$?
+                run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$install" >"$SMOKE_LOG_DIR/$id.install.out" 2>"$errf" || rc=$?
             else
-                run_with_timeout "$budget" "$SERENA_CLI" install "$id" >"$work/install.out" 2>"$errf" || rc=$?
+                run_with_timeout "$budget" "$SERENA_CLI" install "$id" >"$SMOKE_LOG_DIR/$id.install.out" 2>"$errf" || rc=$?
             fi
             ;;
         *)
-            run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$install" >"$work/install.out" 2>"$errf" || rc=$?
+            run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$install" >"$SMOKE_LOG_DIR/$id.install.out" 2>"$errf" || rc=$?
             ;;
     esac
     log_stderr_if_any "$id" "$errf"
     if [ "$rc" -ne 0 ]; then
         [ "$rc" = 124 ] && log "SKIP $id BUDGET: install exceeded ${budget}s"
-        [ "$rc" = 124 ] || log "FAIL $id install: exit=$rc (tail: $(tr '\n' ' ' <"$work/install.out" | cut -c1-300))"
+        [ "$rc" = 124 ] || log "FAIL $id install: exit=$rc (tail: $(tr '\n' ' ' <"$SMOKE_LOG_DIR/$id.install.out" | cut -c1-300))"
         rm -rf "$work"
         [ "$rc" = 124 ] && return 0
         return 1
@@ -377,6 +392,11 @@ shard_run() {
         elif [ "$rc" -ne 0 ]; then
             fail=1
         fi
+        # 门间卫生（失败路径也执行）：失败门曾在 one_door 内无 stop-all，残留 daemon
+        # 持上一门的 SERENA_DAEMON_LOG/RECORD env——下一门请求打到旧进程时观测产物
+        # 写进上一门文件，per-door 归属破坏（smoke R4 观测契约）。
+        "$SERENA_CLI" stop-all >/dev/null 2>&1 || true
+        wait_daemon_gone || true
     done
     "$SERENA_CLI" stop-all >/dev/null 2>&1 || true
     wait_daemon_gone || true
@@ -409,7 +429,10 @@ main() {
     find_py || return 1
     # 工具链 bin 补齐：GITHUB_PATH 追加对同 step 不生效（仅跨 step），go 门 gopls
     # 落 $HOME/go/bin 而 runner 默认 PATH 无它 → LS_NOT_INSTALLED（CI 首跑实锤）。
-    export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.dotnet/tools:$PATH"
+    # $HOME/.opam/default/bin：ocaml 门 ocamllsp 落 opam switch bin（GITHUB_PATH
+    # 同样不生效——run 36567771452 LS_NOT_INSTALLED 实锤），daemon 探测消费本 PATH。
+    export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/.dotnet/tools:$HOME/.opam/default/bin:$PATH"
+    mkdir -p "$SMOKE_LOG_DIR" || { log "FAIL smoke log-dir: $SMOKE_LOG_DIR"; return 1; }
     case "${1:-}" in
         _one) one_door "$2" ;;
         --shard)

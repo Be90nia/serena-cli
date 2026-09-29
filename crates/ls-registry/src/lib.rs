@@ -26,6 +26,7 @@ use ls_adapters::{
     html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter, powershell::PowerShellAdapter,
     pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter, sass::SassAdapter,
     svelte::SvelteAdapter, typescript::TypescriptLanguageServerAdapter, vue::VueAdapter,
+    vts::VtsAdapter,
 };
 
 /// 扩展名 → LanguageId 静态表（小写键）。
@@ -183,6 +184,7 @@ singleton!(CSS, CssAdapter);
 singleton!(SVELTE, SvelteAdapter);
 singleton!(DENO, DenoAdapter);
 singleton!(SASS, SassAdapter);
+singleton!(VTS, VtsAdapter);
 
 /// 路径 → 语言。扩展名小写后查表，命中即返回；其余 None。
 ///
@@ -216,6 +218,11 @@ pub fn resolve_lang_name(path: &Path) -> Option<&'static str> {
 /// 返回 `Arc` 让调用方按 trait 对象持有；`Arc::ptr_eq` 在两次调用间成立（LazyLock 单例）。
 /// 未知语言 / 空串返回 `None`。
 pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
+    // 变体门显式路由（smoke R4）：typescript_vts 是 LS 变体不是语言，不进
+    // LanguageId 枚举——字符串直路由（vts.rs 模块文档）。deno 显式路由门同款思路。
+    if lang == "typescript_vts" {
+        return Some(VTS.clone());
+    }
     let id = LanguageId::from_str_opt(lang)?;
     Some(match id {
         LanguageId::Cpp => CLANGD.clone(),
@@ -313,6 +320,9 @@ pub fn lsp_language_id(lang: &str) -> String {
         // phpactor），didOpen 官方口径是 "php"（docker→dockerfile 同款显式映射，
         // 不赌 LS 对自名的宽容）。lua/scala/swift 恒等走 default 臂。
         "intelephense" => "php".to_string(),
+        // smoke R4：typescript_vts 变体门的 didOpen 官方口径是 "typescript"
+        // （vtsls 消费 TS 文档；变体门 pgsql→sql 同款换算）。
+        "typescript_vts" => "typescript".to_string(),
         other => other.to_string(),
     }
 }
@@ -424,6 +434,22 @@ mod tests {
         );
         // alias：from_str_opt 接受 pwsh（LanguageId 层），adapter_for 同语义。
         assert!(adapter_for("pwsh").is_some());
+    }
+
+    /// smoke R4：typescript_vts 变体门路由闭环——adapter_for 字符串直路由（不经
+    /// LanguageId），languages 归 TypeScript，lsp_language_id 官方口径换算。
+    #[test]
+    fn adapter_for_routes_typescript_vts() {
+        let a = adapter_for("typescript_vts")
+            .unwrap_or_else(|| panic!("--lang typescript_vts 必须路由到 T2 adapter"));
+        let b = adapter_for("typescript_vts").unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "singleton broken for typescript_vts");
+        assert_eq!(a.id(), "vtsls");
+        assert_eq!(a.languages(), &[LanguageId::TypeScript]);
+        // didOpen 官方口径：变体名 → "typescript"（pgsql→sql 同款换算）。
+        assert_eq!(lsp_language_id("typescript_vts"), "typescript");
+        // spec_for 仍按 entry id 命中（install CLI 走 T0 表，adapter 只接管会话）。
+        assert!(config::spec_for("typescript_vts").is_some());
     }
 
     /// bd 56a 后续批：--lang html/css 必须路由到手写 T2 adapter（同包双入口），

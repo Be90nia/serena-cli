@@ -1208,8 +1208,9 @@ version = "5.9.3"
 [servers.typescript_vts]
 # @vtsls/language-server；上游 vts_language_server.py@7a296833 _setup_runtime_dependencies
 # 返回 "{path} --stdio"——vtsls 必须显式 --stdio（裸启动 = CLI 帮助即退 → stdout pump
-# EOF，CI 首跑实锤）。typescript 由依赖 @vtsls/language-service 内置（0.2.9 deps 实锚），
-# 裸 workspace 无需 typescript.tsdk。
+# EOF，CI 首跑实锤）。tsdk 由 vts.rs T2 适配器注入 initializationOptions（smoke R4）：
+# 裸 workspace 无 typescript.tsdk 时 tsserver 桥整体不挂（documentSymbol -32603 /
+# hover 静默，run 36561318948+36567771452 实锤）——本条曾注 "无需 tsdk" 实证不成立。
 languages = ["typescript_vts"]
 install = "npm"
 source_commit = "43ae0211"
