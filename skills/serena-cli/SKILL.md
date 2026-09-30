@@ -5,7 +5,7 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 
 # serena-cli 使用纪律
 
-二进制：`serena-cli.exe`（`D:/Project/serena-rust/target/release/`；已安装到 PATH 则直接 `serena-cli`）。核心原则：**按名寻址，先结构后细节，禁整读文件**。实测对照（真实字符数）：读大文件里的一个函数 260 tok vs 传统 96,615 tok；改函数体 64 vs 223；跨文件 rename 21 vs 225。
+二进制：`serena-cli`（已在 PATH 直接用；未装见 README「Install」——GitHub Release 下载或源码构建）。核心原则：**按名寻址，先结构后细节，禁整读文件**。实测对照（真实字符数）：读大文件里的一个函数 260 tok vs 传统 96,615 tok；改函数体 64 vs 223；跨文件 rename 21 vs 225。
 
 ## 黄金路径（覆盖 90% 场景）
 
@@ -45,11 +45,29 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 
 ## 错误契约
 
-stdout = 紧凑 JSON（默认）+ 可能的 `[warn]` 前缀行；失败 `{"ok":false,"error":{code,message,retryable}}`。高频码：`BAD_ARGS`(参数/文件类型错，不重试) · `WRITE_CONFLICT`(盘上内容与预期不符，先重读) · `LS_TIMEOUT`(retryable，重试) · `LS_NOT_INSTALLED`(跑 `install <lang>`)。退出码 0=成功 1=工具错 2=参数错 4=就绪超时。
+stdout = 紧凑 JSON（默认）+ 可能的 `[warn]` 前缀行；失败 `{"ok":false,"error":{code,message,retryable}}`。高频码：`BAD_ARGS`(参数/文件类型错，不重试) · `WRITE_CONFLICT`(盘上内容与预期不符，先重读) · `LS_TIMEOUT`(retryable，重试) · `LS_NOT_INSTALLED`/`LS_SPAWN_FAILED`(环境问题，走下方处置流程)。退出码 0=成功 1=工具错 2=参数错 4=就绪超时。
 
-## 多语言（11 门真机验证）
+## 环境自检与 LS 故障处置
 
-rust · typescript · javascript · c/cpp · c# · java · bash · json · powershell · vue · python。未装 LS → `install <lang>`（npm/download 型自动装+sha256 校验）。已知边界：bash hover 恒空（依赖 Unix man 页）；vue 诊断受限（走 tsserver 桥待接）；jdtls 需 JRE 25+。
+见到 `LS_NOT_INSTALLED` / `LS_SPAWN_FAILED` / 语义查询恒空 + "not ready" 时，按序执行：
+
+```
+1. serena-cli doctor                    # 六类体检：运行时/PATH/本机 LS/daemon/网络/workspace
+2. serena-cli doctor --lang <lang>      # 聚焦单语言，看哪一项 MISS + hint
+```
+
+- **MISS 的是运行时**（node/uv/JDK…）→ 装运行时（hint 里有命令），重跑 doctor 确认 ok。
+- **MISS 的是 LS 本体** → 先用生态原生装法（rust: `rustup component add rust-analyzer`；pip 系: `pip install ...`；npm 系: `npm i -g ...`）；**servers.toml 收录的语言**（`serena-cli install <lang>` 可装的 73 种）也可以直接 `serena-cli install <lang>` 或 `doctor --fix`（自动装 + sha256 校验）。
+- **防重复下载**：LS 已由 rustup/npm/pipx/系统包管理器装过时**不要**再 `install <lang>` 重复拉一份——doctor 报 MISS 但你确定装过 = **当前进程 PATH 不含它**（GUI 启动的编辑器常见），修 PATH 后重试；仍不行用 `%APPDATA%/serena/external-servers.toml`（用户外部注册表，支持绝对路径 binary，优先级高于内置条目）直接指到已有可执行文件。
+- rust/c++/go/java 等 T2 语言不在 `install <lang>` 名单内（rust 走 rustup 查找链：`rustup which` → PATH → `~/.cargo/bin`），报 NOT_INSTALLED 时按 hint 里给的生态命令装。
+
+## 多语言
+
+**52 语言 CI 真机验证 PASS**：rust · typescript/javascript · c/cpp · c# · go · java · python(pyright/basedpyright/ty/pyrefly 变体同门) · bash · powershell · json/yaml/toml · vue/svelte/astro · php · ruby · kotlin · swift · dart · scala · clojure · erlang · ocaml · lua/luau · julia · zig · gleam · lean4 · r · perl · fortran · rego · cue · docker · sql/pgsql · markdown/latex · html/css/sass · solidity · systemverilog · hlsl · haxe · elm · ada · ansible · deno。
+
+**15 语言有门但证据 SKIP**（环境/许可证限制，明细在 `scripts/smoke_langs.toml` 账本）：al · haskell · pascal · qml · nix · crystal · nextflow · elixir · fsharp · angular · groovy · gdscript · msl · matlab · wolfram。
+
+未装 LS → `install <lang>`（73 种可装，自动下载+sha256 校验；T2 语言如 rust 走生态原生命令，见环境处置节）。已知边界：bash hover 恒空（依赖 Unix man 页）；vue 诊断受限（走 tsserver 桥待接）；jdtls 需 JRE 25+。
 
 ## 环境事实
 
