@@ -1,18 +1,21 @@
 # smoke_langs.toml —— 45 门语言 CI 冒烟矩阵清单（Phase 0 基建，serena-rust）。
 #
 # 三栏对账锚（上游 73 门，详见 local/agent-reports/ci-infra-45lang.md）：
-#   本矩阵（R7 终账 2026-09-29）：69 门 = 53 真门 + 16 SKIP 冻结（nix/java/matlab/
-#   latex/pascal/omnisharp/al/swift/wolfram 存量 9 + R6 证据 SKIP 7：bsl/crystal/
-#   elixir/nextflow/fsharp/haskell/qml；R7 微轮 python/pyright 双门曾短暂 SKIP、
-#   经根因实锚撤 SKIP 回真门——pyright ≤1.1.403 workspaceFolders 楔死，钉版
-#   1.1.414 解药，见 local/agent-reports/smoke-round6-final.md §六）+ W3/W4/W5 已派账
-#   （scala/perl/r/julia 收编、groovy 不入矩阵——angular 先例、wolfram LICENSE 批准
-#   冻结、gdscript HOST/msl HOST 于 R4 账本迁出不入矩阵——angular/groovy 先例）。
-#   总账 73 闭合。
-#   R6 = smoke 终轮（run 36577226543 12 红门处置：5 门修绿 python/pyright/r/
-#   lean4/ruby，7 门证据 SKIP 迁冻结；逐门证据见 local/agent-reports/smoke-round6-final.md）。
-#
-# ── W1-W5 接入模板（加一门 = 两步）──────────────────────────────────────
+#   本矩阵（langs20 终账 2026-09-30）：74 门 = 64 真门 + 10 SKIP 冻结（crystal/
+#   nix/elixir/fsharp/matlab/wolfram 存量 6 + langs20 批新收 4：angular/groovy/
+#   gdscript/msl——原 R4「不入矩阵」裁决被 user 指令「剩余目录语言全部写上 CI」
+#   覆盖，证据链迁入各门 skip_evidence）。langs20 批（bd serena-rust-jp2）十门
+#   SKIP 转真门：java（Adoptium JRE 25 + alternatives）、bsl（update-alternatives
+#   切 21）、haskell（ghc 解析位原地覆盖 bindist 9.4.8）、nextflow（工程组
+#   fixture）、latex（texlab 单二进制裸 .tex 即出符号）、pascal（apt fpc + 条目补
+#   linux 组）、omnisharp（条目补 linux mono 变体 + apt mono-complete）、al（条目
+#   补 unix bin_path）、swift（swift.org tarball 自举）、qml（aqt Qt 6.8.3），
+#   luau 新收真门；逐门死因解除证据见各块 remark。
+#   前账：R7 终账 2026-09-29 = 69 门 = 53 真门 + 16 SKIP 冻结（R6 证据 SKIP 7：
+#   bsl/crystal/elixir/nextflow/fsharp/haskell/qml，run 36577226543 帧级实锚）；
+#   R6 = smoke 终轮（run 36577226543 12 红门处置）。矩阵外仅 sql/mysql（documented
+#   SKIP，见尾部对账节）。
+#   ── W1-W5 接入模板（加一门 = 两步）──────────────────────────────────────
 # 1. 本清单加一个 [[lang]] 块（字段见下）；
 # 2. scripts/smoke_fixtures/ 放一个最小 fixture（1 个具名符号，底线= documentSymbol 非空）。
 # 分片/预算由 scripts/smoke_shard.py 按 budget_secs 自动加权装箱，无需手工排片。
@@ -221,29 +224,21 @@ budget_secs = 420
 [[lang]]
 id = "bsl"
 via = "serena-download"
-install = "sudo apt-get update -qq && sudo apt-get install -y -qq openjdk-21-jre-headless && java -version 2>&1 | head -1 >&2 && $SERENA_CLI install bsl"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq openjdk-21-jre-headless && sudo update-alternatives --set java \"$(update-alternatives --list java | grep -m1 java-21)\" && java -version 2>&1 | head -1 >&2 && $SERENA_CLI install bsl"
 pin = "servers.toml"
 fixture = "module.bsl"
 lang_flag = "bsl"
 budget_secs = 600
-skip_class = "HOST"
-skip_reason = "BSL LS JAR is built for Java 21 (class file 65.0) but the LS process resolves a Java 17 runtime (61.0) on the runner — apt openjdk-21 install prefix does not reach the lazy-spawned daemon's LS spawn; distribution and runner JRE stay unpaired"
-skip_evidence = "run 36577226543 daemon.log lsp_stderr: UnsupportedClassVersionError: BSLLSPLauncher 'has been compiled by a more recent version of the Java Runtime (class file version 65.0), this version of the Java Runtime only recognizes class file versions up to 61.0'（JAR 启动即死，Spring Boot JarLauncher 栈同源；daemon.log 3270 行全为该栈重试）"
-verified = "never"
-remark = "R6 起证据 SKIP（PM 裁决 2026-09-29，run 36577226543 帧级实锚）；此前 R4 观测为 JVM 版本归属先验；LS 进程侧 java 解析为何落在 17（alternatives 已装 21）未定——daemon/LS spawn 的 PATH 传导 W-wave 可查后转真门"
+remark = "langs20 轮转真门：R6 死因 = apt 装了 21 但 alternatives 默认仍指 17，lazy-spawn daemon 的 LS spawn 解析 java 落 17（run 36577226543 UnsupportedClassVersionError 65.0 vs 61.0 实锚）——apt 前置装 21 后必须 update-alternatives --set 切系统软链（install 子 shell 的 PATH/export 不回传 daemon，系统态才是传导面，java 门同源）；java -version 打印留 install.out 作 21 在场证据"
 
 [[lang]]
 id = "nextflow"
 via = "serena-download"
 pin = "servers.toml"
-fixture = "main.nf"
+fixture = "nextflow/main.nf"
 lang_flag = "nextflow"
 budget_secs = 420
-skip_class = "BUDGET"
-skip_reason = "nextflow LS answers documentSymbol with [] / null for standalone fixtures — outline output requires nextflow project context (pipeline scripts/config), not smoke-layer fixable"
-skip_evidence = "run 36577226543 record.jsonl: 130 发 documentSymbol → 65 [] + 65 null，0 error（LS 活着应答但恒空，非瞬态）"
-verified = "never"
-remark = "R6 起证据 SKIP（PM 裁决 2026-09-29）；装法已纠偏（npm 无 nextflow LS 包 registry 404，维持上游同款 JAR download，v26.04.3 sha = GitHub API digest 实锚）；配 nextflow 工程上下文 fixture（nextflow.config 等）即转真门"
+remark = "langs20 轮转真门：R6 死因 = 裸单文件无工程上下文，LS 活着应答但 documentSymbol 恒空（run 36577226543: 130 发 65 [] + 65 null 实锚；账本原注『配 nextflow 工程上下文 fixture 即转真门』）——fixture 改 nextflow/ 工程组（main.nf + nextflow.config），LS 按根目录 nextflow.config 识别工程；装法维持上游同款 JAR download（npm 无包 registry 404 前实锚，v26.04.3 sha = GitHub API digest 锚）"
 
 [[lang]]
 id = "elixir"
@@ -254,10 +249,10 @@ fixture = "elixir/lib/smoke.ex"
 lang_flag = "elixir"
 budget_secs = 600
 skip_class = "BUDGET"
-skip_reason = "expert (NextLS-family) starts its engine asynchronously: documentSymbol arriving before engine init is logged-and-ignored (empty result) — needs an engine-ready sync quirk (upstream elixir_tools adapter has it); adapter W-wave, not smoke-layer fixable"
-skip_evidence = "run 36577226543 window/logMessage: 'Received request textDocument/documentSymbol before engine for fixture was initialized. Ignoring.'（每个 documentSymbol 同款空应答，协议活但零内容）"
+skip_reason = "expert (NextLS-family) starts its engine asynchronously and DROPS documentSymbol requests arriving before engine init ('Ignoring.'); upstream elixir_tools adapter drives readiness via $/progress title watch (end of 'Building <project>' → server_ready event, 300s timeout) — a session-layer wait gate T0 lacks; adapter W-wave, not smoke-layer fixable"
+skip_evidence = "run 36577226543 window/logMessage: 'Received request textDocument/documentSymbol before engine for fixture was initialized. Ignoring.'（每个 documentSymbol 同款空应答，协议活但零内容）+ ↖ mirror elixir_tools/elixir_tools.py@7a296833 check_server_ready: 'The server is considered ready when project build completes' / server_ready.wait(300)（2026-09-30 复核引用）"
 verified = "never"
-remark = "R6 起证据 SKIP（PM 裁决 2026-09-29）；fixture 已是标准 mix 布局（mix.exs + lib/smoke.ex），卡点在 engine-ready 同步而非工程定位；W-wave 适配器批收编即转真门"
+remark = "R6 起证据 SKIP（PM 裁决 2026-09-29）；langs20 轮复核维持——卡点在 engine-ready 信号消费（上游适配器私有 $/progress 窥探），非装法（expert v0.1.0-rc.6 download 条目已在表）；smoke_one.sh 的 wait-ready symbol 档按次重试，但 expert 对未就绪请求是『丢弃不排队』，引擎不广播就绪前重试恒空；W-wave 适配器批收编即转真门"
 
 [[lang]]
 id = "haxe"
@@ -340,7 +335,7 @@ lang_flag = "nix"
 budget_secs = 420
 skip_class = "HOST"
 skip_reason = "nixd needs the Nix toolchain (servers.toml source form `nix build`); no prebuilt assets on GitHub releases; ubuntu-latest runner has no nix"
-skip_evidence = "servers.toml [servers.nixd.source] build_cmd=[nix build]; api.github.com/repos/nix-community/nixd/releases assets=[] (2.8.1-2.9.3, checked 2026-09-29); upstream nixd_ls.py@7a296833 requires nix"
+skip_evidence = "servers.toml [servers.nixd.source] build_cmd=[nix build]; api.github.com/repos/nix-community/nixd/releases assets=[]（2.9.1-2.9.3，2026-09-30 langs20 轮复核仍为 0 资产）; upstream nixd_ls.py@7a296833 requires nix"
 verified = "never"
 remark = "PM 裁决（2026-09-29）：维持 HOST skip——runner 自举 Nix=每次 CI 永久 +4-5min 税，低使用率门不值；SKIP 预算 6→7 特批此条。上游 nixd 出预编译资产即转真门（届时改 download 形态 + assets[].digest sha 锚）"
 
@@ -471,10 +466,10 @@ fixture = "fsharp/main.fs"
 lang_flag = "fsharp"
 budget_secs = 600
 skip_class = "BUDGET"
-skip_reason = "FSAC requires its project-loading command protocol (upstream adapter registers extra handlers to drive .fsproj loading); dotnet restore alone never completes the FSAC project load, so every documentSymbol errors -32603 — adapter W-wave, not smoke-layer fixable"
-skip_evidence = "run 36577226543 stderr: rpc -32603 \"Couldn't find /tmp/.../fixture/main.fs in LoadedProjects. Have the projects loaded yet or have you tried restoring your project/solution?\"（restore 已跑仍报，工程加载不走 restore）"
+skip_reason = "FSAC project loading is driven by the adapter/session layer: upstream fsharp adapter start_server is plain initialize+initialized with no workspacePeek/workspaceLoad driver (↖ mirror fsharp_language_server.py@7a296833), FSAC evaluates the .fsproj asynchronously and answers documentSymbol with -32603 'LoadedProjects' until done — smoke's bounded retry (5×10s, LoadedProjects-transient class) exhausts without the load ever completing; adapter W-wave, not smoke-layer fixable"
+skip_evidence = "run 36577226543 stderr: rpc -32603 \"Couldn't find /tmp/.../fixture/main.fs in LoadedProjects. Have the projects loaded yet or have you tried restoring your project/solution?\"（restore 已跑仍报，工程加载不走 restore；2026-09-30 复核上游 start_server 全文确认无工程加载命令面）"
 verified = "never"
-remark = "R6 起证据 SKIP（PM 裁决 2026-09-29）；fixture main.fsproj + install 期 dotnet restore 维持（FSAC 侧工程命令协议 W-wave 收编即转真门）"
+remark = "R6 起证据 SKIP（PM 裁决 2026-09-29）维持；fixture main.fsproj + install 期 dotnet restore 维持；FSAC 工程加载协议（client 侧 workspacePeek 应答/就绪等待）W-wave 收编即转真门"
 
 [[lang]]
 id = "ruby"
@@ -495,21 +490,17 @@ lang_flag = "solargraph"
 budget_secs = 420
 remark = "变体门：--lang solargraph；保持裸 .rb fixture（solargraph 直跑无需 bundle，ruby 门工程化引入 Gemfile 反会触发其 bundler 语境，不共 fixture 以免假红）"
 
-# ══ W4 批（haskell 于 R6 转证据 SKIP，余六真门；groovy 走 angular 先例不入矩阵，见尾部对账节）════════════
+# ══ W4 批（haskell 于 R6 转 SKIP、langs20 批转回真门；余五真门）════════════
 
 [[lang]]
 id = "haskell"
 via = "binary"
-install = "curl -fsSL https://downloads.haskell.org/~ghc/9.4.8/ghc-9.4.8-x86_64-deb11-linux.tar.xz -o /tmp/ghc.tar.xz && echo \"2743629d040f3213499146cb5154621d6f25e85271019afc9b9009e04d66bf6c  /tmp/ghc.tar.xz\" | sha256sum -c - && sudo tar -xJf /tmp/ghc.tar.xz -C /opt && sudo ln -sf /opt/ghc-9.4.8/bin/ghc /opt/ghc-9.4.8/bin/ghci /usr/local/bin/ && ghc --version && curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.9.0.1/haskell-language-server-2.9.0.1-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && mkdir -p /tmp/hls && tar -xJf /tmp/hls.tar.xz -C /tmp/hls && sudo find /tmp/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && haskell-language-server-wrapper --version"
+install = "curl -fsSL https://downloads.haskell.org/~ghc/9.4.8/ghc-9.4.8-x86_64-deb11-linux.tar.xz -o /tmp/ghc.tar.xz && echo \"2743629d040f3213499146cb5154621d6f25e85271019afc9b9009e04d66bf6c  /tmp/ghc.tar.xz\" | sha256sum -c - && sudo tar -xJf /tmp/ghc.tar.xz -C /opt && curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.9.0.1/haskell-language-server-2.9.0.1-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && mkdir -p /tmp/hls && tar -xJf /tmp/hls.tar.xz -C /tmp/hls && sudo find /tmp/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && GB=\"$(dirname \"$(command -v ghc)\")\" && sudo ln -sf /opt/ghc-9.4.8/bin/ghc \"$GB/ghc\" && sudo ln -sf /opt/ghc-9.4.8/bin/ghc-9.4.8 \"$GB/ghc-9.4.8\" && ghc --version && haskell-language-server-wrapper --version"
 pin = "HLS 2.9.0.1 (bindist deb11) + GHC 9.4.8 (downloads.haskell.org bindist; sha = 官方 SHA256SUMS 2026-09-29)"
 fixture = "main.hs"
 lang_flag = "haskell"
 budget_secs = 900
-skip_class = "HOST"
-skip_reason = "runner preimage ships GHC 9.14.1 on PATH (cabal/stack/ghc preinstalled) and it shadows the bindist pairing; HLS 2.9.0.1 bindist carries binaries only for {9.2.8, 9.4.8, 9.6.6, 9.8.2, 9.10.1} — wrapper finds no match, server starts with no document handlers"
-skip_evidence = "run 36577226543: install 行 `ghc --version` 实印 9.14.1（非 bindist 9.4.8）；lsp_stderr 'Failed to find a HLS version for GHC 9.14.1' → 'no handler for: textDocument/didOpen|documentSymbol|hover'"
-verified = "never"
-remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；R6 起证据 SKIP（PM 裁决 2026-09-29）——R4 假设的『apt ghc 9.4.7』不对，实况是 runner 预装 GHC 9.14.1 活在 PATH（我们 /usr/local/bin 前缀链为何未盖过它待查：bindist 前缀/软链传导嫌疑，同 lean4 dangling 前缀一族）；runner 镜像 GHC 集变化或 wrapper 版本配对解决即转真门"
+remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；langs20 轮转真门：R6 死因 = runner 预装 GHC 9.14.1 活在 PATH 前段（~/.ghcup/bin 一族），bindist 装到 /opt 后 ln /usr/local/bin 盖不过它（run 36577226543 `ghc --version` 实印 9.14.1 → HLS wrapper 'no handler' 实锚）——解药 = `dirname $(command -v ghc)` 定位实际解析位后原地 ln -sf 覆盖为 bindist 9.4.8（含版本命名 ghc-9.4.8 一并补，HLS wrapper/版本化二进制双解析面），ghc --version 打印留 install.out 作配对证据；HLS 2.9.0.1 bindist 携 {9.2.8,9.4.8,9.6.6,9.8.2,9.10.1} 五版本二进制，9.4.8 配对即活"
 
 [[lang]]
 id = "ocaml"
@@ -561,9 +552,9 @@ lang_flag = "crystal"
 budget_secs = 420
 skip_class = "HOST"
 skip_reason = "crystalline binary installs and --version runs, but the LS process dies at spawn (stdout pump EOF) with zero stderr — runner-host specific (install verified, spawn unverifiable on ubuntu-latest); no LSP traffic ever occurs"
-skip_evidence = "run 36577226543: install.out '0.20.0+a5f6f1b' OK；stderr LS_TERMINATED 'stdout pump EOF'；daemon.log 107 行零 lsp_stderr（spawn 即死，无协议帧）"
+skip_evidence = "run 36577226543: install.out '0.20.0+a5f6f1b' OK；stderr LS_TERMINATED 'stdout pump EOF'；daemon.log 107 行零 lsp_stderr（spawn 即死，无协议帧）；langs20 轮复核（2026-09-30）：上游 latest 仍 v0.20.0（2026-09-18）无新版可试，assets 仅 {linux-musl.gz, macos-arm64.gz} 无 win 二进制——本机 Windows 复现路径不存在，spawn 根因只能在 ubuntu runner 主场排查"
 verified = "never"
-remark = "↖ mirror crystal_language_server.py@7a296833（shutil.which 裸启动）；R6 起证据 SKIP（PM 裁决 2026-09-29）；servers.toml crystalline 条目保持 path_only（legacy 锚 canary 断言在案）；本机或有 crystal 工具链的宿主可用，runner 主场即转真门待 spawn 根因（零 stderr 疑静态二进制 io_uring/内核组）排查"
+remark = "↖ mirror crystal_language_server.py@7a296833（shutil.which 裸启动）；R6 起证据 SKIP（PM 裁决 2026-09-29）维持；servers.toml crystalline 条目保持 path_only（legacy 锚 canary 断言在案）；本机或有 crystal 工具链的宿主可用，spawn 根因（零 stderr 疑静态二进制 io_uring/内核组）排查后即转真门"
 
 [[lang]]
 id = "zig"
@@ -575,19 +566,17 @@ lang_flag = "zig"
 budget_secs = 600
 remark = "--lang zig → [servers.zls]（本批 path_only → download 升级，六平台 digest 锚；tarball 内 bin 布局扁平假设为 CI 首跑实锚点）；zig 0.16.0 工具链 ziglang.org 官方 tarball（sha = index.json 实锚）symlink 入 PATH——zls 与 zig 严格同 minor 配对（0.16.x）；serena install 把 zls 落缓存目录不落 PATH（run 36567771452 `zls: command not found` exit 127 实锚）——install 行按缓存布局 glob symlink 到 /usr/local/bin 再验 --version"
 
-# ══ SKIP 门（四类，预算上限 6 条，PM 裁决制）═════════════════════════════
+# ══ R6 存量 SKIP 段（java/latex/pascal/omnisharp/al 已于 langs20 批转真门；matlab 维持 LICENSE SKIP）═══
 
 [[lang]]
 id = "java"
 via = "serena-download"
-pin = "servers.toml"
+install = "curl -fsSL \"https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jre/hotspot/normal/eclipse\" -o /tmp/jre25.tar.gz && sudo mkdir -p /opt/jre25 && sudo tar -xzf /tmp/jre25.tar.gz -C /opt/jre25 --strip-components=1 && sudo update-alternatives --install /usr/bin/java java /opt/jre25/bin/java 2500 && sudo update-alternatives --set java /opt/jre25/bin/java && java -version 2>&1 | head -1 >&2"
+pin = "jdtls snapshot latest (T2 自带下载) + Temurin JRE 25 (api.adoptium.net v3 binary 端点 307→github 实锚 2026-09-30)"
 fixture = "Main.java"
 lang_flag = "java"
 budget_secs = 900
-skip_class = "HOST"
-skip_reason = "jdtls requires JRE 25+, ubuntu-24.04 apt caps at openjdk-21"
-skip_evidence = "local/report-jdtls-autowire.md (JRE 25+ documented); ubuntu-24.04 suite has no openjdk-25"
-verified = "never"
+remark = "langs20 轮转真门：T2 jdtls.rs 走 download.eclipse.org snapshot latest（滚动），本构建要求 JRE 25+（jdtls.rs 模块注释实锚），noble apt 封顶 21 → Adoptium API 直装 JRE 25 并 update-alternatives 切系统默认（install 子 shell 的 env 导出不回传 daemon，系统态软链才是 daemon LS spawn 的 java 解析——bsl 门同源教训）；jdtls 包本体 T2 首启自动下载（doctor.rs hint 实锚），无需 install 行显式装；snapshot 滚动 JDK 下限漂浮为已知漂移（jdtls.rs 已知漂移节），下限再涨时抬 JRE 版本即可"
 
 [[lang]]
 id = "matlab"
@@ -598,9 +587,9 @@ lang_flag = "matlab"
 budget_secs = 600
 skip_class = "LICENSE"
 skip_reason = "MATLAB R2021b+ proprietary license, unobtainable on CI"
-skip_evidence = "local/upstream-ls-catalog.md A17 (Runtime: MATLAB R2021b+ + Node.js)"
+skip_evidence = "local/upstream-ls-catalog.md A17 (Runtime: MATLAB R2021b+ + Node.js)；langs20 轮复核（2026-09-30）：marketplace VSIX 条目 URL 存活（各平台同 URL），LS 启动仍需本机 MATLAB R2021b+ runtime（entry exec node index.js + env MATLAB_INSTALL_PATH），许可证门控不变"
 verified = "never"
-remark = ".m 扩展名归本门（wolfram 仅 .wl/.nb，wolfram 未入矩阵）"
+remark = ".m 扩展名归本门（wolfram 仅 .wl/.nb，wolfram 未入矩阵）；PM 批准冻结（2026-09-29 R4 账本，langs20 轮证据刷新）"
 
 [[lang]]
 id = "latex"
@@ -608,36 +597,28 @@ via = "serena-download"
 pin = "servers.toml"
 fixture = "main.tex"
 lang_flag = "latex"
-budget_secs = 900
-skip_class = "BUDGET"
-skip_reason = "texlab installs but functional coverage needs LaTeX toolchain (texlive ~2GB), exceeds per-door budget"
-skip_evidence = "local/upstream-ls-catalog.md A27 (Runtime: LaTeX toolchain)"
-verified = "never"
+budget_secs = 420
+remark = "langs20 轮转真门：R6 skip 引『需 texlive ~2GB 工具链』过重——复核上游 texlab_language_server.py@7a296833：texlab 是 Rust 单二进制（download 条目已在表，5.25.1 sha = GitHub API assets[].digest 2026-09-30 复锚），documentSymbol 走源码结构解析（section/环境），裸 .tex 即出符号，编译类能力（latexmk 构建）才需工具链；fixture 补 \\section/\\subsection 给结构符号（原 fixture 无节，符号集合为空风险）"
 
 [[lang]]
 id = "pascal"
 via = "serena-download"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq fpc && $SERENA_CLI install pascal && command -v pasls"
 pin = "servers.toml"
 fixture = "smoke.pp"
 lang_flag = "pascal"
 budget_secs = 900
-skip_class = "BUDGET"
-skip_reason = "pasls needs FPC toolchain (apt fpc ~400MB + PP/FPCDIR config), exceeds per-door budget"
-skip_evidence = "local/upstream-ls-catalog.md A20 (Runtime: FPC)"
-verified = "never"
-remark = "W4 接线单 owner：pasls unix 接线 + FPC 前置归 W4 批（本轮 SKIP 占位，Main 裁决 2026-09-29）；FPC 就绪后转真门并复核预算"
+remark = "langs20 轮转真门（W4 接线单收口）：servers.toml pascal 条目补 linux 双组（tar.gz，sha 三方一致 embed=API=官方 checksums，矩阵 §18）；FPC 前置 = apt fpc（noble universe，pasls 对标准布局 /usr/lib/fpc 自发现——上游 pascal_server.py@7a296833 env 仅 settings 显式配置时注入，无 env 直启为默认形态）；apt fpc ~400MB 为预算主体"
 
 [[lang]]
 id = "omnisharp"
 via = "serena-download"
+install = "sudo apt-get update -qq && sudo apt-get install -y -qq mono-complete && $SERENA_CLI install omnisharp && dotnet restore \"$SERENA_FXDIR/smoke.csproj\" --verbosity quiet"
 pin = "servers.toml"
-fixture = "smoke.cs"
+fixture = "omnisharp/smoke.cs"
 lang_flag = "omnisharp"
-budget_secs = 600
-skip_class = "PLATFORM"
-skip_reason = "servers.toml entry pins windows-only group (OmniSharp.exe; upstream runtime_dependencies enables L,W only)"
-skip_evidence = "crates/ls-registry/servers.toml [servers.omnisharp.download] bin_path=OmniSharp.exe win-only"
-verified = "never"
+budget_secs = 900
+remark = "langs20 轮转真门：R6 PLATFORM skip（windows-only pin）死因解除——servers.toml 补 linux-x86_64 组（自包含 mono 变体，sha = 上游 runtime_dependencies.json integrity FB4CAA47… + 本机整包下载复算双锚 2026-09-30；net6 形态需 runner 不具备的 roll-forward 前置故不选，条目注释详证）；mono-complete noble universe 6.8.0.105（packages.ubuntu.com 实锚）；exec 无 -s <sln>，OmniSharp -lsp 走 folder 模式自发现 fixture 目录内 csproj（csharp 门 csproj+restore 先例）；razor 插件不在（单下载 schema 不支持双包，基础 LSP 足够底线探针）；csharp 主门（Roslyn/csharp-ls）不动，本门为变体门"
 
 [[lang]]
 id = "al"
@@ -646,10 +627,7 @@ pin = "servers.toml"
 fixture = "smoke.al"
 lang_flag = "al"
 budget_secs = 600
-skip_class = "PLATFORM"
-skip_reason = "VSIX entry pins windows group only (bin extension/bin/win32/...); unix paths left in entry comment pending W-wave"
-skip_evidence = "crates/ls-registry/servers.toml [servers.al.download] windows-only bin_path"
-verified = "never"
+remark = "langs20 轮转真门：R6 PLATFORM skip 死因解除——servers.toml 补 unix 四组 bin_path_per_platform（VSIX universal zip 多平台合一，extension/bin/{linux|darwin}/Microsoft.Dynamics.Nav.EditorServices.Host 无 .exe 后缀；URL/sha 与 win 组同值，GET-range 200 实锚 2026-09-30）；AL LS 对裸 .al 单对象文件出符号（codeunit/table 解析为语法层）"
 
 # ── W3 批（php/lua/scala/swift；php 块在原位改 intelephense，lua 块在 download 段）──
 
@@ -666,18 +644,15 @@ remark = "path_only 门：servers.toml [servers.scala] 只探 PATH，安装走 c
 
 [[lang]]
 id = "swift"
-via = "path_only"
-pin = "servers.toml"
+via = "binary"
+install = "curl -fsSL https://download.swift.org/swift-6.2.4-release/ubuntu2404/swift-6.2.4-RELEASE/swift-6.2.4-RELEASE-ubuntu24.04.tar.gz -o /tmp/swift.tar.gz && sudo mkdir -p /opt/swift && sudo tar -xzf /tmp/swift.tar.gz -C /opt/swift --strip-components=2 && sudo ln -sf /opt/swift/bin/sourcekit-lsp /opt/swift/bin/swiftc /opt/swift/bin/swift /usr/local/bin/ && sourcekit-lsp --version && swift --version 2>&1 | head -1 >&2"
+pin = "sourcekit-lsp 6.2.4（随 swift.org 6.2.4 RELEASE ubuntu24.04 工具链；release 无官方 per-file digest 故钉 URL——erlang_ls 先例；URL HEAD 200 实锚 2026-09-30）"
 fixture = "main.swift"
 lang_flag = "swift"
-budget_secs = 600
-skip_class = "PLATFORM"
-skip_reason = "sourcekit-lsp ships with the Xcode/Swift toolchain; servers.toml entry is path_only (no installable asset) and ubuntu-latest runners have no Swift toolchain"
-skip_evidence = "servers.toml [servers.sourcekit_lsp] path_only install_hint='install Xcode / Swift toolchain (sourcekit-ls ships with it)'; local/upstream-ls-catalog.md G-class swift = Xcode/Swift 工具链"
-verified = "never"
-remark = "W3 批：Rust 侧接线完备（LanguageId/EXT_TABLE/doctor/sourcekit_lsp 存量条目）；SKIP 账本第 8 条（PM 批准 7→8，硬顶 8）；若未来 runner 出 Swift 工具链或 sourcekit-ls 独立发行即转真门"
+budget_secs = 1200
+remark = "langs20 轮转真门：R6 PLATFORM skip 死因 = 'sourcekit-lsp ships with Xcode/Swift toolchain, ubuntu runner has none'——swift.org 官方 linux tarball 即可脚本化工具链自举（path_only 条目本体不动，工具链入 PATH 即探测面命中）；--strip-components=2 剥 swift-6.2.4-RELEASE-usr/ 包装层；documentSymbol 裸 .swift 走 sourcekitd 语法层，无 Package.swift 亦出符号；tarball ~700MB 为预算主体（1200 上限）"
 
-# ══ W5 批（gleam/lean4/julia 三真门 + qml R6 证据 SKIP + wolfram SKIP 批准冻结；gdscript/msl 已迁出不入矩阵，见尾部对账节）═══
+# ══ W5 批（gleam/lean4/julia 三真门 + wolfram SKIP 批准冻结；qml 于 R6 SKIP、langs20 批转真门）═══
 
 [[lang]]
 id = "gleam"
@@ -692,17 +667,13 @@ remark = "↖ mirror gleam_language_server.py@7a296833（`gleam lsp` 子命令�
 
 [[lang]]
 id = "qml"
-via = "apt"
-install = "sudo apt-get update -qq && sudo apt-get install -y -qq qt6-declarative-dev-tools && sudo ln -sf /usr/lib/qt6/bin/qmlls /usr/local/bin/qmlls && test -x /usr/local/bin/qmlls"
-pin = "suite (ubuntu-24.04 = Qt 6.4.2；qmlls 落 /usr/lib/qt6/bin——packages.ubuntu.com noble qt6-declarative-dev-tools filelist 实锚 2026-09-29；原 /usr/bin/qmlls6 锚有误，run 36567771452 ln 失败实锤)"
+via = "binary"
+install = "pip install --quiet aqtinstall && aqt install-qt linux desktop 6.8.3 linux_gcc_64 --outputdir /opt/qt && sudo find /opt/qt -name qmlls -type f -exec ln -sf {} /usr/local/bin/qmlls \\; && qmlls --version"
+pin = "qmlls 6.8.3（aqt 官方渠道；Qt 6.8 起带 documentSymbol/hover handler——noble apt 封顶 6.4.2 无 handler 为 R6 死因）"
 fixture = "Main.qml"
 lang_flag = "qml"
-budget_secs = 600
-skip_class = "PLATFORM"
-skip_reason = "qmlls 6.4.2 (noble apt ceiling) predates the documentSymbol/hover LSP handlers — needs Qt 6.8+ qmlls, only distributable via Qt official installer (interactive + account, not CI-scriptable)"
-skip_evidence = "run 36577226543 lsp_stderr 双 -32601: 'There was no handler registered with registerDocumentSymbolHandler' / 'registerHoverHandler'（qmlls 错误消息自述无 handler）"
-verified = "never"
-remark = "↖ mirror qml_language_server.py@7a296833（qmlls 裸启动 stdio，条目存量本体不动）；条目 binary_name=qmlls 单名 vs 上游 which 顺序 qmlls6→qmlls——ln -sf 对齐维持；R6 起证据 SKIP（PM 裁决 2026-09-29；R4 的 hover fallback 登记随之撤销——6.4.2 hover 同样无 handler，降级探针无出路）；Qt 新版渠道出现即转真门"
+budget_secs = 1200
+remark = "langs20 轮转真门：R6 死因 = noble apt qmlls 6.4.2 无 documentSymbol/hover handler（run 36577226543 双 -32601 'no handler registered' 实锚），Qt 官方 installer 不可脚本化——aqtinstall 即 CI 事实标准渠道（aqt list-qt 实锚 6.8.3 linux_gcc_64 在架 + base archives 含 qtdeclarative 2026-09-30 本机实测；qmlls 构建于 qt/qtdeclarative tools/qmlls @v6.8.1 源码树实锚）；qmlls 落 libexec/ 布局随版浮动故 find-ln（gleam/erlang find-install 先例）；条目 path_only 本体不动（binary_name=qmlls，上游 which qmlls6→qmlls 顺序与我们单名对齐维持）；Qt 6.8.3 desktop ~1GB 下载为预算主体"
 
 [[lang]]
 id = "lean4"
@@ -733,40 +704,77 @@ lang_flag = "wolfram"
 budget_secs = 300
 skip_class = "LICENSE"
 skip_reason = "LS = WolframKernel bundled LSPServer paclet, ships only with Mathematica 13.0+ / Wolfram Engine 12.1+ (licensed install; free Engine requires Wolfram account + manual download — no package-manager/GitHub route)"
-skip_evidence = "upstream wolfram_language_server.py@7a296833 FileNotFoundError 实锚: 'Install Wolfram Mathematica (13.0+) or Wolfram Engine (12.1+) from https://www.wolfram.com'; 发现链 = WOLFRAM_PATH env/PATH/常见安装位 glob，全依赖本机 Wolfram 安装"
+skip_evidence = "upstream wolfram_language_server.py@7a296833 FileNotFoundError 实锚: 'Install Wolfram Mathematica (13.0+) or Wolfram Engine (12.1+) from https://www.wolfram.com'; 发现链 = WOLFRAM_PATH env/PATH/常见安装位 glob，全依赖本机 Wolfram 安装（langs20 轮 2026-09-30 复核：无免许可可脚本化渠道出现，维持冻结）"
 verified = "never"
 remark = "W5 批：LICENSE SKIP 候选；PM 批准冻结（2026-09-29 R4 账本，SKIP 11 条冻结清单成员）；Rust 侧 LanguageId/EXT_TABLE 已接线（.wl/.nb），servers.toml 新增 [servers.wolfram] 探测面（WolframKernel，持有安装的用户可用，haskell_ls 运行时自备语义）；免许可可脚本化渠道出现即转真门"
 
+# ══ langs20 批（bd serena-rust-jp2，2026-09-30）：A 类 5 门收编（luau 真门 + 四证据 SKIP）════════════
+
+[[lang]]
+id = "luau"
+via = "serena-download"
+pin = "servers.toml"
+fixture = "main.luau"
+lang_flag = "luau"
+budget_secs = 420
+remark = "langs20 批收编（上游 luau_lsp.py@7a296833 luau-lsp 单二进制，`luau-lsp lsp` 子命令——deno/gleam 同款 CLI 内置 LS）；[servers.luau] 条目已存（1.63.0，linux/macos 六 sha = GitHub API assets[].digest 2026-09-30 复核逐条一致，win 组缺省 CI 无涉）；--lang luau 显式路由（.luau 无 EXT_TABLE 占位，'luau' 不别名 Lua——W3 批断言在案）；platform 默认 roblox 口径（上游默认），裸 fixture 走内置定义分析，documentSymbol 兜底"
+
+[[lang]]
+id = "angular"
+via = "serena-download"
+pin = "-"
+fixture = "angular/app.component.ts"
+lang_flag = "angular"
+budget_secs = 300
+skip_class = "HOST"
+skip_reason = "ngserver alone cannot pass any smoke probe: documentSymbol not implemented at all (upstream returns null/-32601 for every file type), and hover/definition/diagnostics all answer null for bare .ts even with @angular/core resolvable — upstream needs tri-server orchestration (ngserver + companion typescript-language-server + HTML companion), which the single-process T0 launch model does not support (angular 不入 servers.toml 断言在案)"
+skip_evidence = "本机裸探针 2026-09-30（@angular/language-server 22.2.0，npm 实装 + probe.py）：initialize 应答正常，但 documentSymbol=null、hover=null（7 组合：裸 .ts/@Component fixture × 绝对/相对 probeLocations × server-request 自动应答开/关）、definition=null、diagnostics 15s 零推送；无 --tsProbeLocations 时 initialize 超时无应答；↖ mirror angular_language_server.py@7a296833 模块注释 'ngserver does not implement textDocument/documentSymbol for any file type' + .ts hover 路由伴随 TS server 实锚"
+verified = "never"
+remark = "npm 包本身存在可装（@angular/language-server 22.2.0，registry 实锚）——SKIP 因果 = 探针词表（documentSymbol/hover/diagnostics 底线）在 ngserver 单进程形态全空，且 T0 npm_args 静态串无法携带 tsProbeLocations 动态路径；rust 侧 LanguageId 无 angular 值、servers.toml 零条目维持（coverage 测试 not-in-table 断言）；T0 支持伴随进程编排（vue 双服务器先例的三角版）或探针词表扩展即转真门"
+
+[[lang]]
+id = "groovy"
+via = "serena-download"
+pin = "-"
+fixture = "main.groovy"
+lang_flag = "groovy"
+budget_secs = 300
+skip_class = "HOST"
+skip_reason = "no installable Groovy LS exists anywhere (R4 结论 langs20 轮四渠道重验全灭): npm registry 无包、上游 groovy adapter 硬性要求用户自备 ls_jar_path、palantir Maven artifact 仅存 POM 无 JAR（Bintray 日落清库）、GroovyLanguageServer/groovy-language-server GitHub releases 为空"
+skip_evidence = "2026-09-30 一手复核：registry.npmjs.org/groovy-language-server 404；api.github.com GroovyLanguageServer/groovy-language-server releases=[]（repo 235★ 活着但零资产）；repo1.maven.org .../com/palantir/ls/groovy-language-server/0.5.5/ 仅 .pom 无 .jar（search.maven.org 索引为幽灵）；open-vsx 'vscode/groovy' = 官方语法高亮内置扩展非 LS；palantir/language-servers repo archived（2018 停更）"
+verified = "never"
+remark = "「门不可能存在」非「门装不上」——真 LS 出现即秒接（真门形态 = coursier bootstrap 或 java -jar，runner JDK 由 java 门前置铺垫）；EXT_TABLE .groovy/.gvy 占位在案，servers.toml 零条目维持（W4 批 perl_ls 注释先例）"
+
+[[lang]]
+id = "gdscript"
+via = "serena-download"
+pin = "-"
+fixture = "main.gd"
+lang_flag = "godot"
+budget_secs = 300
+skip_class = "HOST"
+skip_reason = "godot LS is a TCP client connecting to an ALREADY-RUNNING Godot editor (:6008) — it never spawns a server process, and this repo's launch model is stdio-only (TransportKind has a single Stdio variant); `godot --headless --editor` on CI cannot serve without TCP transport"
+skip_evidence = "↖ mirror godot_language_server.py@7a296833: 'The editor must already be running — this class connects to it rather than launching it' + TCPLanguageServer(connection_info)（R4 账本实锚，langs20 轮 2026-09-30 复核引用仍准）；本仓 TransportKind 仅 Stdio 变体（ls-runtime/src/process.rs:44 实锚 2026-09-30）"
+verified = "never"
+remark = "R4 账本迁出条目 langs20 批转 SKIP 门行（user 指令「全部写上 CI」收编）；EXT_TABLE .gd 占位在案，servers.toml 零条目维持；lsp-core 出 TCP transport + 编辑器宿主编排（angular 三进程同族）即转真门"
+
+[[lang]]
+id = "msl"
+via = "serena-download"
+pin = "-"
+fixture = "main.mrc"
+lang_flag = "msl"
+budget_secs = 300
+skip_class = "PLATFORM"
+skip_reason = "upstream LS is a pygls script living inside the serena repo itself (launch = [sys.executable, msl_lsp_server.py]) with no standalone distribution channel — no npm/pip/GitHub release carries it, and this repo's Rust binary does not bundle the script"
+skip_evidence = "↖ mirror msl_language_server.py@7a296833 ProcessLaunchInfo [sys.executable, msl_lsp_server.py]（R4 账本实锚）；langs20 轮复核（2026-09-30）：pypi.org/pypi/msl-lsp/json 与 msl-lsp-server 均 404，无独立发行渠道出现"
+verified = "never"
+remark = "mSL = mIRC Scripting Language（.mrc），与 Xcode/macOS 无关；R4 账本迁出条目 langs20 批转 SKIP 门行；EXT_TABLE .mrc 占位在案，servers.toml 零条目维持；上游独立发行 msl_lsp（pip 包/独立仓库）即转真门"
+
 # ══ 不入矩阵（对账表栏 3，见报告）═══════════════════════════════════════
-# angular：PM 拍板 documented SKIP——三进程编排 T0 不支持，条目不进 servers.toml，
-#          coverage 标 never-verified。报告见 local/agent-reports/ci-infra-45lang.md。
-# gdscript：PM 裁决（2026-09-29 R4 账本）不入矩阵（angular/groovy 先例）——上游
-#          适配器是 TCP 客户端，连已运行的 Godot 编辑器 :6008，从不自起进程
-#          （godot_language_server.py@7a296833 实锚: 'The editor must already be
-#          running — this class connects to it rather than launching it' +
-#          TCPLanguageServer(connection_info)），而本仓 launch 模型 stdio-only
-#          （ls-runtime TransportKind 仅 Stdio 变体）——`godot --headless --editor`
-#          也无法无 TCP transport 地服务本仓。coverage 标 install-infeasible /
-#          host-required (never-verified)；servers.toml 零条目维持；Rust 侧
-#          LanguageId/EXT_TABLE 已接线（.gd）。lsp-core 出 TCP transport +
-#          编辑器宿主编排（angular 三进程同族）即转真门。
-# msl：PM 裁决（2026-09-29 R4 账本）不入矩阵（angular/groovy 先例）——上游 LS 是
-#          serena 仓库内 pygls 脚本（launch = [sys.executable, msl_lsp_server.py]，
-#          msl_language_server.py@7a296833 ProcessLaunchInfo 实锚），无 npm/pip/
-#          GitHub 独立发行渠道，本仓 Rust 二进制不随附该脚本；mSL = mIRC Scripting
-#          Language（.mrc），与 Xcode/macOS 无关（PM 契约 'metal' 系误读，73 门
-#          对账无 metal 门）。coverage 标 no-distributable-LS (never-verified)；
-#          servers.toml 零条目维持；Rust 侧 LanguageId/EXT_TABLE 已接线（.mrc）。
-#          上游独立发行 msl_lsp（pip 包/独立仓库）即转真门。
-# groovy：PM 裁决（2026-09-29）不入矩阵（angular 先例）——无任何可安装 LS：上游
-#          groovy_language_server.py@7a296833 硬性要求用户自备 ls_jar_path JAR
-#          （_find_groovy_ls_jar RuntimeError 实锚）、npm 无 LS 包、
-#          GroovyLanguageServer GitHub releases=[]（per_page=3，2026-09-29 实查）、
-#          apt groovy = 语言 runtime 非 LS——四条安装路线全灭，「门不可能存在」
-#          非「门装不上」（SKIP 账本 8/8 不动）。coverage 标 install-verified /
-#          no-LS-exists (never-verified)；servers.toml 零条目维持；Rust 侧
-#          LanguageId/EXT_TABLE 已接线（.groovy/.gvy），真 LS 出现即秒接
-#          （真门形态 = java -jar，runner 预装 JDK 17 可用）。
+# langs20 批（2026-09-30）起 angular/groovy/gdscript/msl 四门改为 SKIP 门行入矩阵
+# （user 指令「剩余目录语言全部写上 CI」——原 R4「不入矩阵」裁决被本批覆盖，证据链
+# 迁入各门 skip_evidence，见 langs20 批节）。仍在矩阵外的：
 # sql / mysql：PM 追认 documented SKIP（2026-09-29 smoke 修红轮）——sqls 源码
 #          internal/handler/handler.go:148-168 实锚 capabilities 无
 #          DocumentSymbolProvider、无 diagnostics；无 DB 连接时 hover 内容恒空
@@ -775,8 +783,10 @@ remark = "W5 批：LICENSE SKIP 候选；PM 批准冻结（2026-09-29 R4 账本�
 #          单门私造）。coverage 标 install-verified / probe-infeasible(no DB)；
 #          servers.toml 条目保留（linux install 已修，install/doctor 可用）。若用户
 #          配置 sqls DB 连接，可手动 probe 解锁真门（未来可选增强，非 smoke scope）。
-# perl/r 已于 W4 批收编（真门 path_only+cpanm/CRAN）；groovy 于 W4 批按 angular
-# 先例不入矩阵（见上）；scala 已于 W3 批收编（path_only + coursier bootstrap 门，
+# perl/r 已于 W4 批收编（真门 path_only+cpanm/CRAN）；groovy 于 langs20 批转 SKIP
+# 门行（见上）；scala 已于 W3 批收编（path_only + coursier bootstrap 门，
 # 见上）；julia 已于 W5 批收编（path_only + julia tarball + Pkg 预装门，见上）；
-# wolfram 于 W5 批落真 SKIP 块（LICENSE，PM 批准冻结，见 W5 批节）；gdscript/msl
-# 于 R4 账本（2026-09-29）按 angular/groovy 先例迁出不入矩阵（HOST，见上）。
+# wolfram 于 W5 批落真 SKIP 块（LICENSE，PM 批准冻结，见 W5 批节）；
+# luau 于 langs20 批收编（真门，1.63.0 条目 + 六平台 digest 复核）；
+# java/bsl/haskell/nextflow/latex/pascal/omnisharp/al/swift/qml 十门于 langs20 批
+# 由 SKIP 转真门（逐门死因解除证据见各块 remark；R7 终账 69=53+16 → 74=64+10）。

@@ -346,14 +346,26 @@ allowed_hosts = ["marketplace.visualstudio.com"]
 
 [servers.al.download.url_per_platform]
 "windows-x86_64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/18.0.2242655/vspackage"
+"linux-x86_64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/18.0.2242655/vspackage"
+"linux-aarch64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/18.0.2242655/vspackage"
+"macos-x86_64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/18.0.2242655/vspackage"
+"macos-aarch64" = "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/18.0.2242655/vspackage"
 
 [servers.al.download.sha256_per_platform]
 "windows-x86_64" = "3971995e61a59dc4fcce4a65053072a67991ed624a16635c4f2911f12564b2b9"
+"linux-x86_64" = "3971995e61a59dc4fcce4a65053072a67991ed624a16635c4f2911f12564b2b9"
+"linux-aarch64" = "3971995e61a59dc4fcce4a65053072a67991ed624a16635c4f2911f12564b2b9"
+"macos-x86_64" = "3971995e61a59dc4fcce4a65053072a67991ed624a16635c4f2911f12564b2b9"
+"macos-aarch64" = "3971995e61a59dc4fcce4a65053072a67991ed624a16635c4f2911f12564b2b9"
+
+[servers.al.download.bin_path_per_platform]
+"linux-x86_64" = "extension/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host"
+"linux-aarch64" = "extension/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host"
+"macos-x86_64" = "extension/bin/darwin/Microsoft.Dynamics.Nav.EditorServices.Host"
+"macos-aarch64" = "extension/bin/darwin/Microsoft.Dynamics.Nav.EditorServices.Host"
 # VSIX 形态：universal zip（多平台合一，Marketplace 无官方 digest），各平台同 URL 同
-# sha256；bin_path 随平台段 win32|linux|darwin 变化（unix 无 .exe 后缀），单值字段仅容
-# windows 组：
-#   linux-x86_64 / linux-aarch64 / macos-x86_64 / macos-aarch64 同上 URL / sha256，
-#   bin extension/bin/{linux|darwin}/Microsoft.Dynamics.Nav.EditorServices.Host
+# sha256（embed 真值）；bin_path 随平台段 win32|linux|darwin 变化（unix 无 .exe 后缀）。
+# langs20 轮（2026-09-30）补 unix 四组（URL GET-range 200 实锚）——PLATFORM SKIP 解除。
 
 [servers.bsl]
 languages = ["bsl"]
@@ -784,17 +796,22 @@ allowed_hosts = ["roslynomnisharp.blob.core.windows.net"]
 
 [servers.omnisharp.download.url_per_platform]
 "windows-x86_64" = "https://roslynomnisharp.blob.core.windows.net/releases/1.39.10/omnisharp-win-x64-1.39.10-net6.0.zip"
+"linux-x86_64" = "https://roslynomnisharp.blob.core.windows.net/releases/1.39.10/omnisharp-linux-x64-1.39.10.zip"
 
 [servers.omnisharp.download.sha256_per_platform]
 "windows-x86_64" = "A73327395E7EF92C1D8E307055463DA412662C03F077ECC743462FD2760BB537"
+"linux-x86_64" = "fb4caa47343265100349375d79dbcce1868950ced675cb07fcbe8462edbcdd37"
+
+[servers.omnisharp.download.bin_path_per_platform]
+"linux-x86_64" = "run"
 # sha256 原文大写（上游 JSON integrity 字段；install.rs 校验前统一 to_ascii_lowercase）。
-# linux-x64 net6 变体待扩展（bin OmniSharp，无 .exe）：
-#   linux-x86_64: omnisharp-linux-x64-1.39.10-net6.0.zip
-#     sha256 0926D3BEA060BF4373356B2FC0A68C10D0DE1B1150100B551BA5932814CE51E2
-# Razor 插件为独立 zip（固定 GUID URL 不可模板化）+ exec 追加
-# `--plugin OmniSharpPlugin/Microsoft.AspNetCore.Razor.OmniSharpPlugin.dll`——单下载
-# schema 不支持双包，exec 暂不含 --plugin（基础 OmniSharp LSP 可用）。需 .NET 6-9 runtime；
-# 完整启动还含 -s <sln> --hostPID <pid> 等运行时参数（接线层追加）。
+# linux 组 = 自包含 mono 变体（-net6.0 后缀 URL 对 linux 不存在，404 实锚；net6 形态
+# 实为 omnisharp-linux-x64-net6.0-1.39.10.zip 前缀式命名，需 .NET 6 runtime——runner
+# dotnet 8 默认 roll-forward 不跨 major，故选 mono 自包含变体，bin=zip 根 `run` 启动
+# 脚本经 apt mono-complete 跑 OmniSharp.exe；sha 双锚 = 上游 runtime_dependencies.json
+# integrity FB4CAA47… + 本机整包下载复算 2026-09-30）。Razor 插件为独立 zip（固定 GUID
+# URL 不可模板化）+ exec 追加 --plugin——单下载 schema 不支持双包，exec 暂不含 --plugin
+# （基础 OmniSharp LSP 可用）。
 
 [servers.pascal]
 languages = ["pascal"]
@@ -810,19 +827,26 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 
 [servers.pascal.download.url_per_platform]
 "windows-x86_64" = "https://github.com/zen010101/pascal-language-server/releases/download/v0.2.0/pasls-x86_64-win64.zip"
+"linux-x86_64" = "https://github.com/zen010101/pascal-language-server/releases/download/v0.2.0/pasls-x86_64-linux.tar.gz"
+"linux-aarch64" = "https://github.com/zen010101/pascal-language-server/releases/download/v0.2.0/pasls-aarch64-linux.tar.gz"
 "macos-x86_64" = "https://github.com/zen010101/pascal-language-server/releases/download/v0.2.0/pasls-x86_64-darwin.zip"
 "macos-aarch64" = "https://github.com/zen010101/pascal-language-server/releases/download/v0.2.0/pasls-aarch64-darwin.zip"
 
 [servers.pascal.download.sha256_per_platform]
 "windows-x86_64" = "1493c31552e6f90a59800b2d44669e01fc4551d3647f3cea5dd105a9f6bc73e5"
+"linux-x86_64" = "517259395b0a385a5e848cf48b967645a984be3dd456118bc08771283a822a5b"
+"linux-aarch64" = "cb4986941cfdcf9cb74ece6bbb53a443390a908e880108a37f4ccf82b2d6c502"
 "macos-x86_64" = "0abfcd98f63f77dba74094339a40d4407b69317c1c77b13a26b9b7dbdfd885f1"
 "macos-aarch64" = "d4c2411e406af96ceae12b11e77fdb0c684ca15a68bfd8b4f9c6fe1fbdf515a7"
-# zip 组（M/Ma/W）包内根均为 pasls（win zip 内无 .exe 后缀）。tar.gz 组待扩展：
-#   linux-x86_64: pasls-x86_64-linux.tar.gz
-#     sha256 517259395b0a385a5e848cf48b967645a984be3dd456118bc08771283a822a5b
-#   linux-aarch64: pasls-aarch64-linux.tar.gz
-#     sha256 cb4986941cfdcf9cb74ece6bbb53a443390a908e880108a37f4ccf82b2d6c502
-# 运行 env PP/FPCDIR/LAZARUSDIR/FPCTARGET*；需 FPC。sha 三方一致（embed=API=官方 checksums）。
+
+[servers.pascal.download.archive_per_platform]
+"linux-x86_64" = "tar.gz"
+"linux-aarch64" = "tar.gz"
+# zip 组（M/Ma/W）包内根均为 pasls（win zip 内无 .exe 后缀）；linux 组 tar.gz 根同
+# pasls。sha 三方一致（embed=API=官方 checksums，矩阵 §18 复核）。运行 env
+# PP/FPCDIR/LAZARUSDIR/FPCTARGET* 可选（上游仅 settings 显式配置时注入，pasls 对
+# 标准布局 fpc 自发现）；需 FPC（apt fpc）。langs20 轮（2026-09-30）补 linux 双组
+# ——BUDGET SKIP 解除。
 
 [servers.phpactor]
 languages = ["php"]
