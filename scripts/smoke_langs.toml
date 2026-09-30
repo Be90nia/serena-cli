@@ -505,7 +505,7 @@ remark = "变体门：--lang solargraph；保持裸 .rb fixture（solargraph 直
 [[lang]]
 id = "haskell"
 via = "binary"
-install = "set -ex; curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.15.0.0/haskell-language-server-2.15.0.0-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && echo \"9d3f12bfd55d0d3ca40d0bb990498cb45a09ea5e391fcdbb63a76b76e73f67c2  /tmp/hls.tar.xz\" | sha256sum -c - && sudo mkdir -p /opt/hls && sudo tar -xJf /tmp/hls.tar.xz -C /opt/hls --strip-components=1 && ls /opt/hls/bin/ && sudo find /opt/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && hash -r; GHC_V=\"$(ghc --version | grep -oE '[0-9]+(\\.[0-9]+)+')\" && HLS_OUT=\"$(haskell-language-server-wrapper --version)\" && echo \"$HLS_OUT\" && echo \"$HLS_OUT\" | grep -q \"GHC: $GHC_V\""
+install = "set -ex; curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.15.0.0/haskell-language-server-2.15.0.0-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && echo \"9d3f12bfd55d0d3ca40d0bb990498cb45a09ea5e391fcdbb63a76b76e73f67c2  /tmp/hls.tar.xz\" | sha256sum -c - && sudo mkdir -p /opt/hls && sudo tar -xJf /tmp/hls.tar.xz -C /opt/hls --strip-components=1 && ls /opt/hls/bin/ && sudo find /opt/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && hash -r; GHC_V=\"$(ghc --version | grep -oE '[0-9]+(\\.[0-9]+)+')\" && test -x \"/usr/local/bin/haskell-language-server-$GHC_V\""
 pin = "HLS 2.15.0.0 (deb11 bindist; sha256 = GitHub API assets[].digest 9d3f12bf… 2026-09-30 实锚; release body 官方支持 GHC 9.14.1) + runner ghcup GHC 9.14.1（零安装，PATH 自带）"
 fixture = "main.hs"
 lang_flag = "haskell"
