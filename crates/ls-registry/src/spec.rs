@@ -57,6 +57,43 @@ pub struct ServerSpec {
     /// 内置 servers.toml 不使用本字段（全部缺省 0）；负值 = 显式让位内置。
     #[serde(default)]
     pub priority: i32,
+    /// ---- 上游对拍采纳 Wave 1（T0 三通道，upstream-compare-batchA/B/C 横切根因）----
+    /// 以下字段全部可省；省略 = 行为与引入前逐字节一致（向后兼容硬约束）。
+    /// 合并进 initialize params 的 `initializationOptions`（深层合并：两侧皆对象时
+    /// 递归并集、本表值覆盖；基线缺失/类型不匹配则直接设本值）。
+    /// ↖ mirror: 上游各 `*_language_server.py` `_create_base_initialize_params`
+    ///   的 `initializationOptions`（yaml/dart/elixir 首批消费者，toml 条目注释带行号锚）。
+    #[serde(default)]
+    pub init_options: Option<serde_json::Value>,
+    /// spawn 时注入的环境变量（`[servers.X.env]` 子表）。键为 `PATH`（大小写不敏感）
+    /// 时取「原值 + 平台分隔符 + 本值」追加语义（LS 伴随工具目录可达性）；其余键
+    /// 直接覆盖设置（进程环境其余变量照常继承）。
+    #[serde(default)]
+    pub env: Option<std::collections::HashMap<String, String>>,
+    /// `initialized` 后自动推送一条 `workspace/didChangeConfiguration`
+    /// `{settings: <本值>}`（外层 settings 键由接线层包裹）。
+    /// ↖ mirror: julia_server.py@7a296833 `_start_server` 尾部 nudge
+    ///   （LanguageServer.jl 只在 didChangeConfiguration handler 里触发配置拉取）。
+    #[serde(default)]
+    pub did_change_config: Option<serde_json::Value>,
+    /// `workspace/configuration` 请求的 per-LS 真值应答表：请求 item 的 `section`
+    /// 命中表内条目时回对应 `value`，未命中回 null（与本 crate 引入前的默认
+    /// null 数组行为一致）。仅声明了本字段的条目注册 handler，其它 LS 行为不变。
+    #[serde(default)]
+    pub config_reply: Option<Vec<ConfigReplyEntry>>,
+    /// per-LS 否决 pull 诊断（`textDocument/diagnostic`）：capability 推断为 true
+    /// 时仍强制走 push 缓存。↖ mirror: julia_server.py@7a296833
+    /// `_supports_pull_diagnostics → False`（LanguageServer.jl 对 pull 直接崩溃）。
+    #[serde(default)]
+    pub pull_diagnostics_denied: bool,
+}
+
+/// `[[servers.X.config_reply]]` 条目：section 精确匹配（大小写敏感，LSP
+/// ConfigurationItem.section 原文）→ 真值。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigReplyEntry {
+    pub section: String,
+    pub value: serde_json::Value,
 }
 
 /// §2.2 A 类 download 子表。
@@ -212,6 +249,32 @@ impl ServerSpec {
             "source" => self.source.as_ref().map(KindRef::Source),
             _ => None,
         }
+    }
+
+    /// spawn env 注入表 → `LaunchInfo.env`。未声明 `env` → 空 Vec（现行为）。
+    ///
+    /// `PATH` 键（大小写不敏感，Windows 环境变量语义）按平台分隔符追加在原值后
+    /// —— `Command::envs` 是覆盖语义，此处需显式带原值拼接；其余键直接设置。
+    pub fn spawn_env(&self) -> Vec<(String, String)> {
+        let Some(env) = &self.env else {
+            return Vec::new();
+        };
+        env.iter()
+            .map(|(k, v)| {
+                if k.eq_ignore_ascii_case("PATH") {
+                    let sep = if cfg!(windows) { ";" } else { ":" };
+                    let orig = std::env::var("PATH").unwrap_or_default();
+                    let merged = if orig.is_empty() {
+                        v.clone()
+                    } else {
+                        format!("{orig}{sep}{v}")
+                    };
+                    (k.clone(), merged)
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect()
     }
 }
 
@@ -674,5 +737,135 @@ bin_rel = "b"
             let err = parse(toml).unwrap_err();
             assert!(err.contains(needle), "want `{needle}` in err: {err}");
         }
+    }
+
+    // ---- 上游对拍采纳 Wave 1：T0 三通道字段 ----
+
+    #[test]
+    fn parses_wave1_tuning_channels() {
+        let toml = r#"
+[servers.tuned]
+languages = ["x"]
+install = "path_only"
+init_options = { yaml = { schemaStore = { enable = true } }, top = 1 }
+did_change_config = {}
+pull_diagnostics_denied = true
+
+[servers.tuned.env]
+JAVA_TOOL_OPTIONS = "-Xmx2G"
+
+[[servers.tuned.config_reply]]
+section = "perl"
+value = { perlInc = ["lib"] }
+
+[[servers.tuned.config_reply]]
+section = "other"
+value = "v"
+
+[servers.tuned.path_only]
+binary_name = "b"
+install_hint = "h"
+"#;
+        let parsed = parse(toml).expect("valid toml must parse");
+        let spec = &parsed.servers["tuned"];
+        // init_options：JSON 片（inline table）逐键。
+        let init = spec.init_options.as_ref().unwrap();
+        assert_eq!(
+            init.get("yaml")
+                .unwrap()
+                .get("schemaStore")
+                .unwrap()
+                .get("enable"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(init.get("top"), Some(&serde_json::json!(1)));
+        // env 子表。
+        let env = spec.env.as_ref().unwrap();
+        assert_eq!(
+            env.get("JAVA_TOOL_OPTIONS").map(String::as_str),
+            Some("-Xmx2G")
+        );
+        // did_change_config = {} 是 Some(空对象) 而非 None（julia nudge 语义）。
+        assert_eq!(
+            spec.did_change_config,
+            Some(serde_json::Value::Object(Default::default()))
+        );
+        assert!(spec.pull_diagnostics_denied, "显式 true 生效");
+        // config_reply 数组：section 精确 + 任意 JSON 值。
+        let replies = spec.config_reply.as_ref().unwrap();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0].section, "perl");
+        assert_eq!(
+            replies[0].value.get("perlInc").unwrap().get(0),
+            Some(&serde_json::json!("lib"))
+        );
+        assert_eq!(replies[1].section, "other");
+        assert_eq!(replies[1].value, serde_json::json!("v"));
+    }
+
+    /// 向后兼容硬约束：无新字段的条目，五个通道全为默认值（解析结果与引入前一致）。
+    #[test]
+    fn wave1_fields_default_when_absent() {
+        let toml = r#"
+[servers.plain]
+languages = ["x"]
+install = "path_only"
+[servers.plain.path_only]
+binary_name = "b"
+install_hint = "h"
+"#;
+        let parsed = parse(toml).expect("valid toml must parse");
+        let spec = &parsed.servers["plain"];
+        assert!(spec.init_options.is_none());
+        assert!(spec.env.is_none());
+        assert!(spec.did_change_config.is_none());
+        assert!(spec.config_reply.is_none());
+        assert!(!spec.pull_diagnostics_denied);
+        assert!(spec.spawn_env().is_empty(), "未声明 env = 空 Vec（现行为）");
+    }
+
+    #[test]
+    fn spawn_env_sets_plain_keys_and_appends_path() {
+        let toml = r#"
+[servers.e]
+languages = ["x"]
+install = "path_only"
+[servers.e.env]
+JAVA_TOOL_OPTIONS = "-Xmx2G"
+PATH = "/managed/bin"
+path = "/lower/bin"
+[servers.e.path_only]
+binary_name = "b"
+install_hint = "h"
+"#;
+        let parsed = parse(toml).expect("valid toml must parse");
+        let env: std::collections::HashMap<String, String> =
+            parsed.servers["e"].spawn_env().into_iter().collect();
+        // 非 PATH 键：直接设置。
+        assert_eq!(
+            env.get("JAVA_TOOL_OPTIONS").map(String::as_str),
+            Some("-Xmx2G")
+        );
+        // PATH 键（大小写不敏感归一）：原值在前、注入值在后（平台分隔符）。
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let upper = env.get("PATH").expect("PATH 键存在");
+        let orig = std::env::var("PATH").unwrap_or_default();
+        assert!(
+            upper.ends_with(&format!("{sep}/managed/bin")),
+            "PATH 尾部为注入值: {upper}"
+        );
+        if !orig.is_empty() {
+            assert!(
+                upper.starts_with(&orig),
+                "原 PATH 在前（不被截断/覆盖丢失）"
+            );
+        }
+        // 两个 PATH 变体键（PATH + path）各自独立追注入值——覆盖语义按 toml 键
+        // 逐条生效（spawn 端 envs 覆盖由 OS 大小写不敏感合并，此处只验追加形态）。
+        assert!(
+            env.get("path")
+                .unwrap()
+                .ends_with(&format!("{sep}/lower/bin"))
+        );
     }
 }

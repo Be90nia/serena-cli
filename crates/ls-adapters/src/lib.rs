@@ -227,6 +227,35 @@ pub enum LanguageId {
     /// 非独立发行、我们 Rust 端不随包脚本，无 T0 对应物，不建条目。↖ mirror:
     /// msl_language_server.py@7a296833。
     Msl,
+    /// ---- 上游对拍采纳 W6 批（EXT_TABLE 收口：条目已在 servers.toml，仅补
+    /// LanguageId/扩展名路由——批次 B/C「G 类注释欠账清单」）----
+    /// ↖ mirror: clojure_language_server.py@7a296833（clojure-lsp native，
+    /// 扩展 .clj/.cljs/.cljc/.edn）。
+    Clojure,
+    /// ↖ mirror: elm_language_server.py@7a296833（npm @elm-tooling/elm-language-server）。
+    Elm,
+    /// ↖ mirror: haxe_language_server.py@7a296833（Open VSX vshaxe VSIX 内 server.js）。
+    Haxe,
+    /// ↖ mirror: luau_lsp.py@7a296833（`luau-lsp lsp` 子命令）。
+    Luau,
+    /// ↖ mirror: fsharp_language_server.py@7a296833（dotnet tool fsautocomplete）。
+    FSharp,
+    /// ↖ mirror: bsl_language_server.py@7a296833（1c-syntax JAR，`java -jar`）。
+    Bsl,
+    /// ↖ mirror: systemverilog.py@7a296833（verible-verilog-ls）。扩展 .sv/.svh/.v/.vh。
+    SystemVerilog,
+    /// ↖ mirror: latex_language_server.py@7a296833（texlab）。扩展 .tex/.bib。
+    Latex,
+    /// ↖ mirror: solidity_language_server.py@7a296833（npm @nomicfoundation）。
+    Solidity,
+    /// ↖ mirror: ada_language_server.py@7a296833（AdaCore ALS）。扩展 .ada/.adb/.ads。
+    Ada,
+    /// ↖ mirror: al_language_server.py@7a296833（AL EditorServices host，裸启动）。
+    Al,
+    /// ↖ mirror: hlsl.py@7a296833（shader-sense，shader-language-server --stdio）。
+    /// 扩展族 .hlsl/.hlsli/.fx/.fxh/.cginc/.compute/.shader/.glsl/.vert/.frag/
+    /// .geom/.tesc/.tese/.comp/.wgsl（上游支持全清单 15 个）。
+    Hlsl,
 }
 
 impl LanguageId {
@@ -288,6 +317,19 @@ impl LanguageId {
             Self::Wolfram => "wolfram",
             Self::Godot => "gdscript",
             Self::Msl => "msl",
+            // W6 批：十二门恒等（内部名 = 官方 languageId / 条目路由名）。
+            Self::Clojure => "clojure",
+            Self::Elm => "elm",
+            Self::Haxe => "haxe",
+            Self::Luau => "luau",
+            Self::FSharp => "fsharp",
+            Self::Bsl => "bsl",
+            Self::SystemVerilog => "systemverilog",
+            Self::Latex => "latex",
+            Self::Solidity => "solidity",
+            Self::Ada => "ada",
+            Self::Al => "al",
+            Self::Hlsl => "hlsl",
         }
     }
     /// 反向：lang 字符串 → LanguageId。未知返 None。
@@ -351,6 +393,19 @@ impl LanguageId {
             "wolfram" => Some(Self::Wolfram),
             "gdscript" => Some(Self::Godot),
             "msl" => Some(Self::Msl),
+            // W6 批：十二门语言名（EXT_TABLE 收口同批）。
+            "clojure" => Some(Self::Clojure),
+            "elm" => Some(Self::Elm),
+            "haxe" => Some(Self::Haxe),
+            "luau" => Some(Self::Luau),
+            "fsharp" => Some(Self::FSharp),
+            "bsl" => Some(Self::Bsl),
+            "systemverilog" => Some(Self::SystemVerilog),
+            "latex" => Some(Self::Latex),
+            "solidity" => Some(Self::Solidity),
+            "ada" => Some(Self::Ada),
+            "al" => Some(Self::Al),
+            "hlsl" => Some(Self::Hlsl),
             _ => None,
         }
     }
@@ -428,6 +483,23 @@ impl LanguageId {
             "wl" | "nb" => Some(Self::Wolfram),
             "gd" => Some(Self::Godot),
             "mrc" => Some(Self::Msl),
+            // W6 批：与 ls-registry EXT_TABLE 同步收口（clojure/elm/haxe/luau/
+            // fsharp/bsl/systemverilog/latex/solidity/ada/al/hlsl 族 15 扩展；
+            // .m 刻意不收——MATLAB 歧义已裁决）。.v/.vh 归 SystemVerilog、.os 归
+            // Bsl、.comp 归 Hlsl——表键全小写、无存量冲突。
+            "clj" | "cljs" | "cljc" | "edn" => Some(Self::Clojure),
+            "elm" => Some(Self::Elm),
+            "hx" => Some(Self::Haxe),
+            "luau" => Some(Self::Luau),
+            "fs" | "fsi" | "fsx" => Some(Self::FSharp),
+            "bsl" | "os" => Some(Self::Bsl),
+            "sv" | "svh" | "v" | "vh" => Some(Self::SystemVerilog),
+            "tex" | "bib" => Some(Self::Latex),
+            "sol" => Some(Self::Solidity),
+            "ada" | "adb" | "ads" => Some(Self::Ada),
+            "al" => Some(Self::Al),
+            "hlsl" | "hlsli" | "fx" | "fxh" | "cginc" | "compute" | "shader" | "glsl" | "vert"
+            | "frag" | "geom" | "tesc" | "tese" | "comp" | "wgsl" => Some(Self::Hlsl),
             _ => None,
         }
     }
@@ -545,6 +617,20 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::Wolfram => &["wl", "nb"],
         LanguageId::Godot => &["gd"],
         LanguageId::Msl => &["mrc"],
+        // W6 批：十二门真实源文件扩展名（T0 条目已在 servers.toml；wait_for_index
+        // 默认实现 root 扫描用——hlsl 族取代表扩展名，其余门取主形态）。
+        LanguageId::Clojure => &["clj", "cljs", "cljc", "edn"],
+        LanguageId::Elm => &["elm"],
+        LanguageId::Haxe => &["hx"],
+        LanguageId::Luau => &["luau"],
+        LanguageId::FSharp => &["fs", "fsi", "fsx"],
+        LanguageId::Bsl => &["bsl", "os"],
+        LanguageId::SystemVerilog => &["sv", "svh", "v", "vh"],
+        LanguageId::Latex => &["tex", "bib"],
+        LanguageId::Solidity => &["sol"],
+        LanguageId::Ada => &["ada", "adb", "ads"],
+        LanguageId::Al => &["al"],
+        LanguageId::Hlsl => &["hlsl", "fx", "glsl", "wgsl"],
     }
 }
 

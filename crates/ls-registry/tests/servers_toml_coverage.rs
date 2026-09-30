@@ -147,9 +147,10 @@ fn new_download_entries_parse_with_complete_fields() {
         );
         // 升版锚例外：kotlin 263.4702.0（上游 DEFAULT_KOTLIN_LSP_VERSION + sha 锚）取自
         // 7a296833 kotlin_language_server.py 与同 commit 的 downloaded_dependency_hashes.json；
-        // 其余条目数据源锚 43ae0211。
+        // cue 同批升锚（7a296833 才有 cue_language_server.py，W6 批对拍修正）；其余条目
+        // 数据源锚 43ae0211。
         let anchor = match *id {
-            "kotlin" => "7a296833",
+            "kotlin" | "cue" => "7a296833",
             _ => "43ae0211",
         };
         assert_eq!(
@@ -334,7 +335,8 @@ fn phase3_pkg_entries_parse_with_upstream_pins() {
     assert_eq!(ty.package, "ty");
     assert_eq!(ty.args, Some(vec!["server".to_string()]));
     let pyrefly = servers["python_pyrefly"].uvx.as_ref().unwrap();
-    assert_eq!(pyrefly.version.as_deref(), Some("1.1.1"));
+    // W6 批升版：上游 PYREFLY_VERSION = 1.2.0（pyrefly_server.py@7a296833）。
+    assert_eq!(pyrefly.version.as_deref(), Some("1.2.0"));
     assert_eq!(pyrefly.args, Some(vec!["lsp".to_string()]));
     assert_eq!(
         servers["fortls"].uvx.as_ref().unwrap().version.as_deref(),
@@ -1330,7 +1332,11 @@ fn w3_php_lua_scala_swift_doors_wired() {
     assert_eq!(LanguageId::from_extension("lua"), Some(LanguageId::Lua));
     assert_eq!(LanguageId::from_extension("scala"), Some(LanguageId::Scala));
     assert_eq!(LanguageId::from_extension("swift"), Some(LanguageId::Swift));
-    assert_eq!(LanguageId::from_str_opt("luau"), None, "luau ≠ lua");
+    assert_eq!(
+        LanguageId::from_str_opt("luau"),
+        Some(LanguageId::Luau),
+        "luau ≠ lua（W6 批独立语言门）"
+    );
     assert_eq!(
         LanguageId::from_str_opt("intelephense"),
         Some(LanguageId::Php),

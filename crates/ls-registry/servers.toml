@@ -9,6 +9,9 @@
 # sha256 真值锚：GitHub API assets[].digest（2026-09-19 查询）。
 
 [servers.marksman]
+# Δ 版本注记（2026-09-30 对拍补）：上游 DEFAULT_MARKSMAN_VERSION = "2024-12-18"
+# （marksman.py@7a296833 L30-47），我方钉 2026-02-08——新于上游 pin 的有意偏移，
+# sha256 为 GitHub release digest 一手锚（非抄译），无回归上游钉计划。
 languages = ["markdown"]
 extensions = [".md", ".markdown"]
 install = "download"
@@ -156,12 +159,18 @@ binary_name = "lean"
 install_hint = "install lean via elan (https://lean-lang.org/lean4/doc/setup.html)"
 
 [servers.ocamllsp]
+# 上游 adopt W6（ocaml_lsp_server.py@7a296833 L305-312）：launch =
+# [opam, exec, --, ocamllsp, --fallback-read-dot-merlin]——opam exec 保证 merlin/
+# ocaml-index 环境可达（跨文件 refs），--fallback-read-dot-merlin 让 .merlin 项目
+# 在 merlin 缺失时回落读取。上游另有 OCaml≥5.2 `dune build @ocaml-index` 预建索引
+# 与 5.1.0 硬不兼容预检（T0 无此门，5.1.0 switch 下错误形态差——install hint 记禁）。
 languages = ["ocaml"]
 install = "path_only"
-source_commit = "43ae0211"
+exec = ["opam", "exec", "--", "{bin}", "--fallback-read-dot-merlin"]
+source_commit = "7a296833"
 [servers.ocamllsp.path_only]
 binary_name = "ocamllsp"
-install_hint = "opam install ocaml-lsp-server"
+install_hint = "opam install ocaml-lsp-server (requires OCaml >= 5.2; 5.1.0 is hard-incompatible upstream)"
 
 [servers.qmlls]
 languages = ["qml"]
@@ -218,6 +227,9 @@ install_hint = "install Xcode / Swift toolchain (sourcekit-lsp ships with it)"
 # （裸 `zls` stdio 启动）。运行需匹配版本的 zig 在 PATH——zls 与 zig 严格同
 # minor 配对（0.16.x），zig 工具链走 ziglang.org release（非本条目托管）；裸
 # 启动时 zls 自检 zig（上游 init options zig_exe_path 注入在无值时回落自检）。
+# Δ 我方为上游超集：上游 zls.py@7a296833 L83-88 在 Windows 明确拒绝启动
+# （cross-file refs 不可靠），我方仍提供 win 下载组——PM 裁决在案（refs 可靠性
+# 自担），记录于此。
 languages = ["zig"]
 install = "download"
 exec = ["{bin}"]
@@ -420,28 +432,34 @@ bin_path = "clojure-lsp"
 allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
 
 [servers.clojure.download.url_per_platform]
+"windows-x86_64" = "https://github.com/clojure-lsp/clojure-lsp/releases/download/2026.02.20-16.08.58/clojure-lsp-native-windows-amd64.zip"
 "linux-x86_64" = "https://github.com/clojure-lsp/clojure-lsp/releases/download/2026.02.20-16.08.58/clojure-lsp-native-linux-amd64.zip"
 "linux-aarch64" = "https://github.com/clojure-lsp/clojure-lsp/releases/download/2026.02.20-16.08.58/clojure-lsp-native-linux-aarch64.zip"
 "macos-x86_64" = "https://github.com/clojure-lsp/clojure-lsp/releases/download/2026.02.20-16.08.58/clojure-lsp-native-macos-amd64.zip"
 "macos-aarch64" = "https://github.com/clojure-lsp/clojure-lsp/releases/download/2026.02.20-16.08.58/clojure-lsp-native-macos-aarch64.zip"
 
 [servers.clojure.download.sha256_per_platform]
+"windows-x86_64" = "817b1271288817c954fb9e595278b1f25003827ce31f8785f253dc4ac911041f"
 "linux-x86_64" = "52e8bf4fd4cf171df0a3077c8bb5a3bf598d4c621e94b4876dab943a61267309"
 "linux-aarch64" = "f8f09fa07dd4b6743b5c57270ccf1ee5cdbc5fca09dbca8b6a3b22705b5da4e1"
 "macos-x86_64" = "5507434c27104ab816e096d3336d8191641de8a65b57d76afb585d07167a3cf2"
 "macos-aarch64" = "a14d4db074f665378214e2dc888472e186c228dfa065c777b0534bfda5571669"
-# zip 根二进制 clojure-lsp（unix）/ clojure-lsp.exe（win），win 组待扩展：
-#   windows-x86_64: clojure-lsp-native-windows-amd64.zip
-#     sha256 817b1271288817c954fb9e595278b1f25003827ce31f8785f253dc4ac911041f
-#     bin clojure-lsp.exe
+# zip 根二进制 unix=clojure-lsp / win=clojure-lsp.exe（单值 bin_path 仅容 unix 组）。
+# win 组已启用（上游 adopt W6：clojure_language_server.py@7a296833 win 资产原值）。
 # 运行需 Clojure CLI 在 PATH。
+[servers.clojure.download.bin_path_per_platform]
+"windows-x86_64" = "clojure-lsp.exe"
 
 [servers.cue]
+# ↖ mirror: cue_language_server.py@7a296833（上游 7a296833 已有 cue 适配器——旧锚
+# 43ae0211「上游无 cue 适配器」注记过时，2026-09-30 对拍修正）。上游另以
+# workspace/configuration 回 {}（非 null）；cue 对 null 等价宽容，T0 默认应答不接
+# per-LS 覆盖（宁缺毋滥）。
 languages = ["cue"]
 extensions = [".cue"]
 install = "download"
 exec = ["{bin}", "lsp"]
-source_commit = "43ae0211"
+source_commit = "7a296833"
 
 [servers.cue.download]
 version = "v0.16.1"
@@ -450,30 +468,42 @@ bin_path = "cue"
 allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
 
 [servers.cue.download.url_per_platform]
+"windows-x86_64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_windows_amd64.zip"
+"windows-aarch64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_windows_arm64.zip"
 "linux-x86_64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_linux_amd64.tar.gz"
 "linux-aarch64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_linux_arm64.tar.gz"
 "macos-x86_64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_darwin_amd64.tar.gz"
 "macos-aarch64" = "https://github.com/cue-lang/cue/releases/download/v0.16.1/cue_v0.16.1_darwin_arm64.tar.gz"
 
 [servers.cue.download.sha256_per_platform]
+"windows-x86_64" = "2f24123f458229fcf283db534bd86692ad1074da806defee0f0cc62976c0397c"
+"windows-aarch64" = "e0c15ce53f73e8609b0e8ce6507298f3474b334ac5eb0c826c9497a811fd0cce"
 "linux-x86_64" = "5d644c1305a2b86504c8dcd2ec829cf5b4999efc2cf51ee375624e0455f774ae"
 "linux-aarch64" = "3cc715a9e969f87b93c4fa34cfaef5388b93e96efa20b248e8ad6826abd25a83"
 "macos-x86_64" = "97b0d78e4c5ee49ff72145fd6ef4f4bab0bb332d55f29660de3fec2af5ec96a9"
 "macos-aarch64" = "a72b0cddb377c52d1b003bed9a335d893b70cd75a182cd5e3fee8bae30ddb6d6"
-# win 组（zip 根 cue.exe）待扩展：
-#   windows-x86_64: cue_v0.16.1_windows_amd64.zip
-#     sha256 2f24123f458229fcf283db534bd86692ad1074da806defee0f0cc62976c0397c
-#   windows-aarch64: cue_v0.16.1_windows_arm64.zip
-#     sha256 e0c15ce53f73e8609b0e8ce6507298f3474b334ac5eb0c826c9497a811fd0cce
+# win 组已启用（上游 adopt W6，上游 cue_language_server.py@7a296833 全 6 平台资产，
+# zip 根 cue.exe——单值 bin_path 仅容 unix 组）。
+[servers.cue.download.archive_per_platform]
+"windows-x86_64" = "zip"
+"windows-aarch64" = "zip"
+
+[servers.cue.download.bin_path_per_platform]
+"windows-x86_64" = "cue.exe"
+"windows-aarch64" = "cue.exe"
 
 [servers.dart]
 # Dart SDK 内置 analysis server（`dart language-server`，上游 dart_language_server.py
 # 7a296833 同源）。上游 quirk：rootUri 会被当额外分析根（无去重，oraios/serena#2045），
 # 本 T0 路径仍发 rootUri —— 小项目无感，monorepo 根上空闲 CPU 会偏高（已知边界）。
+# init_options（上游 adopt W6）：↖ mirror dart_language_server.py@7a296833
+# `_create_base_initialize_params`（≈L196-206）——显式关 outline/closingLabels/
+# flutterOutline 降流量、保项目级分析（上游 allowOpenUri 与本拍板键集外，未收）。
 languages = ["dart"]
 extensions = [".dart"]
 install = "download"
 exec = ["{bin}", "language-server", "--client-id", "multilspy.dart", "--client-version", "1.2"]
+init_options = { onlyAnalyzeProjectsWithOpenFiles = false, closingLabels = false, outline = false, flutterOutline = false }
 source_commit = "43ae0211"
 
 [servers.dart.download]
@@ -506,9 +536,13 @@ allowed_hosts = ["storage.googleapis.com"]
 #     bin dart-sdk/bin/dart.exe
 
 [servers.elixir]
+# init_options（上游 adopt W6）：↖ mirror elixir_tools/elixir_tools.py@7a296833
+# `_create_base_initialize_params`（≈L300）——mix_env/mix_target 与上游逐字一致
+# （experimental/extensions 键集在本拍板外，未收）。
 languages = ["elixir"]
 install = "download"
 exec = ["{bin}", "--stdio"]
+init_options = { mix_env = "dev", mix_target = "host" }
 source_commit = "43ae0211"
 
 [servers.elixir.download]
@@ -597,14 +631,18 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 [servers.kotlin]
 # JetBrains managed Kotlin LSP（IntelliJ 平台 headless 形态；上游 kotlin_language_server.py
 # 7a296833 同源，sha 锚 = 其 downloaded_dependency_hashes.json）。包内捆绑 JBR，无需系统
-# JDK；上游另设 env JAVA_TOOL_OPTIONS=-Xmx2G（堆上限，T0 无 env 通道，JVM 默认 1/4 RAM
-# 可用）。server→client 请求（workspace/*/refresh 等）未注册时 lsp-core 默认回 null 成功
+# JDK。env（上游 adopt W6）：↖ mirror kotlin_language_server.py@7a296833 L262-280
+# create_launch_command_env——JVM 默认堆 1/4 RAM，大仓 OOM/内存失控面，上游钉 -Xmx2G。
+# server→client 请求（workspace/*/refresh 等）未注册时 lsp-core 默认回 null 成功
 # ——KLS 对 MethodNotFound 是致命退出（上游注释实锤），本架构天然规避。
 languages = ["kotlin"]
 extensions = [".kt", ".kts"]
 install = "download"
 exec = ["{bin}", "--stdio", "--system-path", "{bin_dir}/system"]
 source_commit = "7a296833"
+
+[servers.kotlin.env]
+JAVA_TOOL_OPTIONS = "-Xmx2G"
 
 [servers.kotlin.download]
 version = "263.4702.0"
@@ -659,19 +697,25 @@ bin_path = "bin/lua-language-server"
 allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
 
 [servers.lua.download.url_per_platform]
+"windows-x86_64" = "https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-win32-x64.zip"
 "linux-x86_64" = "https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-linux-x64.tar.gz"
 "linux-aarch64" = "https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-linux-arm64.tar.gz"
 "macos-x86_64" = "https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-darwin-x64.tar.gz"
 "macos-aarch64" = "https://github.com/LuaLS/lua-language-server/releases/download/3.15.0/lua-language-server-3.15.0-darwin-arm64.tar.gz"
 
 [servers.lua.download.sha256_per_platform]
+"windows-x86_64" = "76a10c05e8c947a448f00a61acead4240484cd1e2e8c66d54401c67d99b77535"
 "linux-x86_64" = "4877b874c52fb7587707898da9026cc3a6c854d9bbab115ef49ac4e6a1b88007"
 "linux-aarch64" = "7dff8edfed4f34cf6325ff384791287d95f9a8dd9615a5279c7c6af81cf8c45d"
 "macos-x86_64" = "01d28a31e264434e51662814a68f584af068393caecfa158c4df5f7fdc3ca2f7"
 "macos-aarch64" = "050f5f493f65112afc116e31281a9f73918546782d3696485dc052724838f58b"
-# win 组（zip，包内 bin/lua-language-server.exe）待扩展：
-#   windows-x86_64: lua-language-server-3.15.0-win32-x64.zip
-#     sha256 76a10c05e8c947a448f00a61acead4240484cd1e2e8c66d54401c67d99b77535
+# win 组已启用（上游 adopt W6：上游 lua_ls.py@7a296833 win32-x64 zip 资产原值，包内
+# bin/lua-language-server.exe——单值 bin_path 仅容 unix 组，win 走 bin_path_per_platform）。
+[servers.lua.download.archive_per_platform]
+"windows-x86_64" = "zip"
+
+[servers.lua.download.bin_path_per_platform]
+"windows-x86_64" = "bin/lua-language-server.exe"
 
 [servers.luau]
 languages = ["luau"]
@@ -686,21 +730,25 @@ bin_path = "luau-lsp"
 allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
 
 [servers.luau.download.url_per_platform]
+"windows-x86_64" = "https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.63.0/luau-lsp-win64.zip"
 "linux-x86_64" = "https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.63.0/luau-lsp-linux-x86_64.zip"
 "linux-aarch64" = "https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.63.0/luau-lsp-linux-arm64.zip"
 "macos-x86_64" = "https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.63.0/luau-lsp-macos.zip"
 "macos-aarch64" = "https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.63.0/luau-lsp-macos.zip"
 
 [servers.luau.download.sha256_per_platform]
+"windows-x86_64" = "eea596d47dc1c94a61ba1b78e6472bb4445bc3309780751515e6ab0a0abba57d"
 "linux-x86_64" = "e4b633ad9a2c15437f60f9e721263f79aa0da606867d8458f0e159a325bf2db8"
 "linux-aarch64" = "355be010f337a6772df6255c92e1fb28a59d194abe5c570453f4186472244355"
 "macos-x86_64" = "01c1d6dd5fee27295b2968915dabb08c192192c46d9fe9c97bf31a130c96b8cb"
 "macos-aarch64" = "01c1d6dd5fee27295b2968915dabb08c192192c46d9fe9c97bf31a130c96b8cb"
-# macos.zip 为 universal（dual-arch 同资产同 sha256）。win 组待扩展：
-#   windows-x86_64: luau-lsp-win64.zip
-#     sha256 eea596d47dc1c94a61ba1b78e6472bb4445bc3309780751515e6ab0a0abba57d
-#     bin luau-lsp.exe
-# 可选辅助文件（type-definitions / api-docs，https://luau-lsp.pages.dev/）未随装。
+# macos.zip 为 universal（dual-arch 同资产同 sha256）。win 组已启用（上游 adopt W6，
+# 上游 luau_lsp.py@7a296833 win64 资产原值，包内 luau-lsp.exe）。
+# 可选辅助文件（type-definitions / api-docs，https://luau-lsp.pages.dev/）未随装——
+# Roblox 全局类型/补全面缺失（上游有 --definitions/--docs 附加启动参，T0 单二进制
+# schema 不支持辅助文件随装；批次 C P1 已记录）。
+[servers.luau.download.bin_path_per_platform]
+"windows-x86_64" = "luau-lsp.exe"
 
 [servers.matlab]
 languages = ["matlab"]
@@ -880,21 +928,29 @@ bin_path = "phpantom_lsp"
 allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
 
 [servers.phpantom.download.url_per_platform]
+"windows-x86_64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-x86_64-pc-windows-msvc.zip"
+"windows-aarch64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-aarch64-pc-windows-msvc.zip"
 "linux-x86_64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-x86_64-unknown-linux-gnu.tar.gz"
 "linux-aarch64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-aarch64-unknown-linux-gnu.tar.gz"
 "macos-x86_64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-x86_64-apple-darwin.tar.gz"
 "macos-aarch64" = "https://github.com/PHPantom-dev/phpantom_lsp/releases/download/0.8.0/phpantom_lsp-aarch64-apple-darwin.tar.gz"
 
 [servers.phpantom.download.sha256_per_platform]
+"windows-x86_64" = "17e23af816fc7ec695fe716f6209df6b0eafcec2fdafb5d9d72e2b352d5ddf83"
+"windows-aarch64" = "352bfd90351c0f35947ea1af458dabe7a4dc4753d0cabaf9711a23a61346a63d"
 "linux-x86_64" = "39615b495e624bbafe8787c3be61acabc123ec5ac23e9b30e00ab7660f50e020"
 "linux-aarch64" = "e87fc96430f1bcc4966f953033a73a4e2ea53b2dbb7dc3e5f71cc8ced9022a57"
 "macos-x86_64" = "e09eef93342cd38c9f9cc6c58064d81b005d06ec6d054e7cdeeec7698dc6c5da"
 "macos-aarch64" = "2cdfd103b5df98d20712eaeea9bd00d2b459e2a588296f1ab8e558fe25fde456"
-# win 组（zip 根 phpantom_lsp.exe）待扩展（唯一全 6 平台资产的上游）：
-#   windows-x86_64: phpantom_lsp-x86_64-pc-windows-msvc.zip
-#     sha256 17e23af816fc7ec695fe716f6209df6b0eafcec2fdafb5d9d72e2b352d5ddf83
-#   windows-aarch64: phpantom_lsp-aarch64-pc-windows-msvc.zip
-#     sha256 352bfd90351c0f35947ea1af458dabe7a4dc4753d0cabaf9711a23a61346a63d
+# win 组已启用（上游 adopt W6：唯一全 6 平台资产的上游，zip 根 phpantom_lsp.exe——
+# 单值 bin_path 仅容 unix 组）。
+[servers.phpantom.download.archive_per_platform]
+"windows-x86_64" = "zip"
+"windows-aarch64" = "zip"
+
+[servers.phpantom.download.bin_path_per_platform]
+"windows-x86_64" = "phpantom_lsp.exe"
+"windows-aarch64" = "phpantom_lsp.exe"
 
 [servers.powershell]
 languages = ["powershell"]
@@ -939,20 +995,26 @@ bin_path = "bin/verible-verilog-ls"
 allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
 
 [servers.systemverilog.download.url_per_platform]
+"windows-x86_64" = "https://github.com/chipsalliance/verible/releases/download/v0.0-4051-g9fdb4057/verible-v0.0-4051-g9fdb4057-win64.zip"
 "linux-x86_64" = "https://github.com/chipsalliance/verible/releases/download/v0.0-4051-g9fdb4057/verible-v0.0-4051-g9fdb4057-linux-static-x86_64.tar.gz"
 "linux-aarch64" = "https://github.com/chipsalliance/verible/releases/download/v0.0-4051-g9fdb4057/verible-v0.0-4051-g9fdb4057-linux-static-arm64.tar.gz"
 "macos-x86_64" = "https://github.com/chipsalliance/verible/releases/download/v0.0-4051-g9fdb4057/verible-v0.0-4051-g9fdb4057-macOS.tar.gz"
 "macos-aarch64" = "https://github.com/chipsalliance/verible/releases/download/v0.0-4051-g9fdb4057/verible-v0.0-4051-g9fdb4057-macOS.tar.gz"
 
 [servers.systemverilog.download.sha256_per_platform]
+"windows-x86_64" = "729aa244036da4a4f87bc026d33555456fc7f7be79778d983ebe9c893f4a0ca3"
 "linux-x86_64" = "f52e5920ef63f70620a6086e09dea8bd778147cd7a9ff827bb7de5d6316b1754"
 "linux-aarch64" = "30dd9c6f6e0f4840d6ba0c9e81ea2774a50b5a1a523a855245f9a9b4beb6b58b"
 "macos-x86_64" = "9ef92e9ad345285dd593763e10ca61c8532fcf47bbb6cf4448f9a9423882d662"
 "macos-aarch64" = "9ef92e9ad345285dd593763e10ca61c8532fcf47bbb6cf4448f9a9423882d662"
 # macOS.tar.gz 为 dual-arch 同资产同 sha256；strip_components=1 剥掉包内 verible-{v}/ 层。
-# win 组（zip，verible-{v}/bin/verible-verilog-ls.exe）待扩展：
-#   windows-x86_64: verible-v0.0-4051-g9fdb4057-win64.zip
-#     sha256 729aa244036da4a4f87bc026d33555456fc7f7be79778d983ebe9c893f4a0ca3
+# win 组已启用（上游 adopt W6：上游 systemverilog.py@7a296833 win-x64 资产原值）：
+# zip 同剥 verible-{v}/ 层 → bin/verible-verilog-ls.exe。
+[servers.systemverilog.download.archive_per_platform]
+"windows-x86_64" = "zip"
+
+[servers.systemverilog.download.bin_path_per_platform]
+"windows-x86_64" = "bin/verible-verilog-ls.exe"
 
 [servers.toml]
 # taplo。unix 资产为 single-gz（非 tar.gz），解压落盘名由安装器固定（pkg 名去 .gz），
@@ -1003,21 +1065,23 @@ bin_path = "terraform-ls"
 allowed_hosts = ["releases.hashicorp.com"]
 
 [servers.terraform.download.url_per_platform]
+"windows-x86_64" = "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_windows_amd64.zip"
 "linux-x86_64" = "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_linux_amd64.zip"
 "linux-aarch64" = "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_linux_arm64.zip"
 "macos-x86_64" = "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_darwin_amd64.zip"
 "macos-aarch64" = "https://releases.hashicorp.com/terraform-ls/0.36.5/terraform-ls_0.36.5_darwin_arm64.zip"
 
 [servers.terraform.download.sha256_per_platform]
+"windows-x86_64" = "a9223462cac9e1c0e6ba33043fbf9fb4483609b6970b5681a6306b04366698ec"
 "linux-x86_64" = "37e645cc54fd03e863157e2a3e773e7a5ff1d6cb3d045e4c20860cac1f550a44"
 "linux-aarch64" = "724f45029f32d02d88b1952c7d1526c59fc8cd5dae49e31b9fed676a83f6cae7"
 "macos-x86_64" = "17c5c480f8eec7e528292565f1c05d5097a41edf7ef8ee2a9f3a18d288a1415a"
 "macos-aarch64" = "fee8743aa71fe2d8b0b9b91283b844cfa57d58457306a62e53a8f38d143cec8c"
-# win 组待扩展（官方另有 windows_arm64，serena 未用）：
-#   windows-x86_64: terraform-ls_0.36.5_windows_amd64.zip
-#     sha256 a9223462cac9e1c0e6ba33043fbf9fb4483609b6970b5681a6306b04366698ec
-#     bin terraform-ls.exe
-# sha256 与官方 SHA256SUMS 实调一致；运行需 terraform CLI 在 PATH。
+# win 组已启用（上游 adopt W6，官方 SHA256SUMS 实调锚原值；官方另有 windows_arm64
+# 未收）；bin=terraform-ls.exe（单值 bin_path 仅容 unix 组）。sha256 与官方
+# SHA256SUMS 实调一致；运行需 terraform CLI 在 PATH。
+[servers.terraform.download.bin_path_per_platform]
+"windows-x86_64" = "terraform-ls.exe"
 
 [servers.latex]
 # texlab。
@@ -1033,21 +1097,26 @@ bin_path = "texlab"
 allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
 
 [servers.latex.download.url_per_platform]
+"windows-x86_64" = "https://github.com/latex-lsp/texlab/releases/download/v5.25.1/texlab-x86_64-windows.zip"
 "linux-x86_64" = "https://github.com/latex-lsp/texlab/releases/download/v5.25.1/texlab-x86_64-linux.tar.gz"
 "linux-aarch64" = "https://github.com/latex-lsp/texlab/releases/download/v5.25.1/texlab-aarch64-linux.tar.gz"
 "macos-x86_64" = "https://github.com/latex-lsp/texlab/releases/download/v5.25.1/texlab-x86_64-macos.tar.gz"
 "macos-aarch64" = "https://github.com/latex-lsp/texlab/releases/download/v5.25.1/texlab-aarch64-macos.tar.gz"
 
 [servers.latex.download.sha256_per_platform]
+"windows-x86_64" = "aa5fc1fe6004c17cd83086a57a8c8f28bb3f360914872711bfbb83490dc3c19e"
 "linux-x86_64" = "c8260b2fd2849cbad7d1f54c4ffa0389f34664b049392107bc4f7f9c8ec542ba"
 "linux-aarch64" = "e0d8e0b27b2e6e3526fa5019323bb3fddb1202a0f0049e527672b5ff323cc15e"
 "macos-x86_64" = "11289a231f0cf382857a6a4a2eda1ba9f4f4e950af343b455797e3922d13b1ea"
 "macos-aarch64" = "3755e9d1d4ad0b25135bdacd2fb453a612e88f48133185f96d660fa550398f66"
-# win 组（zip 根 texlab.exe）待扩展：
-#   windows-x86_64: texlab-x86_64-windows.zip
-#     sha256 aa5fc1fe6004c17cd83086a57a8c8f28bb3f360914872711bfbb83490dc3c19e
-# 运行需 LaTeX 工具链。latest v5.26.0 新增 aarch64-windows 等资产（M/W digest MISSING，
-# 未收）。
+# win 组已启用（上游 adopt W6：latex_language_server.py@7a296833 win-x64 资产原值，
+# zip 根 texlab.exe）。latest v5.26.0 新增 aarch64-windows 等资产（M/W digest MISSING，
+# 未收）。运行需 LaTeX 工具链。
+[servers.latex.download.archive_per_platform]
+"windows-x86_64" = "zip"
+
+[servers.latex.download.bin_path_per_platform]
+"windows-x86_64" = "texlab.exe"
 
 # ---- B/C/D/E/F 类批量收录（Phase 3；数据源 oraios/serena@43ae0211 适配器源码实测：
 # npm/uvx 包名+版本+bin+启动参数均为上游 DEFAULT_*/RuntimeDependency 原值）----
@@ -1262,8 +1331,13 @@ package = "typescript-language-server"
 version = "5.1.3"
 
 [servers.yaml]
+# init_options（上游 adopt W6）：↖ mirror yaml_language_server.py@7a296833
+# `_create_base_initialize_params`（≈L118-129）——schemaStore 开启后 k8s/GHA 等
+# YAML 才有 schema 校验/补全；键集取 PM 拍板子集（format/validate/hover/completion
+# 与 LS 默认一致，不重复声明）。
 languages = ["yaml"]
 install = "npm"
+init_options = { yaml = { schemaStore = { enable = true, url = "https://www.schemastore.org/api/json/catalog.json" } } }
 source_commit = "43ae0211"
 [servers.yaml.npm]
 package = "yaml-language-server"
@@ -1312,10 +1386,11 @@ args = ["server"]
 [servers.python_pyrefly]
 languages = ["python_pyrefly"]
 install = "uvx"
-source_commit = "43ae0211"
+source_commit = "7a296833"
 [servers.python_pyrefly.uvx]
+# 上游 adopt W6：PYREFLY_VERSION = "1.2.0"（pyrefly_server.py@7a296833 L36）。
 package = "pyrefly"
-version = "1.1.1"
+version = "1.2.0"
 entrypoint = "pyrefly"
 args = ["lsp"]
 
@@ -1548,7 +1623,9 @@ install_hint = "bootstrap via coursier: cs bootstrap org.scalameta:metals_2.13:1
 
 # ---- W4 批：perl / r（G 类"exec 特殊待调研"两门收口：path_only + 运行时参数 exec）。
 # 上游 G 类不托管安装（catalog §G61/§G63），T0 = 探测 PATH 解释器 + 镜像 launch argv；
-# groovy 不入本表（上游 H 类用户自备 ls_jar_path JAR，无托管渠道，angular/java 先例）。
+# groovy 不入本表（上游 H 类：LS JAR 无托管渠道需用户自备 ls_jar_path——但 JRE 有
+# 托管：上游经 vscode-java JRE bundle vsix 自动下载，批次 C SKIP 复核实锚；维持
+# SKIP 可辩护，angular/java 先例）。
 
 [servers.perl_ls]
 # ↖ mirror perl_language_server.py@7a296833：launch 串
@@ -1585,10 +1662,14 @@ install_hint = "R -e \"install.packages('languageserver')\" (apt install r-base-
 # ↖ mirror julia_server.py@7a296833：launch 串
 # `julia --startup-file=no --history-file=no -e "using LanguageServer; runserver()" <repo_root>`。
 # Δ 我们省略尾参 repo_root——runserver choose_env 回落链含 pwd 上溯（T0 spawn cwd =
-# 项目根），无工程 fixture 回落默认全局 env，语义等价。Δ 上游另应答
-# workspace/configuration（julia.lint.* 逐项 None）+ 补发 didChangeConfiguration——
-# T0 走 lsp-core 未注册请求默认 null 成功应答（perl 条目注释同源实锚），lint 设置
-# 回落 LS 默认，documentSymbol 底线不受影响。
+# 项目根），无工程 fixture 回落默认全局 env，语义等价。
+# did_change_config（上游 adopt W6）：↖ mirror julia_server.py@7a296833 _start_server
+# 尾部——LanguageServer.jl 只在其 workspace/didChangeConfiguration handler 里触发
+# request_julia_config，不推这条通知则 julia.lint.run 永不被问、runlinter 恒 disabled
+# （零诊断）；上游推 {"settings": {}}（空 settings nudge，逐字同值）。
+# pull_diagnostics_denied（上游 adopt W6）：↖ mirror julia_server.py@7a296833
+# `_supports_pull_diagnostics → False`——LanguageServer.jl 对 textDocument/diagnostic
+# 抛未捕获异常直接崩进程，强制 push 路径。
 # 首启依赖：julia runtime + LanguageServer.jl（手动
 # `julia -e 'using Pkg; Pkg.add("LanguageServer")'` 一次；上游 _install_language_server
 # 同款 300s 超时；CI 冒烟门在 install 行预装）。
@@ -1596,6 +1677,8 @@ languages = ["julia"]
 extensions = [".jl"]
 install = "path_only"
 exec = ["{bin}", "--startup-file=no", "--history-file=no", "-e", "using LanguageServer; runserver()"]
+did_change_config = {}
+pull_diagnostics_denied = true
 [servers.julia.path_only]
 binary_name = "julia"
 install_hint = "install julia (https://julialang.org/downloads) then: julia -e 'using Pkg; Pkg.add(\"LanguageServer\")' (mirror julia_server.py@7a296833)"

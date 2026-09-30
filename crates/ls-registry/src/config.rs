@@ -967,6 +967,92 @@ mod tests {
         assert!(spec_for("rust").is_none(), "手写 T2 语言不进表");
     }
 
+    /// 向后兼容硬约束（Wave 1 验收 #3）：74 门中未声明新字段的条目，五通道解析
+    /// 结果与引入前一致（None/false）。以 marksman（改前就存在的首条目）为代表。
+    #[test]
+    fn builtin_entries_without_tuning_channels_stay_byte_compatible() {
+        let parsed = parse(TOML).expect("内置表必须合法（编译期数据）");
+        for (id, spec) in &parsed.servers {
+            let declares = spec.init_options.is_some()
+                || spec.env.is_some()
+                || spec.did_change_config.is_some()
+                || spec.config_reply.is_some()
+                || spec.pull_diagnostics_denied;
+            if !declares {
+                continue;
+            }
+            // 白名单：本批声明的 5 门。表内出现白名单外条目 = 意外通道声明，
+            // 会改其它 LS 行为——必须人工过目。
+            assert!(
+                ["yaml", "dart", "elixir", "kotlin", "julia"].contains(&id.as_str()),
+                "[servers.{id}] 意外声明 Wave 1 通道"
+            );
+        }
+    }
+
+    /// Wave 1 首批消费者（toml 注释均带上游行号锚）：解析值逐项锁。
+    #[test]
+    fn builtin_wave1_first_consumers_parse() {
+        let parsed = parse(TOML).expect("内置表必须合法（编译期数据）");
+        // yaml：schemaStore 开启（yaml_language_server.py@7a296833）。
+        let yaml = parsed.servers["yaml"].init_options.as_ref().unwrap();
+        assert_eq!(
+            yaml.pointer("/yaml/schemaStore/enable"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            yaml.pointer("/yaml/schemaStore/url"),
+            Some(&serde_json::json!(
+                "https://www.schemastore.org/api/json/catalog.json"
+            ))
+        );
+        // dart：四键 false（dart_language_server.py@7a296833）。
+        let dart = parsed.servers["dart"].init_options.as_ref().unwrap();
+        for k in [
+            "onlyAnalyzeProjectsWithOpenFiles",
+            "closingLabels",
+            "outline",
+            "flutterOutline",
+        ] {
+            assert_eq!(
+                dart.get(k),
+                Some(&serde_json::Value::Bool(false)),
+                "dart.{k}"
+            );
+        }
+        // elixir：mix_env/mix_target（elixir_tools.py@7a296833）。
+        let elixir = parsed.servers["elixir"].init_options.as_ref().unwrap();
+        assert_eq!(
+            elixir.get("mix_env"),
+            Some(&serde_json::json!("dev")),
+            "elixir.mix_env"
+        );
+        assert_eq!(
+            elixir.get("mix_target"),
+            Some(&serde_json::json!("host")),
+            "elixir.mix_target"
+        );
+        // kotlin：JAVA_TOOL_OPTIONS=-Xmx2G（kotlin_language_server.py@7a296833 L262-280）。
+        let kotlin = &parsed.servers["kotlin"];
+        assert_eq!(
+            kotlin
+                .env
+                .as_ref()
+                .unwrap()
+                .get("JAVA_TOOL_OPTIONS")
+                .map(String::as_str),
+            Some("-Xmx2G")
+        );
+        // julia：did_change_config nudge {"settings": {}} + pull 强制 push
+        // （julia_server.py@7a296833 _start_server / _supports_pull_diagnostics）。
+        let julia = &parsed.servers["julia"];
+        assert_eq!(
+            julia.did_change_config,
+            Some(serde_json::Value::Object(Default::default()))
+        );
+        assert!(julia.pull_diagnostics_denied);
+    }
+
     // ---- Phase 4 Task 22b: timeout resolution ----
 
     /// 三层合并：CLI > servers.toml > None。CLI 给值 → 优先；不给 → 走 servers.toml；

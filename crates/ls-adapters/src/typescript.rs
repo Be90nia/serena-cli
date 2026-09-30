@@ -119,6 +119,14 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
     }
 
     async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
+        // didOpen languageId per-file 覆盖（↖ mirror: typescript_language_server.py
+        // @7a296833 `_get_language_id_for_file`：.tsx→typescriptreact / .jsx→
+        // javascriptreact——不发对值则符号 range 在多行 JSX 处截断；deno.rs 先例）。
+        // .ts/.js 等基础值由 supervisor 经 lsp_language_id 注入。
+        session.set_language_id_for_extensions(&[
+            ("tsx", "typescriptreact"),
+            ("jsx", "javascriptreact"),
+        ]);
         // 探针必须用 root 下真实文件：虚拟 URI 不触发 tsserver 的项目 lazy-load，
         // 首个真实工具请求就得独自承担全量扫描（cold-start hang 同根因，
         // 见 local/cold-start-hang-diagnosis.md）。失败也返回 Ok 让 supervisor 放行。

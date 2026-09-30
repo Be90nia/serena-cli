@@ -1018,6 +1018,7 @@ dependencies = [
  "ls-adapters",
  "ls-runtime",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
 ]

@@ -158,6 +158,47 @@ pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("nb", LanguageId::Wolfram),
     ("gd", LanguageId::Godot),
     ("mrc", LanguageId::Msl),
+    // W6 批（上游对拍采纳）：十二门扩展名收口——条目全部已在 servers.toml（B/C 批
+    // 交付模板的「G 类欠账清单」），本批仅补路由。.m 刻意不收（MATLAB 歧义已裁决）。
+    ("clj", LanguageId::Clojure),
+    ("cljs", LanguageId::Clojure),
+    ("cljc", LanguageId::Clojure),
+    ("edn", LanguageId::Clojure),
+    ("elm", LanguageId::Elm),
+    ("hx", LanguageId::Haxe),
+    ("luau", LanguageId::Luau),
+    ("fs", LanguageId::FSharp),
+    ("fsi", LanguageId::FSharp),
+    ("fsx", LanguageId::FSharp),
+    ("bsl", LanguageId::Bsl),
+    ("os", LanguageId::Bsl),
+    ("sv", LanguageId::SystemVerilog),
+    ("svh", LanguageId::SystemVerilog),
+    ("v", LanguageId::SystemVerilog),
+    ("vh", LanguageId::SystemVerilog),
+    ("tex", LanguageId::Latex),
+    ("bib", LanguageId::Latex),
+    ("sol", LanguageId::Solidity),
+    ("ada", LanguageId::Ada),
+    ("adb", LanguageId::Ada),
+    ("ads", LanguageId::Ada),
+    ("al", LanguageId::Al),
+    // hlsl 族 15 个（↖ mirror hlsl.py@7a296833 上游支持全清单）。
+    ("hlsl", LanguageId::Hlsl),
+    ("hlsli", LanguageId::Hlsl),
+    ("fx", LanguageId::Hlsl),
+    ("fxh", LanguageId::Hlsl),
+    ("cginc", LanguageId::Hlsl),
+    ("compute", LanguageId::Hlsl),
+    ("shader", LanguageId::Hlsl),
+    ("glsl", LanguageId::Hlsl),
+    ("vert", LanguageId::Hlsl),
+    ("frag", LanguageId::Hlsl),
+    ("geom", LanguageId::Hlsl),
+    ("tesc", LanguageId::Hlsl),
+    ("tese", LanguageId::Hlsl),
+    ("comp", LanguageId::Hlsl),
+    ("wgsl", LanguageId::Hlsl),
 ];
 
 /// 各 LanguageId 对应的 adapter 单例。
@@ -298,6 +339,21 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
             return None;
         }
         LanguageId::Godot | LanguageId::Msl => return None,
+        // W6 批（上游对拍采纳）：十二门条目已在 servers.toml（clojure/elm/haxe/
+        // luau/fsharp/bsl/systemverilog/latex/solidity/ada/al/hlsl），本批仅补
+        // LanguageId/扩展名路由——走 ensure_launch 接管（W4 十门同款）。
+        LanguageId::Clojure
+        | LanguageId::Elm
+        | LanguageId::Haxe
+        | LanguageId::Luau
+        | LanguageId::FSharp
+        | LanguageId::Bsl
+        | LanguageId::SystemVerilog
+        | LanguageId::Latex
+        | LanguageId::Solidity
+        | LanguageId::Ada
+        | LanguageId::Al
+        | LanguageId::Hlsl => return None,
     })
 }
 
@@ -328,6 +384,10 @@ pub fn lsp_language_id(lang: &str) -> String {
         // smoke R4：typescript_vts 变体门的 didOpen 官方口径是 "typescript"
         // （vtsls 消费 TS 文档；变体门 pgsql→sql 同款换算）。
         "typescript_vts" => "typescript".to_string(),
+        // 上游对拍采纳 W6（批次 A 锚）：ty_server.py:68-70 / pyrefly_server.py:226-228
+        // `_get_language_id_for_file` 强制发 "python"——两 LS 不赌自名宽容
+        // （pyright→python 同款显式映射）。
+        "python_ty" | "python_pyrefly" => "python".to_string(),
         other => other.to_string(),
     }
 }
@@ -345,11 +405,12 @@ mod tests {
     #[test]
     fn pyright_variant_didopen_language_id() {
         assert_eq!(lsp_language_id("pyright"), "python");
-        // python 门本体与其余变体恒等（不加多余映射）。
+        // python 门本体与其余变体恒等（不加多余映射）；ty/pyrefly 例外——上游两
+        // 适配器强制发 "python"（W6 批锚，见 lsp_language_id），原恒等断言随之改。
         assert_eq!(lsp_language_id("python"), "python");
         assert_eq!(lsp_language_id("basedpyright"), "basedpyright");
-        assert_eq!(lsp_language_id("python_ty"), "python_ty");
-        assert_eq!(lsp_language_id("python_pyrefly"), "python_pyrefly");
+        assert_eq!(lsp_language_id("python_ty"), "python");
+        assert_eq!(lsp_language_id("python_pyrefly"), "python");
     }
 
     #[test]
@@ -627,7 +688,9 @@ mod tests {
             resolve(&PathBuf::from("Main.swift")),
             Some(LanguageId::Swift)
         );
-        assert_eq!(LanguageId::from_str_opt("luau"), None);
+        // W6 批：Luau 独立语言门收编（原 None 样本锁随变体加入作废——"不别名到
+        // Lua" 语义升级为 Some(Luau)）。
+        assert_eq!(LanguageId::from_str_opt("luau"), Some(LanguageId::Luau));
         assert_eq!(
             LanguageId::from_str_opt("intelephense"),
             Some(LanguageId::Php)
@@ -685,5 +748,67 @@ mod tests {
         assert_eq!(resolve(&PathBuf::from("main.gd")), Some(LanguageId::Godot));
         assert_eq!(resolve(&PathBuf::from("main.mrc")), Some(LanguageId::Msl));
         assert_eq!(LanguageId::from_str_opt("lean4"), None);
+    }
+
+    /// W6 十二门（上游对拍采纳）：条目已在 servers.toml，本批补 LanguageId/EXT_TABLE
+    /// 路由——全 T0（无手写 adapter）、--lang 语言名命中条目、扩展名各归其门、
+    /// didOpen languageId 恒等。.m 刻意不收（MATLAB 歧义已裁决）。
+    #[test]
+    fn w6_twelve_doors_t0_routing() {
+        // 全部无手写 adapter（T0，走 ensure_launch）。
+        for lang in [
+            "clojure",
+            "elm",
+            "haxe",
+            "luau",
+            "fsharp",
+            "bsl",
+            "systemverilog",
+            "latex",
+            "solidity",
+            "ada",
+            "al",
+            "hlsl",
+        ] {
+            assert!(adapter_for(lang).is_none(), "{lang}: W6 十二门全 T0");
+            assert!(
+                config::spec_for(lang).is_some(),
+                "--lang {lang} 必须命中 servers.toml 条目"
+            );
+            assert_eq!(lsp_language_id(lang), lang, "{lang}: didOpen 恒等");
+        }
+        // 扩展名解析：代表样本覆盖各族（全清单在 EXT_TABLE 注释 + from_extension）。
+        for (path, want) in [
+            ("Main.clj", LanguageId::Clojure),
+            ("Main.cljs", LanguageId::Clojure),
+            ("Main.cljc", LanguageId::Clojure),
+            ("Main.edn", LanguageId::Clojure),
+            ("Main.elm", LanguageId::Elm),
+            ("Main.hx", LanguageId::Haxe),
+            ("Main.luau", LanguageId::Luau),
+            ("Main.fs", LanguageId::FSharp),
+            ("Main.fsi", LanguageId::FSharp),
+            ("Main.fsx", LanguageId::FSharp),
+            ("Main.bsl", LanguageId::Bsl),
+            ("Main.os", LanguageId::Bsl),
+            ("Main.sv", LanguageId::SystemVerilog),
+            ("Main.svh", LanguageId::SystemVerilog),
+            ("Main.v", LanguageId::SystemVerilog),
+            ("Main.vh", LanguageId::SystemVerilog),
+            ("Main.tex", LanguageId::Latex),
+            ("Main.bib", LanguageId::Latex),
+            ("Main.sol", LanguageId::Solidity),
+            ("Main.ada", LanguageId::Ada),
+            ("Main.adb", LanguageId::Ada),
+            ("Main.ads", LanguageId::Ada),
+            ("Main.al", LanguageId::Al),
+            ("Main.hlsl", LanguageId::Hlsl),
+            ("Main.fx", LanguageId::Hlsl),
+            ("Main.cginc", LanguageId::Hlsl),
+            ("Main.comp", LanguageId::Hlsl),
+            ("Main.wgsl", LanguageId::Hlsl),
+        ] {
+            assert_eq!(resolve(&PathBuf::from(path)), Some(want), "{path}");
+        }
     }
 }

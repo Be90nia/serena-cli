@@ -838,21 +838,23 @@ impl Supervisor {
                 }
             })?,
             None => {
-                if ls_registry::config::spec_for(lang).is_none() {
+                let Some((_, spec)) = ls_registry::config::spec_for(lang) else {
                     return Err(ToolError::BadArgs {
                         detail: format!("unknown language: {lang}"),
                     });
-                }
+                };
                 let (_, args) = ls_registry::config::ensure_launch(lang, None, false, false)
                     .map_err(|msg| ToolError::NotInstalled {
                         language: lang.to_string(),
                         hint: msg,
                     })?;
                 // expand_exec 返回完整 argv（exec 模板首元素即 {bin}）。
+                // spec.env：spawn 注入表（PATH 类键追加原值语义，见 spawn_env）；
+                // 未声明 = 空 Vec，行为与引入前一致。
                 ls_runtime::process::LaunchInfo {
                     cmd: args.into_iter().map(Into::into).collect(),
                     cwd: key.root.clone(),
-                    env: Vec::new(),
+                    env: spec.spawn_env(),
                     transport: ls_runtime::process::TransportKind::Stdio,
                 }
             }
@@ -902,12 +904,42 @@ impl Supervisor {
         if let Some(adapter) = &t2 {
             adapter.initialize_patches(&mut params);
         }
+        // T0 三通道·init_options（Wave 1）：spec 声明的初始化选项深合并进
+        // initializationOptions（两侧皆对象递归并集、spec 值覆盖；基线缺失直接设）。
+        // T2 路径条目未声明该字段 → 零行为；T2 adapter 自有 patches 优先级不变。
+        if let Some((_, spec)) = ls_registry::config::spec_for(lang)
+            && let Some(opts) = &spec.init_options
+        {
+            let slot = params
+                .initialization_options
+                .get_or_insert_with(|| serde_json::Value::Object(Default::default()));
+            deep_merge_json(slot, opts);
+        }
 
         let session = Session::start(Some(child), params).await?;
         // didOpen 的 languageId 用 adapter 真实语言（默认 "cpp" 对 rust-analyzer
         // 等严格 LS 是错语言 → 文档拒收）。session_for 是唯一 spawn 点，此处注入
         // 覆盖全部会话路径。lsp_language_id 换算 LSP 官方名（docker→dockerfile）。
         session.set_language_id(&ls_registry::lsp_language_id(lang));
+        // T0 三通道·did_change_config + config_reply（Wave 1）：仅声明了字段的
+        // 条目生效（julia nudge 先例），其余 LS 零行为。推送在 initialized 之后、
+        // 任何 didOpen 之前（此时会话刚握手完成）。
+        if let Some((_, spec)) = ls_registry::config::spec_for(lang) {
+            if let Some(cfg) = &spec.did_change_config {
+                let _ = session.client().notify(
+                    "workspace/didChangeConfiguration",
+                    serde_json::json!({ "settings": cfg }),
+                );
+            }
+            if let Some(replies) = spec.config_reply.as_ref().filter(|r| !r.is_empty()) {
+                let replies = std::sync::Arc::new(replies.clone());
+                session
+                    .client()
+                    .on_server_request("workspace/configuration", move |msg| {
+                        Some(configuration_reply_from_spec(&replies, &msg))
+                    });
+            }
+        }
         // 注册 publishDiagnostics handler → 写 diag_cache + 累 generation。
         let cache_root = key.root.clone();
         let cache = std::sync::Arc::clone(&self.diag_cache);
@@ -976,11 +1008,14 @@ impl Supervisor {
         }
 
         // 写一次、读多次；错就当不支持（fallback push 与 2.4 之前等价）。
+        // per-LS 否决（Wave 1）：spec 声明 pull_diagnostics_denied = true 时强制
+        // push（↖ mirror julia_server.py@7a296833：LanguageServer.jl 对 pull 崩溃）。
         let supports_pull = session
             .server_capabilities()
             .as_ref()
             .map(supports_pull_diagnostics)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && !ls_registry::config::spec_for(lang).is_some_and(|(_, s)| s.pull_diagnostics_denied);
         self.pull_diag_supported
             .lock()
             .unwrap()
@@ -4891,6 +4926,52 @@ pub fn attach_warning(value: &mut serde_json::Value, warnings: &[String]) {
 fn is_workspace_load_error(message: &str) -> bool {
     let m = message.to_lowercase();
     m.contains("fetchworkspaceerror") || m.contains("believes it's in a workspace")
+}
+
+/// JSON 对象深层合并（T0 三通道·init_options）：两侧皆对象 → 递归并集、`overlay`
+/// 覆盖同名键；否则 `overlay` 整体替换。
+fn deep_merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(k) {
+                    Some(bv) if bv.is_object() && v.is_object() => deep_merge_json(bv, v),
+                    _ => {
+                        b.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o.clone(),
+    }
+}
+
+/// T0 三通道·config_reply：spec 声明的 per-LS 真值应答表 → `workspace/configuration`
+/// 结果。items 逐项按 `section` 精确匹配（大小写敏感）；未命中/缺 section/缺 items
+/// 回 null（数组长度仍与 items 等长——与 lsp-core 默认应答形态一致）。
+fn configuration_reply_from_spec(
+    replies: &[ls_registry::spec::ConfigReplyEntry],
+    msg: &lsp_core::framing::JsonRpc,
+) -> serde_json::Value {
+    let items = msg
+        .params
+        .as_ref()
+        .and_then(|p| p.get("items"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    serde_json::Value::Array(
+        items
+            .iter()
+            .map(|item| {
+                item.get("section")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| replies.iter().find(|r| r.section == s))
+                    .map(|r| r.value.clone())
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .collect(),
+    )
 }
 
 /// 0-based LSP Position 是否落在任一符号的 range 内（bd serena-rust-we0 判据）。
@@ -10173,6 +10254,73 @@ mod not_installed_display_tests {
         assert!(
             msg.contains("serena-cli ls-use <lang> <path-to-ls-binary>"),
             "ls-use 指引: {msg}"
+        );
+    }
+}
+
+/// 上游对拍采纳 Wave 1：T0 三通道接线层的纯函数单测（不拉 LS）。
+#[cfg(test)]
+mod wave1_tuning_channel_tests {
+    use super::*;
+    use ls_registry::spec::ConfigReplyEntry;
+    use lsp_core::framing::JsonRpc;
+
+    #[test]
+    fn deep_merge_json_overlays_nested_keys_and_replaces_types() {
+        let mut base = serde_json::json!({ "a": { "x": 1, "y": 2 }, "keep": true });
+        let overlay = serde_json::json!({ "a": { "y": 3, "z": 4 }, "b": "new" });
+        deep_merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({ "a": { "x": 1, "y": 3, "z": 4 }, "keep": true, "b": "new" })
+        );
+        // 类型不匹配：overlay 整体替换该键。
+        let mut base2 = serde_json::json!({ "a": { "x": 1 } });
+        deep_merge_json(&mut base2, &serde_json::json!({ "a": [1, 2] }));
+        assert_eq!(base2, serde_json::json!({ "a": [1, 2] }));
+    }
+
+    fn reply(section: &str, value: serde_json::Value) -> ConfigReplyEntry {
+        ConfigReplyEntry {
+            section: section.to_string(),
+            value,
+        }
+    }
+
+    #[test]
+    fn configuration_reply_matches_section_and_keeps_null_misses() {
+        let replies = vec![
+            reply("perl", serde_json::json!({ "perlInc": ["lib"] })),
+            reply("runlinter", serde_json::Value::Bool(true)),
+        ];
+        let msg = JsonRpc::notification(
+            "workspace/configuration",
+            serde_json::json!({ "items": [
+                { "section": "perl" },
+                { "section": "unknown" },
+                { },
+                { "section": "runlinter" },
+            ]}),
+        );
+        assert_eq!(
+            configuration_reply_from_spec(&replies, &msg),
+            serde_json::json!([
+                { "perlInc": ["lib"] },
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                true,
+            ]),
+            "命中回真值、未命中/缺 section 回 null（等长数组 = 默认应答形态）"
+        );
+    }
+
+    #[test]
+    fn configuration_reply_without_items_returns_empty_array() {
+        let replies = vec![reply("x", serde_json::json!(1))];
+        let msg = JsonRpc::notification("workspace/configuration", serde_json::json!({}));
+        assert_eq!(
+            configuration_reply_from_spec(&replies, &msg),
+            serde_json::json!([])
         );
     }
 }
