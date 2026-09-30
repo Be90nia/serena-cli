@@ -1,0 +1,113 @@
+# LS Stress Matrix —— 3 平台 × 6 分片 × 5 小时循环压测（bd serena-rust-2p5）。
+#
+# 与 ls-smoke.yml（周冒烟，ubuntu 单轮）互补，不替代：
+#   - 门执行器（smoke_one.sh）与分片（smoke_shard.py LPT）原样复用，无第二份逻辑；
+#     平台差异全部在门清单 install_windows/install_macos 平台行（含 "SKIP" 哨兵），
+#     三平台跑同一分片计划。
+#   - 片内循环：stress_loop.sh while SECONDS < 上限（cycle_secs input，默认
+#     18000s = 5h；机制验证 dispatch 600s）。每轮（cycle）裁决落 stress-logs/
+#     cycle-N.md，哨兵（LS 进程数 / daemon RSS / 残留 lock / 缓存 MB）每轮前后
+#     各采一次；job 末尾 stress_report.py 出 verdict 矩阵 + flaky 清单 + 趋势。
+#   - 超时：单轮时长 = 片预算（LPT 均衡 ~25-40min）＜ 335min job 上限（5h 循环
+#     + 45min 上传余量；循环上限已内建 -2700s 保护）。
+# 平台 pin 具体镜像（ubuntu-24.04 / windows-2025 / macos-15 arm64）——门分类
+#   按 actions/runner-images 这三张 Readme 取证（Rustup/PowerShell/R/Ruby/
+#   Python/JAVA_HOME_21+25 预装），镜像漂移会破坏分类锚。
+# 成本护栏：concurrency 防双跑（18 job × 5h）。
+
+name: LS Stress
+
+on:
+  workflow_dispatch:
+    inputs:
+      cycle_secs:
+        description: "片内压测循环秒数：机制验证 600，全量 5h 用默认 18000"
+        type: number
+        default: 18000
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ls-stress
+  cancel-in-progress: true
+
+jobs:
+  build-cli:
+    # 三平台各构建一次（debug profile，同 ls-smoke 楔约），artifact 按平台分发。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-stress-${{ hashFiles('Cargo.lock') }}
+      - name: build serena-cli (debug)
+        run: cargo build --bin serena-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: serena-cli-${{ matrix.os }}
+          # windows 产物 = serena-cli.exe，通配两者
+          path: target/debug/serena-cli*
+          retention-days: 3
+
+  plan:
+    # 与 ls-smoke 共享 smoke_shard.py 单一事实源；分片平台无关（门内按平台选行）。
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.shard.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: shard
+        run: |
+          python3 scripts/smoke_shard.py --selfcheck
+          matrix=$(python3 scripts/smoke_shard.py --matrix)
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  stress:
+    needs: [build-cli, plan]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 335 # 5h 循环 + 构建拉取 + 报告上传余量
+    strategy:
+      fail-fast: false # 单门/单轮失败只红所在 (os, shard)，不连坐
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+        shard: [1, 2, 3, 4, 5, 6]
+    env:
+      # 真机冒烟本体：显式开 LS e2e（与 m0-ci 的 =1 门禁语义互补，同 ls-smoke）。
+      SERENA_SKIP_LS_E2E: "0"
+      # windows 产物带 .exe 后缀（build-cli upload 用通配，下载名 = serena-cli.exe）
+      SERENA_CLI: ${{ github.workspace }}/bin/${{ matrix.os == 'windows-2025' && 'serena-cli.exe' || 'serena-cli' }}
+      SMOKE_LOG_DIR: ${{ github.workspace }}/stress-logs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: serena-cli-${{ matrix.os }}
+          path: bin/
+      - name: prepare cli
+        run: |
+          chmod +x "$SERENA_CLI" || true
+          "$SERENA_CLI" --version
+      - name: stress loop (os=${{ matrix.os }} shard=${{ matrix.shard }} cycle_secs=${{ inputs.cycle_secs }})
+        run: scripts/stress_loop.sh --shard ${{ matrix.shard }} --cycle-secs ${{ inputs.cycle_secs }}
+      - name: upload stress logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-logs-${{ matrix.os }}-s${{ matrix.shard }}
+          path: stress-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: hygiene stop-all
+        if: always()
+        run: |
+          "$SERENA_CLI" stop-all || true

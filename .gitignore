@@ -21,3 +21,7 @@ local/
 # smoke_one.sh 本地调试的 per-door 观测产物（CI 走 artifact，不落盘仓库）
 smoke-logs/
 
+# stress_loop.sh 本地调试产物 + python 字节码（test_smoke_platform_keys import 产物）
+stress-logs/
+__pycache__/
+

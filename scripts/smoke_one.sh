@@ -18,6 +18,13 @@
 #   SMOKE_LANGS  清单路径（默认 scripts/smoke_langs.toml）
 #   SHARDS       片数（默认 6，须与 workflow plan job 一致）
 #   PROBE_TIMEOUT 单次探针超时秒（默认 240）
+#   SERENA_EXTRA_ENV install 行可写的 bash 片段文件（每门临时文件）：install 成功后
+#                 被 smoke_one.sh source——CLI→daemon→探针全链继承（install 子 shell
+#                 的 export 不回传父进程，bsl JVM17 教训；文件中转 = update-alternatives
+#                 系统态传导的跨平台等价物，java/bsl/zig/julia/haxe/lean4 平台行用）。
+# 平台（bd serena-rust-2p5 压测三平台）：按 uname 选行——install_windows/install_macos
+#   可选键，缺省回退 install（linux 语义）；值 = "SKIP" → 该平台 SKIP PLATFORM 输出
+#   （c 类门，不红；逐门平台证据在清单 remark + local/agent-reports/stress-harness.md）。
 #   SMOKE_LOG_DIR per-door 观测产物目录（默认 $PWD/smoke-logs；CI = checkout 根，
 #                 workflow 作 artifact 上传）。每门四件：<id>.stderr.log（CLI stderr）、
 #                 <id>.install.out（install stdout）、<id>.daemon.log（daemon tracing，
@@ -30,6 +37,10 @@
 # 致 7 门零裁决行，"FAIL=0" 假绿，S9 P0）。
 
 set -u -o pipefail
+
+# windows runner：python stdout 管道默认 cp1252——manifest remark 含中文，
+# manifest_rows 打印即 UnicodeEncodeError 全门红（PYUTF8 强制 UTF-8，py3.7+）。
+export PYTHONUTF8=1
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -59,16 +70,42 @@ run_with_timeout() {
     shift
     if has_timeout; then
         timeout "$secs" "$@"
-    else
-        "$@"
+        return
     fi
+    # bash 内建看门狗回退（macOS 无 GNU timeout；windows Git Bash 的 timeout.exe
+    # 互斥已由 has_timeout 试跑排除）：后台执行 + 逐秒轮询，超时 kill 并把 exit
+    # 归一 124（BUDGET 判据依赖 GNU timeout 语义）。stdout/stderr 经临时文件转交，
+    # 调用方的命令替换/重定向语义不变。杀父不追孙——与 GNU timeout 默认行为
+    # 一致（门残留由 stop-all 卫生 + 裁决自检兜底），非回退独有缺口。
+    local out err rc pid i=0
+    out=$(mktemp) && err=$(mktemp) || return 125
+    "$@" >"$out" 2>"$err" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$secs" ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        rc=124
+    else
+        wait "$pid"
+        rc=$?
+    fi
+    cat "$out"
+    cat "$err" >&2
+    rm -f "$out" "$err"
+    return "$rc"
 }
 
 # ---- python（需 tomllib，3.11+）----
 find_py() {
     if [ -z "${_PY:-}" ]; then
         local c
-        for c in python3 python; do
+        # python3 优先（linux/mac）；windows runner 无 python3 shim 时落 python
+        # （windows-2025 = 3.12 有 tomllib）→ py launcher 兜底（latest Python 3）。
+        for c in python3 python py; do
             if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import tomllib' 2>/dev/null; then
                 _PY="$c"
                 return 0
@@ -89,7 +126,8 @@ with open(sys.argv[1], "rb") as f:
 for e in data["lang"]:
     keys = ("id", "via", "install", "pin", "fixture", "lang_flag",
             "budget_secs", "extra_assert", "fallback_assert", "skip_class",
-            "skip_reason", "skip_evidence", "verified", "remark")
+            "skip_reason", "skip_evidence", "verified", "remark",
+            "install_windows", "install_macos")
     print("\x1f".join(str(e.get(k, "")) for k in keys))
 PYEOF
 }
@@ -127,9 +165,19 @@ wait_daemon_gone() {
 # ---- uv 自举（uvx 类条目依赖；smoke 只认自装，不消费 runner 预装 ----
 ensure_uv() {
     command -v uvx >/dev/null 2>&1 && return 0
-    log "LOG uvx installing uv (astral.sh installer)"
-    curl -LsSf https://astral.sh/uv/install.sh | sh 1>&2
-    export PATH="$HOME/.local/bin:$PATH"
+    case "$(uname -s)" in
+        MING* | MSYS* | CYGWIN*)
+            # astral install.sh 不支持 windows（官方走 PowerShell 装法）；runner
+            # 自带 pip（windows-2025 Readme: pip 26.2.1）→ pip 装 uv（PyPI 有 win 轮子）。
+            log "LOG uvx installing uv (pip)"
+            pip install --quiet uv 1>&2 || python -m pip install --quiet uv 1>&2
+            ;;
+        *)
+            log "LOG uvx installing uv (astral.sh installer)"
+            curl -LsSf https://astral.sh/uv/install.sh | sh 1>&2
+            export PATH="$HOME/.local/bin:$PATH"
+            ;;
+    esac
     command -v uvx >/dev/null 2>&1
 }
 
@@ -256,10 +304,22 @@ one_door() {
         return 1
     fi
     IFS=$'\x1f' read -r id via install pin fixture lang_flag budget extra fallback skip_class \
-        skip_reason skip_evidence verified remark <<<"$row"
+        skip_reason skip_evidence verified remark install_windows install_macos <<<"$row"
 
     if [ -n "$skip_class" ]; then
         log "SKIP $id $skip_class: $skip_reason [$skip_evidence] verified=$verified"
+        return 0
+    fi
+
+    # 平台行选择（压测三平台）：linux 恒走 install（行为零变化）；macos/windows
+    # 缺省回退 install；值 = "SKIP" → 该平台 SKIP PLATFORM（c 类门，不红）。
+    local eff="$install"
+    case "$PLAT" in
+        macos) [ -n "$install_macos" ] && eff="$install_macos" ;;
+        windows) [ -n "$install_windows" ] && eff="$install_windows" ;;
+    esac
+    if [ "$eff" = "SKIP" ]; then
+        log "SKIP $id PLATFORM: no portable install line for $PLAT (see manifest remark)"
         return 0
     fi
 
@@ -276,6 +336,10 @@ one_door() {
     : >"$errf"
     export SERENA_DAEMON_LOG="$SMOKE_LOG_DIR/$id.daemon.log"
     export SERENA_RECORD="$SMOKE_LOG_DIR/$id.record.jsonl"
+    # install 行 → 父进程的 env 传导通道（见头部 SERENA_EXTRA_ENV 注释）。
+    local extra_env="$work/extra-env.sh"
+    export SERENA_EXTRA_ENV="$extra_env"
+    : >"$extra_env"
 
     # fixture → workspace 外（serena 纪律：workspace 内散文件语义层静默返空）。
     local src="$SELF_DIR/smoke_fixtures/$fixture"
@@ -313,17 +377,17 @@ one_door() {
             case "$via" in
                 serena-uvx) ensure_uv || { log "FAIL $id install: uv bootstrap"; rm -rf "$work"; return 1; } ;;
             esac
-            if [ -n "$install" ]; then
+            if [ -n "$eff" ]; then
                 # 清单 install 行优先（apt runtime 前置 + $SERENA_CLI install 连写）。
                 # 曾无条件走 `install <id>`，前置被静默跳过 —— bsl 跑在 runner 预装
                 # JVM 17（条目要求 21）启动即死 LS_TERMINATED，即此坑。
-                run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$install" >"$SMOKE_LOG_DIR/$id.install.out" 2>"$errf" || rc=$?
+                run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$eff" >"$SMOKE_LOG_DIR/$id.install.out" 2>"$errf" || rc=$?
             else
                 run_with_timeout "$budget" "$SERENA_CLI" install "$id" >"$SMOKE_LOG_DIR/$id.install.out" 2>"$errf" || rc=$?
             fi
             ;;
         *)
-            run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$install" >"$SMOKE_LOG_DIR/$id.install.out" 2>"$errf" || rc=$?
+            run_with_timeout "$budget" env SERENA_CLI="$SERENA_CLI" bash -c "$eff" >"$SMOKE_LOG_DIR/$id.install.out" 2>"$errf" || rc=$?
             ;;
     esac
     log_stderr_if_any "$id" "$errf"
@@ -333,6 +397,13 @@ one_door() {
         rm -rf "$work"
         [ "$rc" = 124 ] && return 0
         return 1
+    fi
+    # install 行的 env 传导落地：子 shell export 不回传（bsl JVM17 教训），文件
+    # 中转后 source 进本进程 → CLI→daemon→探针全链继承。linux 老行不写此文件，
+    # 行为零变化。
+    if [ -s "$SERENA_EXTRA_ENV" ]; then
+        # shellcheck disable=SC1090
+        . "$SERENA_EXTRA_ENV"
     fi
 
     # 冷启动等待：wait-ready --stage symbol = 底线同判据（overview 首符号非空）的
@@ -381,11 +452,8 @@ shard_run() {
     logf=$(mktemp) || { log "FAIL shard $shard: mktemp"; return 1; }
     for id in $ids; do
         budget=$(manifest_row "$id" | awk -F'\x1f' '{print $7}')
-        if has_timeout; then
-            timeout $((budget + 120)) "$SELF" _one "$id" 2>&1 | tee -a "$logf"
-        else
-            "$SELF" _one "$id" 2>&1 | tee -a "$logf"
-        fi
+        # 看门狗统一走 run_with_timeout（macOS 无 GNU timeout → bash 内建回退档）。
+        run_with_timeout $((budget + 120)) "$SELF" _one "$id" 2>&1 | tee -a "$logf"
         rc=$?
         if [ "$rc" = 124 ]; then
             log "SKIP $id BUDGET: door exceeded $((budget + 120))s watchdog"
@@ -427,6 +495,15 @@ shard_run() {
 
 main() {
     find_py || return 1
+    # 平台检测（压测三平台）：Git Bash = MINGW*/MSYS*；macos = Darwin。
+    PLAT=linux
+    case "$(uname -s)" in
+        Darwin*) PLAT=macos ;;
+        MING* | MSYS* | CYGWIN*) PLAT=windows ;;
+    esac
+    # 平台行通用安装目标（b 类行 cp 二进制/脚本到这里；main() 已把它前插 PATH，
+    # daemon 与探针可见）。目标不存在时 cp 落空 → 门红，故先建。
+    mkdir -p "$HOME/.local/bin" 2>/dev/null || true
     # 工具链 bin 补齐：GITHUB_PATH 追加对同 step 不生效（仅跨 step），go 门 gopls
     # 落 $HOME/go/bin 而 runner 默认 PATH 无它 → LS_NOT_INSTALLED（CI 首跑实锤）。
     # $HOME/.opam/default/bin：ocaml 门 ocamllsp 落 opam switch bin（GITHUB_PATH

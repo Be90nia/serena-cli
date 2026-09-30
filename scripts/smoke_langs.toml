@@ -21,6 +21,19 @@
 #   bsl/crystal/elixir/nextflow/fsharp/haskell/qml，run 36577226543 帧级实锚）；
 #   R6 = smoke 终轮（run 36577226543 12 红门处置）。矩阵外仅 sql/mysql（documented
 #   SKIP，见尾部对账节）。
+#   ── 平台分类（bd serena-rust-2p5，压测三平台 2026-09-30）────────────────────
+#   linux 门数与分片不变（74 = 60 真门 + 14 SKIP；14 证据 SKIP 门三平台维持原
+#   SKIP 输出）。60 真门三类（逐门证据 = local/agent-reports/stress-harness.md）：
+#   a 类 portable-as-is 31 门（serena-npm/uvx/download 三平台资产 + npm/go/dotnet/
+#   rustup 生态装法 + windows Rustup/Ruby/Python 预装——runner Readme 实锚）；
+#   b 类 14 门补 install_windows/install_macos 平台行（cpp/bsl/java/haxe/zig/scala/
+#   lean4/gleam/julia + swift/clojure/pascal/r/ruby 单平台行）——全部一手取证
+#   （GitHub assets[].digest / ziglang index.json / julialang-s3 versions.json /
+#   runner-images Readme / homebrew-core formula）；c 类 15 门无平台资产或装法超重
+#   → install_windows|install_macos = "SKIP"（该平台 SKIP PLATFORM 输出不红）。
+#   runner 事实锚 = actions/runner-images images/{macos/macos-15-arm64,
+#   windows/Windows2025}-Readme.md（Rustup 1.29/PowerShell 7.6/R 4.6.1/Ruby 3.3/
+#   Python 3.12+3.14/JAVA_HOME_21+25 双平台预装）。
 #   ── W1-W5 接入模板（加一门 = 两步）──────────────────────────────────────
 # 1. 本清单加一个 [[lang]] 块（字段见下）；
 # 2. scripts/smoke_fixtures/ 放一个最小 fixture（1 个具名符号，底线= documentSymbol 非空）。
@@ -98,10 +111,12 @@ remark = "T2 手写适配器；v0.23.0 = 2026-09-25 真机冒烟版（local/repo
 id = "cpp"
 via = "apt"
 install = "sudo apt-get update -qq && sudo apt-get install -y -qq clangd || (sudo apt-get install -y -qq clangd-18 && sudo ln -sf \"$(command -v clangd-18)\" /usr/local/bin/clangd)"
-pin = "suite"
+pin = "suite (linux apt / macos Xcode CLT); windows clangd 18.1.3 (clangd release, 无 digest 锚故钉 URL)"
 fixture = "main.cpp"
 budget_secs = 420
-remark = "T2 手写适配器；apt 元包无 /usr/bin/clangd 时软链 clangd-18"
+install_windows = "W=$(cygpath -m \"$HOME\") && curl -fsSL https://github.com/clangd/clangd/releases/download/18.1.3/clangd-windows-18.1.3.zip -o \"$W/clangd.zip\" && mkdir -p \"$W/clangd18\" && python -m zipfile -e \"$W/clangd.zip\" \"$W/clangd18\" && find \"$W/clangd18\" -name 'clangd.exe' -exec cp {} \"$HOME/.local/bin/clangd.exe\" \\; && clangd --version"
+install_macos = "sudo ln -sf \"$(xcrun --find clangd)\" /usr/local/bin/clangd && clangd --version"
+remark = "T2 手写适配器；apt 元包无 /usr/bin/clangd 时软链 clangd-18；stress 平台行（bd serena-rust-2p5）：windows = clangd release zip（API 资产实锚 2026-09-30）cp 入 $HOME/.local/bin（main() PATH 前置），macos = Xcode CLT 16.4 自带 clangd（macos-15-arm64 Readme 实锚）xcrun 软链"
 
 [[lang]]
 id = "csharp"
@@ -185,7 +200,8 @@ fixture = "pg.sql"
 lang_flag = "pgsql"
 budget_secs = 420
 fallback_assert = "diagnostics"
-remark = "--lang pgsql 显式路由（.sql 归 ls-registry EXT_TABLE sql 语言，sql 门见不入矩阵节）；pgls 无 DB 连接时 documentSymbol 无 capability（条目注释真机实锚），降级验语法诊断——libpg_query 本地 parser 无 DB 可用（同注释 2 条语法错实锚）"
+remark = "--lang pgsql 显式路由（.sql 归 ls-registry EXT_TABLE sql 语言，sql 门见不入矩阵节）；pgls 无 DB 连接时 documentSymbol 无 capability（条目注释真机实锚），降级验语法诊断——libpg_query 本地 parser 无 DB 可用（同注释 2 条语法错实锚）；stress：macos 组资产仅注释未启用（servers.toml）→ install_macos = SKIP 平台跳"
+install_macos = "SKIP"
 
 [[lang]]
 id = "powershell"
@@ -201,6 +217,8 @@ via = "serena-download"
 pin = "servers.toml"
 fixture = "app.toml"
 budget_secs = 300
+install_windows = "SKIP"
+remark = "stress：win 组注释未启用（servers.toml，taplo windows zip 资产+sha 在注释）→ win 压测跳；linux/macos 走已启用组"
 
 [[lang]]
 id = "kotlin"
@@ -209,6 +227,8 @@ pin = "servers.toml"
 fixture = "main.kt"
 lang_flag = "kotlin"
 budget_secs = 600
+install_macos = "SKIP"
+remark = "stress：macos 组资产仅注释形态（.sit 解压未启用，servers.toml）→ macos 压测跳；win/linux 走已启用组"
 
 [[lang]]
 id = "dart"
@@ -217,7 +237,8 @@ pin = "servers.toml"
 fixture = "main.dart"
 lang_flag = "dart"
 budget_secs = 900
-remark = "整 Dart SDK 下载（~250MB），预算最重档"
+install_macos = "SKIP"
+remark = "整 Dart SDK 下载（~250MB），预算最重档；stress：macos 组仅注释未启用（servers.toml）→ macos 压测跳"
 
 [[lang]]
 id = "lua"
@@ -226,6 +247,8 @@ pin = "servers.toml"
 fixture = "main.lua"
 lang_flag = "lua"
 budget_secs = 420
+install_windows = "SKIP"
+remark = "stress：win 组注释未启用（asset+sha 已锚 servers.toml 注释）→ win 压测跳；linux/macos 走已启用组"
 
 [[lang]]
 id = "bsl"
@@ -235,7 +258,9 @@ pin = "servers.toml"
 fixture = "module.bsl"
 lang_flag = "bsl"
 budget_secs = 600
-remark = "langs20 轮转真门：R6 死因 = apt 装了 21 但 alternatives 默认仍指 17，lazy-spawn daemon 的 LS spawn 解析 java 落 17（run 36577226543 UnsupportedClassVersionError 65.0 vs 61.0 实锚）——apt 前置装 21 后必须 update-alternatives --set 切系统软链（install 子 shell 的 PATH/export 不回传 daemon，系统态才是传导面，java 门同源）；java -version 打印留 install.out 作 21 在场证据"
+remark = "langs20 轮转真门：R6 死因 = apt 装了 21 但 alternatives 默认仍指 17，lazy-spawn daemon 的 LS spawn 解析 java 落 17（run 36577226543 UnsupportedClassVersionError 65.0 vs 61.0 实锚）——apt 前置装 21 后必须 update-alternatives --set 切系统软链（install 子 shell 的 PATH/export 不回传 daemon，系统态才是传导面，java 门同源）；java -version 打印留 install.out 作 21 在场证据；stress 平台行 = JAVA_HOME_21_{X64,arm64} 前插 daemon PATH（runner 预装 Temurin 21/25 双版本，Windows2025/macos-15-arm64 Readme 实锚）——$SERENA_EXTRA_ENV 文件中转由 smoke_one.sh source，即 update-alternatives 系统态传导的跨平台等价物"
+install_windows = "JB=$(cygpath -u \"$JAVA_HOME_21_X64\")/bin && echo \"export PATH=\\\"$JB:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && java -version 2>&1 | head -1 >&2 && $SERENA_CLI install bsl"
+install_macos = "echo \"export PATH=\\\"$JAVA_HOME_21_arm64/bin:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && java -version 2>&1 | head -1 >&2 && $SERENA_CLI install bsl"
 
 [[lang]]
 id = "nextflow"
@@ -268,11 +293,13 @@ remark = "R6 起证据 SKIP（PM 裁决 2026-09-29）；langs20 轮复核维持�
 id = "haxe"
 via = "serena-download"
 install = "sudo apt-get update -qq && sudo apt-get install -y -qq haxe && $SERENA_CLI install haxe"
-pin = "servers.toml"
+pin = "servers.toml (LS VSIX universal) + haxe 编译器 4.3.7 (win 官方 zip) / brew suite (macos)"
 fixture = "Main.hx"
 lang_flag = "haxe"
 budget_secs = 600
-remark = "运行需 Haxe 编译器（apt suite 版）"
+install_windows = "W=$(cygpath -m \"$HOME\") && curl -fsSL https://github.com/HaxeFoundation/haxe/releases/download/4.3.7/haxe-4.3.7-win64.zip -o \"$W/haxe.zip\" && mkdir -p \"$W/haxe437\" && python -m zipfile -e \"$W/haxe.zip\" \"$W/haxe437\" && HX=$(cygpath -u \"$(find \"$W/haxe437\" -name haxe.exe | head -1 | xargs dirname)\") && echo \"export PATH=\\\"$HX:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && haxe --version && $SERENA_CLI install haxe"
+install_macos = "command -v haxe >/dev/null 2>&1 || brew install haxe; haxe --version && $SERENA_CLI install haxe"
+remark = "运行需 Haxe 编译器（apt suite 版）；stress 平台行：macos = brew formula haxe（homebrew-core 实锚 2026-09-30），windows = 官方 release win64.zip（API 资产实锚；内层目录为日期 hash 名非版本名——本机解包实锚，find 解析防布局假设）；haxe.exe 需同目录 std/ → EXTRA_ENV 前插解压根目录而非拷贝单文件"
 
 [[lang]]
 id = "php"
@@ -292,7 +319,9 @@ pin = "servers.toml"
 fixture = "core.clj"
 lang_flag = "clojure"
 budget_secs = 600
-remark = "clojure-lsp native 二进制 + Clojure CLI runtime（apt suite 版）"
+remark = "clojure-lsp native 二进制 + Clojure CLI runtime（apt suite 版）；stress 平台行：macos = brew formula clojure（homebrew-core 实锚 2026-09-30，clojure-tools 1.12.6）补 CLI runtime（LS native 二进制 servers.toml macos 组已有）；windows = clojure-lsp 无 win 资产（条目注释）+ CLI 装 scoop 重 → 压测跳"
+install_macos = "command -v clojure >/dev/null 2>&1 || brew install clojure; clojure --version 2>&1 | head -1 >&2 && $SERENA_CLI install clojure"
+install_windows = "SKIP"
 
 [[lang]]
 id = "ada"
@@ -310,6 +339,8 @@ pin = "servers.toml"
 fixture = "smoke.sv"
 lang_flag = "systemverilog"
 budget_secs = 420
+install_windows = "SKIP"
+remark = "stress：win 组注释未启用（servers.toml，verible win64 zip 资产在）→ win 压测跳；linux/macos 走已启用组"
 
 [[lang]]
 id = "hlsl"
@@ -318,6 +349,8 @@ pin = "servers.toml"
 fixture = "shader.hlsl"
 lang_flag = "hlsl"
 budget_secs = 420
+install_macos = "SKIP"
+remark = "stress：上游无 macos 资产（servers.toml 条目注释，M/Ma 走 cargo install 非下载形态）→ macos 压测跳；win/linux 走已启用组"
 
 [[lang]]
 id = "terraform"
@@ -326,7 +359,8 @@ pin = "servers.toml"
 fixture = "main.tf"
 lang_flag = "terraform"
 budget_secs = 420
-remark = "上游适配器要求 terraform CLI 在 PATH（模块特性）；底线 documentSymbol 纯语法层不依赖，runner 未装 terraform CLI 属预期"
+install_windows = "SKIP"
+remark = "上游适配器要求 terraform CLI 在 PATH（模块特性）；底线 documentSymbol 纯语法层不依赖，runner 未装 terraform CLI 属预期；stress：win 组注释未启用 → win 压测跳"
 
 [[lang]]
 id = "cue"
@@ -335,6 +369,8 @@ pin = "servers.toml"
 fixture = "main.cue"
 lang_flag = "cue"
 budget_secs = 420
+install_windows = "SKIP"
+remark = "stress：win 组注释未启用（servers.toml，cue windows zip 资产+sha 在注释）→ win 压测跳；linux/macos 走已启用组"
 
 [[lang]]
 id = "nix"
@@ -489,7 +525,8 @@ pin = "servers.toml"
 fixture = "ruby/smoke.rb"
 lang_flag = "ruby"
 budget_secs = 420
-remark = "需 ruby + gem（ubuntu-latest runner 预装，无 bundler——gem install 显式补，run 36567771452 `bundle: command not found` 实锚）；bundler 必须 sudo（apt ruby 的系统 gem home /var/lib/gems 不通写，run 36577226543 Gem::FilePermissionError 实锚——serena install ruby 本体走 --user-install 不受影响，ok:true）；bundle install 走 fixture 本地 vendor/bundle（bundle config set --local path 落 .bundle/config，ruby-lsp SetupBundler 经 BUNDLE_GEMFILE 自动读到，无需 env 传导）——ruby-lsp 裸启动无 bundle 上下文即 LS_TERMINATED（run 36528495148 实锚），有 Gemfile 还须 bundle 可解析（run 36561318948：仅 Gemfile 未 install 仍 EOF），smoke_one.sh 另向 LS 进程链 export BUNDLE_GEMFILE"
+remark = "需 ruby + gem（ubuntu-latest runner 预装，无 bundler——gem install 显式补，run 36567771452 `bundle: command not found` 实锚）；bundler 必须 sudo（apt ruby 的系统 gem home /var/lib/gems 不通写，run 36577226543 Gem::FilePermissionError 实锚——serena install ruby 本体走 --user-install 不受影响，ok:true）；bundle install 走 fixture 本地 vendor/bundle（bundle config set --local path 落 .bundle/config，ruby-lsp SetupBundler 经 BUNDLE_GEMFILE 自动读到，无需 env 传导）——ruby-lsp 裸启动无 bundle 上下文即 LS_TERMINATED（run 36528495148 实锚），有 Gemfile 还须 bundle 可解析（run 36561318948：仅 Gemfile 未 install 仍 EOF），smoke_one.sh 另向 LS 进程链 export BUNDLE_GEMFILE；stress：windows = runner 预装 Ruby 3.3.12 + RubyGems（Windows2025 Readme 实锚），免 sudo 直 gem home（可写性 = 机制绿轮验证点）；macos = linux 行原样（sudo 存在）跑通"
+install_windows = "$SERENA_CLI install ruby && gem install bundler --no-document && cd \"$SERENA_FXDIR\" && bundle config set --local path vendor/bundle && bundle install --jobs 4 --quiet && ruby -v"
 
 [[lang]]
 id = "solargraph"
@@ -523,7 +560,9 @@ pin = "ocamllsp suite (opam) + ocaml-system (apt 4.14, 免编译器源码构建)
 fixture = "main.ml"
 lang_flag = "ocaml"
 budget_secs = 1200
-remark = "↖ mirror ocaml_lsp_server.py@7a296833（opam exec -- which ocamllsp 取路径后裸直启 = path_only 语义）；ocamllsp 本体编译 ~3-6min 为预算主体；OCaml 5.1.0 不兼容上游明示——apt 4.14 避开；opam switch bin 不在 runner PATH 且 GITHUB_PATH 对同 step 不生效（run 36567771452 LS_NOT_INSTALLED 实锚）——smoke_one.sh main() 把 $HOME/.opam/default/bin 补进进程 PATH（go/dotnet tools 同款）"
+remark = "↖ mirror ocaml_lsp_server.py@7a296833（opam exec -- which ocamllsp 取路径后裸直启 = path_only 语义）；ocamllsp 本体编译 ~3-6min 为预算主体；OCaml 5.1.0 不兼容上游明示——apt 4.14 避开；opam switch bin 不在 runner PATH 且 GITHUB_PATH 对同 step 不生效（run 36567771452 LS_NOT_INSTALLED 实锚）——smoke_one.sh main() 把 $HOME/.opam/default/bin 补进进程 PATH（go/dotnet tools 同款）；stress：opam 编译链 windows 无装法、macos 源码编译超重（PM c 类判据）→ 双平台压测跳"
+install_windows = "SKIP"
+install_macos = "SKIP"
 
 [[lang]]
 id = "erlang"
@@ -533,7 +572,9 @@ pin = "erlang_ls 1.1.0 (OTP 25 build; release 无 digest 锚故钉 URL) + erlang
 fixture = "main.erl"
 lang_flag = "erlang"
 budget_secs = 600
-remark = "entry exec 修复 [--transport stdio]——裸启动 = TCP 模式，stdio pump 挂死（mirror erlang_language_server.py@7a296833 ProcessLaunchInfo）；资产按 OTP 配对（ubuntu-24.04 apt = OTP 25.3.2.8，launchpad 实锚）→ -25 tarball"
+remark = "entry exec 修复 [--transport stdio]——裸启动 = TCP 模式，stdio pump 挂死（mirror erlang_language_server.py@7a296833 ProcessLaunchInfo）；资产按 OTP 配对（ubuntu-24.04 apt = OTP 25.3.2.8，launchpad 实锚）→ -25 tarball；stress：erlang_ls release 无 win/mac 资产（linux-OTP 配对 tarball 唯一），macos 源码构建 OTP 配对漂移 → 双平台压测跳"
+install_windows = "SKIP"
+install_macos = "SKIP"
 
 [[lang]]
 id = "perl"
@@ -543,7 +584,9 @@ pin = "Perl::LanguageServer suite (cpanm --notest)"
 fixture = "main.pl"
 lang_flag = "perl"
 budget_secs = 900
-remark = "↖ mirror perl_language_server.py@7a296833 launch 串逐字（entry perl_ls exec）；上游另应答 workspace/configuration + didChangeConfiguration——T0 走 lsp-core 未注册请求默认 null 成功应答（kotlin 条目注释同源实锚），文件过滤回落 LS 默认；cpanm 依赖自动解算为预算主体，IO::AIO（AnyEvent::AIO 传递依赖）从 CPAN 源码构建必挂（run 36567771452 `Configure failed for IO-AIO-4.81` 实锚）——apt libio-aio-perl 预装后 cpanm 视为已满足整包跳过"
+remark = "↖ mirror perl_language_server.py@7a296833 launch 串逐字（entry perl_ls exec）；上游另应答 workspace/configuration + didChangeConfiguration——T0 走 lsp-core 未注册请求默认 null 成功应答（kotlin 条目注释同源实锚），文件过滤回落 LS 默认；cpanm 依赖自动解算为预算主体，IO::AIO（AnyEvent::AIO 传递依赖）从 CPAN 源码构建必挂（run 36567771452 `Configure failed for IO-AIO-4.81` 实锚）——apt libio-aio-perl 预装后 cpanm 视为已满足整包跳过；stress：CPAN 源码构建 windows 无 Strawberry 前置、macos 编译时长不可控 → 双平台压测跳"
+install_windows = "SKIP"
+install_macos = "SKIP"
 
 [[lang]]
 id = "r"
@@ -553,7 +596,9 @@ pin = "languageserver suite (P3M noble 预编译) + r-base-core suite"
 fixture = "main.r"
 lang_flag = "r"
 budget_secs = 900
-remark = "↖ mirror r_language_server.py@7a296833 launch 串逐字（entry r_ls exec）；CRAN 源码编译依赖链在 runner 挂（run 36567771452 deps 中途断，日志截断不可回溯）——改 P3M（Posit Package Manager）noble 预编译二进制仓，免整链编译，缺二进制的包自动回落源码；回落源码的 fs 需 libuv 头（run 36577226543 错误消息自报 deb 名 libuv1-dev：'uv.h: No such file or directory'），apt 显式补"
+remark = "↖ mirror r_language_server.py@7a296833 launch 串逐字（entry r_ls exec）；CRAN 源码编译依赖链在 runner 挂（run 36567771452 deps 中途断，日志截断不可回溯）——改 P3M（Posit Package Manager）noble 预编译二进制仓，免整链编译，缺二进制的包自动回落源码；回落源码的 fs 需 libuv 头（run 36577226543 错误消息自报 deb 名 libuv1-dev：'uv.h: No such file or directory'），apt 显式补；stress 平台行 = R 4.6.1 windows 预装（Windows2025 Readme 实锚）/ macos brew formula r 兜底 + CRAN languageserver（win/mac 默认二进制包类型，免 P3M linux 专用仓）"
+install_windows = "R --vanilla --slave -e \"install.packages('languageserver', repos='https://cloud.r-project.org')\" && R --vanilla --slave -e \"cat(as.character(packageVersion('languageserver')))\""
+install_macos = "command -v R >/dev/null 2>&1 || brew install r; R --vanilla --slave -e \"install.packages('languageserver', repos='https://cloud.r-project.org')\" && R --vanilla --slave -e \"cat(as.character(packageVersion('languageserver')))\""
 
 [[lang]]
 id = "crystal"
@@ -573,11 +618,13 @@ remark = "↖ mirror crystal_language_server.py@7a296833（shutil.which 裸启�
 id = "zig"
 via = "serena-download"
 install = "curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz && echo \"70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz\" | sha256sum -c - && sudo tar -xJf /tmp/zig.tar.xz -C /usr/local && sudo ln -sf /usr/local/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig && \"$SERENA_CLI\" install zig && zig version && sudo ln -sf \"$HOME\"/.local/share/serena/ls/zls/*/zls /usr/local/bin/zls && zls --version"
-pin = "servers.toml"
+pin = "servers.toml + zig 0.16.0 工具链 (ziglang.org index.json sha 实锚 2026-09-30, 三平台)"
 fixture = "main.zig"
 lang_flag = "zig"
 budget_secs = 600
-remark = "--lang zig → [servers.zls]（本批 path_only → download 升级，六平台 digest 锚；tarball 内 bin 布局扁平假设为 CI 首跑实锚点）；zig 0.16.0 工具链 ziglang.org 官方 tarball（sha = index.json 实锚）symlink 入 PATH——zls 与 zig 严格同 minor 配对（0.16.x）；serena install 把 zls 落缓存目录不落 PATH（run 36567771452 `zls: command not found` exit 127 实锚）——install 行按缓存布局 glob symlink 到 /usr/local/bin 再验 --version"
+install_windows = "W=$(cygpath -m \"$HOME\") && curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip -o \"$W/zig.zip\" && echo \"68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e  $W/zig.zip\" | sha256sum -c - && mkdir -p \"$W/zig016\" && python -m zipfile -e \"$W/zig.zip\" \"$W/zig016\" && ZD=$(cygpath -u \"$W\")/zig016/zig-x86_64-windows-0.16.0 && echo \"export PATH=\\\"$ZD:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && zig version && $SERENA_CLI install zig && find \"$(cygpath -u \"$LOCALAPPDATA\")/serena/ls/zls\" -name 'zls.exe' -exec cp {} \"$HOME/.local/bin/zls.exe\" \\; && zls --version"
+install_macos = "curl -fsSL https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz -o /tmp/zig.tar.xz && echo \"b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  /tmp/zig.tar.xz\" | shasum -a 256 -c - && mkdir -p \"$HOME/zig016\" && tar -xJf /tmp/zig.tar.xz -C \"$HOME/zig016\" && echo \"export PATH=\\\"$HOME/zig016/zig-aarch64-macos-0.16.0:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && zig version && $SERENA_CLI install zig && find \"$HOME/.local/share/serena/ls/zls\" -name zls -exec cp {} \"$HOME/.local/bin/zls\" \\; && zls --version"
+remark = "--lang zig → [servers.zls]（本批 path_only → download 升级，六平台 digest 锚；tarball 内 bin 布局扁平假设为 CI 首跑实锚点）；zig 0.16.0 工具链 ziglang.org 官方 tarball（sha = index.json 实锚）symlink 入 PATH——zls 与 zig 严格同 minor 配对（0.16.x）；serena install 把 zls 落缓存目录不落 PATH（run 36567771452 `zls: command not found` exit 127 实锚）——install 行按缓存布局 glob symlink 到 /usr/local/bin 再验 --version；stress 平台行：win/mac zig 解压到 $HOME 后 EXTRA_ENV 前插 bin（zig 需同目录 lib），zls 从平台缓存根 glob 拷入 $HOME/.local/bin（main() PATH 前置）——win 缓存根 = %LOCALAPPDATA%/serena/ls"
 
 # ══ R6 存量 SKIP 段（java/latex/pascal/omnisharp/al 已于 langs20 批转真门；matlab 维持 LICENSE SKIP）═══
 
@@ -585,11 +632,13 @@ remark = "--lang zig → [servers.zls]（本批 path_only → download 升级，
 id = "java"
 via = "serena-download"
 install = "curl -fsSL \"https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jre/hotspot/normal/eclipse\" -o /tmp/jre25.tar.gz && sudo mkdir -p /opt/jre25 && sudo tar -xzf /tmp/jre25.tar.gz -C /opt/jre25 --strip-components=1 && sudo update-alternatives --install /usr/bin/java java /opt/jre25/bin/java 2500 && sudo update-alternatives --set java /opt/jre25/bin/java && java -version 2>&1 | head -1 >&2"
-pin = "jdtls snapshot latest (T2 自带下载) + Temurin JRE 25 (api.adoptium.net v3 binary 端点 307→github 实锚 2026-09-30)"
+pin = "jdtls snapshot latest (T2 自带下载) + Temurin JRE 25（linux = api.adoptium.net v3 binary 端点 307→github 实锚 2026-09-30；win/mac = runner 预装 JAVA_HOME_25_{X64,arm64}，Windows2025/macos-15-arm64 Readme 实锚 25.0.4）"
 fixture = "Main.java"
 lang_flag = "java"
 budget_secs = 900
-remark = "langs20 轮转真门：T2 jdtls.rs 走 download.eclipse.org snapshot latest（滚动），本构建要求 JRE 25+（jdtls.rs 模块注释实锚），noble apt 封顶 21 → Adoptium API 直装 JRE 25 并 update-alternatives 切系统默认（install 子 shell 的 env 导出不回传 daemon，系统态软链才是 daemon LS spawn 的 java 解析——bsl 门同源教训）；jdtls 包本体 T2 首启自动下载（doctor.rs hint 实锚），无需 install 行显式装；snapshot 滚动 JDK 下限漂浮为已知漂移（jdtls.rs 已知漂移节），下限再涨时抬 JRE 版本即可"
+install_windows = "JB=$(cygpath -u \"$JAVA_HOME_25_X64\")/bin && echo \"export PATH=\\\"$JB:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && java -version 2>&1 | head -1 >&2"
+install_macos = "echo \"export PATH=\\\"$JAVA_HOME_25_arm64/bin:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && java -version 2>&1 | head -1 >&2"
+remark = "langs20 轮转真门：T2 jdtls.rs 走 download.eclipse.org snapshot latest（滚动），本构建要求 JRE 25+（jdtls.rs 模块注释实锚），noble apt 封顶 21 → Adoptium API 直装 JRE 25 并 update-alternatives 切系统默认（install 子 shell 的 env 导出不回传 daemon，系统态软链才是 daemon LS spawn 的 java 解析——bsl 门同源教训）；jdtls 包本体 T2 首启自动下载（doctor.rs hint 实锚），无需 install 行显式装；snapshot 滚动 JDK 下限漂浮为已知漂移（jdtls.rs 已知漂移节），下限再涨时抬 JRE 版本即可；stress 平台行 = runner 已预装 25 → JAVA_HOME_25 前插 EXTRA_ENV PATH（免 Adoptium 下载），替代 linux 系统态传导"
 
 [[lang]]
 id = "matlab"
@@ -611,7 +660,8 @@ pin = "servers.toml"
 fixture = "main.tex"
 lang_flag = "latex"
 budget_secs = 420
-remark = "langs20 轮转真门：R6 skip 引『需 texlive ~2GB 工具链』过重——复核上游 texlab_language_server.py@7a296833：texlab 是 Rust 单二进制（download 条目已在表，5.25.1 sha = GitHub API assets[].digest 2026-09-30 复锚），documentSymbol 走源码结构解析（section/环境），裸 .tex 即出符号，编译类能力（latexmk 构建）才需工具链；fixture 补 \\section/\\subsection 给结构符号（原 fixture 无节，符号集合为空风险）"
+install_windows = "SKIP"
+remark = "langs20 轮转真门：R6 skip 引『需 texlive ~2GB 工具链』过重——复核上游 texlab_language_server.py@7a296833：texlab 是 Rust 单二进制（download 条目已在表，5.25.1 sha = GitHub API assets[].digest 2026-09-30 复锚），documentSymbol 走源码结构解析（section/环境），裸 .tex 即出符号，编译类能力（latexmk 构建）才需工具链；fixture 补 \\section/\\subsection 给结构符号（原 fixture 无节，符号集合为空风险）；stress：win 组注释未启用 → win 压测跳"
 
 [[lang]]
 id = "pascal"
@@ -621,7 +671,9 @@ pin = "servers.toml"
 fixture = "smoke.pp"
 lang_flag = "pascal"
 budget_secs = 900
-remark = "langs20 R4 封顶轮（路径 a+b 双管）：daemon.log 显示 pasls 存活且每 10s 'Reloaded .../smoke.pp in 0 ms' 但 documentSymbol 恒空（Reload 反复 = 探针重试 didOpen 非 LS 自愈）——路径 a 否定：↖ mirror pascal_server.py@7a296833 _start_server 全文 = 裸 initialize+initialized，env 仅 settings 显式配置注入，无 init-options/didSave/等待 quirk（5s ready 兜底即用）；路径 b 采纳：fixture 改标准 unit 形态（unit Smoke; interface 函数 + implementation）——CodeTools 符号树只出 interface 段符号，裸 program 骨架零符号；bin_path 内层目录修复已 R2 实绿（install.out exe=pasls-x86_64-linux/pasls）；FPC 前置 = apt fpc"
+remark = "langs20 R4 封顶轮（路径 a+b 双管）：daemon.log 显示 pasls 存活且每 10s 'Reloaded .../smoke.pp in 0 ms' 但 documentSymbol 恒空（Reload 反复 = 探针重试 didOpen 非 LS 自愈）——路径 a 否定：↖ mirror pascal_server.py@7a296833 _start_server 全文 = 裸 initialize+initialized，env 仅 settings 显式配置注入，无 init-options/didSave/等待 quirk（5s ready 兜底即用）；路径 b 采纳：fixture 改标准 unit 形态（unit Smoke; interface 函数 + implementation）——CodeTools 符号树只出 interface 段符号，裸 program 骨架零符号；bin_path 内层目录修复已 R2 实绿（install.out exe=pasls-x86_64-linux/pasls）；FPC 前置 = apt fpc；stress 平台行：macos = brew formula fpc（arm64 bottle 在，homebrew-core 实锚 2026-09-30）+ pasls macos 组资产；windows = pasls 资产在但 FPC win InnoSetup 装法重且 sourceforge URL 本网络无法一手验证 → 压测跳"
+install_macos = "command -v fpc >/dev/null 2>&1 || brew install fpc; fpc -iV && $SERENA_CLI install pascal"
+install_windows = "SKIP"
 
 [[lang]]
 id = "omnisharp"
@@ -631,7 +683,8 @@ pin = "servers.toml"
 fixture = "omnisharp/smoke.cs"
 lang_flag = "omnisharp"
 budget_secs = 900
-remark = "langs20 R2 改版：R1 的 mono 自包含变体（zip + apt mono-complete）首跑 initialize 30s 超时（run 36649455255——mono JIT 冷启动超出 lsp-core 单请求 30s，lsp-core 非目标不可动）——servers.toml linux 组改 net6 tar.gz（beta.4 前缀 URL，sha = 本机 45.5MB 整包下载一手锚）：根 `OmniSharp` 原生 apphost 冷启动快一个量级，runtimeconfig 自带 rollForward LatestMajor → runner dotnet 8 直接可跑（免 mono 免 env，条目注释详证）；exec 无 -s <sln>，OmniSharp -lsp 走 folder 模式自发现 fixture 目录内 csproj（csharp 门 csproj+restore 先例）；razor 插件不在（单下载 schema 不支持双包，基础 LSP 足够底线探针）；csharp 主门（Roslyn/csharp-ls）不动，本门为变体门"
+remark = "langs20 R2 改版：R1 的 mono 自包含变体（zip + apt mono-complete）首跑 initialize 30s 超时（run 36649455255——mono JIT 冷启动超出 lsp-core 单请求 30s，lsp-core 非目标不可动）——servers.toml linux 组改 net6 tar.gz（beta.4 前缀 URL，sha = 本机 45.5MB 整包下载一手锚）：根 `OmniSharp` 原生 apphost 冷启动快一个量级，runtimeconfig 自带 rollForward LatestMajor → runner dotnet 8 直接可跑（免 mono 免 env，条目注释详证）；exec 无 -s <sln>，OmniSharp -lsp 走 folder 模式自发现 fixture 目录内 csproj（csharp 门 csproj+restore 先例）；razor 插件不在（单下载 schema 不支持双包，基础 LSP 足够底线探针）；csharp 主门（Roslyn/csharp-ls）不动，本门为变体门；stress：上游无 macos 资产（win/linux 双组已启用）→ macos 压测跳"
+install_macos = "SKIP"
 
 [[lang]]
 id = "al"
@@ -653,22 +706,26 @@ remark = "langs20 R2 转真门（gzip 解包 + chmod 执行位两轮修复，ins
 id = "scala"
 via = "coursier"
 install = "curl -fLo cs.gz https://github.com/coursier/coursier/releases/download/v2.1.25/cs-x86_64-pc-linux.gz && gunzip -f cs.gz && chmod +x cs && ./cs bootstrap org.scalameta:metals_2.13:1.6.4 -o metals --java-opt -Xss4m && sudo ln -sf \"$PWD/metals\" /usr/local/bin/metals"
-pin = "metals_2.13:1.6.4（上游 scala_language_server.py@43ae0211 DEFAULT_METALS_VERSION）+ coursier v2.1.25"
+pin = "metals_2.13:1.6.4（上游 scala_language_server.py@43ae0211 DEFAULT_METALS_VERSION）+ coursier v2.1.25（win zip / mac gz，assets[].digest 实锚 2026-09-30）"
 fixture = "scala/Main.scala"
 lang_flag = "scala"
 budget_secs = 900
 fallback_assert = "hover:2:7"
-remark = "path_only 门：servers.toml [servers.scala] 只探 PATH，安装走 coursier bootstrap 到 /usr/local/bin（JDK 11+，runner 预装 17）；GitHub release 无预编译资产（v1.6.9 assets=[] 2026-09-29 实查）。fixture 无 build 文件——T0 不应答 import 构建提示（上游应答之），无 build 走 metals standalone PC；documentSymbol 若空降级 hover 探针"
+install_windows = "W=$(cygpath -m \"$HOME\") && curl -fsSL https://github.com/coursier/coursier/releases/download/v2.1.25/cs-x86_64-pc-win32.zip -o \"$W/cs.zip\" && echo \"35fa5c65b2439ffb3609cf699e6a89a7d5d8e0eb794b2ce51005d96f9efd5242  $W/cs.zip\" | sha256sum -c - && python -m zipfile -e \"$W/cs.zip\" \"$HOME/.local/bin\" && \"$HOME/.local/bin/cs.exe\" bootstrap org.scalameta:metals_2.13:1.6.4 -o \"$HOME/.local/bin/metals\" --java-opt -Xss4m && metals --version"
+install_macos = "curl -fsSL https://github.com/coursier/coursier/releases/download/v2.1.25/cs-aarch64-apple-darwin.gz -o /tmp/cs.gz && echo \"43a485b1bc5c8d13a4614b5a59211b6612d62b38b9b4166d6bddbdefb4ace4de  /tmp/cs.gz\" | shasum -a 256 -c - && gunzip -f /tmp/cs.gz && chmod +x /tmp/cs && /tmp/cs bootstrap org.scalameta:metals_2.13:1.6.4 -o \"$HOME/.local/bin/metals\" --java-opt -Xss4m && metals --version"
+remark = "path_only 门：servers.toml [servers.scala] 只探 PATH，安装走 coursier bootstrap 到 /usr/local/bin（JDK 11+，runner 预装 17）；GitHub release 无预编译资产（v1.6.9 assets=[] 2026-09-29 实查）。fixture 无 build 文件——T0 不应答 import 构建提示（上游应答之），无 build 走 metals standalone PC；documentSymbol 若空降级 hover 探针；stress 平台行 = coursier bootstrap 到 $HOME/.local/bin（main() PATH 前置），JDK win/mac runner 预装 17/21（Readme 实锚）；macos-latest 固定 macos-15 arm64 → aarch64 资产"
 
 [[lang]]
 id = "swift"
 via = "binary"
 install = "curl -fsSL https://download.swift.org/swift-6.2.4-release/ubuntu2404/swift-6.2.4-RELEASE/swift-6.2.4-RELEASE-ubuntu24.04.tar.gz -o /tmp/swift.tar.gz && sudo mkdir -p /opt/swift && sudo tar -xzf /tmp/swift.tar.gz -C /opt/swift --strip-components=2 && sudo ln -sf /opt/swift/bin/sourcekit-lsp /opt/swift/bin/swiftc /opt/swift/bin/swift /usr/local/bin/ && swift --version 2>&1 | head -1 >&2 && test -x /usr/local/bin/sourcekit-lsp"
-pin = "sourcekit-lsp 6.2.4（随 swift.org 6.2.4 RELEASE ubuntu24.04 工具链；release 无官方 per-file digest 故钉 URL——erlang_ls 先例；URL HEAD 200 实锚 2026-09-30）"
+pin = "sourcekit-lsp 6.2.4（随 swift.org 6.2.4 RELEASE ubuntu24.04 工具链；release 无官方 per-file digest 故钉 URL——erlang_ls 先例；URL HEAD 200 实锚 2026-09-30）; macos = Xcode CLT 16.4 自带（suite，PM 指定免装）；windows = 工具链 700MB 超重压测跳"
 fixture = "main.swift"
 lang_flag = "swift"
 budget_secs = 1200
-remark = "langs20 R2 修：R1 首跑工具链装好、symlink 已建，但验证命令 `sourcekit-lsp --version` 不存在（Unknown option exit 64，run 36649455255 实锚）→ swift --version（工具链级，支持）打 install.out + test -x 收口；其余锚同 R1：swift.org 官方 linux tarball 脚本化自举（path_only 条目本体不动，工具链入 PATH 即探测面命中），--strip-components=2 剥 swift-6.2.4-RELEASE-usr/ 包装层，documentSymbol 裸 .swift 走 sourcekitd 语法层，tarball ~700MB 为预算主体（1200 上限）"
+install_macos = "sudo ln -sf \"$(xcrun --find sourcekit-lsp)\" /usr/local/bin/sourcekit-lsp && test -x /usr/local/bin/sourcekit-lsp"
+install_windows = "SKIP"
+remark = "langs20 R2 修：R1 首跑工具链装好、symlink 已建，但验证命令 `sourcekit-lsp --version` 不存在（Unknown option exit 64，run 36649455255 实锚）→ swift --version（工具链级，支持）打 install.out + test -x 收口；其余锚同 R1：swift.org 官方 linux tarball 脚本化自举（path_only 条目本体不动，工具链入 PATH 即探测面命中），--strip-components=2 剥 swift-6.2.4-RELEASE-usr/ 包装层，documentSymbol 裸 .swift 走 sourcekitd 语法层，tarball ~700MB 为预算主体（1200 上限）；stress 平台行：macos = Xcode 自带 sourcekit-lsp（macos-15 Readme Xcode CLT 16.4 实锚）xcrun symlink；windows 700MB 超重 → SKIP PLATFORM（PM 拍板示例）"
 
 # ══ W5 批（gleam/lean4/julia 三真门 + wolfram SKIP 批准冻结；qml R6 SKIP → langs20 R2 短暂转真门 → R3 回 SKIP 两 strike）═══
 
@@ -676,12 +733,14 @@ remark = "langs20 R2 修：R1 首跑工具链装好、symlink 已建，但验证
 id = "gleam"
 via = "binary"
 install = "curl -fsSL https://github.com/gleam-lang/gleam/releases/download/v1.18.1/gleam-v1.18.1-x86_64-unknown-linux-musl.tar.gz -o /tmp/gleam.tar.gz && echo \"4955a38c2e8c99457458e2471472ccd5ee3c45bd7637a315ce33bccf0dd75d9e  /tmp/gleam.tar.gz\" | sha256sum -c - && mkdir -p /tmp/gleam && tar -xzf /tmp/gleam.tar.gz -C /tmp/gleam && sudo find /tmp/gleam -type f -name gleam -exec install -m 755 {} /usr/local/bin/ \\; && gleam --version"
-pin = "gleam v1.18.1 (musl 静态单二进制; sha256 = GitHub API assets[].digest 2026-09-29)"
+pin = "gleam v1.18.1 (musl 静态单二进制; sha256 = GitHub API assets[].digest 2026-09-29; win/mac 资产 digest 实锚 2026-09-30)"
 fixture = "main.gleam"
 lang_flag = "gleam"
 budget_secs = 300
 fallback_assert = "hover:2:7"
-remark = "↖ mirror gleam_language_server.py@7a296833（`gleam lsp` 子命令，deno/cue 同款 CLI 内置 LS，条目存量本体不动）；上游适配器等首批 $/progress 依赖解析——T0 无此等待门由工具层超时承担；bare fixture 无 gle.toml 走单文件分析，documentSymbol 若空降级 hover 探针；tarball 解包布局未知故 find-install（haskell/erlang 先例）"
+install_windows = "W=$(cygpath -m \"$HOME\") && curl -fsSL https://github.com/gleam-lang/gleam/releases/download/v1.18.1/gleam-v1.18.1-x86_64-pc-windows-msvc.zip -o \"$W/gleam.zip\" && echo \"1702b597e27486be7eb5fd8d3624eeca7ae5e183009e01ae2550b8a9b2a96a44  $W/gleam.zip\" | sha256sum -c - && mkdir -p \"$W/gleamx\" && python -m zipfile -e \"$W/gleam.zip\" \"$W/gleamx\" && find \"$W/gleamx\" -name 'gleam.exe' -exec cp {} \"$HOME/.local/bin/gleam.exe\" \\; && gleam --version"
+install_macos = "curl -fsSL https://github.com/gleam-lang/gleam/releases/download/v1.18.1/gleam-v1.18.1-aarch64-apple-darwin.tar.gz -o /tmp/gleam.tar.gz && echo \"1aae21fd5c70b89e0972427934a13b33886efa7f08bf428e1baee5ebd10d1753  /tmp/gleam.tar.gz\" | shasum -a 256 -c - && mkdir -p /tmp/gleamx && tar -xzf /tmp/gleam.tar.gz -C /tmp/gleamx && find /tmp/gleamx -type f -name gleam -exec cp {} \"$HOME/.local/bin/gleam\" \\; && gleam --version"
+remark = "↖ mirror gleam_language_server.py@7a296833（`gleam lsp` 子命令，deno/cue 同款 CLI 内置 LS，条目存量本体不动）；上游适配器等首批 $/progress 依赖解析——T0 无此等待门由工具层超时承担；bare fixture 无 gle.toml 走单文件分析，documentSymbol 若空降级 hover 探针；tarball 解包布局未知故 find-install（haskell/erlang 先例）；stress 平台行 = 官方单二进制资产（aarch64-apple-darwin / x86_64-pc-windows-msvc，digest 实锚）cp 入 $HOME/.local/bin（main() PATH 前置），find-install 同 linux 行"
 
 [[lang]]
 id = "qml"
@@ -701,21 +760,25 @@ remark = "langs20 R2 转真门、R3 回 SKIP（PM 两 strike 定论 2026-09-30�
 id = "lean4"
 via = "binary"
 install = "sudo apt-get update -qq && sudo apt-get install -y -qq zstd && curl -fsSL https://github.com/leanprover/lean4/releases/download/v4.34.1/lean-4.34.1-linux.tar.zst -o /tmp/lean.tar.zst && echo \"47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4  /tmp/lean.tar.zst\" | sha256sum -c - && sudo tar --zstd -xf /tmp/lean.tar.zst -C /opt && sudo ln -sf /opt/lean-4.34.1-linux/bin/lean /usr/local/bin/lean && lean --version"
-pin = "lean v4.34.1 (最新稳定版，rc 链 4.35.0 排除; sha256 = GitHub API assets[].digest 2026-09-29)"
+pin = "lean v4.34.1 (最新稳定版，rc 链 4.35.0 排除; linux tar.zst sha256 = GitHub API assets[].digest 2026-09-29; win/mac zip digest 实锚 2026-09-30)"
 fixture = "Main.lean"
 lang_flag = "lean"
 budget_secs = 900
-remark = "↖ mirror lean4_language_server.py@7a296833（`lean --server`，条目存量本体不动）；580MB tar.zst 全工具链（免 elan，钉版确定性）——tar.zst 解压需 zstd（runner 无，apt 显式补，run 36567771452 `tar --zstd` exit 127 实锚），tarball 内解包前缀 lean-4.34.1-linux/（run 36577226543 range 拉头部解流实锚：首条目 `lean-4.34.1-linux/`；旧锚 lean/bin/lean 有误——ln 落 dangling symlink，bash PATH 搜索跳过即报 `lean: command not found` exit 127）；Δ 未抄上游 lake env LEAN_PATH 注入——standalone fixture 走基础符号（def/theorem documentSymbol）；--lang lean 命中 [servers.lean4]（语言名=lean 官方口径，条目 id=lean4，zls/zig 双名先例）"
+install_windows = "W=$(cygpath -m \"$HOME\") && curl -fsSL https://github.com/leanprover/lean4/releases/download/v4.34.1/lean-4.34.1-windows.zip -o \"$W/lean.zip\" && echo \"457698d4e2132243e899ff32178d7ae63c16431d09ed9ad524d859c3581992af  $W/lean.zip\" | sha256sum -c - && mkdir -p \"$W/lean434\" && python -m zipfile -e \"$W/lean.zip\" \"$W/lean434\" && LB=$(cygpath -u \"$(find \"$W/lean434\" -name lean.exe | head -1 | xargs dirname)\") && echo \"export PATH=\\\"$LB:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && lean --version"
+install_macos = "curl -fsSL https://github.com/leanprover/lean4/releases/download/v4.34.1/lean-4.34.1-darwin_aarch64.zip -o /tmp/lean.zip && echo \"9019fcd34e93fddf0ecf9d40d28f05a86ba563ac3b701a9c5116ce1c96379360  /tmp/lean.zip\" | shasum -a 256 -c - && mkdir -p \"$HOME/lean434\" && unzip -q /tmp/lean.zip -d \"$HOME/lean434\" && LB=$(dirname \"$(find \"$HOME/lean434\" -name lean | head -1)\") && echo \"export PATH=\\\"$LB:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && lean --version"
+remark = "↖ mirror lean4_language_server.py@7a296833（`lean --server`，条目存量本体不动）；580MB tar.zst 全工具链（免 elan，钉版确定性）——tar.zst 解压需 zstd（runner 无，apt 显式补，run 36567771452 `tar --zstd` exit 127 实锚），tarball 内解包前缀 lean-4.34.1-linux/（run 36577226543 range 拉头部解流实锚：首条目 `lean-4.34.1-linux/`；旧锚 lean/bin/lean 有误——ln 落 dangling symlink，bash PATH 搜索跳过即报 `lean: command not found` exit 127）；Δ 未抄上游 lake env LEAN_PATH 注入——standalone fixture 走基础符号（def/theorem documentSymbol）；--lang lean 命中 [servers.lean4]（语言名=lean 官方口径，条目 id=lean4，zls/zig 双名先例）；stress 平台行 = 官方 zip（免 zstd 依赖，~800MB 下载为预算主体；mac 用 darwin_aarch64.zip 免 tar.zst），lean 需同目录 lib → EXTRA_ENV 前插解压 bin 而非拷贝单文件"
 
 [[lang]]
 id = "julia"
 via = "binary"
 install = "curl -fsSL https://julialang-s3.julialang.org/bin/linux/x64/1.13/julia-1.13.1-linux-x86_64.tar.gz -o /tmp/julia.tar.gz && echo \"0f2e18c8dea60a2c8711d089cd9612f7a8df394b89e5208096fe5867647e0908  /tmp/julia.tar.gz\" | sha256sum -c - && sudo tar -xzf /tmp/julia.tar.gz -C /opt && sudo ln -sf /opt/julia-1.13.1/bin/julia /usr/local/bin/julia && julia -e 'using Pkg; Pkg.add(\"LanguageServer\")' && julia -e 'using LanguageServer; println(\"ls-ok\")'"
-pin = "julia v1.13.1 (sha256 = julialang-s3 versions.json 官方锚 2026-09-29；二进制已不在 GitHub release——资产仅源码+full 包) + LanguageServer.jl latest (Pkg 解算)"
+pin = "julia v1.13.1 (sha256 = julialang-s3 versions.json 官方锚 2026-09-29；二进制已不在 GitHub release——资产仅源码+full 包; win zip / mac aarch64 tar.gz versions.json sha 实锚 2026-09-30) + LanguageServer.jl latest (Pkg 解算)"
 fixture = "main.jl"
 lang_flag = "julia"
 budget_secs = 1200
-remark = "↖ mirror julia_server.py@7a296833（launch argv 逐字，条目本批新增 path_only）；Pkg.add LanguageServer 预装为预算主体（上游 _install_language_server 超时 300s，含 precompile）；T0 spawn cwd = 项目根 → runserver choose_env pwd 回落（上游尾参 repo_root 省略，语义等价）；workspace/configuration 走 lsp-core null 应答，lint 回落默认——底线 documentSymbol 不受影响；budget 1200 为上限估待 CI 实测校准"
+install_windows = "W=$(cygpath -m \"$HOME\") && curl -fsSL https://julialang-s3.julialang.org/bin/winnt/x64/1.13/julia-1.13.1-win64.zip -o \"$W/julia.zip\" && echo \"648e39c58158c5c8dde08bb0df0b5bce51d517be1396a37a539bb61bc241c8b4  $W/julia.zip\" | sha256sum -c - && mkdir -p \"$W/julia113\" && python -m zipfile -e \"$W/julia.zip\" \"$W/julia113\" && JB=$(cygpath -u \"$(find \"$W/julia113\" -name julia.exe | head -1 | xargs dirname)\") && echo \"export PATH=\\\"$JB:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && julia -e 'using Pkg; Pkg.add(\"LanguageServer\")' && julia -e 'using LanguageServer; println(\"ls-ok\")'"
+install_macos = "curl -fsSL https://julialang-s3.julialang.org/bin/mac/aarch64/1.13/julia-1.13.1-macaarch64.tar.gz -o /tmp/julia.tar.gz && echo \"a3e0259d4777c2b776c2cba134d5b6c6c124048dcb913f8881517892c49a0f7f  /tmp/julia.tar.gz\" | shasum -a 256 -c - && mkdir -p \"$HOME/julia113\" && tar -xzf /tmp/julia.tar.gz -C \"$HOME/julia113\" && JB=$(dirname \"$(find \"$HOME/julia113\" -name julia | head -1)\") && echo \"export PATH=\\\"$JB:\\$PATH\\\"\" > \"$SERENA_EXTRA_ENV\" && . \"$SERENA_EXTRA_ENV\" && julia -e 'using Pkg; Pkg.add(\"LanguageServer\")' && julia -e 'using LanguageServer; println(\"ls-ok\")'"
+remark = "↖ mirror julia_server.py@7a296833（launch argv 逐字，条目本批新增 path_only）；Pkg.add LanguageServer 预装为预算主体（上游 _install_language_server 超时 300s，含 precompile）；T0 spawn cwd = 项目根 → runserver choose_env pwd 回落（上游尾参 repo_root 省略，语义等价）；workspace/configuration 走 lsp-core null 应答，lint 回落默认——底线 documentSymbol 不受影响；budget 1200 为上限估待 CI 实测校准；stress 平台行 = julialang-s3 官方 archive（versions.json sha 实锚），julia 需同目录 lib → EXTRA_ENV 前插解压 bin；Pkg.add 装法与 linux 行同"
 
 [[lang]]
 id = "wolfram"
@@ -739,7 +802,8 @@ pin = "servers.toml"
 fixture = "main.luau"
 lang_flag = "luau"
 budget_secs = 420
-remark = "langs20 批收编（上游 luau_lsp.py@7a296833 luau-lsp 单二进制，`luau-lsp lsp` 子命令——deno/gleam 同款 CLI 内置 LS）；[servers.luau] 条目已存（1.63.0，linux/macos 六 sha = GitHub API assets[].digest 2026-09-30 复核逐条一致，win 组缺省 CI 无涉）；--lang luau 显式路由（.luau 无 EXT_TABLE 占位，'luau' 不别名 Lua——W3 批断言在案）；platform 默认 roblox 口径（上游默认），裸 fixture 走内置定义分析，documentSymbol 兜底"
+install_windows = "SKIP"
+remark = "langs20 批收编（上游 luau_lsp.py@7a296833 luau-lsp 单二进制，`luau-lsp lsp` 子命令——deno/gleam 同款 CLI 内置 LS）；[servers.luau] 条目已存（1.63.0，linux/macos 六 sha = GitHub API assets[].digest 2026-09-30 复核逐条一致，win 组缺省 CI 无涉）；--lang luau 显式路由（.luau 无 EXT_TABLE 占位，'luau' 不别名 Lua——W3 批断言在案）；platform 默认 roblox 口径（上游默认），裸 fixture 走内置定义分析，documentSymbol 兜底；stress：win 组注释未启用（asset+sha 在注释）→ win 压测跳"
 
 [[lang]]
 id = "angular"
