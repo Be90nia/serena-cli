@@ -472,6 +472,40 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 注册/覆盖/列出/移除用户自装 LS（写 external-servers.toml；bd serena-rust-4ux）。
+    /// 已知语言/id → 继承内置条目，仅改指你的二进制；未知 id → `--lang <LANG>
+    /// --ext .<ext>` 注册全新语言。注册在 daemon 重启后生效。
+    LsUse {
+        /// 语言名或 server id（与 <path> 搭配注册/覆盖）。
+        #[arg(default_value = "")]
+        lang_or_id: String,
+        /// LS 二进制路径（Windows .exe/.cmd/.bat；存在 + 可执行校验）。
+        path: Option<String>,
+        /// 列出 external 注册条目 + 每语言生效来源（注册视角；全量视图用 ls-list）。
+        #[arg(long)]
+        list: bool,
+        /// 全新语言注册：语言名（与 --ext 成对必填）。
+        #[arg(long, value_name = "LANG")]
+        lang: Option<String>,
+        /// 全新语言注册：扩展名（如 .mydsl；与 --lang 成对必填）。
+        #[arg(long, value_name = "EXT")]
+        ext: Option<String>,
+        /// 移除注册条目（其余内容与注释逐字节保留）。
+        #[arg(long, value_name = "ID")]
+        remove: Option<String>,
+    },
+    /// 全量 LS 清单（内置 servers.toml 条目 × 实装状态 + external 新语言条目）。
+    LsList {
+        /// 人类可读表格（默认 JSON）。
+        #[arg(long)]
+        table: bool,
+    },
+    /// 卸载 serena 托管缓存里的 LS（只删 `{cache_root}/{id}/`；不碰 PATH/生态安装/
+    /// external 注册路径）。未知 id 会列出已装 id。
+    LsRemove {
+        /// servers.toml 条目 id。
+        id: String,
+    },
     /// 长连接 shell（stdin/stdout JSONL）。Task 18。
     ///
     /// 每行 stdin 一个 JSON 请求，响应逐行写 stdout。协议形状：
@@ -625,6 +659,39 @@ async fn cli_main() -> ExitCode {
             let lang = lang.clone();
             let json = *json;
             return tokio::task::spawn_blocking(move || cmd_uninstall(&lang, json))
+                .await
+                .unwrap_or(ExitCode::from(3));
+        }
+        // ls-use / ls-list / ls-remove：纯本地 fs/注册表操作（bd serena-rust-4ux）。
+        Some(Cmd::LsUse {
+            lang_or_id,
+            path,
+            list,
+            lang,
+            ext,
+            remove,
+        }) => {
+            let id = lang_or_id.clone();
+            let bin = path.clone();
+            let list = *list;
+            let new_lang = lang.clone();
+            let new_ext = ext.clone();
+            let remove = remove.clone();
+            return tokio::task::spawn_blocking(move || {
+                cmd_ls_use(&id, bin, list, new_lang, new_ext, remove)
+            })
+            .await
+            .unwrap_or(ExitCode::from(3));
+        }
+        Some(Cmd::LsList { table }) => {
+            let table = *table;
+            return tokio::task::spawn_blocking(move || cmd_ls_list(table))
+                .await
+                .unwrap_or(ExitCode::from(3));
+        }
+        Some(Cmd::LsRemove { id }) => {
+            let id = id.clone();
+            return tokio::task::spawn_blocking(move || cmd_ls_remove(&id))
                 .await
                 .unwrap_or(ExitCode::from(3));
         }
@@ -2009,6 +2076,9 @@ async fn forward(
         | Some(Cmd::StopAll)
         | Some(Cmd::Install { .. })
         | Some(Cmd::Uninstall { .. })
+        | Some(Cmd::LsUse { .. })
+        | Some(Cmd::LsList { .. })
+        | Some(Cmd::LsRemove { .. })
         | Some(Cmd::Shell)
         | Some(Cmd::Doctor { .. })
         | Some(Cmd::LintShell { .. })
@@ -2273,6 +2343,466 @@ fn dir_size(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+// ===== ls-use / ls-list / ls-remove（bd serena-rust-4ux）=====
+
+/// 本地管理命令的标准错误 JSON（与 daemon 9 错误码 wire 契约同形；retryable 恒
+/// false——本地 fs/配置错误重试无意义）。
+fn local_err_json(code: &str, msg: &str) {
+    println!(
+        "{}",
+        json!({"ok": false, "error": {"code": code, "message": msg, "retryable": false}})
+    );
+}
+
+/// ls-use <LANG_OR_ID> <PATH>：注册/覆盖；--list；--remove <ID>；--lang/--ext
+/// 注册全新语言。已知语言/id → 继承内置 languages/extensions/exec。
+fn cmd_ls_use(
+    lang_or_id: &str,
+    path: Option<String>,
+    list: bool,
+    new_lang: Option<String>,
+    new_ext: Option<String>,
+    remove: Option<String>,
+) -> ExitCode {
+    let Some(cfg_path) = ls_registry::config::external_servers_path() else {
+        local_err_json(
+            "INTERNAL",
+            "cannot resolve external-servers.toml path (no APPDATA/HOME)",
+        );
+        return ExitCode::from(3);
+    };
+    let cfg_str = cfg_path.display().to_string();
+
+    if list {
+        return cmd_ls_use_list(&cfg_path);
+    }
+    if let Some(id) = remove {
+        if !ls_registry::config::valid_block_id(&id) {
+            local_err_json(
+                "BAD_ARGS",
+                &format!("invalid server id `{id}` (expected [A-Za-z0-9_-])"),
+            );
+            return ExitCode::from(2);
+        }
+        return match ls_registry::config::external_block_remove(&cfg_path, &id) {
+            Ok(true) => {
+                println!(
+                    "{}",
+                    json!({"ok": true, "server": id, "file": cfg_str, "removed": true})
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                local_err_json(
+                    "BAD_ARGS",
+                    &format!("`{id}` is not registered in {cfg_str}"),
+                );
+                ExitCode::from(2)
+            }
+            Err(e) => {
+                local_err_json("INTERNAL", &format!("write {cfg_str}: {e}"));
+                ExitCode::from(3)
+            }
+        };
+    }
+
+    let Some(bin_raw) = path else {
+        eprintln!(
+            "usage: serena-cli ls-use <LANG_OR_ID> <PATH_TO_BINARY> | --list | --remove <ID>"
+        );
+        return ExitCode::from(2);
+    };
+    if lang_or_id.is_empty() {
+        local_err_json("BAD_ARGS", "language name or server id required");
+        return ExitCode::from(2);
+    }
+    let bin = match ls_registry::config::validate_user_binary(Path::new(&bin_raw)) {
+        Ok(b) => b,
+        Err(m) => {
+            local_err_json("BAD_ARGS", &m);
+            return ExitCode::from(2);
+        }
+    };
+    let (id, languages, extensions, exec, is_override) = match ls_registry::config::builtin_spec_for(
+        lang_or_id,
+    ) {
+        Some((id, spec)) => (
+            id.to_string(),
+            spec.languages.clone(),
+            spec.extensions.clone(),
+            ls_registry::config::inherited_exec(spec),
+            true,
+        ),
+        None => match (new_lang, new_ext) {
+            (Some(l), Some(e)) => {
+                if !ls_registry::config::valid_block_id(lang_or_id) {
+                    local_err_json(
+                        "BAD_ARGS",
+                        &format!("invalid server id `{lang_or_id}` (expected [A-Za-z0-9_-])"),
+                    );
+                    return ExitCode::from(2);
+                }
+                let ext = if e.starts_with('.') {
+                    e
+                } else {
+                    format!(".{e}")
+                };
+                (
+                    lang_or_id.to_string(),
+                    vec![l],
+                    vec![ext],
+                    Vec::new(),
+                    false,
+                )
+            }
+            (got_lang, got_ext) => {
+                let mut msg = format!("unknown language/server id `{lang_or_id}`");
+                let cands = ls_registry::config::similar_server_ids(lang_or_id);
+                if !cands.is_empty() {
+                    let near: Vec<&str> = cands.iter().take(10).copied().collect();
+                    msg.push_str(&format!("; similar: {}", near.join(", ")));
+                }
+                match (got_lang, got_ext) {
+                        (None, Some(_)) => msg.push_str("; --lang is required together with --ext"),
+                        (Some(_), None) => msg.push_str("; --ext is required together with --lang"),
+                        _ => msg.push_str(&format!(
+                            "; to register a brand-new language: serena-cli ls-use {lang_or_id} <path> --lang <LANG> --ext .<ext>"
+                        )),
+                    }
+                local_err_json("BAD_ARGS", &msg);
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let block =
+        ls_registry::config::ls_use_block(&id, &languages, &extensions, &exec, &bin, is_override);
+    if let Err(e) = ls_registry::config::external_block_upsert(&cfg_path, &id, &block) {
+        local_err_json("INTERNAL", &format!("write {cfg_str}: {e}"));
+        return ExitCode::from(3);
+    }
+    println!(
+        "{}",
+        json!({
+            "ok": true,
+            "server": id,
+            "file": cfg_str,
+            "mode": if is_override { "override" } else { "new" },
+            "note": "takes effect after daemon restart (serena-cli stop-all or idle timeout)",
+        })
+    );
+    ExitCode::SUCCESS
+}
+
+/// ls-use --list：external 条目 + 每语言生效来源（builtin / external-override /
+/// external-new；负 priority 且撞内置 → 实际生效源是 builtin）。
+fn cmd_ls_use_list(cfg_path: &Path) -> ExitCode {
+    let mut entries = ls_registry::config::external_entries(cfg_path);
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let servers: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(id, spec)| {
+            let per_lang: Vec<serde_json::Value> = spec
+                .languages
+                .iter()
+                .map(|l| {
+                    let conflicts = ls_registry::config::builtin_spec_for(&id).is_some()
+                        || ls_registry::config::builtin_spec_for(l).is_some();
+                    let source = if conflicts {
+                        if spec.priority < 0 {
+                            "builtin"
+                        } else {
+                            "external-override"
+                        }
+                    } else {
+                        "external-new"
+                    };
+                    json!({"language": l, "source": source})
+                })
+                .collect();
+            json!({
+                "id": id,
+                "languages": spec.languages,
+                "priority": spec.priority,
+                "binary_name": spec.path_only.as_ref().map(|p| p.binary_name.clone()),
+                "language_source": per_lang,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        json!({
+            "ok": true,
+            "file": cfg_path.display().to_string(),
+            "servers": servers,
+            "unregister": "serena-cli ls-use --remove <ID>",
+        })
+    );
+    ExitCode::SUCCESS
+}
+
+/// cache_root/<id>/ 下的版本目录（目录名 = version/latest），各记递归字节数。
+fn cache_versions(id_dir: &Path) -> Vec<(String, PathBuf, u64)> {
+    let Ok(entries) = std::fs::read_dir(id_dir) else {
+        return Vec::new();
+    };
+    let mut v: Vec<(String, PathBuf, u64)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| {
+            let bytes = dir_size(&e.path());
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                e.path(),
+                bytes,
+            )
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// ls-list：内置表全条目 × 实装状态（installed / external-override /
+/// not-installed）+ external 新语言条目 + 总计（installed 数 / 可释放字节）。
+fn cmd_ls_list(table: bool) -> ExitCode {
+    let cache_root = ls_registry::config::dirs_cache_root();
+    let external: std::collections::BTreeMap<String, ls_registry::spec::ServerSpec> =
+        ls_registry::config::external_servers_path()
+            .map(|p| ls_registry::config::external_entries(&p))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let builtin: Vec<_> = ls_registry::config::builtin_entries();
+    let builtin_ids: std::collections::BTreeSet<&str> = builtin.iter().map(|(id, _)| *id).collect();
+
+    let mut servers = Vec::new();
+    let mut installed_count = 0usize;
+    let mut reclaimable = 0u64;
+    for (id, spec) in &builtin {
+        let versions = cache_versions(&cache_root.join(id));
+        let bytes: u64 = versions.iter().map(|(_, _, b)| *b).sum();
+        let overridden = external.get(*id).is_some_and(|s| s.priority >= 0);
+        let state = if overridden {
+            "external-override"
+        } else if !versions.is_empty() {
+            "installed"
+        } else {
+            "not-installed"
+        };
+        let mut entry = json!({
+            "id": id,
+            "languages": spec.languages,
+            "state": state,
+        });
+        if overridden {
+            entry["binary_name"] = external[*id]
+                .path_only
+                .as_ref()
+                .map(|p| json!(p.binary_name.clone()))
+                .unwrap_or(serde_json::Value::Null);
+        }
+        if !versions.is_empty() {
+            installed_count += 1;
+            reclaimable += bytes;
+            entry["versions"] = json!(
+                versions
+                    .iter()
+                    .map(|(v, p, b)| json!({
+                        "version": v,
+                        "path": p.display().to_string(),
+                        "bytes": b,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if state == "not-installed" {
+            entry["install_hint"] = json!(format!("serena-cli install {id}"));
+        }
+        servers.push(entry);
+    }
+    // external 新语言条目（id 不在内置表）——与 ls-use --list 条目同形。
+    let external_new: Vec<serde_json::Value> = external
+        .iter()
+        .filter(|(id, _)| !builtin_ids.contains(id.as_str()))
+        .map(|(id, s)| {
+            json!({
+                "id": id,
+                "languages": s.languages,
+                "binary_name": s.path_only.as_ref().map(|p| p.binary_name.clone()),
+            })
+        })
+        .collect();
+
+    if table {
+        println!("{:<24}{:<18}{:<20}DETAIL", "ID", "LANGUAGES", "STATE");
+        for e in &servers {
+            let id = e["id"].as_str().unwrap_or("");
+            let langs = e["languages"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let state = e["state"].as_str().unwrap_or("");
+            let detail = match state {
+                "installed" => e["versions"]
+                    .as_array()
+                    .map(|vs| {
+                        vs.iter()
+                            .map(|v| {
+                                format!(
+                                    "{} ({} bytes)",
+                                    v["version"].as_str().unwrap_or("?"),
+                                    v["bytes"].as_u64().unwrap_or(0)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default(),
+                "external-override" => e["binary_name"].as_str().unwrap_or("").to_string(),
+                _ => e["install_hint"].as_str().unwrap_or("").to_string(),
+            };
+            println!("{:<24}{:<18}{:<20}{}", id, langs, state, detail);
+        }
+        for e in &external_new {
+            let id = e["id"].as_str().unwrap_or("");
+            let langs = e["languages"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let bin = e["binary_name"].as_str().unwrap_or("");
+            println!("{:<24}{:<18}{:<20}{}", id, langs, "external-new", bin);
+        }
+        println!(
+            "\ninstalled {}/{}; reclaimable {reclaimable} bytes; external-new: {}",
+            installed_count,
+            servers.len(),
+            external_new.len()
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{}",
+        json!({
+            "ok": true,
+            "cache_root": cache_root.display().to_string(),
+            "total": servers.len(),
+            "installed": installed_count,
+            "reclaimable_bytes": reclaimable,
+            "servers": servers,
+            "external_new": external_new,
+        })
+    );
+    ExitCode::SUCCESS
+}
+
+/// ls-remove 失败语义（cmd 层映射 9 错误码 + exit code）。
+#[derive(Debug)]
+enum LsRemoveFail {
+    BadArgs(String),
+    NotFound(String),
+    Internal(String),
+}
+
+/// 只删 cache_root/<id>/：id 字符集闸（防 `..`/分隔符）+ canonicalize 后必须仍在
+/// cache root 下（防软链/符号链接越界，复用 ensure_within_cache_root）。
+/// 返回 (删除路径, 释放字节)。
+fn ls_remove_dir(root: &Path, id: &str) -> Result<(PathBuf, u64), LsRemoveFail> {
+    let valid = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !valid {
+        return Err(LsRemoveFail::BadArgs(format!(
+            "invalid server id `{id}` (expected [A-Za-z0-9_-])"
+        )));
+    }
+    let dir = root.join(id);
+    if !dir.is_dir() {
+        let installed = installed_ids(root).join(", ");
+        return Err(LsRemoveFail::NotFound(format!(
+            "`{id}` not found under cache root {}; installed: [{installed}]",
+            root.display()
+        )));
+    }
+    let dir = ls_registry::config::ensure_within_cache_root(root, &dir)
+        .map_err(LsRemoveFail::Internal)?;
+    let bytes = dir_size(&dir);
+    std::fs::remove_dir_all(&dir)
+        .map_err(|e| LsRemoveFail::Internal(format!("remove `{}`: {e}", dir.display())))?;
+    Ok((ls_registry::config::strip_unc(dir), bytes))
+}
+
+/// cache root 下的已装 id 清单（目录名，排序）。`undo` 是事务栈目录非 LS 安装。
+fn installed_ids(root: &Path) -> Vec<String> {
+    const NON_SERVER_DIRS: [&str; 1] = ["undo"];
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut v: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !NON_SERVER_DIRS.iter().any(|x| x == n))
+        .collect();
+    v.sort();
+    v
+}
+
+fn cmd_ls_remove(id: &str) -> ExitCode {
+    let cache_root = ls_registry::config::dirs_cache_root();
+    let ext_registered = ls_registry::config::external_servers_path()
+        .map(|p| {
+            ls_registry::config::external_entries(&p)
+                .iter()
+                .any(|(eid, _)| eid == id)
+        })
+        .unwrap_or(false);
+    match ls_remove_dir(&cache_root, id) {
+        Ok((path, bytes)) => {
+            if ext_registered {
+                eprintln!(
+                    "note: `{id}` is also registered in external-servers.toml; unregister with `serena-cli ls-use --remove {id}`"
+                );
+            }
+            println!(
+                "{}",
+                json!({"ok": true, "removed": id, "path": path.display().to_string(), "bytes_freed": bytes})
+            );
+            ExitCode::SUCCESS
+        }
+        Err(LsRemoveFail::BadArgs(m)) => {
+            local_err_json("BAD_ARGS", &m);
+            ExitCode::from(2)
+        }
+        Err(LsRemoveFail::NotFound(m)) => {
+            if ext_registered {
+                local_err_json(
+                    "BAD_ARGS",
+                    &format!(
+                        "`{id}` has no serena-managed cache dir; it is registered in external-servers.toml — unregister with `serena-cli ls-use --remove {id}`"
+                    ),
+                );
+            } else {
+                local_err_json("BAD_ARGS", &m);
+            }
+            ExitCode::from(2)
+        }
+        Err(LsRemoveFail::Internal(m)) => {
+            local_err_json("INTERNAL", &m);
+            ExitCode::from(3)
+        }
+    }
 }
 
 /// cargo metadata 健康检查（bd xzb-doctor 的 doctor 侧）：项目目录落在别的
@@ -3641,5 +4171,69 @@ mod residual_reap_tests {
         assert!(is_serena_daemon_image("cli.exe"));
         assert!(!is_serena_daemon_image("python.exe"));
         assert!(!is_serena_daemon_image("serena-cli-helper.exe"));
+    }
+}
+
+/// ls-remove 的参数化单测（bd serena-rust-4ux）：临时 fake cache 三例——
+/// 越界拒绝 / 正常删除 / 未知 id 列已装清单。
+#[cfg(test)]
+mod ls_remove_tests {
+    use super::*;
+
+    fn fake_cache(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "serena-ls-remove-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("marksman").join("0.10.0")).unwrap();
+        std::fs::write(
+            d.join("marksman").join("0.10.0").join("marksman.exe"),
+            b"fake",
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.join("zls").join("latest")).unwrap();
+        d
+    }
+
+    #[test]
+    fn ls_remove_deletes_only_target_id_dir() {
+        let root = fake_cache("ok");
+        let (path, bytes) = ls_remove_dir(&root, "marksman").expect("删除应成功");
+        let shown = path.display().to_string();
+        assert!(!shown.contains(r"\\?\"), "返回路径不得带 UNC 前缀: {shown}");
+        assert!(path.ends_with("marksman"));
+        assert!(bytes > 0, "释放字节数必须 >0");
+        assert!(!root.join("marksman").exists());
+        assert!(root.join("zls").is_dir(), "其它 id 目录必须幸存");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ls_remove_rejects_path_traversal_and_separators() {
+        let root = fake_cache("traversal");
+        for bad in ["..", "a/b", "a\\b", "."] {
+            let err = ls_remove_dir(&root, bad).expect_err("必须拒绝");
+            assert!(matches!(err, LsRemoveFail::BadArgs(_)), "bad={bad}");
+        }
+        assert!(root.join("marksman").is_dir(), "拒绝时不得删任何目录");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ls_remove_unknown_id_lists_installed() {
+        let root = fake_cache("unknown");
+        let err = ls_remove_dir(&root, "nosuchls").expect_err("未知 id 必须报错");
+        match err {
+            LsRemoveFail::NotFound(m) => {
+                assert!(
+                    m.contains("marksman") && m.contains("zls"),
+                    "须列已装 id: {m}"
+                );
+                assert!(m.contains("nosuchls"));
+            }
+            other => panic!("want NotFound, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 }

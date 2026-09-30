@@ -119,9 +119,9 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
     use supervisor::ToolError;
     let (code, message) = match err {
         ToolError::BadArgs { detail } => (WireErrorCode::BadArgs, detail.clone()),
-        ToolError::NotInstalled { language, hint } => {
-            (WireErrorCode::LsNotInstalled, format!("{language}: {hint}"))
-        }
+        // NotInstalled 走 Display 全文（含 hint + ls-use 注册指引，bd serena-rust-4ux）
+        // ——手拼 `{language}: {hint}` 会绕过中央注入点，agent 消费的 wire 消息拿不到指引。
+        ToolError::NotInstalled { .. } => (WireErrorCode::LsNotInstalled, err.to_string()),
         ToolError::Core(core) => match core {
             supervisor::CoreErrorWire::Rpc { code, message } => {
                 (WireErrorCode::RpcError, format!("rpc {code}: {message}"))
@@ -317,6 +317,12 @@ mod tests {
         assert_eq!(w.code, WireErrorCode::LsNotInstalled);
         assert_eq!(w.ls.as_deref(), Some("cpp"));
         assert!(!w.retryable);
+        // wire message 必须带 ls-use 中央指引（bd serena-rust-4ux）——agent 消费面。
+        assert!(
+            w.message.contains("serena-cli ls-use"),
+            "wire message 缺 ls-use 指引: {}",
+            w.message
+        );
     }
 
     #[test]

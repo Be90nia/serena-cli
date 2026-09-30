@@ -273,6 +273,281 @@ pub fn all_server_ids() -> impl Iterator<Item = &'static str> {
     builtin.chain(external)
 }
 
+/// 内置表遍历（`ls-list` 全量清单用）：按 id 排序的 (id, spec)。
+pub fn builtin_entries() -> Vec<(&'static str, &'static ServerSpec)> {
+    let mut v: Vec<_> = SERVERS
+        .servers
+        .iter()
+        .map(|(k, s)| (k.as_str(), s))
+        .collect();
+    v.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    v
+}
+
+/// 内置表查找（`ls-use` override 的继承源；已有 external 条目不作为继承源——
+/// 重注册走整块替换）。
+pub fn builtin_spec_for(lang_or_id: &str) -> Option<(&'static str, &'static ServerSpec)> {
+    table_hit(&SERVERS, lang_or_id)
+}
+
+/// 未知 id 报错的相近候选：id 或语言名前缀匹配（大小写不敏感），按 id 排序去重。
+pub fn similar_server_ids(prefix: &str) -> Vec<&'static str> {
+    let pfx = prefix.to_lowercase();
+    let mut hits: Vec<&'static str> = SERVERS
+        .servers
+        .iter()
+        .filter(|(id, s)| {
+            id.to_lowercase().starts_with(&pfx)
+                || s.languages
+                    .iter()
+                    .any(|l| l.to_lowercase().starts_with(&pfx))
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    hits.sort_unstable();
+    hits.dedup();
+    hits
+}
+
+/// `ls-use` 继承启动模板：exec 非空逐字继承；空则把子表启动参数（npm/uvx/dotnet/
+/// gem 的 args/npm_args）拼到 `{bin}` 后——npm 条目 exec 恒空而 npm_args 才是启动
+/// 参数，不拼会丢 `--stdio`；全空 = 裸启动（`expand_exec` 缺省 `[{bin}]`）。
+pub fn inherited_exec(spec: &ServerSpec) -> Vec<String> {
+    if !spec.exec.is_empty() {
+        return spec.exec.clone();
+    }
+    let args: Vec<String> = match spec.kind_table() {
+        Some(crate::spec::KindRef::Npm(n)) => n.npm_args.clone().unwrap_or_default(),
+        Some(crate::spec::KindRef::Uvx(u)) => u.args.clone().unwrap_or_default(),
+        Some(crate::spec::KindRef::Dotnet(d)) => d.args.clone().unwrap_or_default(),
+        Some(crate::spec::KindRef::Gem(g)) => g.args.clone().unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    if args.is_empty() {
+        Vec::new()
+    } else {
+        let mut exec = vec!["{bin}".to_string()];
+        exec.extend(args);
+        exec
+    }
+}
+
+/// 剥 Windows canonicalize 的 `\\?\` 前缀（写 TOML 前必须——LS 侧 URI/路径匹配不认
+/// UNC 形态；`\\?\UNC\server\share` → `\\server\share`）。手写不引 dunce。
+pub fn strip_unc(p: PathBuf) -> PathBuf {
+    let s = p.as_os_str().to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest.to_string()),
+        None => p,
+    }
+}
+
+/// `ls-use` 二进制校验（存在 + 可执行）。Windows 收 .exe/.cmd/.bat；Unix 查 X_OK
+/// 位。返回去 UNC 的绝对路径；失败给 BAD_ARGS 文案。
+pub fn validate_user_binary(raw: &Path) -> Result<PathBuf, String> {
+    let p = raw
+        .canonicalize()
+        .map_err(|e| format!("LS binary `{}`: {e}", raw.display()))?;
+    if !p.is_file() {
+        return Err(format!("`{}` is not a file", raw.display()));
+    }
+    #[cfg(windows)]
+    {
+        let ok = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "exe" | "cmd" | "bat"));
+        if !ok {
+            return Err(format!(
+                "`{}`: not an executable (.exe/.cmd/.bat required)",
+                raw.display()
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&p)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0);
+        if mode & 0o111 == 0 {
+            return Err(format!("`{}`: not executable (no X bit)", raw.display()));
+        }
+    }
+    Ok(strip_unc(p))
+}
+
+/// TOML 字符串字面量：无 `'` 走 literal string（Windows 反斜杠路径零转义）；
+/// 有 `'` 退 basic string（转义 `\` 与 `"`）。
+fn toml_str(s: &str) -> String {
+    if !s.contains('\'') {
+        return format!("'{s}'");
+    }
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+fn toml_str_list(items: &[String]) -> String {
+    let joined: Vec<String> = items.iter().map(|s| toml_str(s)).collect();
+    format!("[{}]", joined.join(", "))
+}
+
+/// `ls-use` 条目的 TOML 块（provenance 注释 + path_only 子表）。extensions/exec
+/// 为空则省略对应键（schema 缺省：extensions=[] / 裸启动）。
+pub fn ls_use_block(
+    id: &str,
+    languages: &[String],
+    extensions: &[String],
+    exec: &[String],
+    binary: &Path,
+    is_override: bool,
+) -> String {
+    let origin = if is_override {
+        "override of the built-in entry (same id/language wins ties)"
+    } else {
+        "new language registration"
+    };
+    let mut b = format!("[servers.{id}]\n");
+    b.push_str(&format!(
+        "# registered by `serena-cli ls-use` — {origin}; hand-edit freely, schema: crates/ls-registry/src/spec.rs\n"
+    ));
+    b.push_str(&format!("languages = {}\n", toml_str_list(languages)));
+    if !extensions.is_empty() {
+        b.push_str(&format!("extensions = {}\n", toml_str_list(extensions)));
+    }
+    b.push_str("install = \"path_only\"\n");
+    if !exec.is_empty() {
+        b.push_str(&format!("exec = {}\n", toml_str_list(exec)));
+    }
+    b.push_str(&format!("\n[servers.{id}.path_only]\n"));
+    b.push_str(&format!(
+        "binary_name = {}\n",
+        toml_str(&binary.display().to_string())
+    ));
+    b.push_str("install_hint = \"user-registered via serena-cli ls-use\"\n");
+    b
+}
+
+/// 全新注册条目的 id 合法性（TOML 裸键字符集——块定位/解析都依赖它）。
+pub fn valid_block_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// external-servers.toml 新建时的文件头。
+const EXTERNAL_FILE_HEADER: &str = "\
+# serena external language servers — user registry (managed by `serena-cli ls-use`).\n\
+# Entries follow the built-in servers.toml schema (crates/ls-registry/src/spec.rs);\n\
+# same-id/language entries override the built-in table (priority default 0: external wins ties).\n\n";
+
+/// 定位 `[servers.<id>]` 顶层表头块：返回 (块起点, 块终点) 字节偏移。块终点 =
+/// 下一个顶层表头行首（`[servers.<x>]` 单段名，或任何其它 `[table]`——防御非
+/// servers 顶层表）或 EOF；紧邻块头的空行吸收进块（删除后不留双空行）。行匹配
+/// trim `\r`（\r\n 兼容）。未命中 → None。
+fn find_server_block(text: &str, id: &str) -> Option<(usize, usize)> {
+    let header = format!("[servers.{id}]");
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let line_at = |s: usize| {
+        let rest = &text[s..];
+        let e = rest.find('\n').unwrap_or(rest.len());
+        rest[..e].trim_end_matches('\r')
+    };
+    let is_boundary = |l: &str| {
+        if !l.starts_with('[') {
+            return false;
+        }
+        match l.strip_prefix("[servers.") {
+            Some(inner) => !inner.strip_suffix(']').unwrap_or("").contains('.'),
+            None => true,
+        }
+    };
+    let pos = line_starts.iter().position(|&s| line_at(s) == header)?;
+    let mut start = line_starts[pos];
+    if pos > 0 {
+        let prev = line_starts[pos - 1];
+        if line_at(prev).trim().is_empty() {
+            start = prev;
+        }
+    }
+    let end = line_starts[pos + 1..]
+        .iter()
+        .find(|&&s| is_boundary(line_at(s)))
+        .copied()
+        .unwrap_or(text.len());
+    Some((start, end))
+}
+
+/// `ls-use` 注册写入：`[servers.<id>]` 块整块替换/追加（字符串级——文件其余内容
+/// 与注释逐字节不动，禁反序列化重序列化）。文件不存在 → 创建（带头部注释）。
+pub fn external_block_upsert(path: &Path, id: &str, block: &str) -> std::io::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let out = if text.is_empty() {
+        format!("{EXTERNAL_FILE_HEADER}{block}")
+    } else {
+        match find_server_block(&text, id) {
+            Some((s, e)) => format!("{}{block}{}", &text[..s], &text[e..]),
+            None => {
+                let mut out = text;
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                if !out.ends_with("\n\n") {
+                    out.push('\n');
+                }
+                out.push_str(block);
+                out
+            }
+        }
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, out)
+}
+
+/// `ls-use --remove`：移除 `[servers.<id>]` 块（其余内容/注释逐字节保留）。
+/// 命中 → `Ok(true)`；无该 id / 文件不存在 → `Ok(false)`。
+pub fn external_block_remove(path: &Path, id: &str) -> std::io::Result<bool> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match find_server_block(&text, id) {
+        Some((s, e)) => {
+            std::fs::write(path, format!("{}{}", &text[..s], &text[e..]))?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// external 条目清单（fresh load，不经 `EXTERNAL` 缓存——同进程写后读需见新值；
+/// parse 失败 → 空清单，与 `load_external` 静默容错同语义）。
+pub fn external_entries(path: &Path) -> Vec<(String, spec::ServerSpec)> {
+    load_external(path)
+        .map(|t| t.servers.into_iter().collect())
+        .unwrap_or_default()
+}
+
 /// platform key（design §2.2）。
 pub fn platform_key(os: Os, arch: ls_runtime::deps::Arch) -> String {
     let os = match os {
@@ -1329,5 +1604,239 @@ package = "@vue/language-server"
             err.contains("bin_path_per_platform.linux-x86_64 must not be empty"),
             "want override-empty error, got: {err}"
         );
+    }
+
+    // ===== ls-use 写入层（bd serena-rust-4ux）=====
+
+    fn ls_use_tmp_path(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "serena-ls-use-test-{}-{tag}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    const LS_USE_SAMPLE: &str = "\
+# user registry header comment
+[servers.alpha]
+languages = [\"alpha\"]
+install = \"path_only\"
+[servers.alpha.path_only]
+binary_name = \"alpha\"
+install_hint = \"x\"
+
+[servers.beta]
+# beta 内联注释
+languages = [\"beta\"]
+install = \"path_only\"
+[servers.beta.path_only]
+binary_name = \"beta\"
+install_hint = \"y\"
+";
+
+    #[test]
+    fn ls_use_upsert_creates_file_with_header_when_missing() {
+        let p =
+            std::env::temp_dir().join(format!("serena-ls-use-fresh-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let block = ls_use_block(
+            "mydsl",
+            &["mydsl".to_string()],
+            &[".mydsl".to_string()],
+            &[],
+            Path::new("D:/tools/mydsl-ls.exe"),
+            false,
+        );
+        external_block_upsert(&p, "mydsl", &block).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.starts_with("# serena external language servers"));
+        assert!(text.contains("binary_name = 'D:/tools/mydsl-ls.exe'"));
+        let parsed = load_external(&p).expect("upsert 产物必须可解析");
+        assert!(parsed.servers.contains_key("mydsl"));
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn ls_use_upsert_preserves_comments_and_other_entries() {
+        let p = ls_use_tmp_path("preserve");
+        std::fs::write(&p, LS_USE_SAMPLE).unwrap();
+        let block = ls_use_block(
+            "alpha",
+            &["alpha".to_string()],
+            &[],
+            &["{bin}".to_string(), "serve".to_string()],
+            Path::new("E:/new/alpha.exe"),
+            true,
+        );
+        external_block_upsert(&p, "alpha", &block).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        // 头注释 / beta 整块（含内联注释）逐字保留。
+        assert!(text.starts_with("# user registry header comment\n"));
+        assert!(text.contains("# beta 内联注释"));
+        assert!(text.contains("binary_name = \"beta\""));
+        // alpha 块被整体替换（旧值不在，新值在，且恰一次）。
+        assert!(!text.contains("binary_name = \"alpha\""));
+        assert_eq!(text.matches("binary_name = 'E:/new/alpha.exe'").count(), 1);
+        let parsed = load_external(&p).expect("替换后仍可解析");
+        assert_eq!(
+            parsed.servers["alpha"]
+                .path_only
+                .as_ref()
+                .unwrap()
+                .binary_name,
+            "E:/new/alpha.exe"
+        );
+        assert_eq!(parsed.servers.len(), 2);
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn ls_use_upsert_replaces_last_block_at_eof() {
+        let p = ls_use_tmp_path("at-eof");
+        std::fs::write(&p, LS_USE_SAMPLE).unwrap();
+        let block = ls_use_block(
+            "beta",
+            &["beta".to_string()],
+            &[],
+            &[],
+            Path::new("E:/new/beta.exe"),
+            true,
+        );
+        external_block_upsert(&p, "beta", &block).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("binary_name = 'E:/new/beta.exe'"));
+        assert!(text.contains("binary_name = \"alpha\""));
+        let parsed = load_external(&p).expect("EOF 块替换后仍可解析");
+        assert_eq!(parsed.servers.len(), 2);
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn ls_use_upsert_tolerates_crlf() {
+        let p = ls_use_tmp_path("crlf");
+        std::fs::write(&p, LS_USE_SAMPLE.replace('\n', "\r\n")).unwrap();
+        let block = ls_use_block(
+            "alpha",
+            &["alpha".to_string()],
+            &[],
+            &[],
+            Path::new("E:/crlf/alpha.exe"),
+            true,
+        );
+        external_block_upsert(&p, "alpha", &block).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("binary_name = 'E:/crlf/alpha.exe'"));
+        assert!(
+            text.contains("binary_name = \"beta\""),
+            "CRLF 下 beta 块必须幸存"
+        );
+        let parsed = load_external(&p).expect("CRLF 混合内容仍可解析");
+        assert_eq!(parsed.servers.len(), 2);
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn ls_use_remove_keeps_rest_and_reports_missing() {
+        let p = ls_use_tmp_path("remove");
+        std::fs::write(&p, LS_USE_SAMPLE).unwrap();
+        assert!(external_block_remove(&p, "alpha").unwrap());
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.starts_with("# user registry header comment\n"));
+        assert!(text.contains("# beta 内联注释"));
+        assert!(!text.contains("[servers.alpha]"));
+        // 不存在的 id → false；再 remove 一次也 false（幂等语义）。
+        assert!(!external_block_remove(&p, "alpha").unwrap());
+        assert!(!external_block_remove(&p, "gamma").unwrap());
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    /// e2e（fake binary）：upsert → load_external 解析 → merge_pick external 胜出。
+    #[test]
+    fn ls_use_upsert_then_merge_pick_prefers_external() {
+        let p = ls_use_tmp_path("merge");
+        let block = ls_use_block(
+            "marksman",
+            &["markdown".to_string()],
+            &[".md".to_string()],
+            &["{bin}".to_string(), "server".to_string()],
+            Path::new("D:/tools/marksman.exe"),
+            true,
+        );
+        external_block_upsert(&p, "marksman", &block).unwrap();
+        let ext = load_external(&p).expect("external 表可解析");
+        let ext_hit = ext
+            .servers
+            .iter()
+            .find(|(id, _)| id.as_str() == "marksman")
+            .map(|(id, s)| (id.as_str(), s));
+        let picked = merge_pick(builtin_spec_for("markdown"), ext_hit).expect("双表均命中");
+        assert_eq!(picked.0, "marksman");
+        assert!(picked.2, "external 必须胜出（并列缺省 0）");
+        assert_eq!(
+            picked.1.path_only.as_ref().unwrap().binary_name,
+            "D:/tools/marksman.exe"
+        );
+        assert_eq!(picked.1.languages, vec!["markdown"]);
+        assert_eq!(picked.1.extensions, vec![".md"]);
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn validate_user_binary_accepts_fake_and_rejects_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("fake_ls.exe");
+        std::fs::write(&fake, b"not really an exe").unwrap();
+        let got = validate_user_binary(&fake).expect("fake exe 应通过校验");
+        let got = got.display().to_string();
+        assert!(!got.contains(r"\\?\"), "UNC 前缀必须剥离: {got}");
+        // 路径含 tempdir（可能 8.3 短名）→ 只断言文件名与存在性。
+        assert!(got.ends_with("fake_ls.exe"));
+        assert!(Path::new(&got).is_file());
+        let missing = dir.path().join("absent_ls.exe");
+        assert!(validate_user_binary(&missing).is_err());
+    }
+
+    #[test]
+    fn builtin_spec_for_hits_by_id_and_language() {
+        let (id_by_lang, _) = builtin_spec_for("markdown").expect("语言名命中");
+        assert_eq!(id_by_lang, "marksman");
+        let (id_by_id, _) = builtin_spec_for("marksman").expect("id 命中");
+        assert_eq!(id_by_id, "marksman");
+        assert!(builtin_spec_for("no-such-lang-xyz").is_none());
+        assert!(similar_server_ids("mark").contains(&"marksman"));
+        assert!(similar_server_ids("zzz-none").is_empty());
+    }
+
+    #[test]
+    fn inherited_exec_folds_kind_args() {
+        let npm = parse(
+            "[servers.n]\nlanguages = [\"n\"]\ninstall = \"npm\"\n[servers.n.npm]\npackage = \"p\"\nbin_rel = \"b\"\nnpm_args = [\"--stdio\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inherited_exec(&npm.servers["n"]),
+            vec!["{bin}".to_string(), "--stdio".to_string()]
+        );
+        let dl = parse(
+            "[servers.d]\nlanguages = [\"d\"]\ninstall = \"download\"\nexec = [\"{bin}\", \"lsp\"]\n[servers.d.download]\nversion = \"1\"\narchive = \"raw\"\nbin_path = \"ls\"\n[servers.d.download.url_per_platform]\n\"windows-x86_64\" = \"https://github.com/x/ls\"\n[servers.d.download.sha256_per_platform]\n\"windows-x86_64\" = \"cc\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inherited_exec(&dl.servers["d"]),
+            vec!["{bin}".to_string(), "lsp".to_string()]
+        );
+        let bare = parse("[servers.b]\nlanguages = [\"b\"]\ninstall = \"path_only\"\n[servers.b.path_only]\nbinary_name = \"b\"\ninstall_hint = \"x\"\n").unwrap();
+        assert!(inherited_exec(&bare.servers["b"]).is_empty());
+    }
+
+    #[test]
+    fn valid_block_id_rejects_path_traversal_and_dots() {
+        assert!(valid_block_id("marksman"));
+        assert!(valid_block_id("my-dsl_2"));
+        assert!(!valid_block_id(""));
+        assert!(!valid_block_id("../evil"));
+        assert!(!valid_block_id("my.dsl"));
+        assert!(!valid_block_id("a b"));
     }
 }

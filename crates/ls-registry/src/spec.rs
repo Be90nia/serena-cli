@@ -14,8 +14,11 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 /// `servers.toml` 顶层（内置 include_str! 单表 + external-servers.toml 运行时表共用）。
+/// `servers` 带 serde default：ls-use 移除全部条目后只剩头注释的文件按空表解析，
+/// 不报 `missing field servers`（用户注册表为空是常态，不是错误）。
 #[derive(Debug, Deserialize)]
 pub struct ServersToml {
+    #[serde(default)]
     pub servers: HashMap<String, ServerSpec>,
 }
 

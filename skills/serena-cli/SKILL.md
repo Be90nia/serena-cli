@@ -59,6 +59,7 @@ stdout = 紧凑 JSON（默认）+ 可能的 `[warn]` 前缀行；失败 `{"ok":f
 - **MISS 的是运行时**（node/uv/JDK…）→ 装运行时（hint 里有命令），重跑 doctor 确认 ok。
 - **MISS 的是 LS 本体** → 先用生态原生装法（rust: `rustup component add rust-analyzer`；pip 系: `pip install ...`；npm 系: `npm i -g ...`）；**servers.toml 收录的语言**（`serena-cli install <lang>` 可装的 73 种）也可以直接 `serena-cli install <lang>` 或 `doctor --fix`（自动装 + sha256 校验）。
 - **防重复下载**：LS 已由 rustup/npm/pipx/系统包管理器装过时**不要**再 `install <lang>` 重复拉一份——doctor 报 MISS 但你确定装过 = **当前进程 PATH 不含它**（GUI 启动的编辑器常见），修 PATH 后重试；仍不行用 `%APPDATA%/serena/external-servers.toml`（用户外部注册表，支持绝对路径 binary，优先级高于内置条目）直接指到已有可执行文件。
+- **一键接入自装 LS**：`serena-cli ls-use <lang或id> <LS二进制绝对路径>`（写 external-servers.toml，已知语言自动继承内置 languages/extensions/exec；`--lang <LANG> --ext .<ext>` 注册全新语言；`--list` 列注册、`--remove <id>` 移除；`ls-list` 看全量实装状态、`ls-remove <id>` 卸载 serena 托管缓存）。注册在 daemon 重启后生效。
 - rust/c++/go/java 等 T2 语言不在 `install <lang>` 名单内（rust 走 rustup 查找链：`rustup which` → PATH → `~/.cargo/bin`），报 NOT_INSTALLED 时按 hint 里给的生态命令装。
 
 ## 多语言

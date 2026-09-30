@@ -20,7 +20,7 @@ Trade-off: you lose the "MCP auto-discovery" story. You gain `bash`-debuggabilit
 
 ## What it covers
 
-### CLI commands (56)
+### CLI commands (59)
 
 Read / navigate (7): `overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -34,7 +34,7 @@ Undo / redo (2): `undo` (`--steps N`, `--list`) · `redo` — transactional snap
 
 Completion (1): `completion` (with `--limit` and per-file-suffix trigger inference)
 
-Admin (5): `status` · `stop-all` · `install <lang>` · `uninstall <lang>` · `shell` (JSONL stdin/stdout session)
+Admin (8): `status` · `stop-all` · `install <lang>` · `uninstall <lang>` · `ls-use <lang-or-id> <path>` · `ls-list` · `ls-remove <id>` · `shell` (JSONL stdin/stdout session)
 
 Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker`
 
@@ -123,6 +123,21 @@ serena-cli --help
 3. **SHA-256 verify** — hashes are anchored to the upstream SolidLSP matrix in `local/ls-download-matrix.md`. Mismatched bytes fail closed with `LS_NOT_INSTALLED`.
 
 Hand-installed T2 servers (rustup toolchain, system Python, etc.) are also accepted — `install` is convenience, not a gate.
+
+### Using an LS you already have (custom path)
+
+No need to re-download what your machine already has. `ls-use` points a `servers.toml` entry at your own binary by writing `%APPDATA%/serena/external-servers.toml` (`~/.config/serena/` on Unix):
+
+```bash
+serena-cli ls-use python D:/tools/jedi-ls.exe    # known language/id: inherits languages/extensions/exec, swaps in your binary
+serena-cli ls-use mydsl D:/tools/mydsl-ls.exe --lang mydsl --ext .mydsl   # brand-new language
+serena-cli ls-use --list                         # registered entries + per-language effective source
+serena-cli ls-use --remove mydsl                 # unregister (rest of the file, comments included, stays byte-identical)
+serena-cli ls-list                               # full inventory: builtin × installed / external-override / not-installed + reclaimable bytes
+serena-cli ls-remove marksman                    # uninstall serena-managed cache only (never touches PATH/ecosystem installs)
+```
+
+Registration takes effect after a daemon restart (`serena-cli stop-all` or the idle timeout). Entries are plain TOML — hand-editing is fine; `ls-use` only rewrites its own `[servers.<id>]` block.
 
 ## Golden path (8 commands, ~90% of agent traffic)
 

@@ -111,8 +111,12 @@ pub enum ToolError {
     #[error("bad args: {detail}")]
     BadArgs { detail: String },
 
-    /// LS 未安装（PATH 找不到）—— exit 1 + install_hint。
-    #[error("language server for `{language}` not installed: {hint}")]
+    /// LS 未安装（PATH 找不到）—— exit 1 + install_hint。中央注入点：所有语言的
+    /// NOT_INSTALLED 都走本 Display，在此追加 ls-use 指引即覆盖全部语言
+    /// （bd serena-rust-4ux；用户自装 LS 免重装下载）。
+    #[error(
+        "language server for `{language}` not installed: {hint}; if you already have the LS binary on disk, register it with `serena-cli ls-use <lang> <path-to-ls-binary>`"
+    )]
     NotInstalled { language: String, hint: String },
 
     /// lsp-core 错误冒泡 —— 此后调用方可判定是否 LS 崩溃 / RPC / 超时。
@@ -10145,6 +10149,30 @@ mod semantic_readiness_and_args_tests {
         assert!(
             sup.launch_exe_valid(&key),
             "evict 必须同步清 launch_exe 登记"
+        );
+    }
+}
+
+/// NotInstalled Display 的 ls-use 中央指引（bd serena-rust-4ux）：所有语言的
+/// NOT_INSTALLED 文案都必须带 ls-use 注册指引（用户自装 LS 免重复下载）。
+#[cfg(test)]
+mod not_installed_display_tests {
+    use super::*;
+
+    #[test]
+    fn not_installed_display_carries_ls_use_guidance() {
+        let e = ToolError::NotInstalled {
+            language: "python".to_string(),
+            hint: "pip install pyright".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("not installed: pip install pyright"),
+            "原 hint 保留: {msg}"
+        );
+        assert!(
+            msg.contains("serena-cli ls-use <lang> <path-to-ls-binary>"),
+            "ls-use 指引: {msg}"
         );
     }
 }

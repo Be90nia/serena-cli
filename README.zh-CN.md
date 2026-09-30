@@ -22,7 +22,7 @@
 
 ## 覆盖范围
 
-### CLI 命令（55 个）
+### CLI 命令（58 个）
 
 读取 / 导航（7 个）：`overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -36,7 +36,7 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 补全（1 个）：`completion`（支持 `--limit` 与按文件后缀的 trigger 推断）
 
-管理（4 个）：`status` · `stop-all` · `install <lang>` · `shell`（JSONL stdin/stdout 会话）
+管理（7 个）：`status` · `stop-all` · `install <lang>` · `ls-use <lang或id> <path>` · `ls-list` · `ls-remove <id>` · `shell`（JSONL stdin/stdout 会话）
 
 长尾（19 个）：`defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker`
 
@@ -125,6 +125,21 @@ serena-cli --help
 3. **SHA-256 校验** —— 哈希锚定于 `local/ls-download-matrix.md` 中的上游 SolidLSP 矩阵。字节不匹配即失败关闭（fail closed），报 `LS_NOT_INSTALLED`。
 
 手动安装的 T2 server（rustup toolchain、系统 Python 等）同样被接受 —— `install` 是便利设施，不是门槛。
+
+### 使用你已装好的 LS（自定义路径）
+
+机器上已有的 LS 不必重复下载。`ls-use` 把 `servers.toml` 条目改指你自己的二进制，写入 `%APPDATA%/serena/external-servers.toml`（Unix `~/.config/serena/`）：
+
+```bash
+serena-cli ls-use python D:/tools/jedi-ls.exe    # 已知语言/id：继承内置 languages/extensions/exec，仅换二进制
+serena-cli ls-use mydsl D:/tools/mydsl-ls.exe --lang mydsl --ext .mydsl   # 全新语言
+serena-cli ls-use --list                         # 列注册条目 + 每语言生效来源
+serena-cli ls-use --remove mydsl                 # 移除注册（其余内容与注释逐字节保留）
+serena-cli ls-list                               # 全量清单：内置 × installed / external-override / not-installed + 可释放字节
+serena-cli ls-remove marksman                    # 只卸载 serena 托管缓存（不碰 PATH/生态安装）
+```
+
+注册在 daemon 重启后生效（`serena-cli stop-all` 或等空闲超时）。条目是普通 TOML，可手改；`ls-use` 只重写自己的 `[servers.<id>]` 块。
 
 ## 黄金路径（8 条命令，约占 agent 流量的 90%）
 
