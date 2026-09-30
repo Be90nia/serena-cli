@@ -503,12 +503,12 @@ remark = "变体门：--lang solargraph；保持裸 .rb fixture（solargraph 直
 [[lang]]
 id = "haskell"
 via = "binary"
-install = "set -ex; curl -fsSL https://downloads.haskell.org/~ghc/9.4.8/ghc-9.4.8-x86_64-deb11-linux.tar.xz -o /tmp/ghc.tar.xz && echo \"2743629d040f3213499146cb5154621d6f25e85271019afc9b9009e04d66bf6c  /tmp/ghc.tar.xz\" | sha256sum -c - && sudo tar -xJf /tmp/ghc.tar.xz -C /opt && ls -la /opt/ghc-9.4.8/bin/ && sudo ln -sf /opt/ghc-9.4.8/bin/ghc /opt/ghc-9.4.8/bin/ghc-9.4.8 /opt/ghc-9.4.8/bin/ghci /usr/local/bin/ && hash -r; ls -la /usr/local/bin/ghc; which ghc; ghc --version && curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.9.0.1/haskell-language-server-2.9.0.1-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && mkdir -p /tmp/hls && tar -xJf /tmp/hls.tar.xz -C /tmp/hls && sudo find /tmp/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && haskell-language-server-wrapper --version"
+install = "set -ex; curl -fsSL https://downloads.haskell.org/~ghc/9.4.8/ghc-9.4.8-x86_64-deb11-linux.tar.xz -o /tmp/ghc.tar.xz && echo \"2743629d040f3213499146cb5154621d6f25e85271019afc9b9009e04d66bf6c  /tmp/ghc.tar.xz\" | sha256sum -c - && sudo mkdir -p /opt/ghc && sudo tar -xJf /tmp/ghc.tar.xz -C /opt/ghc --strip-components=1 && ls /opt/ghc/bin/ && sudo ln -sf /opt/ghc/bin/ghc /opt/ghc/bin/ghc-9.4.8 /opt/ghc/bin/ghci /usr/local/bin/ && hash -r; ls -la /usr/local/bin/ghc; which ghc; ghc --version && curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.9.0.1/haskell-language-server-2.9.0.1-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && sudo mkdir -p /opt/hls && sudo tar -xJf /tmp/hls.tar.xz -C /opt/hls --strip-components=1 && sudo find /opt/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && haskell-language-server-wrapper --version"
 pin = "HLS 2.9.0.1 (bindist deb11) + GHC 9.4.8 (downloads.haskell.org bindist; sha = 官方 SHA256SUMS 2026-09-29)"
 fixture = "main.hs"
 lang_flag = "haskell"
 budget_secs = 900
-remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；langs20 R3 修：R2 的 if 防御分支把可观测性全吃了（run 36653605574 stderr 仅一行 ghc 127，tar/ln 死点不可见——防御分支第二次掩盖故障 = 反模式，已删）→ 整行改朴素序列 + set -ex 轨迹（tar/ln/ls/which/ghc --version 逐步进 stderr.log），ghc --version 前加 hash -r + ls -la 双探针；R2 死因待轨迹定性（主嫌疑 = /usr/local/bin 在 daemon/step PATH 的传导或 ln 前置步静默失败）；glibc 边界：deb11 bindist（glibc 2.31）在 noble（2.39）向前兼容，轨迹若现 loader 错误即换 deb12/noble 变体（downloads.haskell.org 目录取证）；配对证据 = ghc --version + haskell-language-server-wrapper --version 双打印落 install.out"
+remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；langs20 R4 根因实锤（r3s6/haskell.stderr.log 轨迹：`ls: cannot access '/opt/ghc-9.4.8/bin/'`）——deb11 bindist 顶层目录名不叫 ghc-9.4.8 → 改布局无关解包：GHC/HLS 双 tarball 各 --strip-components=1 解到 /opt/ghc 与 /opt/hls，ln 指向 /opt/ghc/bin/ghc；set -ex 轨迹与 hash -r/ls/which 三探针保留（R3 引入，定性功臣）；glibc 边界：deb11 bindist（2.31）在 noble（2.39）向前兼容，轨迹现 loader 错误即换 deb12/noble 变体；配对证据 = ghc --version + haskell-language-server-wrapper --version 双打印落 install.out"
 
 [[lang]]
 id = "ocaml"
@@ -616,7 +616,7 @@ pin = "servers.toml"
 fixture = "smoke.pp"
 lang_flag = "pascal"
 budget_secs = 900
-remark = "langs20 R3 修：R2 死在链尾验证 `command -v pasls` exit 1 假红——pasls 装在 ~/.local/share/serena/ls/ 缓存不在 PATH（run 36653605574 install.out：install 本体 ok:true 且 exe=pasls-x86_64-linux/pasls，bin_path 修复已生效）→ 删该验证，install 自身打印的 exe JSON 即验证；FPC 前置 = apt fpc（noble universe，pasls 对标准布局 /usr/lib/fpc 自发现——上游 pascal_server.py@7a296833 env 仅 settings 显式配置时注入，无 env 直启为默认形态）；apt fpc ~400MB 为预算主体"
+remark = "langs20 R4 封顶轮（路径 a+b 双管）：daemon.log 显示 pasls 存活且每 10s 'Reloaded .../smoke.pp in 0 ms' 但 documentSymbol 恒空（Reload 反复 = 探针重试 didOpen 非 LS 自愈）——路径 a 否定：↖ mirror pascal_server.py@7a296833 _start_server 全文 = 裸 initialize+initialized，env 仅 settings 显式配置注入，无 init-options/didSave/等待 quirk（5s ready 兜底即用）；路径 b 采纳：fixture 改标准 unit 形态（unit Smoke; interface 函数 + implementation）——CodeTools 符号树只出 interface 段符号，裸 program 骨架零符号；bin_path 内层目录修复已 R2 实绿（install.out exe=pasls-x86_64-linux/pasls）；FPC 前置 = apt fpc"
 
 [[lang]]
 id = "omnisharp"
@@ -631,12 +631,12 @@ remark = "langs20 R2 改版：R1 的 mono 自包含变体（zip + apt mono-compl
 [[lang]]
 id = "al"
 via = "binary"
-install = "set -ex; curl -fsSL -o /tmp/al.vsix.gz \"https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/18.0.2242655/vspackage\" && gunzip -f /tmp/al.vsix.gz && python3 -m zipfile -e /tmp/al.vsix /tmp/alx/ && sudo mkdir -p /opt/al-ls && sudo cp -r /tmp/alx/extension/bin/linux/. /opt/al-ls/ && sudo ln -sf /opt/al-ls/Microsoft.Dynamics.Nav.EditorServices.Host /usr/local/bin/ && test -x /usr/local/bin/Microsoft.Dynamics.Nav.EditorServices.Host"
+install = "set -ex; curl -fsSL -o /tmp/al.vsix.gz \"https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/18.0.2242655/vspackage\" && gunzip -f /tmp/al.vsix.gz && python3 -m zipfile -e /tmp/al.vsix /tmp/alx/ && sudo mkdir -p /opt/al-ls && sudo cp -r /tmp/alx/extension/bin/linux/. /opt/al-ls/ && sudo find /opt/al-ls -maxdepth 1 -iname '*host*' -type f -exec chmod +x {} \\; && sudo ln -sf /opt/al-ls/Microsoft.Dynamics.Nav.EditorServices.Host /usr/local/bin/ && test -x /usr/local/bin/Microsoft.Dynamics.Nav.EditorServices.Host"
 pin = "al extension 18.0.2242655 (vspackage URL 钉版; vspackage 字节 = gzip 包 zip, CI run 36649455255 观测 sha 534abdde… 与本机 317MB 全量下载复算逐字一致——gzip 传输层字节稳定、非 zip 真值故不进 servers.toml sha 锚)"
 fixture = "smoke.al"
 lang_flag = "al"
 budget_secs = 600
-remark = "langs20 R3 修：R2 首跑 exit=1 两路日志全空——唯一静默 exit 1 命令 = 链尾 test -x（前置步若真失败都会 loud）→ 最可能 = cp 后 /opt/al-ls/Host 未落位使 ln -sf 建出 dangling symlink（ln 本身 exit 0）→ install 行最前加 `set -ex; ` 下轮凭 bash -x 轨迹定位真实死点；vspackage 内层 zip 布局证据 = R2 本机 317MB 全量下载解包：gzip 内层 zip 319,744,694 bytes，extension/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host（72,568 bytes 原生 apphost，454 个 linux 条目含同目录 runtime dll），Host.runtimeconfig includedFrameworks 8.0.24（self-contained）；vspackage 字节稳定双锚（CI run 36649455255 观测 sha 534abdde… 与 R2 本机复算逐字一致）"
+remark = "langs20 R4 根因实锤（r3s1/al.stderr.log set -ex 轨迹）：curl/gunzip/zipfile/mkdir/cp/ln 全静默过，唯链尾 test -x 挂——python3 -m zipfile -e 解压不保留 unix 可执行位（Host 644 落盘 → symlink 指向存在但不可执行文件；上游 serena b83b655c 'fix: zip extract permission bits' #2102 同类坑）→ cp 后对 /opt/al-ls 的 *host* 二进制 chmod +x；vspackage 内层 zip 布局证据 = R2 本机 317MB 全量下载解包：gzip 内层 zip 319,744,694 bytes，extension/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host（72,568 bytes 原生 apphost，454 linux 条目含同目录 runtime dll），Host.runtimeconfig includedFrameworks 8.0.24（self-contained）；vspackage 字节稳定双锚（CI run 36649455255 观测 sha 534abdde… 与本机复算逐字一致）"
 
 # ── W3 批（php/lua/scala/swift；php 块在原位改 intelephense，lua 块在 download 段）──
 
