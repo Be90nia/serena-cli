@@ -1,7 +1,7 @@
 # smoke_langs.toml —— 45 门语言 CI 冒烟矩阵清单（Phase 0 基建，serena-rust）。
 #
 # 三栏对账锚（上游 73 门，详见 local/agent-reports/ci-infra-45lang.md）：
-#   本矩阵（langs20 R5 终账 2026-09-30）：74 门 = 61 真门 + 13 SKIP 冻结（crystal/
+#   本矩阵（langs20 R6 终账 2026-09-30）：74 门 = 60 真门 + 14 SKIP 冻结（haskell R6 回场：spawn 静默死 crystal 同签名）（crystal/
 #   nix/elixir/fsharp/nextflow/matlab/wolfram 存量 7 + langs20 批新收 4：angular/
 #   groovy/gdscript/msl + R3/R5 回场 2：nextflow（didChangeConfiguration 注入缺口）/
 #   qml（qmlls 两 strike 无 handler）+ R5 回场 1：al（裸 .al 休眠需 BC 工程上下文，
@@ -15,7 +15,7 @@
 #   omnisharp/pascal/qml/swift）→ R2 run 36653605574 = 59/11/4（al/haskell/pascal/
 #   qml）→ R3 run 36657710307 = 59/12/3（al/haskell/pascal，qml 已 SKIP）→ R4 run
 #   36659777378 = 60/12/2（pascal fixture unit 形态转绿；余 al/haskell）→ R5 = 终局
-#   轮（al 转 SKIP、haskell HLS 配对断言，目标 FAIL=0 = 61/13/0）。逐门证据见各块
+#   轮（al 转 SKIP、haskell HLS 配对断言 61/13）→ R6（2ace364）：haskell 后端存在性断言修通入探针、spawn 静默死（crystal 同签名）转 SKIP，终局 = 60/14/0 目标。逐门证据见各块
 #   remark。
 #   前账：R7 终账 2026-09-29 = 69 门 = 53 真门 + 16 SKIP 冻结（R6 证据 SKIP 7：
 #   bsl/crystal/elixir/nextflow/fsharp/haskell/qml，run 36577226543 帧级实锚）；
@@ -510,6 +510,9 @@ pin = "HLS 2.15.0.0 (deb11 bindist; sha256 = GitHub API assets[].digest 9d3f12bf
 fixture = "main.hs"
 lang_flag = "haskell"
 budget_secs = 900
+skip_class = "HOST"
+skip_reason = "HLS 2.15.0.0 多版本后端安装链全通(9.14.1 后端存在性断言过)但 spawn 即死: stdout pump EOF 零 stderr——与 crystal 同签名(runner-host 静默死判例);七层剥离链 sha/PATH/bindist 布局/ghcup 版本竞速/配对断言/后端存在性/spawn 死 全程在案"
+skip_evidence = "run 36662209793 haskell probe: LS_TERMINATED stdout pump EOF (attempts=1); 安装侧终态见同轮 install.out (ls /opt/hls/bin 列出 9.6.7-9.14.1 全家族)"
 remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；langs20 R5 终局修（r4s6/haskell.install.out 尾部自证）：runner 自带 ghcup `/usr/local/.ghcup/bin/ghc` = 9.14.1 且 PATH 排在 /usr/local/bin 前（`ghc --version` 实印 9.14.1），我们装的 HLS 2.9.0.1 wrapper 自选 9.10.1 后端（`2.9.0.1 (GHC: 9.10.1)`），按项目 GHC 9.14.1 找匹配落空 → 降级会话 'no handler for textDocument/documentSymbol'（daemon.log 实锤）——路径 a 终局：不装 GHC（runner 现成 9.14.1，省 200MB+），改装 HLS 2.15.0.0 deb11 bindist（release body 官方支持清单首列 GHC 9.14.1，2026-09-03 发布；sha = GitHub API assets[].digest 实锚），install 尾加版本配对断言：wrapper --version 输出须含 `GHC: <ghc --version 解析值>` 方放行；HLS 下载段 267MB 为预算主体"
 
 [[lang]]
@@ -811,4 +814,4 @@ remark = "mSL = mIRC Scripting Language（.mrc），与 Xcode/macOS 无关；R4 
 # （R1-R4 CI 轮次 FAIL 逐门修复：haskell 终局 = HLS 2.15.0.0 配对 runner ghcup
 # 9.14.1 + 版本配对断言）；al 于 R2 转真门、R5 封顶回 SKIP（裸 .al 休眠需 BC 工程
 # 上下文，install 链已全绿）；nextflow/qml 于 R1 转、R2/R3 回 SKIP（会话层协议
-# 缺口 / qmlls 构建 capability 两 strike）。R5 终账 74 = 61 真门 + 13 SKIP。
+# 缺口 / qmlls 构建 capability 两 strike）。R6 终账 74 = 60 真门 + 14 SKIP。
