@@ -583,7 +583,9 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 "linux-x86_64" = "https://github.com/antaalt/shader-sense/releases/download/v1.3.1/shader-language-server-x86_64-unknown-linux-gnu.zip"
 
 [servers.hlsl.download.sha256_per_platform]
-"windows-x86_64" = "49081c5547ddde1b8b3b17295282a80ddacbca1d6f5dcd834e2788c02baba997"
+# win sha R3 重锚（2026-09-30）：R1 抄录错一位（…02baba997 ↔ 真值 …02bafa997，CI run
+# 36670130529 sha mismatch 实锚）——API assets[].digest 复核逐字重锚，上游资产未漂移。
+"windows-x86_64" = "49081c5547ddde1b8b3b17295282a80ddacbca1d6f5dcd834e2788c02bafa997"
 "windows-aarch64" = "a3b3799affe2cad27652e788376b46fe76e1a6c2ce45946a486dcb26c9091412"
 "linux-x86_64" = "61710df7ca17a2d063b598936c57c56c49fbf837707a1aa886f9b0193a35be3c"
 
@@ -770,11 +772,16 @@ bin_path = "OmniSharp.exe"
 allowed_hosts = ["roslynomnisharp.blob.core.windows.net"]
 
 [servers.omnisharp.download.url_per_platform]
-"windows-x86_64" = "https://roslynomnisharp.blob.core.windows.net/releases/1.39.10/omnisharp-win-x64-1.39.10-net6.0.zip"
+# win URL R3 重锚（2026-09-30）：正式版路径 releases/1.39.10/ 两种命名均 404（CI run
+# 36670130529 实锚 + 本机 HEAD 复核）——win 包与 linux 同源只在 1.39.10-beta.4 前缀
+# （omnisharp-win-x64-net6.0.zip，HEAD 200 实锚），sha = 本机整包下载一手锚。
+"windows-x86_64" = "https://roslynomnisharp.blob.core.windows.net/releases/1.39.10-beta.4/omnisharp-win-x64-net6.0.zip"
 "linux-x86_64" = "https://roslynomnisharp.blob.core.windows.net/releases/1.39.10-beta.4/omnisharp-linux-x64-net6.0.tar.gz"
 
 [servers.omnisharp.download.sha256_per_platform]
-"windows-x86_64" = "A73327395E7EF92C1D8E307055463DA412662C03F077ECC743462FD2760BB537"
+# win sha R3 重锚 = 本机整包下载复算一手锚（blob 无 digest 服务，linux 组同款做法；
+# 旧值 A7332739… 来源不可溯且 URL 本就 404 从未到达校验步，直接替换）。
+"windows-x86_64" = "a744caee255a37909898c7cd87dbdc28d29335a5af626dc8cab3990c0a90a43b"
 "linux-x86_64" = "a489e6cd1c1340ba9a8523a3bc82042e582d480910a582082289253962eab7dd"
 
 [servers.omnisharp.download.archive_per_platform]

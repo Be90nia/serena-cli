@@ -27,6 +27,7 @@ use lsp_types::InitializeParams;
 use serde_json::json;
 
 use crate::{LanguageId, LanguageServerAdapter, ProjectCtx, not_installed_error, which_no_unc};
+use ls_runtime::install_pkg::npm_bin_path;
 
 /// serena npm 缓存目录 pin（= servers.toml [servers.typescript_vts] npm 段，禁随意改；
 /// 升版 = 缓存目录键换新，servers.toml version 与本常量同改）。
@@ -35,15 +36,6 @@ const CACHE_VERSION: &str = "0.3.0";
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VtsAdapter;
-
-/// 缓存内 vtsls 入口：`{cache}/{id}/{version}/node_modules/.bin/vtsls`（ensure_launch
-/// npm 缓存命中同款布局；unix = node shebang 脚本，T0 同路径已在 CI 验证可 spawn）。
-fn cached_vtsls() -> PathBuf {
-    default_cache_root()
-        .join(CACHE_ID)
-        .join(CACHE_VERSION)
-        .join("node_modules/.bin/vtsls")
-}
 
 /// typescript `lib/`（tsdk）：tsserver 程序与内置 lib 的根（与 vtsls 同 node_modules，
 /// servers.toml secondary_packages 保证同装）。
@@ -55,10 +47,13 @@ fn cached_tsdk() -> PathBuf {
 }
 
 /// vtsls 解析：serena npm 缓存命中优先 → PATH（用户全局自装）→ 标准未安装错误。
+/// 缓存命中必须走 [`npm_bin_path`]：npm 的裸名 bin 在 Windows 是 sh 脚本，
+/// CreateProcess 直接 spawn 报 os error 193 "%1 is not a valid Win32 application"
+/// （run 36670130529 实锚）——Windows 只认 `.cmd` shim（json/css/bash 适配器同约束）。
 fn resolve_vtsls() -> anyhow::Result<PathBuf> {
-    let cached = cached_vtsls();
-    if cached.is_file() {
-        return Ok(cached);
+    let install = default_cache_root().join(CACHE_ID).join(CACHE_VERSION);
+    if let Some(exe) = npm_bin_path(&install, "vtsls") {
+        return Ok(exe);
     }
     which_no_unc("vtsls").ok_or_else(|| {
         not_installed_error(
@@ -153,5 +148,83 @@ mod tests {
     fn vts_declares_type_script_family() {
         assert_eq!(VtsAdapter.id(), "vtsls");
         assert_eq!(VtsAdapter.languages(), &[LanguageId::TypeScript]);
+    }
+
+    /// R2 spawn 修复接线（run 36670130529 实锚 os error 193）：缓存布局下
+    /// resolve 必须落 npm_bin_path 的平台正确 shim——Windows 造了 .cmd 就返回
+    /// .cmd（裸名是 sh 脚本不可 spawn），Unix 返回裸名。env 注入 + 还原对齐
+    /// powershell.rs 测试先例；which 分支（用户全局自装）不在本测（PATH 依赖）。
+    /// 全程持锁串行：env 注入与并行测试的 env 读互踩（gopls/typescript.rs 同款锁）。
+    static RESOLVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_prefers_platform_shim_from_cache() {
+        let _seq = RESOLVE_TEST_LOCK
+            .lock()
+            .expect("RESOLVE_TEST_LOCK poisoned");
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        // default_cache_root = {LOCALAPPDATA}/serena/ls（unix ~/.local/share/serena/ls）
+        // ——注入的是 LOCALAPPDATA/HOME 本体，布局要补 serena/ls 段（powershell.rs 同款）。
+        let cache_root = if cfg!(windows) {
+            cache_dir.path().join("serena/ls")
+        } else {
+            cache_dir.path().join(".local/share/serena/ls")
+        };
+        let bin_dir = cache_root
+            .join(CACHE_ID)
+            .join(CACHE_VERSION)
+            .join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir .bin");
+        let home_key = if cfg!(windows) {
+            "LOCALAPPDATA"
+        } else {
+            "HOME"
+        };
+        let home_original = std::env::var_os(home_key);
+        let path_original = std::env::var_os("PATH");
+        // SAFETY: 单线程测试内注入 + 末尾还原；PATH 指空目录屏蔽 which 分支命中
+        // 真机 vtsls 的干扰。
+        unsafe {
+            std::env::set_var(home_key, cache_dir.path());
+            std::env::set_var("PATH", cache_dir.path());
+        }
+        // 只有裸名：Windows 视为不可 spawn 的 sh 脚本 → 落 which（空 PATH）→ Err。
+        std::fs::write(bin_dir.join("vtsls"), "").expect("write bare shim");
+        let bare_only = resolve_vtsls();
+        // 补 .cmd shim：Windows 必须返回 .cmd；Unix 必须仍返回裸名。
+        std::fs::write(bin_dir.join("vtsls.cmd"), "").expect("write cmd shim");
+        let with_cmd = resolve_vtsls();
+        unsafe {
+            match &path_original {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+            match &home_original {
+                Some(p) => std::env::set_var(home_key, p),
+                None => std::env::remove_var(home_key),
+            }
+        }
+        if cfg!(windows) {
+            assert!(
+                bare_only.is_err(),
+                "裸名 sh 脚本不可 spawn（os error 193 实锚），不得命中: {bare_only:?}"
+            );
+            assert_eq!(
+                with_cmd.expect("cmd shim resolved"),
+                bin_dir.join("vtsls.cmd"),
+                "Windows 必须解析到 .cmd shim"
+            );
+        } else {
+            assert_eq!(
+                bare_only.expect("bare resolved"),
+                bin_dir.join("vtsls"),
+                "Unix 裸名可直接 spawn"
+            );
+            assert_eq!(
+                with_cmd.expect("bare still resolved"),
+                bin_dir.join("vtsls"),
+                "Unix 不受 .cmd 影响"
+            );
+        }
     }
 }

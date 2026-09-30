@@ -116,3 +116,5 @@ jobs:
         if: always()
         run: |
           "$SERENA_CLI" stop-all || true
+          # windows 门失败路径可能残留锁住的 fixture 目录（node LS 持锁）——job 末尾兜底清
+          rm -rf .smoke-tmp 2>/dev/null || true

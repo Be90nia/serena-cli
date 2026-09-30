@@ -103,21 +103,27 @@ run_with_timeout() {
 find_py() {
     if [ -z "${_PY:-}" ]; then
         local c
-        # python3 优先（linux/mac）；windows runner 无 python3 shim 时落 python
-        # （windows-2025 = 3.12 有 tomllib）→ py launcher 兜底（latest Python 3）。
-        for c in python3 python py; do
+        # 回退链（R2 macos 加固）：macos runner 的 python3/python 可能落在无 tomllib
+        # 的 CLT 3.9，brew 版本化命令（python3.1x）在 PATH 深处——逐个探测 import
+        # tomllib 成功者用之。windows py launcher 兜底（latest Python 3）。
+        for c in python3 python py python3.14 python3.13 python3.12 python3.11; do
             if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import tomllib' 2>/dev/null; then
                 _PY="$c"
                 return 0
             fi
         done
-        log "FAIL smoke no-python-with-tomllib"
+        log "FAIL smoke no-python-with-tomllib (candidates: python3/python/py/python3.1x)"
         return 1
     fi
 }
 
 # ---- 清单读取：每门一行，\x1f 分隔（非空白分隔符——bash read 会合并相邻
 # tab/space，空字段（如省略的 install）会左移错位，unit separator 无此坑）----
+# ⚠ awk FS 禁写字面 `-F'\x1f'`：bash 不解释单引号内 \x，awk 收到 4 字符串 `\x1f`——
+# gawk 按 hex escape 解（linux 绿），BSD awk（macos）无 \x 转义 → FS 退化 → $1==want
+# 恒假 → 全门 not-in-manifest（R2 run 36670130529 macos 实锚）。FS 必须传真字节变量。
+MANIFEST_SEP=$'\x1f'
+
 manifest_rows() {
     "${_PY}" - "$LANGS_FILE" <<'PYEOF'
 import sys, tomllib
@@ -133,7 +139,7 @@ PYEOF
 }
 
 manifest_row() {
-    manifest_rows | awk -F'\x1f' -v want="$1" '$1 == want { found=$0 } END { print found }'
+    manifest_rows | awk -F "$MANIFEST_SEP" -v want="$1" '$1 == want { found=$0 } END { print found }'
 }
 
 log_stderr_if_any() {
@@ -300,6 +306,11 @@ one_door() {
     local row
     row=$(manifest_row "$id")
     if [ -z "$row" ]; then
+        # 一次性诊断（R2 macos 教训：manifest_rows 每门秒败时看不到 python 侧真相）。
+        if [ -z "${_MANIFEST_DIAG:-}" ]; then
+            _MANIFEST_DIAG=1
+            log "LOG manifest diag: py=${_PY:-unset} ver=$("${_PY:-}" --version 2>&1 | head -1) tomllib=$("${_PY:-}" -c 'import tomllib; print("ok")' 2>&1 | head -1)"
+        fi
         log "FAIL $id not-in-manifest ($LANGS_FILE)"
         return 1
     fi
@@ -325,7 +336,17 @@ one_door() {
 
     local t0=$SECONDS
     local work errf
-    work=$(mktemp -d) || { log "FAIL $id mktemp"; return 1; }
+    # windows runner 的 mktemp→$TEMP 是 8.3 短名（RUNNER~1）：T0 生成的 fixture URI
+    # 带 RUNNER~1 → pyright 系内部按长名归一后 -32602 "not open in the session"
+    # （R2 python_ty 实锚）；vscode-langservers 系同前缀 documentSymbol 恒空（R2
+    # json/css 实锚）。改用 GITHUB_WORKSPACE 下长路径目录（PM 拍板）；本机调试无
+    # GITHUB_WORKSPACE → 回退 mktemp。每门独立 door-<id>-<pid> 目录，用完即删。
+    if [ "$PLAT" = windows ] && [ -n "${GITHUB_WORKSPACE:-}" ]; then
+        work="$GITHUB_WORKSPACE/.smoke-tmp/door-$id-$$"
+        mkdir -p "$work" || { log "FAIL $id smoke-tmp mkdir"; return 1; }
+    else
+        work=$(mktemp -d) || { log "FAIL $id mktemp"; return 1; }
+    fi
     # per-door 观测产物落持久目录（CI 作 artifact 上传，本地调试留 smoke-logs/）：
     #   <id>.stderr.log   CLI 侧 stderr（含 daemon stderr 行 + 探针/安装错误）
     #   <id>.install.out  install 步骤 stdout（apt/cpanm 断点全文，此前 400 字符截断）
@@ -451,7 +472,7 @@ shard_run() {
     local logf
     logf=$(mktemp) || { log "FAIL shard $shard: mktemp"; return 1; }
     for id in $ids; do
-        budget=$(manifest_row "$id" | awk -F'\x1f' '{print $7}')
+        budget=$(manifest_row "$id" | awk -F "$MANIFEST_SEP" '{print $7}')
         # 看门狗统一走 run_with_timeout（macOS 无 GNU timeout → bash 内建回退档）。
         run_with_timeout $((budget + 120)) "$SELF" _one "$id" 2>&1 | tee -a "$logf"
         rc=$?
@@ -476,7 +497,7 @@ shard_run() {
     local bad="" n flag pat
     for id in $ids; do
         # manifest_row 字段序：id(1) via(2) install(3) pin(4) fixture(5) lang_flag(6)。
-        flag=$(manifest_row "$id" | awk -F'\x1f' '{print $6}')
+        flag=$(manifest_row "$id" | awk -F "$MANIFEST_SEP" '{print $6}')
         pat="${flag:-$id}"
         n=$(grep -cE "^(PASS|FAIL|SKIP) (${id}|${pat})( |$)" "$logf")
         [ "$n" -eq 1 ] || bad="$bad ${id}x${n}"

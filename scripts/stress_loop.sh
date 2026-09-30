@@ -42,10 +42,11 @@ done
 [ -n "$SHARD" ] && [ -n "$CYCLE_SECS" ] || usage
 case "$CYCLE_SECS" in '' | *[!0-9]*) usage ;; esac
 
-# python（tomllib 3.11+）：windows python3 shim 缺位 → python（3.12）/ py launcher
-# 兜底，与 smoke_one.sh find_py 同款链。
+# python（tomllib 3.11+）：回退链与 smoke_one.sh find_py 同款——macos 的
+# python3/python 可能落 CLT 3.9，版本化命令（python3.1x）在 PATH 深处；windows
+# python3 shim 缺位 → python（3.12）/ py launcher 兜底。
 PY=""
-for c in python3 python py; do
+for c in python3 python py python3.14 python3.13 python3.12 python3.11; do
     if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import tomllib' 2>/dev/null; then
         PY="$c"
         break
@@ -135,6 +136,9 @@ fi
 cycle=0
 while [ "$SECONDS" -lt "$LIMIT" ]; do
     cycle=$((cycle + 1))
+    # 上轮 windows 门失败路径可能残留锁住的 fixture 目录（node LS 持目录锁）——
+    # 轮首 best-effort 清，防 .smoke-tmp 跨 cycle 累积（|| true：仍被锁则容忍）。
+    [ -n "${GITHUB_WORKSPACE:-}" ] && rm -rf "$GITHUB_WORKSPACE/.smoke-tmp" 2>/dev/null || true
     log "== stress cycle $cycle start (plat=$PLAT shard=$SHARD SECONDS=$SECONDS limit=$LIMIT)"
     collect_sentinel "c${cycle}-before"
     "$SELF_DIR/smoke_one.sh" --shard "$SHARD" 2>&1 | tee "$SMOKE_LOG_DIR/cycle-${cycle}.md" || true
