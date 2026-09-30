@@ -1,16 +1,21 @@
 # smoke_langs.toml —— 45 门语言 CI 冒烟矩阵清单（Phase 0 基建，serena-rust）。
 #
 # 三栏对账锚（上游 73 门，详见 local/agent-reports/ci-infra-45lang.md）：
-#   本矩阵（langs20 终账 2026-09-30）：74 门 = 64 真门 + 10 SKIP 冻结（crystal/
-#   nix/elixir/fsharp/matlab/wolfram 存量 6 + langs20 批新收 4：angular/groovy/
-#   gdscript/msl——原 R4「不入矩阵」裁决被 user 指令「剩余目录语言全部写上 CI」
-#   覆盖，证据链迁入各门 skip_evidence）。langs20 批（bd serena-rust-jp2）十门
-#   SKIP 转真门：java（Adoptium JRE 25 + alternatives）、bsl（update-alternatives
-#   切 21）、haskell（ghc 解析位原地覆盖 bindist 9.4.8）、nextflow（工程组
-#   fixture）、latex（texlab 单二进制裸 .tex 即出符号）、pascal（apt fpc + 条目补
-#   linux 组）、omnisharp（条目补 linux mono 变体 + apt mono-complete）、al（条目
-#   补 unix bin_path）、swift（swift.org tarball 自举）、qml（aqt Qt 6.8.3），
-#   luau 新收真门；逐门死因解除证据见各块 remark。
+#   本矩阵（langs20 R2 终账 2026-09-30）：74 门 = 63 真门 + 11 SKIP 冻结（crystal/
+#   nix/elixir/fsharp/nextflow/matlab/wolfram 存量 7 + langs20 批新收 4：angular/
+#   groovy/gdscript/msl——原 R4「不入矩阵」裁决被 user 指令「剩余目录语言全部写上
+#   CI」覆盖，证据链迁入各门 skip_evidence）。langs20 批九门 SKIP 转真门：java
+#   （Adoptium JRE 25 + alternatives）、bsl（update-alternatives 切 21）、haskell
+#   （bindist 直 ln /usr/local/bin）、latex（texlab 单二进制裸 .tex 即出符号）、
+#   pascal（apt fpc + 条目补 linux 组）、omnisharp（条目补 linux net6 tar.gz 原生
+#   apphost）、al（path_only + gzip 解包 install 行）、swift（swift.org tarball
+#   自举）、qml（aqt Qt 6.8.3），luau 新收真门；nextflow 于 R1 转、R2 回 SKIP
+#   （真死因 = client 侧 didChangeConfiguration 注入缺口，非工程上下文，见其块）。
+#   R1 首轮 CI（run 36649455255 @ bdada3f）57 PASS/10 SKIP/7 FAIL 的 R2 根因修复：
+#   al sha（vspackage 变 gzip 包 zip → path_only 解包）、haskell（本轮镜像 PATH 无
+#   ghc → bindist 直 ln）、omnisharp（mono JIT initialize 30s 超时 → net6 原生
+#   apphost）、pascal（tarball 内层同名目录）、qml/swift（验证命令不支持
+#   --version）。逐门证据见各块 remark。
 #   前账：R7 终账 2026-09-29 = 69 门 = 53 真门 + 16 SKIP 冻结（R6 证据 SKIP 7：
 #   bsl/crystal/elixir/nextflow/fsharp/haskell/qml，run 36577226543 帧级实锚）；
 #   R6 = smoke 终轮（run 36577226543 12 红门处置）。矩阵外仅 sql/mysql（documented
@@ -238,7 +243,11 @@ pin = "servers.toml"
 fixture = "nextflow/main.nf"
 lang_flag = "nextflow"
 budget_secs = 420
-remark = "langs20 轮转真门：R6 死因 = 裸单文件无工程上下文，LS 活着应答但 documentSymbol 恒空（run 36577226543: 130 发 65 [] + 65 null 实锚；账本原注『配 nextflow 工程上下文 fixture 即转真门』）——fixture 改 nextflow/ 工程组（main.nf + nextflow.config），LS 按根目录 nextflow.config 识别工程；装法维持上游同款 JAR download（npm 无包 registry 404 前实锚，v26.04.3 sha = GitHub API digest 锚）"
+skip_class = "BUDGET"
+skip_reason = "nextflow LS answers documentSymbol with [] unless the CLIENT injects workspace/didChangeConfiguration after initialized: upstream adapter sends a config-change notification whose error-reporting/exclude/plugin settings differ from what the server holds, which alone triggers the async workspace scan ($/progress under the initialize token) — a post-initialized notification channel T0 lacks; requests answered before the scan completes see an empty AST cache; adapter W-wave, not smoke-layer fixable"
+skip_evidence = "run 36649455255 record.jsonl: 工程组 fixture（main.nf + nextflow.config）下 documentSymbol 仍 5 attempts 全 []（LS 活着应答非瞬态）；↖ mirror nextflow_language_server.py@7a296833 L86 'workspace scan is asynchronous and reported via $/progress under the initialize token; requests answered before it ends see an empty AST cache' + L292 'does not index anything on initialized; it (re-)scans the workspace only when a configuration change arrives … Without this notification, every symbol request answers with an empty result'（2026-09-30 全文复核）"
+verified = "never"
+remark = "langs20 R1 转 R2 回 SKIP：工程组 fixture（R1 假设的死因）已证不足——真卡点 = client 侧 didChangeConfiguration 注入 + scan 完成等待，均为会话层 quirk（upstream _flush_deferred_workspace_scan 注释：首个 didOpen 还会 re-defer 扫描，1s debounce 只在无 pending change 的回合跑）；T0 框架出 post-initialized 通知通道或 W-wave 适配器即转真门，fixture 工程组维持"
 
 [[lang]]
 id = "elixir"
@@ -495,12 +504,12 @@ remark = "变体门：--lang solargraph；保持裸 .rb fixture（solargraph 直
 [[lang]]
 id = "haskell"
 via = "binary"
-install = "curl -fsSL https://downloads.haskell.org/~ghc/9.4.8/ghc-9.4.8-x86_64-deb11-linux.tar.xz -o /tmp/ghc.tar.xz && echo \"2743629d040f3213499146cb5154621d6f25e85271019afc9b9009e04d66bf6c  /tmp/ghc.tar.xz\" | sha256sum -c - && sudo tar -xJf /tmp/ghc.tar.xz -C /opt && curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.9.0.1/haskell-language-server-2.9.0.1-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && mkdir -p /tmp/hls && tar -xJf /tmp/hls.tar.xz -C /tmp/hls && sudo find /tmp/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && GB=\"$(dirname \"$(command -v ghc)\")\" && sudo ln -sf /opt/ghc-9.4.8/bin/ghc \"$GB/ghc\" && sudo ln -sf /opt/ghc-9.4.8/bin/ghc-9.4.8 \"$GB/ghc-9.4.8\" && ghc --version && haskell-language-server-wrapper --version"
+install = "curl -fsSL https://downloads.haskell.org/~ghc/9.4.8/ghc-9.4.8-x86_64-deb11-linux.tar.xz -o /tmp/ghc.tar.xz && echo \"2743629d040f3213499146cb5154621d6f25e85271019afc9b9009e04d66bf6c  /tmp/ghc.tar.xz\" | sha256sum -c - && sudo tar -xJf /tmp/ghc.tar.xz -C /opt && sudo ln -sf /opt/ghc-9.4.8/bin/ghc /opt/ghc-9.4.8/bin/ghc-9.4.8 /opt/ghc-9.4.8/bin/ghci /usr/local/bin/ && if command -v ghc >/dev/null 2>&1 && [ \"$(command -v ghc)\" != \"/usr/local/bin/ghc\" ]; then sudo ln -sf /opt/ghc-9.4.8/bin/ghc \"$(dirname \"$(command -v ghc)\")/ghc\"; fi && ghc --version && curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.9.0.1/haskell-language-server-2.9.0.1-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && mkdir -p /tmp/hls && tar -xJf /tmp/hls.tar.xz -C /tmp/hls && sudo find /tmp/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && haskell-language-server-wrapper --version"
 pin = "HLS 2.9.0.1 (bindist deb11) + GHC 9.4.8 (downloads.haskell.org bindist; sha = 官方 SHA256SUMS 2026-09-29)"
 fixture = "main.hs"
 lang_flag = "haskell"
 budget_secs = 900
-remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；langs20 轮转真门：R6 死因 = runner 预装 GHC 9.14.1 活在 PATH 前段（~/.ghcup/bin 一族），bindist 装到 /opt 后 ln /usr/local/bin 盖不过它（run 36577226543 `ghc --version` 实印 9.14.1 → HLS wrapper 'no handler' 实锚）——解药 = `dirname $(command -v ghc)` 定位实际解析位后原地 ln -sf 覆盖为 bindist 9.4.8（含版本命名 ghc-9.4.8 一并补，HLS wrapper/版本化二进制双解析面），ghc --version 打印留 install.out 作配对证据；HLS 2.9.0.1 bindist 携 {9.2.8,9.4.8,9.6.6,9.8.2,9.10.1} 五版本二进制，9.4.8 配对即活"
+remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；langs20 R2 修：R1 死因 = 本轮 runner 镜像 PATH 里根本没有 ghc（`command -v ghc` 空 → dirname 落 `.` → ln 到 cwd，ghc --version 127，run 36649455255 s6 实锚——R6 的『预装 9.14.1 活在 PATH』在 24.04 镜像不成立）——改主路线 = bindist 二进制直 ln /usr/local/bin（系统 PATH 恒覆盖，daemon LS spawn 同源），command -v ghc 仅作防御性覆盖保留；配对证据 = install 行 ghc --version（9.4.8）+ haskell-language-server-wrapper --version（2.9.0.1）双打印落 install.out，HLS 2.9.0.1 bindist 携 {9.2.8,9.4.8,9.6.6,9.8.2,9.10.1}（R6 wrapper 报错枚举即证明 9.4.8 二进制在案）"
 
 [[lang]]
 id = "ocaml"
@@ -608,26 +617,27 @@ pin = "servers.toml"
 fixture = "smoke.pp"
 lang_flag = "pascal"
 budget_secs = 900
-remark = "langs20 轮转真门（W4 接线单收口）：servers.toml pascal 条目补 linux 双组（tar.gz，sha 三方一致 embed=API=官方 checksums，矩阵 §18）；FPC 前置 = apt fpc（noble universe，pasls 对标准布局 /usr/lib/fpc 自发现——上游 pascal_server.py@7a296833 env 仅 settings 显式配置时注入，无 env 直启为默认形态）；apt fpc ~400MB 为预算主体"
+remark = "langs20 R2 修：R1 首跑死在 servers.toml linux 组 bin_path='pasls'——tarball 内层包一层同名目录（run 36649455255 'bin_path pasls missing after extract' 实锚）→ bin_path_per_platform 改 pasls-x86_64-linux/pasls / pasls-aarch64-linux/pasls（双 tarball 本机逐字节列目录实锚，sha=entry pin 逐字一致）；FPC 前置 = apt fpc（noble universe，pasls 对标准布局 /usr/lib/fpc 自发现——上游 pascal_server.py@7a296833 env 仅 settings 显式配置时注入，无 env 直启为默认形态）；apt fpc ~400MB 为预算主体"
 
 [[lang]]
 id = "omnisharp"
 via = "serena-download"
-install = "sudo apt-get update -qq && sudo apt-get install -y -qq mono-complete && $SERENA_CLI install omnisharp && dotnet restore \"$SERENA_FXDIR/smoke.csproj\" --verbosity quiet"
+install = "$SERENA_CLI install omnisharp && dotnet restore \"$SERENA_FXDIR/smoke.csproj\" --verbosity quiet"
 pin = "servers.toml"
 fixture = "omnisharp/smoke.cs"
 lang_flag = "omnisharp"
 budget_secs = 900
-remark = "langs20 轮转真门：R6 PLATFORM skip（windows-only pin）死因解除——servers.toml 补 linux-x86_64 组（自包含 mono 变体，sha = 上游 runtime_dependencies.json integrity FB4CAA47… + 本机整包下载复算双锚 2026-09-30；net6 形态需 runner 不具备的 roll-forward 前置故不选，条目注释详证）；mono-complete noble universe 6.8.0.105（packages.ubuntu.com 实锚）；exec 无 -s <sln>，OmniSharp -lsp 走 folder 模式自发现 fixture 目录内 csproj（csharp 门 csproj+restore 先例）；razor 插件不在（单下载 schema 不支持双包，基础 LSP 足够底线探针）；csharp 主门（Roslyn/csharp-ls）不动，本门为变体门"
+remark = "langs20 R2 改版：R1 的 mono 自包含变体（zip + apt mono-complete）首跑 initialize 30s 超时（run 36649455255——mono JIT 冷启动超出 lsp-core 单请求 30s，lsp-core 非目标不可动）——servers.toml linux 组改 net6 tar.gz（beta.4 前缀 URL，sha = 本机 45.5MB 整包下载一手锚）：根 `OmniSharp` 原生 apphost 冷启动快一个量级，runtimeconfig 自带 rollForward LatestMajor → runner dotnet 8 直接可跑（免 mono 免 env，条目注释详证）；exec 无 -s <sln>，OmniSharp -lsp 走 folder 模式自发现 fixture 目录内 csproj（csharp 门 csproj+restore 先例）；razor 插件不在（单下载 schema 不支持双包，基础 LSP 足够底线探针）；csharp 主门（Roslyn/csharp-ls）不动，本门为变体门"
 
 [[lang]]
 id = "al"
-via = "serena-download"
-pin = "servers.toml"
+via = "binary"
+install = "curl -fsSL -o /tmp/al.vsix.gz \"https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/18.0.2242655/vspackage\" && gunzip -f /tmp/al.vsix.gz && python3 -m zipfile -e /tmp/al.vsix /tmp/alx/ && sudo mkdir -p /opt/al-ls && sudo cp -r /tmp/alx/extension/bin/linux/. /opt/al-ls/ && sudo ln -sf /opt/al-ls/Microsoft.Dynamics.Nav.EditorServices.Host /usr/local/bin/ && test -x /usr/local/bin/Microsoft.Dynamics.Nav.EditorServices.Host"
+pin = "al extension 18.0.2242655 (vspackage URL 钉版; vspackage 字节 = gzip 包 zip, CI run 36649455255 观测 sha 534abdde… 与本机 317MB 全量下载复算逐字一致——gzip 传输层字节稳定、非 zip 真值故不进 servers.toml sha 锚)"
 fixture = "smoke.al"
 lang_flag = "al"
 budget_secs = 600
-remark = "langs20 轮转真门：R6 PLATFORM skip 死因解除——servers.toml 补 unix 四组 bin_path_per_platform（VSIX universal zip 多平台合一，extension/bin/{linux|darwin}/Microsoft.Dynamics.Nav.EditorServices.Host 无 .exe 后缀；URL/sha 与 win 组同值，GET-range 200 实锚 2026-09-30）；AL LS 对裸 .al 单对象文件出符号（codeunit/table 解析为语法层）"
+remark = "langs20 R2 改版：R1 的 download 形态首跑即 sha mismatch（entry 旧 embed sha 3971995e 为 gzip 前时代值）——取证 vspackage 现为 gzip 包 zip（magic 1f8b→PK，Accept-Encoding identity/VSCode UA 均不可关，gzip 内层 zip 319MB 含 extension/bin/linux/ 原生 Host），install schema 无两级解包 → servers.toml 转 path_only（scala 先例），install 行 curl+gunzip+python3 -m zipfile 自解；linux Host = self-contained（Host.runtimeconfig includedFrameworks 8.0.24 自带 runtime，免 dotnet）；entry 版本 18.0.2242655 的 API listing 已被 marketplace 收走但 vspackage 端点仍服务（本机实锚），新版 18.0.2732683 为 net10 纯托管包无 linux 原生（CDN 资产实测）故不升版"
 
 # ── W3 批（php/lua/scala/swift；php 块在原位改 intelephense，lua 块在 download 段）──
 
@@ -645,12 +655,12 @@ remark = "path_only 门：servers.toml [servers.scala] 只探 PATH，安装走 c
 [[lang]]
 id = "swift"
 via = "binary"
-install = "curl -fsSL https://download.swift.org/swift-6.2.4-release/ubuntu2404/swift-6.2.4-RELEASE/swift-6.2.4-RELEASE-ubuntu24.04.tar.gz -o /tmp/swift.tar.gz && sudo mkdir -p /opt/swift && sudo tar -xzf /tmp/swift.tar.gz -C /opt/swift --strip-components=2 && sudo ln -sf /opt/swift/bin/sourcekit-lsp /opt/swift/bin/swiftc /opt/swift/bin/swift /usr/local/bin/ && sourcekit-lsp --version && swift --version 2>&1 | head -1 >&2"
+install = "curl -fsSL https://download.swift.org/swift-6.2.4-release/ubuntu2404/swift-6.2.4-RELEASE/swift-6.2.4-RELEASE-ubuntu24.04.tar.gz -o /tmp/swift.tar.gz && sudo mkdir -p /opt/swift && sudo tar -xzf /tmp/swift.tar.gz -C /opt/swift --strip-components=2 && sudo ln -sf /opt/swift/bin/sourcekit-lsp /opt/swift/bin/swiftc /opt/swift/bin/swift /usr/local/bin/ && swift --version 2>&1 | head -1 >&2 && test -x /usr/local/bin/sourcekit-lsp"
 pin = "sourcekit-lsp 6.2.4（随 swift.org 6.2.4 RELEASE ubuntu24.04 工具链；release 无官方 per-file digest 故钉 URL——erlang_ls 先例；URL HEAD 200 实锚 2026-09-30）"
 fixture = "main.swift"
 lang_flag = "swift"
 budget_secs = 1200
-remark = "langs20 轮转真门：R6 PLATFORM skip 死因 = 'sourcekit-lsp ships with Xcode/Swift toolchain, ubuntu runner has none'——swift.org 官方 linux tarball 即可脚本化工具链自举（path_only 条目本体不动，工具链入 PATH 即探测面命中）；--strip-components=2 剥 swift-6.2.4-RELEASE-usr/ 包装层；documentSymbol 裸 .swift 走 sourcekitd 语法层，无 Package.swift 亦出符号；tarball ~700MB 为预算主体（1200 上限）"
+remark = "langs20 R2 修：R1 首跑工具链装好、symlink 已建，但验证命令 `sourcekit-lsp --version` 不存在（Unknown option exit 64，run 36649455255 实锚）→ swift --version（工具链级，支持）打 install.out + test -x 收口；其余锚同 R1：swift.org 官方 linux tarball 脚本化自举（path_only 条目本体不动，工具链入 PATH 即探测面命中），--strip-components=2 剥 swift-6.2.4-RELEASE-usr/ 包装层，documentSymbol 裸 .swift 走 sourcekitd 语法层，tarball ~700MB 为预算主体（1200 上限）"
 
 # ══ W5 批（gleam/lean4/julia 三真门 + wolfram SKIP 批准冻结；qml 于 R6 SKIP、langs20 批转真门）═══
 
@@ -668,12 +678,12 @@ remark = "↖ mirror gleam_language_server.py@7a296833（`gleam lsp` 子命令�
 [[lang]]
 id = "qml"
 via = "binary"
-install = "pip install --quiet aqtinstall && aqt install-qt linux desktop 6.8.3 linux_gcc_64 --outputdir /opt/qt && sudo find /opt/qt -name qmlls -type f -exec ln -sf {} /usr/local/bin/qmlls \\; && qmlls --version"
+install = "pip install --quiet aqtinstall && aqt install-qt linux desktop 6.8.3 linux_gcc_64 --outputdir /opt/qt && sudo find /opt/qt -name qmlls -type f -exec ln -sf {} /usr/local/bin/qmlls \\; && qmlls --help >/dev/null && test -x /usr/local/bin/qmlls"
 pin = "qmlls 6.8.3（aqt 官方渠道；Qt 6.8 起带 documentSymbol/hover handler——noble apt 封顶 6.4.2 无 handler 为 R6 死因）"
 fixture = "Main.qml"
 lang_flag = "qml"
 budget_secs = 1200
-remark = "langs20 轮转真门：R6 死因 = noble apt qmlls 6.4.2 无 documentSymbol/hover handler（run 36577226543 双 -32601 'no handler registered' 实锚），Qt 官方 installer 不可脚本化——aqtinstall 即 CI 事实标准渠道（aqt list-qt 实锚 6.8.3 linux_gcc_64 在架 + base archives 含 qtdeclarative 2026-09-30 本机实测；qmlls 构建于 qt/qtdeclarative tools/qmlls @v6.8.1 源码树实锚）；qmlls 落 libexec/ 布局随版浮动故 find-ln（gleam/erlang find-install 先例）；条目 path_only 本体不动（binary_name=qmlls，上游 which qmlls6→qmlls 顺序与我们单名对齐维持）；Qt 6.8.3 desktop ~1GB 下载为预算主体"
+remark = "langs20 R2 修：R1 首跑 aqt 装成后死在验证命令 `qmlls --version`（qmlls 无 version 选项 exit 1，run 36649455255 s2 实锚——LS 本体装成功了）→ 换 `qmlls --help` 可用性探测 + test -x 双验；其余锚同 R1：Qt 6.8 起带 documentSymbol/hover handler（noble apt 6.4.2 无 handler 为 R6 死因，run 36577226543 双 -32601 实锚），aqt = CI 事实标准渠道（aqt list-qt 实锚 6.8.3 linux_gcc_64 在架 + base archives 含 qtdeclarative 2026-09-30 本机实测；qmlls 构建于 qt/qtdeclarative tools/qmlls @v6.8.1 源码树实锚）；qmlls 落 libexec/ 布局随版浮动故 find-ln（gleam/erlang find-install 先例）；条目 path_only 本体不动；Qt 6.8.3 desktop ~1GB 下载为预算主体"
 
 [[lang]]
 id = "lean4"
@@ -788,5 +798,7 @@ remark = "mSL = mIRC Scripting Language（.mrc），与 Xcode/macOS 无关；R4 
 # 见上）；julia 已于 W5 批收编（path_only + julia tarball + Pkg 预装门，见上）；
 # wolfram 于 W5 批落真 SKIP 块（LICENSE，PM 批准冻结，见 W5 批节）；
 # luau 于 langs20 批收编（真门，1.63.0 条目 + 六平台 digest 复核）；
-# java/bsl/haskell/nextflow/latex/pascal/omnisharp/al/swift/qml 十门于 langs20 批
-# 由 SKIP 转真门（逐门死因解除证据见各块 remark；R7 终账 69=53+16 → 74=64+10）。
+# java/bsl/haskell/latex/pascal/omnisharp/al/swift/qml 九门于 langs20 批由 SKIP 转
+# 真门（R1 首轮 CI run 36649455255 七门 FAIL 已 R2 根因修复，逐门证据见各块
+# remark）；nextflow 于 R1 转、R2 回 SKIP（didChangeConfiguration 注入缺口）。
+# R2 终账 74 = 63 真门 + 11 SKIP。

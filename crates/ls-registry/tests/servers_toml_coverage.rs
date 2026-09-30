@@ -14,10 +14,11 @@ use ls_registry::spec;
 
 const SERVERS_TOML: &str = include_str!("../servers.toml");
 
-/// A 类批量收录的 24 个新 download 条目（矩阵 §1-§25 顺序，eclipse_jdtls 跳过）。
+/// A 类批量收录的 23 个新 download 条目（矩阵 §1-§25 顺序，eclipse_jdtls 跳过；
+/// al 于 langs20 R2 转 path_only——marketplace vspackage 变 gzip 包 zip，download
+/// schema 无两级解包，2026-09-30）。
 const NEW_DOWNLOAD_IDS: &[&str] = &[
     "ada",
-    "al",
     "bsl",
     "csharp",
     "clojure",
@@ -66,8 +67,8 @@ fn new_download_entries_parse_with_complete_fields() {
     let servers = parsed_servers();
     assert_eq!(
         NEW_DOWNLOAD_IDS.len(),
-        24,
-        "矩阵 25 条清单减 eclipse_jdtls 应为 24"
+        23,
+        "矩阵 25 条清单减 eclipse_jdtls 减 al(path_only) 应为 23"
     );
     for id in NEW_DOWNLOAD_IDS {
         let spec = servers
