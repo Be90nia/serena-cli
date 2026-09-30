@@ -28,6 +28,11 @@ on:
 permissions:
   contents: read
 
+# windows runner 默认 PowerShell——本工作流步骤全是 bash 语法，统一切 bash。
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ls-stress
   cancel-in-progress: true
