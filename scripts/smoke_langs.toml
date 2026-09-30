@@ -1,20 +1,22 @@
 # smoke_langs.toml —— 45 门语言 CI 冒烟矩阵清单（Phase 0 基建，serena-rust）。
 #
 # 三栏对账锚（上游 73 门，详见 local/agent-reports/ci-infra-45lang.md）：
-#   本矩阵（langs20 R3 终账 2026-09-30）：74 门 = 62 真门 + 12 SKIP 冻结（crystal/
+#   本矩阵（langs20 R5 终账 2026-09-30）：74 门 = 61 真门 + 13 SKIP 冻结（crystal/
 #   nix/elixir/fsharp/nextflow/matlab/wolfram 存量 7 + langs20 批新收 4：angular/
-#   groovy/gdscript/msl + qml R3 回场——apt 6.4.2 与 aqt 6.8.3 两 strike 证明 CI 可
-#   得 qmlls 构建均无 documentSymbol handler，install 通路已全绿纯 capability 缺口）。
-#   langs20 批七门 SKIP 转真门存活：java（Adoptium JRE 25 + alternatives）、bsl
-#   （update-alternatives 切 21）、haskell（bindist 直 ln /usr/local/bin，R3 带
-#   set -ex 轨迹诊断）、latex（texlab 单二进制裸 .tex 即出符号）、pascal（apt fpc +
-#   条目补 linux 组）、omnisharp（条目补 linux net6 tar.gz 原生 apphost）、al
-#   （path_only + gzip 解包 install 行，R3 带 set -ex 轨迹诊断）、swift（swift.org
-#   tarball 自举），luau 新收真门；nextflow/qml 于 R1 转、R2/R3 回 SKIP（真死因 =
-#   会话层协议缺口 / qmlls 构建 capability，见各块 skip_evidence）。
-#   CI 轮次账：R1 run 36649455255 = 57 PASS/10 SKIP/7 FAIL；R2 run 36653605574 =
-#   59 PASS/11 SKIP/4 FAIL（al/haskell/pascal/qml，pascal 为链尾验证假红已删）。
-#   逐门证据见各块 remark。
+#   groovy/gdscript/msl + R3/R5 回场 2：nextflow（didChangeConfiguration 注入缺口）/
+#   qml（qmlls 两 strike 无 handler）+ R5 回场 1：al（裸 .al 休眠需 BC 工程上下文，
+#   install 链已全绿）。langs20 批六门 SKIP 转真门存活：java（Adoptium JRE 25 +
+#   alternatives）、bsl（update-alternatives 切 21）、haskell（HLS 2.15.0.0 配对
+#   runner ghcup GHC 9.14.1 + 版本配对断言）、latex（texlab 单二进制裸 .tex 即出
+#   符号）、pascal（apt fpc + 条目补 linux 组 + fixture unit 形态）、omnisharp（条目
+#   补 linux net6 tar.gz 原生 apphost）、swift（swift.org tarball 自举），luau 新收
+#   真门。
+#   CI 轮次账：R1 run 36649455255 = 57 PASS/10 SKIP/7 FAIL（al/haskell/nextflow/
+#   omnisharp/pascal/qml/swift）→ R2 run 36653605574 = 59/11/4（al/haskell/pascal/
+#   qml）→ R3 run 36657710307 = 59/12/3（al/haskell/pascal，qml 已 SKIP）→ R4 run
+#   36659777378 = 60/12/2（pascal fixture unit 形态转绿；余 al/haskell）→ R5 = 终局
+#   轮（al 转 SKIP、haskell HLS 配对断言，目标 FAIL=0 = 61/13/0）。逐门证据见各块
+#   remark。
 #   前账：R7 终账 2026-09-29 = 69 门 = 53 真门 + 16 SKIP 冻结（R6 证据 SKIP 7：
 #   bsl/crystal/elixir/nextflow/fsharp/haskell/qml，run 36577226543 帧级实锚）；
 #   R6 = smoke 终轮（run 36577226543 12 红门处置）。矩阵外仅 sql/mysql（documented
@@ -503,12 +505,12 @@ remark = "变体门：--lang solargraph；保持裸 .rb fixture（solargraph 直
 [[lang]]
 id = "haskell"
 via = "binary"
-install = "set -ex; curl -fsSL https://downloads.haskell.org/~ghc/9.4.8/ghc-9.4.8-x86_64-deb11-linux.tar.xz -o /tmp/ghc.tar.xz && echo \"2743629d040f3213499146cb5154621d6f25e85271019afc9b9009e04d66bf6c  /tmp/ghc.tar.xz\" | sha256sum -c - && sudo mkdir -p /opt/ghc && sudo tar -xJf /tmp/ghc.tar.xz -C /opt/ghc --strip-components=1 && ls /opt/ghc/bin/ && sudo ln -sf /opt/ghc/bin/ghc /opt/ghc/bin/ghc-9.4.8 /opt/ghc/bin/ghci /usr/local/bin/ && hash -r; ls -la /usr/local/bin/ghc; which ghc; ghc --version && curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.9.0.1/haskell-language-server-2.9.0.1-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && sudo mkdir -p /opt/hls && sudo tar -xJf /tmp/hls.tar.xz -C /opt/hls --strip-components=1 && sudo find /opt/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && haskell-language-server-wrapper --version"
-pin = "HLS 2.9.0.1 (bindist deb11) + GHC 9.4.8 (downloads.haskell.org bindist; sha = 官方 SHA256SUMS 2026-09-29)"
+install = "set -ex; curl -fsSL https://github.com/haskell/haskell-language-server/releases/download/2.15.0.0/haskell-language-server-2.15.0.0-x86_64-linux-deb11.tar.xz -o /tmp/hls.tar.xz && echo \"9d3f12bfd55d0d3ca40d0bb990498cb45a09ea5e391fcdbb63a76b76e73f67c2  /tmp/hls.tar.xz\" | sha256sum -c - && sudo mkdir -p /opt/hls && sudo tar -xJf /tmp/hls.tar.xz -C /opt/hls --strip-components=1 && ls /opt/hls/bin/ && sudo find /opt/hls -type f -name 'haskell-language-server*' -exec install -m 755 {} /usr/local/bin/ \\; && hash -r; GHC_V=\"$(ghc --version | grep -oE '[0-9]+(\\.[0-9]+)+')\" && HLS_OUT=\"$(haskell-language-server-wrapper --version)\" && echo \"$HLS_OUT\" && echo \"$HLS_OUT\" | grep -q \"GHC: $GHC_V\""
+pin = "HLS 2.15.0.0 (deb11 bindist; sha256 = GitHub API assets[].digest 9d3f12bf… 2026-09-30 实锚; release body 官方支持 GHC 9.14.1) + runner ghcup GHC 9.14.1（零安装，PATH 自带）"
 fixture = "main.hs"
 lang_flag = "haskell"
 budget_secs = 900
-remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；langs20 R4 根因实锤（r3s6/haskell.stderr.log 轨迹：`ls: cannot access '/opt/ghc-9.4.8/bin/'`）——deb11 bindist 顶层目录名不叫 ghc-9.4.8 → 改布局无关解包：GHC/HLS 双 tarball 各 --strip-components=1 解到 /opt/ghc 与 /opt/hls，ln 指向 /opt/ghc/bin/ghc；set -ex 轨迹与 hash -r/ls/which 三探针保留（R3 引入，定性功臣）；glibc 边界：deb11 bindist（2.31）在 noble（2.39）向前兼容，轨迹现 loader 错误即换 deb12/noble 变体；配对证据 = ghc --version + haskell-language-server-wrapper --version 双打印落 install.out"
+remark = "↖ mirror haskell_language_server.py@7a296833 [wrapper --lsp]（entry exec 已修）；langs20 R5 终局修（r4s6/haskell.install.out 尾部自证）：runner 自带 ghcup `/usr/local/.ghcup/bin/ghc` = 9.14.1 且 PATH 排在 /usr/local/bin 前（`ghc --version` 实印 9.14.1），我们装的 HLS 2.9.0.1 wrapper 自选 9.10.1 后端（`2.9.0.1 (GHC: 9.10.1)`），按项目 GHC 9.14.1 找匹配落空 → 降级会话 'no handler for textDocument/documentSymbol'（daemon.log 实锤）——路径 a 终局：不装 GHC（runner 现成 9.14.1，省 200MB+），改装 HLS 2.15.0.0 deb11 bindist（release body 官方支持清单首列 GHC 9.14.1，2026-09-03 发布；sha = GitHub API assets[].digest 实锚），install 尾加版本配对断言：wrapper --version 输出须含 `GHC: <ghc --version 解析值>` 方放行；HLS 下载段 267MB 为预算主体"
 
 [[lang]]
 id = "ocaml"
@@ -636,7 +638,11 @@ pin = "al extension 18.0.2242655 (vspackage URL 钉版; vspackage 字节 = gzip 
 fixture = "smoke.al"
 lang_flag = "al"
 budget_secs = 600
-remark = "langs20 R4 根因实锤（r3s1/al.stderr.log set -ex 轨迹）：curl/gunzip/zipfile/mkdir/cp/ln 全静默过，唯链尾 test -x 挂——python3 -m zipfile -e 解压不保留 unix 可执行位（Host 644 落盘 → symlink 指向存在但不可执行文件；上游 serena b83b655c 'fix: zip extract permission bits' #2102 同类坑）→ cp 后对 /opt/al-ls 的 *host* 二进制 chmod +x；vspackage 内层 zip 布局证据 = R2 本机 317MB 全量下载解包：gzip 内层 zip 319,744,694 bytes，extension/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host（72,568 bytes 原生 apphost，454 linux 条目含同目录 runtime dll），Host.runtimeconfig includedFrameworks 8.0.24（self-contained）；vspackage 字节稳定双锚（CI run 36649455255 观测 sha 534abdde… 与本机复算逐字一致）"
+skip_class = "HOST"
+skip_reason = "AL LS Host runs indefinitely with zero stderr for standalone .al files but never activates symbol providers — it requires Business Central project context (app.json + .alpackages symbol baseline) which the smoke framework does not scaffold; documentSymbol answered empty on every probe"
+skip_evidence = "run 36659777378 r4s1/al.daemon.log：LS 存活 6 分钟零 stderr、documentSymbol 恒空 ×5（R4 chmod 修复后 install/启动链全绿——死点纯在工程上下文缺失，非装法非执行位）；上游 al_language_server.py@7a296833 依赖 AL 项目环境（app.json/package 缓存）为设计语义"
+verified = "never"
+remark = "langs20 R2 转真门（gzip 解包 + chmod 执行位两轮修复，install 链终局全绿）、R5 封顶转 SKIP（PM 定论 2026-09-30）：裸 .al 文件休眠为 AL LS 设计行为，smoke 框架不做 BC 工程脚手架；复活通路已留存——本门 install 行（vspackage gzip 解包 → /opt/al-ls + symlink）+ servers.toml [servers.al] path_only 条目完整，未来框架支持工程脚手架或上游提供 standalone 模式即原样转真门"
 
 # ── W3 批（php/lua/scala/swift；php 块在原位改 intelephense，lua 块在 download 段）──
 
@@ -801,7 +807,8 @@ remark = "mSL = mIRC Scripting Language（.mrc），与 Xcode/macOS 无关；R4 
 # 见上）；julia 已于 W5 批收编（path_only + julia tarball + Pkg 预装门，见上）；
 # wolfram 于 W5 批落真 SKIP 块（LICENSE，PM 批准冻结，见 W5 批节）；
 # luau 于 langs20 批收编（真门，1.63.0 条目 + 六平台 digest 复核）；
-# java/bsl/haskell/latex/pascal/omnisharp/al/swift 七门于 langs20 批由 SKIP 转真门
-# （R1/R2 CI 轮次 FAIL 已逐门修复，al/haskell R3 带 set -ex 轨迹诊断，逐门证据见
-# 各块 remark）；nextflow/qml 于 R1 转、R2/R3 回 SKIP（会话层协议缺口 / qmlls
-# 构建 capability 两 strike）。R3 终账 74 = 62 真门 + 12 SKIP。
+# java/bsl/haskell/latex/pascal/omnisharp/swift 七门于 langs20 批由 SKIP 转真门存活
+# （R1-R4 CI 轮次 FAIL 逐门修复：haskell 终局 = HLS 2.15.0.0 配对 runner ghcup
+# 9.14.1 + 版本配对断言）；al 于 R2 转真门、R5 封顶回 SKIP（裸 .al 休眠需 BC 工程
+# 上下文，install 链已全绿）；nextflow/qml 于 R1 转、R2/R3 回 SKIP（会话层协议
+# 缺口 / qmlls 构建 capability 两 strike）。R5 终账 74 = 61 真门 + 13 SKIP。
