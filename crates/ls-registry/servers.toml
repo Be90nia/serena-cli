@@ -783,6 +783,7 @@ languages = ["nextflow"]
 install = "download"
 exec = ["java", "-jar", "{bin}"]
 source_commit = "43ae0211"
+did_change_config = { nextflow = { debug = false, errorReportingMode = "errors", files = { exclude = ["work", ".nextflow"] } } }
 
 [servers.nextflow.download]
 version = "26.04.3"
