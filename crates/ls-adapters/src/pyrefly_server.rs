@@ -250,6 +250,14 @@ mod tests {
 
     #[test]
     fn launch_prefers_entry_then_uvx_from() {
+        // 环境门：无 pyrefly/uvx 的机器（CI runner 裸 env）跳过——resolve 依赖 PATH。
+        if std::env::var_os("PATH").is_none_or(|p| {
+            !["pyrefly", "pyrefly.exe", "uvx", "uvx.exe"]
+                .iter()
+                .any(|b| std::env::split_paths(&p).any(|d| d.join(b).is_file()))
+        }) {
+            return;
+        }
         // 形状锁：uvx 路径四段 argv（resolve 结果依赖环境 PATH，锁 --from 分支形状）。
         let cmd = resolve_launch().expect("launch resolvable (pyrefly or uvx on PATH)");
         if cmd[0].to_string_lossy().ends_with("uvx")
