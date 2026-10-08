@@ -578,7 +578,7 @@
           "type": "number"
         },
         "_max_tokens": {
-          "description": "soft budget on items (private)",
+          "description": "soft budget on list output (private)",
           "required": false,
           "type": "number"
         },
@@ -729,7 +729,7 @@
       "args": {
         "top_n": {
           "default": 20,
-          "description": "E: top symbols by ref count",
+          "description": "E: per-file top-level symbol map (top N)",
           "required": false,
           "type": "number"
         }

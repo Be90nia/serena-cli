@@ -1188,6 +1188,21 @@ version = "1.14.4"
 bin_rel = "intelephense"
 npm_args = ["--stdio"]
 
+[servers.devsense_php]
+# ↖ mirror: devsense_php_language_server.py@3b99f8b0 (upstream PR #1917)
+# 第三方 PHP LS（Devsense 维护的 devsense-php-ls npm 包，平台多 arch binary）；
+# 本机 CI-only 注册——fixture 与 install 全 PLATFORM SKIP，本机不跑，仅保留
+# 用户 `--lang php_devsense` 显式路由面。语言路由 `php` 仍归 phpactor 条目（不
+# 抢默认），`php_devsense` 仅按 entry id 显式路由可达（避撞先例同 intelephense）。
+languages = ["php_devsense"]
+install = "npm"
+source_commit = "3b99f8b0"
+[servers.devsense_php.npm]
+package = "devsense-php-ls"
+version = "1.0.19197"
+bin_rel = "devsense.php.ls"
+npm_args = ["--stdio"]
+
 [servers.json]
 languages = ["json"]
 install = "npm"

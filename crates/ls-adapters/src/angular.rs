@@ -45,7 +45,10 @@ use lsp_core::framing::JsonRpc;
 use lsp_types::InitializeParams;
 use serde_json::{Value, json};
 
-use crate::{LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error};
+use crate::{
+    LanguageId, LanguageServerAdapter, ProjectCtx, ProjectRootSlot, RequestHooks,
+    not_installed_error,
+};
 
 /// 四包 pin（↖ mirror `DEFAULT_ANGULAR_LANGUAGE_SERVER_VERSION` 等，禁随意改）：
 /// @angular/language-server 21.2.10 + @angular/language-service 21.2.10 +
@@ -72,8 +75,9 @@ const WATCH_POLL: Duration = Duration::from_millis(500);
 /// root 未设置时的退路：虚拟探针 URI。
 const PROBE_FALLBACK: &str = "file:///__angular_ready_probe__";
 
-/// 当前会话项目 root（零字段单例 → 静态槽，supervisor 经 set_project_root 写入）。
-static PROBE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6；零字段单例 →
+/// 静态槽，supervisor 经 set_project_root 写入。读侧无键，走 get_last 相邻语义）。
+static PROBE_ROOT: ProjectRootSlot = ProjectRootSlot::new();
 
 /// ngserver 伴生会话（.html definition/hover/references）。key = root。
 static NG_COMPANION: Mutex<Option<(PathBuf, std::sync::Arc<lsp_core::session::Session>)>> =
@@ -315,7 +319,7 @@ impl LanguageServerAdapter for AngularAdapter {
     }
 
     fn set_project_root(&self, root: &Path) {
-        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+        PROBE_ROOT.set(root);
     }
 
     /// `.html` 语义重路由（↖ mirror 路由表 `.html` 行）：documentSymbol → vscode-html
@@ -341,11 +345,7 @@ impl LanguageServerAdapter for AngularAdapter {
         session: &std::sync::Arc<lsp_core::session::Session>,
     ) -> anyhow::Result<()> {
         let install = resolve_install()?;
-        let root = PROBE_ROOT
-            .lock()
-            .expect("PROBE_ROOT poisoned")
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = PROBE_ROOT.get_last().unwrap_or_else(|| PathBuf::from("."));
 
         // 硬前提探测：@angular/core 缺失 → 模板特性静默空（上游 warn 同款）。
         if find_angular_core_install(&root).is_none() {

@@ -16,8 +16,7 @@
 //!   （同步覆盖 Cargo workspace + git submodules；gopls 视角下 go.work 命中即生效，
 //!   其他 marker 命中不影响 gopls —— 它会忽略无关 folder；URL/等后续 monorepo）。
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,7 +24,8 @@ use ls_runtime::process::{LaunchInfo, TransportKind};
 use lsp_types::InitializeParams;
 
 use crate::{
-    LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error, which_no_unc,
+    LanguageId, LanguageServerAdapter, ProjectCtx, ProjectRootSlot, RequestHooks,
+    not_installed_error, which_no_unc,
 };
 
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,9 +33,12 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// root 未设置 / 无候选文件时的退路：旧版虚拟探针 URI（不触发项目索引，仅保底）。
 const PROBE_FALLBACK: &str = "file:///__gopls_ready_probe__";
 
-/// 当前会话项目 root。adapter 是零字段单例（`Copy`）存不了实例状态 —— 会话级数据
-/// 放静态槽，由 supervisor::session_for 在 `on_server_ready` 前经 `set_project_root` 写入。
-static PROBE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6）。adapter 是零字段
+/// 单例（`Copy`）存不了实例状态 —— 会话级数据放静态槽，由 supervisor::session_for
+/// 在 `on_server_ready` 前经 `set_project_root` 写入。go.work 的 monorepo module
+/// 探测（initialize_patches）从 params.root_uri 反解本会话 root（该时机槽内 last
+/// 还是上一个会话）；探针读侧无键，走 get_last 相邻语义。
+static PROBE_ROOT: ProjectRootSlot = ProjectRootSlot::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GoplsAdapter;
@@ -70,7 +73,10 @@ impl LanguageServerAdapter for GoplsAdapter {
         // M2 深度：探测 go.work / Cargo workspace / git submodules → 追加到 workspaceFolders。
         // supervisor 已设 root 为唯一 folder；这里 extend 多 module。
         // 探测未命中（单 module 项目）→ 不动 workspaceFolders。
-        let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
+        // bd serena-rust-4y6：root 从本会话 params.root_uri 反解 —— 静态槽此处
+        // 还停留在上一个会话的 root，单槽时代跨项目 monorepo 探测错位的实锚。
+        #[allow(deprecated)]
+        let root = crate::project_root::root_uri_to_path(base.root_uri.as_ref());
         let Some(root) = root else {
             return;
         };
@@ -83,7 +89,7 @@ impl LanguageServerAdapter for GoplsAdapter {
     }
 
     fn set_project_root(&self, root: &Path) {
-        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+        PROBE_ROOT.set(root);
     }
 
     async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
@@ -116,7 +122,7 @@ impl GoplsAdapter {
     /// `on_server_ready` 将发出的探针 URI：root 下真实小文件的 file URI；root 未设置
     /// 或无候选文件时退虚拟 URI。
     fn probe_uri(&self) -> String {
-        let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
+        let root = PROBE_ROOT.get_last();
         match root {
             Some(root) => crate::probe_uri_for_root(&root, self.languages(), PROBE_FALLBACK),
             None => PROBE_FALLBACK.to_string(),
@@ -127,6 +133,7 @@ impl GoplsAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     /// initialize_patches / set_project_root 读写进程级全局 PROBE_ROOT —— 并行测试
     /// 下「set→use」会被另一测试的 set 插入（读到别人的 root 目录）。全程持锁串行。
@@ -173,8 +180,13 @@ mod tests {
         let adapter = GoplsAdapter;
         adapter.set_project_root(dir.path());
         let mut params = lsp_types::InitializeParams::default();
-        // supervisor 已设 root 为唯一 folder；模拟之。
+        // supervisor 已设 root 为唯一 folder + root_uri；新契约（bd serena-rust-4y6）
+        // 下 initialize_patches 从 params.root_uri 反解本会话 root。
         let uri_str = lsp_core::docsync::path_to_uri_str(dir.path());
+        #[allow(deprecated)]
+        {
+            params.root_uri = Some(lsp_types::Uri::from_str(&uri_str).unwrap());
+        }
         params.workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
             uri: lsp_types::Uri::from_str(&uri_str).unwrap(),
             name: "root".to_string(),
@@ -203,6 +215,10 @@ mod tests {
         adapter.set_project_root(dir.path());
         let mut params = lsp_types::InitializeParams::default();
         let uri_str = lsp_core::docsync::path_to_uri_str(dir.path());
+        #[allow(deprecated)]
+        {
+            params.root_uri = Some(lsp_types::Uri::from_str(&uri_str).unwrap());
+        }
         params.workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
             uri: lsp_types::Uri::from_str(&uri_str).unwrap(),
             name: "root".to_string(),

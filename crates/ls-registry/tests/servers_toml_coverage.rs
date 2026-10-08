@@ -184,8 +184,8 @@ fn legacy_entries_survive_batch_addition() {
     }
     assert_eq!(
         servers.len(),
-        74,
-        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）+ bd 56a 第一批 +2 docker/sql + 第二批 +2 pgls/sqls-mysql + 后续批 +1 css + W3 +1 scala + W5 +2 julia/wolfram + W3b +1 angular（html/yaml/marksman/kotlin/dart/ansible 等为存量条目，多批零新增）——集成收口 PM 实测 74"
+        75,
+        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）+ bd 56a 第一批 +2 docker/sql + 第二批 +2 pgls/sqls-mysql + 后续批 +1 css + W3 +1 scala + W5 +2 julia/wolfram + W3b +1 angular + r8.5 +1 devsense_php（html/yaml/marksman/kotlin/dart/ansible 等为存量条目，多批零新增）"
     );
     let marksman = &servers["marksman"];
     assert_eq!(marksman.install, "download");
@@ -233,11 +233,14 @@ fn phase3_pkg_entries_parse_with_upstream_pins() {
     let mut seen: HashSet<&'static str> = HashSet::new();
 
     // npm 类：必填四件 + 版本 pin spot-check + secondary 展开正确。
+    // r8.5：devsense_php 入表（upstream PR #1917；bin_rel = devsense.php.ls，
+    // npm_args=["--stdio"]，version=1.0.19197）。
     const NPM_IDS: &[&str] = &[
         "bash",
         "ansible",
         "elm",
         "intelephense",
+        "devsense_php",
         "json",
         "solidity",
         "scss",
@@ -1312,8 +1315,10 @@ fn w3_php_lua_scala_swift_doors_wired() {
 
     // T0 分流：--lang 透传值 → spec_for 命中条目；三门 adapter_for 全 None。
     // scala 除外：W3 采纳（bd 69e batchA 缺失[高]）已升 T2。
+    // r8.5：devsense_php 入表（upstream PR #1917；同 intelephense T0+entry id 路由）。
     for (lang, want_id) in [
         ("intelephense", "intelephense"),
+        ("devsense_php", "devsense_php"),
         ("lua", "lua"),
         ("swift", "sourcekit_lsp"),
     ] {
@@ -1338,7 +1343,9 @@ fn w3_php_lua_scala_swift_doors_wired() {
     assert_eq!(php_route_id, "phpactor", "语言路由 php 归 phpactor（存量）");
 
     // LSP didOpen 官方口径：仅 intelephense→php 显式映射；lua/scala/swift 恒等。
+    // r8.5：devsense_php 同样映射到 "php"（同 intelephense 理由）。
     assert_eq!(ls_registry::lsp_language_id("intelephense"), "php");
+    assert_eq!(ls_registry::lsp_language_id("php_devsense"), "php");
     assert_eq!(ls_registry::lsp_language_id("lua"), "lua");
     assert_eq!(ls_registry::lsp_language_id("scala"), "scala");
     assert_eq!(ls_registry::lsp_language_id("swift"), "swift");
@@ -1358,6 +1365,13 @@ fn w3_php_lua_scala_swift_doors_wired() {
         Some(LanguageId::Php),
         "php 门 entry id 别名"
     );
+    // r8.5：devsense_php 不别名到 Php（独立门 PhpDevsense）；扩展名 .php
+    // 仍归 Php 主门——devsense_php 仅按 entry id 显式路由可达。
+    assert_eq!(
+        LanguageId::from_str_opt("php_devsense"),
+        Some(LanguageId::PhpDevsense),
+        "devsense_php 独立门（不抢 Php 主门）"
+    );
 
     // php 门：intelephense npm 条目 pin 锚（phase3 NPM_IDS 已有，此处锁冒烟门消费面）。
     let intel = servers
@@ -1369,6 +1383,25 @@ fn w3_php_lua_scala_swift_doors_wired() {
     assert_eq!(intel_npm.version.as_deref(), Some("1.14.4"));
     assert_eq!(
         intel_npm.npm_args.as_deref(),
+        Some(["--stdio".to_string()].as_slice())
+    );
+
+    // r8.5 adopt：devsense_php npm 条目 pin 锚（mirror upstream PR #1917）。
+    let devsense = servers
+        .get("devsense_php")
+        .expect("[servers.devsense_php] missing");
+    assert_eq!(
+        devsense.languages,
+        vec!["php_devsense"],
+        "语言名 = php_devsense（不抢 Php 主门）"
+    );
+    assert_eq!(devsense.install, "npm");
+    let devsense_npm = devsense.npm.as_ref().expect("devsense_php: npm table");
+    assert_eq!(devsense_npm.package, "devsense-php-ls");
+    assert_eq!(devsense_npm.version.as_deref(), Some("1.0.19197"));
+    assert_eq!(devsense_npm.bin_rel, "devsense.php.ls");
+    assert_eq!(
+        devsense_npm.npm_args.as_deref(),
         Some(["--stdio".to_string()].as_slice())
     );
 

@@ -19,7 +19,6 @@
 //! - 上游未 override supports_implementation_request → false。
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -30,7 +29,8 @@ use lsp_types::InitializeParams;
 use serde_json::{Value, json};
 
 use crate::{
-    LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error, which_no_unc,
+    LanguageId, LanguageServerAdapter, ProjectCtx, ProjectRootSlot, RequestHooks,
+    not_installed_error, which_no_unc,
 };
 
 /// 主 LS 就绪探针超时（documentSymbol 对真实 .scss；兼触发 some-sass 的 workspace 扫描）。
@@ -44,9 +44,10 @@ const CACHE_VERSION: &str = "2.3.8";
 /// root 未设置时的退路：虚拟探针 URI（仅保底，真实 .scss/.sass 才触发扫描）。
 const PROBE_FALLBACK: &str = "file:///__some_sass_ready_probe__";
 
-/// 当前会话项目 root（零字段单例存不了实例状态 —— 会话级数据放静态槽，由
-/// supervisor::session_for 在 `on_session_ready` 前经 `set_project_root` 写入）。
-static PROBE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6；零字段单例存不了
+/// 实例状态 —— 会话级数据放静态槽，由 supervisor::session_for 在 `on_session_ready`
+/// 前经 `set_project_root` 写入。读侧无键，走 get_last 相邻语义）。
+static PROBE_ROOT: ProjectRootSlot = ProjectRootSlot::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SassAdapter;
@@ -185,7 +186,7 @@ impl LanguageServerAdapter for SassAdapter {
     }
 
     fn set_project_root(&self, root: &Path) {
-        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+        PROBE_ROOT.set(root);
     }
 
     async fn on_session_ready(
@@ -201,11 +202,7 @@ impl LanguageServerAdapter for SassAdapter {
 
         // 就绪探针：真实 .scss/.sass 优先（some-sass 初始化后自扫 workspace，
         // documentSymbol 兼作预热），失败只放行。
-        let root = PROBE_ROOT
-            .lock()
-            .expect("PROBE_ROOT poisoned")
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = PROBE_ROOT.get_last().unwrap_or_else(|| PathBuf::from("."));
         let probe_uri = crate::probe_uri_for_root(&root, &[LanguageId::Sass], PROBE_FALLBACK);
         let probe = session
             .request::<Value>(

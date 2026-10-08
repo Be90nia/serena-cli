@@ -28,20 +28,20 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 - JSON 解析：stdout 首行可能是 `[warn] ...` 人读行——解析前先切出第一个 `{`。
 - **写类命令对无 LS 的文件类型拒写**（如 .txt → BAD_ARGS "file not supported"）——纯文本用普通文件工具。
 - 大改/不确定结果 → 改完跑 `undo` 验证能回滚再继续；`undo --list` 看栈。rename 改多文件 = 一个事务，undo 一次全回滚。
-- 深度语义（call-hierarchy、repo-map）依赖全量索引热身（分钟级），冷会话可能返空——改用 `refs` 拼接。
+- 深度语义 call-hierarchy 依赖全量索引热身（分钟级），冷会话可能返空——改用 `refs` 拼接。`repo-map` 主源 documentSymbol + 文本兜底，冷会话可用（bd serena-rust-fj17）。
 
-## 命令速查（55 个，按类）
+## 命令速查（59 个，按类）
 
 | 类 | 命令 |
 |---|---|
 | 读/导航(7) | overview · symbol-tree · read-file(1-based 含端，回传 hash) · list-dir · find-file · search · hover |
 | 符号(8) | find-symbol · symbol-body · def · refs · find-implementations · find-referencing-symbols · find-referencing-code-snippets · containing-symbol |
-| 上下文聚合 | edit-context(改前必备) · repo-map(全 project 符号热度图) · defining-symbol · signature-help |
-| 诊断(3) | diagnostics(--wait-gen N) · workspace-diagnostic · signature-help |
+| 上下文聚合 | edit-context(改前必备) · repo-map(全 project 按文件顶层符号清单，LS 免热身) · defining-symbol · signature-help |
+| 诊断(2) | diagnostics(--wait-gen N) · workspace-diagnostic |
 | 编辑(11) | replace-body · replace-text-in-symbol · insert-text-{before,after}-symbol · delete-text-in-symbol · insert-at-line · replace-lines · delete-lines · rename-symbol(跨文件自动同步) · safe-delete-symbol(有引用拒删) · create-text-file |
 | undo/redo(2) | undo(--steps N / --list) · redo —— 事务级：rename 多文件一次回滚；新建文件 undo 即删；文件被外部改过则拒绝(WRITE_CONFLICT)；栈 20 步/200MB/30 天，重启升级不丢 |
-| 补全/长尾 | completion · code-action · format · format-range · inlay-hint · folding-range · document-highlight · semantic-tokens · code-lens · call-hierarchy · type-hierarchy · moniker · document-link · folding-range |
-| 管理 | status · warm · wait-ready(--stage symbol\|semantic) · stop-all · install <lang> · doctor · shell(JSONL 长连接) · lint-shell |
+| 补全/长尾 | completion · code-action · format · format-range · inlay-hint · folding-range · document-highlight · semantic-tokens · code-lens · call-hierarchy · type-hierarchy · moniker · document-link |
+| 管理 | status · warm · wait-ready(--stage symbol\|semantic) · stop-all · install <lang> · uninstall <lang> · ls-use <lang\|id> <path> · ls-list · ls-remove <id> · doctor · shell(JSONL 长连接) · lint-shell |
 
 ## 错误契约
 

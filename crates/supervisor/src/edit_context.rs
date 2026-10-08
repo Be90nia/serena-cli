@@ -88,13 +88,15 @@ fn column_of_symbol_on_line(body_text: &str, line_0based: u32, symbol: &str) -> 
 }
 
 /// `edit-context` 聚合入口。任一段失败不影响其他字段。
+/// 第二返回值 = 降级警示（bd serena-rust-e0hi/8vo9）：callers 空且语义层未证就绪
+/// 时由 [`Supervisor::referencing_empty_warnings`] 给出，dispatch 层 attach 到 wire。
 pub async fn collect(
     sup: &Supervisor,
     root: &Path,
     file: &str,
     symbol: &str,
     lang: Option<&str>,
-) -> EditContextReport {
+) -> (EditContextReport, Vec<String>) {
     let mut report = EditContextReport {
         file: file.into(),
         symbol: symbol.into(),
@@ -103,6 +105,7 @@ pub async fn collect(
         doc: None,
         tests: None,
     };
+    let mut warnings = Vec::new();
 
     // 1) body：symbol-body + 缓存里取 range。
     let mut body_line_0based: u32 = 0;
@@ -134,6 +137,13 @@ pub async fn collect(
                     container_name: c.container_name.clone(),
                 })
                 .collect();
+            // 空 callers = 真无 caller 或语义未就绪（类型分析窗口 refs 静默返空），
+            // 警示让 AI 可分；refs 失败（callers=null）不警示，failure 已由 null 表达。
+            if callers.is_empty() {
+                warnings = sup.referencing_empty_warnings(root);
+            } else {
+                sup.mark_semantic_ready(root);
+            }
             report.callers = Some(callers);
             report.tests = Some(tests);
         }
@@ -150,7 +160,7 @@ pub async fn collect(
         }
     }
 
-    report
+    (report, warnings)
 }
 
 /// 把 `HoverContents` 三 variant 折叠为人类可读 doc 字符串：
@@ -284,7 +294,7 @@ mod tests {
         let sup = crate::Supervisor::direct().await.expect("supervisor");
         // 预热 + busy-retry 直到 callers 非空且 doc Some（RA cold-start 索引就绪；
         // refs 与 hover 就绪时间不同步，只盯 callers 会在 hover 仍冷时漏出循环）。
-        let mut report = collect(&sup, &root, "lib.rs", "add", Some("rust")).await;
+        let (mut report, _) = collect(&sup, &root, "lib.rs", "add", Some("rust")).await;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
         while std::time::Instant::now() < deadline {
             let callers_ok = report
@@ -296,7 +306,7 @@ mod tests {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            report = collect(&sup, &root, "lib.rs", "add", Some("rust")).await;
+            report = collect(&sup, &root, "lib.rs", "add", Some("rust")).await.0;
         }
 
         assert!(report.body.is_some(), "body 必须有内容");
@@ -335,7 +345,7 @@ mod tests {
             return;
         }
         let sup = crate::Supervisor::direct().await.expect("supervisor");
-        let report = collect(
+        let (report, warnings) = collect(
             &sup,
             &root,
             "lib.rs",
@@ -344,10 +354,15 @@ mod tests {
         )
         .await;
 
-        // 失败隔离契约：body 失败 → callers/doc/tests 也都 None（短路在 if let Some(body)）。
+        // 失败隔离契约：body 失败 → callers/doc/tests 也都 None（短路在 if let Some(body)）；
+        // 失败≠降级 → warnings 必须为空（e0hi/8vo9 旗只随空 hits 走）。
         assert!(report.body.is_none(), "body 失败必须 None");
         assert!(report.callers.is_none(), "callers 必须 None（短路）");
         assert!(report.doc.is_none(), "doc 必须 None（短路）");
         assert!(report.tests.is_none(), "tests 必须 None（短路）");
+        assert!(
+            warnings.is_empty(),
+            "refs 失败（callers=null）不警示，降级旗只认空 hits: {warnings:?}"
+        );
     }
 }

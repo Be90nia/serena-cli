@@ -8,7 +8,7 @@
 
 `serena-rust` 让 LLM agent 能够按 **symbol 名**（函数、类型、字段）而非行号来导航、搜索和编辑代码库。它原生讲 LSP（Language Server Protocol），因此同一套工具可跨 Rust、TypeScript、Python、Go、C/C++、C# 和 Java 使用，无需按语言分别适配。
 
-这是对 [Serena](https://github.com/oraios/serena) 的聚焦复刻，锚定在上游 commit `43ae0211`，持续跟进 CLI 型 agent 实际消费的功能子集（无 MCP、无 Python、除标准的每 root 单 session 模型外不做 LSP server 多路复用）。
+这是对 [Serena](https://github.com/oraios/serena) 的聚焦复刻，锚定在上游 commit `7a296833`，持续跟进 CLI 型 agent 实际消费的功能子集（无 MCP、无 Python、除标准的每 root 单 session 模型外不做 LSP server 多路复用）。
 
 ## 为什么是 CLI + skill，而不是 MCP
 
@@ -22,7 +22,7 @@
 
 ## 覆盖范围
 
-### CLI 命令（58 个）
+### CLI 命令（59 个）
 
 读取 / 导航（7 个）：`overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -36,7 +36,7 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 补全（1 个）：`completion`（支持 `--limit` 与按文件后缀的 trigger 推断）
 
-管理（7 个）：`status` · `stop-all` · `install <lang>` · `ls-use <lang或id> <path>` · `ls-list` · `ls-remove <id>` · `shell`（JSONL stdin/stdout 会话）
+管理（8 个）：`status` · `stop-all` · `install <lang>` · `uninstall <lang>` · `ls-use <lang或id> <path>` · `ls-list` · `ls-remove <id>` · `shell`（JSONL stdin/stdout 会话）
 
 长尾（19 个）：`defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker`
 
@@ -203,17 +203,15 @@ serena-cli safe-delete-symbol <file> <symbol>   # 有引用时拒绝删除
 
 7-crate Cargo workspace：
 
-- `crates/lsp-core` —— JSON-RPC 帧封装，带 id 归一化的请求/响应 client，`ContentModified` 重试
-- `crates/runtime` — 托管 LSP 进程启动，3-pump 拓扑（上游 `ls_process.py` 的镜像）
-- `crates/transport` —— stdio / TCP 传输
-- `crates/registry` —— `LanguageServerId` ↔ 文件扩展名映射表
+- `crates/lsp-core` —— JSON-RPC 帧封装，带 id 归一化的请求/响应 client，`ContentModified` 重试，托管 LSP 进程启动 + stdio/TCP 传输（3-pump 拓扑，上游 `ls_process.py` 的镜像）
+- `crates/ls-registry` —— `LanguageServerId` ↔ 文件扩展名映射表
 - `crates/ls-adapters` —— 各 LS 的启动参数 + 就绪探测（rust-analyzer / clangd / pyright / gopls / typescript / csharp-ls / jdtls）
 - `crates/supervisor` —— `Supervisor` trait + `DaemonSupervisor` 实现：per-key 负载门、session 缓存、工具分发、写门、symbol 缓存
 - `crates/daemon` —— HTTP 前端（axum）、9 错误码 wire 契约、单例锁、空闲 reaper、优雅关闭
 - `crates/cli` —— clap 子命令、`--json` 模式、`shell` JSONL 会话、`install`、管理命令
 - `crates/ls-runtime` —— `deps.rs`（下载/SHA）、`install.rs`（自动安装流程）、`servers.toml` 适配器
 
-架构唯一事实源是 [`ARCHITECTURE.md`](ARCHITECTURE.md)。9 个错误码（`internal`、`not_found`、`invalid_request`、`unauthorized`、`rpc_error`、`timeout`、`ls_spawn_failed`、`ls_not_installed`、`unsupported`）是 wire 契约 —— 禁改名、禁拆分、禁合并。
+架构唯一事实源是 [`ARCHITECTURE.md`](ARCHITECTURE.md)。9 个错误码（`BAD_ARGS`、`LS_NOT_INSTALLED`、`LS_SPAWN_FAILED`、`LS_NOT_READY`、`LS_TERMINATED`、`LS_TIMEOUT`、`RPC_ERROR`、`WRITE_CONFLICT`、`INTERNAL`）是 wire 契约 —— 禁改名、禁拆分、禁合并。
 
 ## 局限
 
@@ -254,7 +252,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## 致谢
 
-- [oraios/serena](https://github.com/oraios/serena) —— 本复刻所参照的原始 Python MCP server。锚定在上游 commit `43ae0211`。
+- [oraios/serena](https://github.com/oraios/serena) —— 本复刻所参照的原始 Python MCP server。锚定在上游 commit `7a296833`。
 - [helix-editor/helix](https://github.com/helix-editor/helix) —— `crates/supervisor/src/root.rs` 中的 `find_lsp_workspace` 算法为其直接翻译。
 - Cargo 依赖树（jsonrpc-core、tokio、axum、lsp-types 等）—— 见 `Cargo.lock`。
 

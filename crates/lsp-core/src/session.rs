@@ -731,9 +731,9 @@ impl Session {
                 ls: "ls".into(),
                 cause: format!("session failed: {cause}"),
             }),
-            SessionState::Uninitialized | SessionState::Initializing => Err(CoreError::Io(
-                std::io::Error::other("session not ready after notify"),
-            )),
+            SessionState::Uninitialized | SessionState::Initializing => Err(CoreError::NotReady {
+                cause: "session not ready after gate open".into(),
+            }),
         }
     }
 
@@ -782,9 +782,9 @@ impl Session {
                 ls: "ls".into(),
                 cause: format!("session failed: {cause}"),
             }),
-            SessionState::Uninitialized | SessionState::Initializing => Err(CoreError::Io(
-                std::io::Error::other("session not ready after notify"),
-            )),
+            SessionState::Uninitialized | SessionState::Initializing => Err(CoreError::NotReady {
+                cause: "session not ready after gate open".into(),
+            }),
         }
     }
     /// 通知转发（无响应）。Ready 前到达也走等门逻辑 —— 通知一般不阻塞但保持一致性。

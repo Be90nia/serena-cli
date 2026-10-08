@@ -24,12 +24,20 @@ def load_doors(langs_path):
 
     SKIP 门 budget 取 0 参与 LPT：排序自然落在所有真门之后，装箱不占预算，
     但保证分片计划覆盖清单里每一门（smoke_one.sh 据此输出 SKIP 裁决行）。
+
+    ci_only 门（`ci_only = true`）默认从本地矩阵排除；CI workflow 设
+    `SERENA_CI_ONLY_INCL=1` 时纳入全集（r8.5 adopt：PHP Devsense 等实验门
+    本机不跑，CI 才跑；保持本地 smoke 矩阵绿色不污染）。
     """
     import tomllib
 
     with open(langs_path, "rb") as f:
         data = tomllib.load(f)
-    doors = [(int(e.get("budget_secs", 0)), e["id"]) for e in data["lang"]]
+    doors = []
+    for e in data["lang"]:
+        if e.get("ci_only") and os.environ.get("SERENA_CI_ONLY_INCL") != "1":
+            continue  # ci_only 门本地排除；CI workflow 设 env 启用
+        doors.append((int(e.get("budget_secs", 0)), e["id"]))
     return sorted(doors, key=lambda t: (-t[0], t[1]))
 
 

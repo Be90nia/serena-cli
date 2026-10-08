@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
-use supervisor::{Supervisor, ToolError};
+use supervisor::{Supervisor, SupervisorTrait, ToolError};
 
 mod lint_shell;
 
@@ -240,7 +240,7 @@ enum Cmd {
     },
     /// 全 workspace 符号地图（按调用热度 top N）。ai-token §10-E。
     RepoMap {
-        /// top N 符号（默认 20；超过会按 direct_refs 降序截断）。
+        /// top N 符号（默认 20；超过按文件+顶层符号清单截断）。
         #[arg(long, default_value_t = 20)]
         top_n: u32,
     },
@@ -590,10 +590,12 @@ async fn cli_main() -> ExitCode {
 
     let lock_path = daemon::serve::default_lock_path();
 
-    // ---- daemon 模式：本进程做 daemon，阻塞至 shutdown ----
-    if cli.daemon {
-        // 全库 tracing::warn!/info! 的唯一出口：不 init 则全部静默丢弃（排障全盲）。
-        // RUST_LOG 控制，默认 info；stderr —— daemon 由 lazy-spawn 时 stdout 已重定向。
+    // 全库 tracing::warn!/info! 的唯一出口：不 init 则全部静默丢弃（排障全盲）。
+    // daemon 分支自持本进程输出；forward/shell/wait-ready 链此前零 subscriber——
+    // 冷启动/token 刷新/draining 重试 0 stderr 线索（bd serena-rust-53s）。
+    // --direct 除外：进程内 supervisor 的 info 事件量会淹没 CLI stderr。
+    // RUST_LOG 控制，默认 info；stderr —— daemon 由 lazy-spawn 时 stdout 已重定向。
+    if !cli.direct {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -601,6 +603,10 @@ async fn cli_main() -> ExitCode {
             )
             .with_writer(std::io::stderr)
             .try_init();
+    }
+
+    // ---- daemon 模式：本进程做 daemon，阻塞至 shutdown ----
+    if cli.daemon {
         let cfg = daemon::serve::ServeConfig {
             lock_path,
             ..Default::default()
@@ -728,16 +734,20 @@ async fn cli_main() -> ExitCode {
     }
 }
 
-/// M0 --direct 路径（行为不变）。
+/// M0 --direct 路径。bd serena-rust-kns：与 forward 共用 [`tool_request`] 组装 +
+/// [`inject_private_args`] 注入，经 `execute_tool` 走同一 envelope/截断管线
+/// —— `--json`/`--max-tokens`/`--compress`/`--delta` 与转发模式同一语义。
 async fn run_direct(cli: &Cli) -> ExitCode {
     let Some(root) = cli.project.clone() else {
         eprintln!("--direct requires --project <ROOT>");
         return ExitCode::from(2);
     };
     let root = dunce::canonicalize(&root).unwrap_or(root);
-    // 用户未传 --lang 时按 file 后缀/shebang/文件名推断；显式 --lang 优先。
-    let effective_lang: Option<String> = cli.lang.clone().or_else(|| autodetect_lang(cli));
-    let lang_ref = effective_lang.as_deref();
+    let Some((tool, mut args)) = tool_request(&cli.cmd) else {
+        eprintln!("this subcommand is daemon-mode only in M1");
+        return ExitCode::from(2);
+    };
+    inject_private_args(&mut args, cli);
     let sup = match Supervisor::direct().await {
         Ok(s) => s,
         Err(e) => {
@@ -745,171 +755,35 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let res: Result<(), ToolError> = match &cli.cmd {
-        Some(Cmd::Overview { file, .. }) => sup
-            .tool_overview(&root, file, lang_ref)
-            .await
-            .and_then(|hits| print_json(&json!(hits))),
-        Some(Cmd::SymbolTree { dir, max_files }) => sup
-            .tool_symbol_tree(&root, dir, lang_ref, *max_files)
-            .await
-            .and_then(|tree| print_json(&tree)),
-        Some(Cmd::Def { file, line, col }) => sup
-            .tool_def(&root, file, *line, *col, lang_ref)
-            .await
-            .and_then(|opt| print_json(&json!(opt))),
-        Some(Cmd::Refs {
-            file, line, col, ..
-        }) => sup
-            .tool_refs(&root, file, *line, *col, lang_ref)
-            .await
-            .and_then(|vec| print_json(&json!(vec))),
-        Some(Cmd::Completion {
-            file,
-            line,
-            col,
-            limit,
-            trigger,
-        }) => {
-            let trigger = trigger
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .or_else(|| infer_trigger_char(file));
-            sup.tool_completion(
-                &root,
-                file,
-                *line,
-                *col,
-                *limit as usize,
-                trigger.as_deref(),
-                lang_ref,
-            )
-            .await
-            .and_then(|resp| print_json(&json!(resp)))
+    // 用户未传 --lang 时按 file 后缀/shebang/文件名推断；显式 --lang 优先。
+    let effective_lang: Option<String> = cli.lang.clone().or_else(|| autodetect_lang(cli));
+    match sup
+        .execute_tool(
+            tool,
+            &root.to_string_lossy(),
+            args,
+            effective_lang.as_deref(),
+        )
+        .await
+    {
+        Ok(data) => {
+            // O2（bd serena-rust-bxd）对齐 forward：warning 上 stderr，不吞。
+            if let Some(w) = data.get("warning").and_then(|v| v.as_str()) {
+                eprintln!("[warn] {w}");
+            }
+            if payload_is_empty(&data) && data.get("warning").is_some() {
+                eprintln!(
+                    "[hint] index warming: semantic layer not ready, empty result may be false negative (rerun or use wait-ready)"
+                );
+            }
+            match print_json(&data) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(tool_error_exit(&e))
+                }
+            }
         }
-        // ==== Phase 1 · 上游 wrapper 缺口（13 个 --direct 路径）====
-        Some(Cmd::CodeAction {
-            file,
-            line,
-            col,
-            kind,
-        }) => sup
-            .tool_code_action(&root, file, *line, *col, kind.as_deref(), lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::Format {
-            file,
-            tab_size,
-            insert_spaces,
-        }) => sup
-            .tool_format(&root, file, *tab_size, *insert_spaces, lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::FormatRange {
-            file,
-            start_line,
-            start_col,
-            end_line,
-            end_col,
-            tab_size,
-            insert_spaces,
-        }) => sup
-            .tool_format_range(
-                &root,
-                file,
-                *start_line,
-                *start_col,
-                *end_line,
-                *end_col,
-                *tab_size,
-                *insert_spaces,
-                lang_ref,
-            )
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::InlayHint {
-            file,
-            start_line,
-            end_line,
-        }) => sup
-            .tool_inlay_hint(&root, file, *start_line, *end_line, lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::DocumentHighlight { file, line, col }) => sup
-            .tool_document_highlight(&root, file, *line, *col, lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::FoldingRange { file }) => sup
-            .tool_folding_range(&root, file, lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::SemanticTokens { file }) => sup
-            .tool_semantic_tokens(&root, file, lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::CodeLens { file }) => sup
-            .tool_code_lens(&root, file, lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::DocumentLink { file }) => sup
-            .tool_document_link(&root, file, lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::CallHierarchy {
-            op,
-            file,
-            line,
-            col,
-            item,
-        }) => {
-            handle_call_hierarchy(
-                &sup,
-                &root,
-                op,
-                file.as_deref(),
-                *line,
-                *col,
-                item.as_deref(),
-                lang_ref,
-            )
-            .await
-        }
-        Some(Cmd::TypeHierarchy {
-            op,
-            file,
-            line,
-            col,
-            item,
-        }) => {
-            handle_type_hierarchy(
-                &sup,
-                &root,
-                op,
-                file.as_deref(),
-                *line,
-                *col,
-                item.as_deref(),
-                lang_ref,
-            )
-            .await
-        }
-        Some(Cmd::Moniker { file, line, col }) => sup
-            .tool_moniker(&root, file, *line, *col, lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        Some(Cmd::WorkspaceDiagnostic) => sup
-            .tool_workspace_diagnostic(&root, lang_ref)
-            .await
-            .and_then(|v| print_json(&json!(v))),
-        other => {
-            let _ = other;
-            eprintln!("this subcommand is daemon-mode only in M1");
-            return ExitCode::from(2);
-        }
-    };
-    match res {
-        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let exit = tool_error_exit(&e);
             eprintln!("{e}");
@@ -925,124 +799,6 @@ fn tool_error_exit(e: &ToolError) -> u8 {
         ToolError::Protocol { .. } => 1,
         ToolError::Serialize(_) => 3,
         ToolError::Core(_) | ToolError::Launch(_) => 3,
-    }
-}
-
-/// Phase 1 · call-hierarchy 三件套的 --direct 调度（op=prepare|incoming|outgoing）。
-///
-/// prepare 必填 file/line/col；incoming/outgoing 必填 --item（CallHierarchyItem JSON）。
-#[allow(clippy::too_many_arguments)]
-async fn handle_call_hierarchy(
-    sup: &Supervisor,
-    root: &Path,
-    op: &str,
-    file: Option<&str>,
-    line: Option<u32>,
-    col: Option<u32>,
-    item: Option<&str>,
-    lang: Option<&str>,
-) -> Result<(), ToolError> {
-    match op {
-        "prepare" => {
-            let f = file.ok_or_else(|| ToolError::BadArgs {
-                detail: "prepare requires <file> <line> <col>".into(),
-            })?;
-            let l = line.ok_or_else(|| ToolError::BadArgs {
-                detail: "prepare requires <line>".into(),
-            })?;
-            let c = col.ok_or_else(|| ToolError::BadArgs {
-                detail: "prepare requires <col>".into(),
-            })?;
-            let items = sup.tool_call_hierarchy_prepare(root, f, l, c, lang).await?;
-            print_json(&json!(items))
-        }
-        "incoming" => {
-            let item_str = item.ok_or_else(|| ToolError::BadArgs {
-                detail: "incoming requires --item".into(),
-            })?;
-            let item_val: serde_json::Value =
-                serde_json::from_str(item_str).map_err(|e| ToolError::BadArgs {
-                    detail: format!("bad --item JSON: {e}"),
-                })?;
-            let v = sup
-                .tool_call_hierarchy_incoming(root, item_val, lang)
-                .await?;
-            print_json(&json!(v))
-        }
-        "outgoing" => {
-            let item_str = item.ok_or_else(|| ToolError::BadArgs {
-                detail: "outgoing requires --item".into(),
-            })?;
-            let item_val: serde_json::Value =
-                serde_json::from_str(item_str).map_err(|e| ToolError::BadArgs {
-                    detail: format!("bad --item JSON: {e}"),
-                })?;
-            let v = sup
-                .tool_call_hierarchy_outgoing(root, item_val, lang)
-                .await?;
-            print_json(&json!(v))
-        }
-        other => Err(ToolError::BadArgs {
-            detail: format!("unknown call-hierarchy op: {other}"),
-        }),
-    }
-}
-
-/// Phase 1 · type-hierarchy 三件套的 --direct 调度（op=prepare|supertypes|subtypes）。
-#[allow(clippy::too_many_arguments)]
-async fn handle_type_hierarchy(
-    sup: &Supervisor,
-    root: &Path,
-    op: &str,
-    file: Option<&str>,
-    line: Option<u32>,
-    col: Option<u32>,
-    item: Option<&str>,
-    lang: Option<&str>,
-) -> Result<(), ToolError> {
-    match op {
-        "prepare" => {
-            let f = file.ok_or_else(|| ToolError::BadArgs {
-                detail: "prepare requires <file> <line> <col>".into(),
-            })?;
-            let l = line.ok_or_else(|| ToolError::BadArgs {
-                detail: "prepare requires <line>".into(),
-            })?;
-            let c = col.ok_or_else(|| ToolError::BadArgs {
-                detail: "prepare requires <col>".into(),
-            })?;
-            let items = sup.tool_type_hierarchy_prepare(root, f, l, c, lang).await?;
-            print_json(&json!(items))
-        }
-        "supertypes" => {
-            let item_str = item.ok_or_else(|| ToolError::BadArgs {
-                detail: "supertypes requires --item".into(),
-            })?;
-            let item_val: serde_json::Value =
-                serde_json::from_str(item_str).map_err(|e| ToolError::BadArgs {
-                    detail: format!("bad --item JSON: {e}"),
-                })?;
-            let v = sup
-                .tool_type_hierarchy_supertypes(root, item_val, lang)
-                .await?;
-            print_json(&json!(v))
-        }
-        "subtypes" => {
-            let item_str = item.ok_or_else(|| ToolError::BadArgs {
-                detail: "subtypes requires --item".into(),
-            })?;
-            let item_val: serde_json::Value =
-                serde_json::from_str(item_str).map_err(|e| ToolError::BadArgs {
-                    detail: format!("bad --item JSON: {e}"),
-                })?;
-            let v = sup
-                .tool_type_hierarchy_subtypes(root, item_val, lang)
-                .await?;
-            print_json(&json!(v))
-        }
-        other => Err(ToolError::BadArgs {
-            detail: format!("unknown type-hierarchy op: {other}"),
-        }),
     }
 }
 
@@ -1102,6 +858,7 @@ where
                 if Instant::now() >= deadline {
                     return Err(format!("daemon transport error {status}: {payload}"));
                 }
+                tracing::warn!(status = status.as_u16(), "daemon draining; retrying within window");
                 tokio::time::sleep(backoff).await;
             }
         }
@@ -1194,8 +951,11 @@ fn name_column_in_line(line_text: &str, name: &str) -> Option<u32> {
 
 /// semantic 档 hover 探针候选位置（bd serena-rust-7m8）：overview 符号数组 →
 /// 至多 [`SEMANTIC_PROBE_SYMBOLS`] 个「符号名自身」坐标。每符号 selectionRange.start
-/// 优先；无则读探针文件 range.start 行内找符号名文本（标识符偏移）；行内无该名 /
-/// 行越界（模板符号等）→ 退 range.start，保证仍有候选可试（不把假阴性换成丢探针）。
+/// 优先；无则读探针文件 range.start 行内找符号名文本（标识符偏移 = 用户代码
+/// 标识符）。行内无该名 / 行越界（模板符号等）→ **丢弃该候选**，绝不退
+/// range.start：行首落在 use/derive/声明修饰上时 RA 对行首 stdlib token hover
+/// 恒空（bd serena-rust-b8sp），假探针会把「已就绪」永判 pending；候选全灭
+/// 由调用方在进度行点明根因。
 fn hover_probe_positions(data: &serde_json::Value, file_text: Option<&str>) -> Vec<(u32, u32)> {
     let Some(symbols) = data.as_array() else {
         return Vec::new();
@@ -1220,15 +980,12 @@ fn hover_probe_positions(data: &serde_json::Value, file_text: Option<&str>) -> V
         let Some(line) = range_start.get("line").and_then(|v| v.as_u64()) else {
             continue;
         };
-        let start_col = range_start
-            .get("character")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let col = file_text
+        if let Some(col) = file_text
             .and_then(|t| t.split('\n').nth(line as usize))
             .and_then(|l| name_column_in_line(l.strip_suffix('\r').unwrap_or(l), name))
-            .unwrap_or(start_col);
-        out.push((line as u32, col));
+        {
+            out.push((line as u32, col));
+        }
     }
     out
 }
@@ -1396,6 +1153,7 @@ async fn cmd_wait_ready(
                     ))
                 })
         });
+        let mut probe_count = 0usize;
         if symbol_up.is_some() {
             if stage == WaitStage::Symbol {
                 eprintln!("ready (symbol) in {}s", started.elapsed().as_secs());
@@ -1406,11 +1164,20 @@ async fn cmd_wait_ready(
             // —— csharp-ls range.start=行首 / astro 模板符号 hover 合法 null）。
             // we0 warning / 全候选未就绪 → pending 续等；探测期瞬态 ≠ 确认就绪，
             // 等待语义不做硬失败，超时判据不变。
-            let file_text = std::fs::read_to_string(&probe_path).ok();
+            // b8sp：探针文件必须按项目根拼绝对路径读——`--file src/main.rs` 是相对
+            // 路径时 read_to_string 相对 CWD 解析，cwd ≠ 项目根 → 读空 → name-in-line
+            // 全灭 → 7m8 探针静默退化成 range.start 行首假探针（hover 恒空）。
+            let file_text = std::fs::read_to_string(if probe_path.is_absolute() {
+                probe_path.clone()
+            } else {
+                root.join(&probe_path)
+            })
+            .ok();
             let positions = overview
                 .as_ref()
                 .map(|data| hover_probe_positions(data, file_text.as_deref()))
                 .unwrap_or_default();
+            probe_count = positions.len();
             for (line, col) in positions {
                 match probe_tool_call(
                     &client,
@@ -1437,9 +1204,15 @@ async fn cmd_wait_ready(
             return ExitCode::from(4);
         }
         let progress = if symbol_up.is_some() {
-            "symbol-ok hover-pending"
+            // b8sp：候选全灭（符号名在探针文件内不可定位）时点明根因，不假装
+            // 「类型分析还在热身」——那是永不 ready 的死等。
+            if probe_count == 0 {
+                format!("symbol-ok hover-pending (no probeable identifier in {rel})")
+            } else {
+                "symbol-ok hover-pending".to_string()
+            }
         } else {
-            "symbol-pending"
+            "symbol-pending".to_string()
         };
         eprintln!("wait-ready: probe #{round} {progress}");
         tokio::time::sleep(wait_ready_backoff(round)).await;
@@ -1458,7 +1231,9 @@ async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<(), ForwardFail
             // 死 lock（或无 lock）：lazy-spawn。不在这里删 lock——daemon 子进程
             // 的 lock 仲裁会带宽限接管，CLI 无归属凭据先删会误伤启动中/易主 lock。
             let port = spawn_daemon_child()?;
+            tracing::info!(port, "lazy-spawned daemon child; waiting for readiness");
             wait_ready(port, SPAWN_WAIT).await?;
+            tracing::info!(port, "daemon ready after lazy-spawn");
             format!("http://127.0.0.1:{port}")
         }
     };
@@ -1701,17 +1476,11 @@ where
     unreachable!("last backoff round returns in-loop")
 }
 
-/// 按子命令转发 HTTP。
-async fn forward(
-    cli: &Cli,
-    base: &str,
-    token: &mut String,
-    lock_path: &Path,
-    lang: Option<&str>,
-) -> Result<(), ForwardFailure> {
-    let client = http_client();
-    // 工具名与 args 组装。
-    let (tool, args): (&str, serde_json::Value) = match &cli.cmd {
+/// 子命令 → (工具名, wire args)。forward/--direct 共用同一组装（bd serena-rust-kns：
+/// 两条路径同一 envelope/截断管线）。管理命令与 None 在 cli_main 已提前分流：
+/// forward 侧 expect panic（原 unreachable! 语义）；--direct 侧照旧报 daemon-mode only。
+fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> {
+    Some(match cmd {
         // 本地管理命令已在 main 提前 return；到达此处即编程错误。
         Some(Cmd::Overview { file, .. }) => ("overview", json!({"file": file})),
         Some(Cmd::SymbolTree { dir, max_files }) => {
@@ -2083,27 +1852,22 @@ async fn forward(
         | Some(Cmd::Doctor { .. })
         | Some(Cmd::LintShell { .. })
         | Some(Cmd::WaitReady { .. })
-        | None => {
-            unreachable!("handled earlier")
-        }
-    };
-    let project_root = resolve_project_root(cli.project.clone());
-    // Phase 4 基建 Task 22b：CLI flag → args 私有字段 → supervisor 三层合并。
-    let mut args = args;
-    inject_timeout_args(&mut args, cli.request_timeout, cli.index_timeout);
-    // J（§11-J）：--delta → args._delta（supervisor maybe_delta 消费；sanitize 不清，
-    // 与 _compact 同套私有约定）。仅 4 个集合型位置工具。
+        | None => return None,
+    })
+}
+
+/// forward/--direct 共用：CLI 全局 flag → args 私有字段。supervisor 消费：
+/// `_timeout_ms`/`_index_timeout_ms` 三层合并（Task 22b）、`_delta` 编排（§11-J）、
+/// `_compact` envelope（§10-H）、`_max_tokens`/`_compress` 末尾后处理（§10-G）。
+/// 两条路径同一注入 = 同一输出契约（kns）。
+fn inject_private_args(args: &mut serde_json::Value, cli: &Cli) {
+    inject_timeout_args(args, cli.request_timeout, cli.index_timeout);
     if cmd_requests_delta(&cli.cmd)
         && let Some(obj) = args.as_object_mut()
     {
         obj.insert("_delta".into(), serde_json::json!(true));
     }
-    // H（§10-H）：--json → args._compact=false（supervisor 位置工具 envelope 消费；
-    // sanitize 不清，与 _delta/_max_tokens 同套私有约定）。默认（无 --json）不注入
-    // → 老 wire（紧凑形态）完全不变。
-    inject_compact_arg(&mut args, cli.json);
-    // G（§10-G）：--max-tokens/--compress → args 私有字段（supervisor 末尾统一
-    // 后处理消费；sanitize 不清，与 _compact/_delta 同套私有约定）。
+    inject_compact_arg(args, cli.json);
     if let Some(obj) = args.as_object_mut() {
         if let Some(n) = cli.max_tokens {
             obj.insert("_max_tokens".into(), serde_json::json!(n));
@@ -2112,6 +1876,21 @@ async fn forward(
             obj.insert("_compress".into(), serde_json::json!(true));
         }
     }
+}
+
+/// 按子命令转发 HTTP。
+async fn forward(
+    cli: &Cli,
+    base: &str,
+    token: &mut String,
+    lock_path: &Path,
+    lang: Option<&str>,
+) -> Result<(), ForwardFailure> {
+    let client = http_client();
+    let (tool, mut args) = tool_request(&cli.cmd)
+        .expect("handled earlier: local commands returned before forward");
+    let project_root = resolve_project_root(cli.project.clone());
+    inject_private_args(&mut args, cli);
     // d3a：编排 envelope——invocation_id 来源 --invocation-id 覆写 > 自动生成
     // （UUID v4，std 熵）。header + body envelope 双通道携带；daemon 按
     // invocation_id 记重放日志（成功失败都记）。
@@ -2157,6 +1936,7 @@ async fn forward(
         && let Some(fresh) = refresh_token_if_stale(lock_path, token).await
     {
         // daemon 换代后缓存 token 过期：已刷新，用新 token 重发一次。
+        tracing::info!("403 with stale token; refreshed from lock, retrying once");
         *token = fresh;
         resp = send_once(token)
             .await
@@ -4035,16 +3815,27 @@ mod net_retry_tests {
     }
 
     #[test]
-    fn probe_positions_fall_back_and_null_hovers_stay_pending() {
-        // name 不在 range.start 行（模板/复合符号形态）或行越界 → 退 range.start，
-        // 候选不丢；全 null hover 响应仍判 pending（等待语义不变，超时判据兜底）。
+    fn probe_positions_drops_symbols_without_locatable_name() {
+        // bd serena-rust-b8sp：name 不在 range.start 行（模板/复合符号形态）或行越界
+        // → 丢弃候选，绝不退 range.start——行首 stdlib/修饰 token 的 hover 恒空，
+        // 会把已就绪永判 pending。全 null/空 hover 仍判 pending（等待语义不变）。
         let wire = json!([
             {"name": "p", "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 9}}},
             {"name": "q", "range": {"start": {"line": 9, "character": 2}, "end": {"line": 9, "character": 12}}}
         ]);
         assert_eq!(
             hover_probe_positions(&wire, Some("<div>\n</div>")),
-            vec![(0, 4), (9, 2)]
+            Vec::<(u32, u32)>::new(),
+            "两个候选都不可定位 → 空候选集（调用方给根因行），不打行首"
+        );
+        // name 可定位的用户标识符保留（同轮混排只留可定位者）。
+        let wire_mixed = json!([
+            {"name": "p", "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 9}}},
+            {"name": "main", "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 10}}}
+        ]);
+        assert_eq!(
+            hover_probe_positions(&wire_mixed, Some("<div>\n</div>\nfn main() {}\n")),
+            vec![(2, 3)]
         );
         // 全 null/空 hover → hover_ready 全 false → 循环判 pending（非假阳性）。
         assert!(!hover_ready(&serde_json::Value::Null));

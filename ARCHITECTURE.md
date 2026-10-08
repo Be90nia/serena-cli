@@ -111,7 +111,7 @@ serena-rust/
 │   │       ├── lockfile.rs     # daemon 探测/lazy-spawn 协议（§2 分支 B）
 │   │       └── reaper.rs       # 全局空闲自杀（默认 15min，阈值可配 §6.4）；Δ 每 LS 实例空闲卸载在 supervisor（默认 10min）
 │   └── cli/                    # 唯一 bin：serena-cli
-│       └── src/main.rs         # clap 解析（47 子命令 = 42 工具 + status/stop-all/install/shell/doctor）→
+│       └── src/main.rs         # clap 解析（59 子命令，2026-10-08 实测 Cmd enum；分类清单见 README「CLI commands」）→
 │                               #   探测 daemon → 转发/拉起；--daemon 进 daemon 模式；--direct 开发模式；
 │                               #   doctor/install 直连 supervisor/ls-registry
 └── tests/                      # 集成测试：真实拉起 clangd 的冒烟（M0 验收），逐 T0 适配器冒烟（M2）
@@ -502,7 +502,7 @@ stateDiagram-v2
 | crate | 错误类型（thiserror） | 上游对应物 |
 |---|---|---|
 | ls-runtime | `RuntimeError::{Spawn{cmd, cause}, Download{url, expected_sha, actual_sha}, MissingRuntime{what, install_hint}, Env{var}}` | ls_exceptions.py + dependency_provider 抛错 |
-| lsp-core | `CoreError::{Framing{detail}, Io{source}, Rpc{code, message}, Timeout{method, secs}, Terminated{ls, cause}, ServerCancelled{method}}` | `↖ mirror: ls_process.py@43ae021 LSPError / LanguageServerTerminatedException / TimeoutError`；`ServerCancelled` 对应 LSP ErrorCodes.ServerCancelled |
+| lsp-core | `CoreError::{Framing{detail}, Io{source}, Rpc{code, message}, Timeout{method, secs}, Terminated{ls, cause}, ServerCancelled{method}, NotReady{cause}}` | `↖ mirror: ls_process.py@43ae021 LSPError / LanguageServerTerminatedException / TimeoutError`；`ServerCancelled` 对应 LSP ErrorCodes.ServerCancelled；`NotReady` 为 `Δ` 新增（bd serena-rust-iyz：未就绪竞态从 Io 兜底拆出，wire 映射 LS_NOT_READY retryable） |
 | ls-adapters | `anyhow::Error`（适配器是被编排的末端，错误统一上抛） | 上游子类直接 raise |
 | ls-registry | 实际未用 anyhow（比声明更收敛）：spec 解析与 config 层错误均返 `String` 消息 | — |
 | supervisor | `ToolError::{BadArgs{detail}, NotInstalled{language, hint}, Core(CoreError), WriteConflict{path, reason}, Launch(anyhow::Error), Serialize(anyhow::Error), Protocol{tool, reason}}`（thiserror，供 wire 映射；`Launch` 内嵌 anyhow 收口适配器错误；`Serialize`/`Protocol` 为 `Δ` 新增——确定性失败与协议语义错从 Launch 兜底拆出，避免被误标 retryable） | — |
@@ -539,7 +539,10 @@ flowchart LR
     "code": "WRITE_CONFLICT",          // 见下表枚举
     "message": "file changed on disk since last sync: src/main.rs",
     "ls": "clangd",                     // 可选：涉及的语言服务器
-    "retryable": true                   // 客户端是否可直接重试
+    "retryable": true,                  // 客户端是否可直接重试
+    "hint": "another write may hold the gate or content has changed; re-read the file and retry"
+                                        // 可选（bd serena-rust-i4j）：WRITE_CONFLICT 专属
+                                        // 自检指引；其余错误码省略该字段
   } }
 ```
 
@@ -552,7 +555,7 @@ flowchart LR
 | `LS_TERMINATED` | 会话崩溃（supervisor 会懒重启，重试即触发） | true | 1 |
 | `LS_TIMEOUT` | 请求超时（双轨：普通 30s / 索引类 workspace/* 120s；per-LS `timeout_ms`/`index_timeout_ms` 与 CLI `--request-timeout`/`--index-timeout` 可覆盖。300s 是 CLI 转发总超时 `FORWARD_TIMEOUT`，非 per-LS 默认） | true | 1 |
 | `RPC_ERROR` | LS 返回 JSON-RPC error | case | 1 |
-| `WRITE_CONFLICT` | 盘上内容与 LSP 状态不符（§3.3 防线） | false（需重读） | 1 |
+| `WRITE_CONFLICT` | 盘上内容与 LSP 状态不符（§3.3 防线）；wire 附 `hint`（重读后重试指引，bd serena-rust-i4j） | false（需重读） | 1 |
 | `INTERNAL` | daemon 内部 bug（anyhow 兜底，含 chain 摘要） | false | 3 |
 
 HTTP 层错误保留给传输语义：`404` 未知工具名、`503` daemon 关停中。**工具级失败走 200 + `{ok:false}`**，让 CLI 的分支只看 JSON，不看状态码二次判错。CLI exit：0 成功 / 1 工具失败 / 2 用法错误 / 3 daemon 或传输故障（含 daemon 拉起失败）/ 4 `wait-ready` 超时（bd serena-rust-55m）。转发路径对 `503 DAEMON_DRAINING`（stop-all 后 reaper 收尾窗口）做客户端侧自愈：≤5s 窗口内每 300ms 重试一次完整链路（重新探活 + lazy-spawn），超窗仍 draining 则原样报错 rc=3（bd serena-rust-g0m）。
@@ -636,3 +639,22 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 | A7 | 新增 `--direct` 开发模式（CLI 进程内直调 supervisor） | M0 冒烟与单测不经 HTTP；代价是 cli 多一条对 supervisor 的依赖路径（本来就有） |
 
 **本文档不决定**（遵循任务非目标）：§11 开放问题（项目名、replace-body 里程碑归属等）维持 DESIGN.md 现状，不在此拍板。
+
+### 9.1 相对上游的 Δ 改动清单（正文 `Δ` 标注汇总）
+
+正文各处以 `Δ` 前缀标注本项目相对上游 serena 的显式改动（见卷首追溯约定），汇总如下；对 DESIGN §4 的修订已在上表 A2–A4，此处不重复。
+
+| Δ 条目 | 影响文件 | 一句话理由 |
+|---|---|---|
+| stderr 分级不设独立 logmap.rs，stderr 泵用通用 tracing 缺省分级 | `crates/ls-runtime`（stderr 泵） | per-LS 前缀表（如 clangd `I[..]/E[..]`）随 T2 深度 quirk 再落地 |
+| TCP 传输（Godot 6008）未落地 | `crates/lsp-core/src/transport/mod.rs` | 随 Godot 场景任务补 |
+| 诊断/符号缓存不归 lsp-core，上移 supervisor（`DiagCache`/`symbol_cache`/`diag_generation`） | `crates/supervisor/src/lib.rs` | 缓存与代际归属实例池层（§3.4 权威表） |
+| 项目缓存加 LRU/空闲回收 | `crates/supervisor/src/lib.rs` | 上游 `_loaded_projects_by_root` 只进不出，长驻会累积 |
+| 每 LS 实例空闲卸载放 supervisor（默认 10min），daemon 只管全局空闲自杀（15min） | `crates/supervisor`；`crates/daemon/src/reaper.rs` | 实例卸载与进程自毁分层（阈值见 §6.4） |
+| 分支 B（daemon 探测/残留仲裁）全部自有设计 | `crates/daemon/src/lockfile.rs` | 覆盖「启动中」「draining 收尾」两个窗口，最少机制（TCP 探活 + `boot_ms` + token） |
+| `gen_token` 非加密安全，有意为之 | `crates/daemon/src/lockfile.rs` | 校验目标是本机防误连/防跨会话误投，不作抗恶意进程边界 |
+| 服务器→客户端请求未注册 handler 时默认回空成功响应 | `crates/lsp-core/src/client.rs`（泵内分发） | vscode-languageserver-node 系把 `registerCapability` 错误响应当致命（helix 同款 quirk） |
+| writer task 单所有者 stdin，等价替换上游 `_stdin_lock` | `crates/lsp-core/src/transport` | 多任务并写一把锁 ↔ 单任务顺序写，语义相同、无锁竞争 |
+| trait 增补 `wait_for_index` + `set_project_root`（SolidLSP Phase 3.2） | `crates/ls-adapters/src/lib.rs` | cold-start rename 超时 / replace-body range 错位的对症点（上游无此等待） |
+| docsync 新增 `LocalDirty` 显式命名写事务中间态 | `crates/lsp-core/src/docsync.rs` | 供 `WRITE_CONFLICT` 判定引用 |
+| `ToolError` 自 `Launch` 兜底拆出 `Serialize`/`Protocol` | `crates/supervisor` | 确定性失败与协议语义错不再被误标 retryable |

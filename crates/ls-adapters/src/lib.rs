@@ -39,6 +39,7 @@ pub mod jedi_server;
 pub mod json;
 pub mod nextflow;
 pub mod powershell;
+pub mod project_root;
 pub mod pyre_server;
 pub mod pyrefly_server;
 pub mod pyright;
@@ -51,6 +52,8 @@ pub mod ty_server;
 pub mod typescript;
 pub mod vts;
 pub mod vue;
+
+pub use project_root::{ProjectKey, ProjectRootSlot};
 
 /// 语言标识：与 `servers.toml` `languages` 字段、claude 端 ProjectCtx.language 一一对应。
 ///
@@ -136,6 +139,12 @@ pub enum LanguageId {
     /// 走 intelephense（npm，`--lang intelephense` 按 entry id 显式路由，phpantom
     /// 同款）。↖ mirror: intelephense.py@43ae021。
     Php,
+    /// T0 配置驱动（r8.5 adopt 批，servers.toml [servers.devsense_php] 条目）：
+    /// Devsense 维护的 devsense-php-ls npm 包（多 arch platform binary）。本机
+    /// CI-only：fixture 与 install 全 PLATFORM SKIP，仅保留 `--lang php_devsense`
+    /// 显式路由面供预装用户调用；语言路由 `php` 不抢默认，仍归 phpactor 条目。
+    /// ↖ mirror: devsense_php_language_server.py@3b99f8b0（PR #1917）。
+    PhpDevsense,
     /// T0 配置驱动（W3 批，servers.toml lua 条目 = LuaLS lua-language-server）。
     /// ↖ mirror: lua_ls.py@43ae021（GitHub release tar.gz 3.15.0 sha 内嵌）。
     Lua,
@@ -314,6 +323,7 @@ impl LanguageId {
             Self::Deno => "deno",
             Self::Sass => "sass",
             Self::Php => "php",
+            Self::PhpDevsense => "php_devsense",
             Self::Lua => "lua",
             Self::Scala => "scala",
             Self::Swift => "swift",
@@ -392,6 +402,8 @@ impl LanguageId {
             // W3 批：intelephense 别名（phpantom 同款按 entry id 显式路由——
             // 语言路由 `php` 归 phpactor 条目，冒烟门 --lang intelephense）。
             "php" | "intelephense" => Some(Self::Php),
+            // r8.5 adopt：devsense_php 仅按 entry id 显式路由，不抢语言 `php`。
+            "php_devsense" => Some(Self::PhpDevsense),
             "lua" => Some(Self::Lua),
             "scala" => Some(Self::Scala),
             "swift" => Some(Self::Swift),
@@ -619,6 +631,9 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::Sass => &["sass", "scss"],
         // W3 批：四门均为真实 LS 可解析的源文件扩展名。
         LanguageId::Php => &["php"],
+        // r8.5 adopt：devsense_php 复用 .php 探针（按 entry id 显式路由，扩展
+        // 名分流归 Php 门——probe 不会被调用，仅保持非空防全局断言）。
+        LanguageId::PhpDevsense => &["php"],
         LanguageId::Lua => &["lua"],
         LanguageId::Scala => &["scala"],
         LanguageId::Swift => &["swift"],

@@ -71,6 +71,9 @@ jobs:
     env:
       # 本 job 是真机冒烟本体：显式开 LS e2e（与 m0-ci 的 =1 门禁语义互补）。
       SERENA_SKIP_LS_E2E: "0"
+      # ci_only 门（r8.5 adopt：本机默认排除，CI 纳入全集）—— smoke_shard.py 据
+      # 此 env 切换过滤；本地不设即排除 devsense_php 等实验门。
+      SERENA_CI_ONLY_INCL: "1"
       SERENA_CLI: ${{ github.workspace }}/serena-cli
     steps:
       - uses: actions/checkout@v4

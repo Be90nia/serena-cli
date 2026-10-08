@@ -21,7 +21,6 @@
 //! LSP 实现，与 pyright 共享探测链；架构 / M2 探测层保持一致。
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,7 +28,8 @@ use ls_runtime::process::{LaunchInfo, TransportKind};
 use lsp_types::InitializeParams;
 
 use crate::{
-    LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error, which_no_unc,
+    LanguageId, LanguageServerAdapter, ProjectCtx, ProjectRootSlot, RequestHooks,
+    not_installed_error, which_no_unc,
 };
 
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,9 +37,11 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// root 未设置 / 无候选文件时的退路：旧版虚拟探针 URI（不触发项目索引，仅保底）。
 const PROBE_FALLBACK: &str = "file:///__pyright_ready_probe__";
 
-/// 当前会话项目 root。adapter 是零字段单例（`Copy`）存不了实例状态 —— 会话级数据
-/// 放静态槽，由 supervisor::session_for 在 `on_server_ready` 前经 `set_project_root` 写入。
-static PROBE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6）。adapter 是零字段
+/// 单例（`Copy`）存不了实例状态 —— 会话级数据放静态槽，由 supervisor::session_for
+/// 在 `on_server_ready` 前经 `set_project_root` 写入。initialize_patches 的 venv
+/// 探测从 params.root_uri 反解本会话 root（该时机槽内 last 还是上一个会话）。
+static PROBE_ROOT: ProjectRootSlot = ProjectRootSlot::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PyrightAdapter;
@@ -96,7 +98,11 @@ impl LanguageServerAdapter for PyrightAdapter {
         // 不启动（裸探针二分实锚：1.1.403 去 workspaceFolders 即应答、1.1.414
         // 全形态即应答、1.1.403+注入+workspaceFolders 仍楔），修法 = 钉版升
         // 1.1.414（[servers.pyright] uvx + npm 门同步）。
-        let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
+        // bd serena-rust-4y6：root 从本会话 params.root_uri 反解 —— 静态槽此处
+        // 还停留在上一个会话的 root（set_project_root 在 initialize 之后才调用），
+        // 单槽时代跨项目 venv 注入错位的实锚。
+        #[allow(deprecated)]
+        let root = crate::project_root::root_uri_to_path(base.root_uri.as_ref());
         let Some(interp) = root
             .as_deref()
             .and_then(find_python_interpreter)
@@ -115,7 +121,7 @@ impl LanguageServerAdapter for PyrightAdapter {
     }
 
     fn set_project_root(&self, root: &Path) {
-        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+        PROBE_ROOT.set(root);
     }
 
     /// smoke R6（run 36577226543 python 门帧实锚）：探针 documentSymbol 先于
@@ -161,7 +167,7 @@ impl PyrightAdapter {
     /// run 36577226543 探针 documentSymbol 先于 didOpen，此后全部请求零应答）；
     /// 标记文件 / 虚拟 URI 无文件可开，维持裸探针旧行为。
     fn probe_target(&self) -> (String, Option<PathBuf>) {
-        let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
+        let root = PROBE_ROOT.get_last();
         let source = root
             .as_deref()
             .and_then(|r| crate::find_language_source_file(r, self.languages(), 4));

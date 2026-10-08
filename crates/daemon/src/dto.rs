@@ -98,6 +98,10 @@ pub struct WireError {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ls: Option<String>,
     pub retryable: bool,
+    /// 行动指引（bd serena-rust-i4j）：WRITE_CONFLICT 携带，告诉 agent 冲突不是
+    /// 参数错、重读后重试即可。其余错误码 None（序列化时省略，向后兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// `GET /status` 响应。
@@ -125,6 +129,12 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
         ToolError::Core(core) => match core {
             supervisor::CoreErrorWire::Rpc { code, message } => {
                 (WireErrorCode::RpcError, format!("rpc {code}: {message}"))
+            }
+            // bd serena-rust-iyz：未就绪竞态（gate 开但握手未 settle）曾误走 Io
+            // 兜底冒充 INTERNAL，LsNotReady 沦为死码。ARCH §5：Ready 是唯一
+            // 服务态，其余状态按 §6.3 返回 LS_NOT_READY（retryable）。
+            supervisor::CoreErrorWire::NotReady { cause } => {
+                (WireErrorCode::LsNotReady, cause.clone())
             }
             supervisor::CoreErrorWire::Timeout { method, secs } => (
                 WireErrorCode::LsTimeout,
@@ -156,11 +166,21 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
         ToolError::NotInstalled { language, .. } => Some(language.clone()),
         _ => None,
     };
+    // bd serena-rust-i4j：写门/内容冲突统一带自检 hint —— agent 拿到的是
+    // 「盘上内容与预期不符」而非参数错，指引重读重试，避免误诊为 BAD_ARGS。
+    let hint = match err {
+        ToolError::WriteConflict { .. } => Some(
+            "another write may hold the gate or content has changed; re-read the file and retry"
+                .to_string(),
+        ),
+        _ => None,
+    };
     WireError {
         code,
         message,
         ls,
         retryable: code.retryable(),
+        hint,
     }
 }
 
@@ -232,6 +252,7 @@ mod tests {
             message: "x".into(),
             ls: None,
             retryable: false,
+            hint: None,
         };
         let j = serde_json::to_string(&e).unwrap();
         assert!(j.contains("\"code\":\"WRITE_CONFLICT\""), "got: {j}");
@@ -289,6 +310,7 @@ mod tests {
                 message: "x".into(),
                 ls: None,
                 retryable: false,
+                hint: None,
             },
         };
         let j = serde_json::to_string(&resp).unwrap();
@@ -336,6 +358,27 @@ mod tests {
         assert!(!w.retryable);
     }
 
+    /// bd serena-rust-i4j：WRITE_CONFLICT 必须携带自检 hint（重读重试指引），
+    /// 其余错误码 hint 为 None（序列化省略）—— agent 靠它区分「并发冲突」
+    /// 与「参数错」，不再把 needle 失配误诊为 BAD_ARGS。
+    #[test]
+    fn wire_error_from_write_conflict_carries_reread_hint() {
+        let e = supervisor::ToolError::WriteConflict {
+            path: "src/x.rs".into(),
+            reason: "needle not found in symbol body".into(),
+        };
+        let w = wire_error_from_tool_error(&e);
+        assert_eq!(w.code, WireErrorCode::WriteConflict);
+        let hint = w.hint.expect("WRITE_CONFLICT must carry hint");
+        assert!(hint.contains("re-read"), "got: {hint}");
+        assert!(hint.contains("retry"), "got: {hint}");
+
+        let bad = wire_error_from_tool_error(&supervisor::ToolError::BadArgs {
+            detail: "missing pattern".into(),
+        });
+        assert!(bad.hint.is_none(), "BAD_ARGS must not carry hint");
+    }
+
     #[test]
     fn wire_error_from_core_timeout() {
         let e = supervisor::ToolError::Core(supervisor::CoreErrorWire::Timeout {
@@ -344,6 +387,36 @@ mod tests {
         });
         let w = wire_error_from_tool_error(&e);
         assert_eq!(w.code, WireErrorCode::LsTimeout);
+        assert!(w.retryable);
+    }
+
+    /// bd serena-rust-iyz：未就绪竞态（Initializing 窗口）→ LS_NOT_READY +
+    /// retryable，不再错层 INTERNAL（LsNotReady 死码回归）。
+    #[test]
+    fn wire_error_from_core_not_ready_maps_ls_not_ready() {
+        let e = supervisor::ToolError::Core(supervisor::CoreErrorWire::NotReady {
+            cause: "session not ready after gate open".into(),
+        });
+        let w = wire_error_from_tool_error(&e);
+        assert_eq!(w.code, WireErrorCode::LsNotReady);
+        assert!(w.retryable);
+        assert!(
+            w.message.contains("not ready"),
+            "AI 判读关键词: {}",
+            w.message
+        );
+    }
+
+    /// bd serena-rust-iyz：Failed 态到来的请求走 LS_TERMINATED（现有码表内
+    /// 合理映射：supervisor 懒重启，重试即触发）——锁语义防回归。
+    #[test]
+    fn wire_error_from_failed_session_maps_ls_terminated() {
+        let e = supervisor::ToolError::Core(supervisor::CoreErrorWire::Terminated {
+            ls: "ls".into(),
+            cause: "session failed before request".into(),
+        });
+        let w = wire_error_from_tool_error(&e);
+        assert_eq!(w.code, WireErrorCode::LsTerminated);
         assert!(w.retryable);
     }
 

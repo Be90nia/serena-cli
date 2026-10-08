@@ -84,6 +84,7 @@ fn walk_nested(items: &[lsp_types::DocumentSymbol], name: &str) -> Option<lsp_ty
 /// 在 `text` 内 `[range.start, range.end]` 范围内，定位 `needle` 第一次出现处 byte 范围。
 /// 返回 (start_byte, end_byte) 在 text 内的绝对 byte offset。
 fn locate_in_range(
+    path: &Path,
     text: &str,
     range: lsp_types::Range,
     needle: &str,
@@ -112,8 +113,15 @@ fn locate_in_range(
         detail: format!("range end: {e}"),
     })?;
     let body = &text[start_byte..end_byte];
-    let rel = body.find(needle).ok_or_else(|| EditError::BadArgs {
-        detail: "needle not found in symbol body".into(),
+    let rel = body.find(needle).ok_or_else(|| {
+        // bd serena-rust-i4j：needle 在符号体内找不到 ≠ 参数错 —— 符号 range 是
+        // 拿门后现解析的，此处失配说明盘上内容已被并发写改掉。报 BAD_ARGS 会
+        // 误导 agent 误诊参数、盲目重试；归 WRITE_CONFLICT（重读重试语义）。
+        EditError::WriteConflict {
+            path: path.display().to_string(),
+            reason: "needle not found in symbol body (content changed under a concurrent write)"
+                .into(),
+        }
     })?;
     Ok((start_byte + rel, start_byte + rel + needle.len()))
 }
@@ -167,7 +175,7 @@ pub async fn replace_text_in_symbol(
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
-    let (lo, hi) = locate_in_range(&content, range, old_text, OffsetEncoding::Utf16)?;
+    let (lo, hi) = locate_in_range(file, &content, range, old_text, OffsetEncoding::Utf16)?;
     let mut new_content = String::with_capacity(content.len() + new_text.len());
     new_content.push_str(&content[..lo]);
     new_content.push_str(new_text);

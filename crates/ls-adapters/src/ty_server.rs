@@ -12,18 +12,21 @@
 //! - 不写 ty.toml 自动生成；用户自管。
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use async_trait::async_trait;
 use ls_runtime::process::{LaunchInfo, TransportKind};
 use lsp_types::InitializeParams;
 
 use crate::{
-    LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error, which_no_unc,
+    LanguageId, LanguageServerAdapter, ProjectCtx, ProjectRootSlot, RequestHooks,
+    not_installed_error, which_no_unc,
 };
 
-/// 当前会话项目 root。同构于 pyright.rs —— Python LSP 系共享探测链。
-static PROBE_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+/// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6）。同构于 pyright.rs
+/// —— Python LSP 系共享探测链。无键读侧走 `get_last`（与 supervisor
+/// set→on_* 相邻序列配套）；initialize_patches 的 venv 探测从 params.root_uri
+/// 反解本会话 root（该时机槽内 last 还是上一个会话）。
+static PROBE_ROOT: ProjectRootSlot = ProjectRootSlot::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TyServerAdapter;
@@ -62,7 +65,11 @@ impl LanguageServerAdapter for TyServerAdapter {
 
     fn initialize_patches(&self, base: &mut InitializeParams) {
         // 与 pyright 同款 venv 探测 → 注入 python.pythonPath。
-        let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
+        // bd serena-rust-4y6：root 从本会话 params.root_uri 反解 —— 静态槽此处
+        // 还停留在上一个会话的 root（set_project_root 在 initialize 之后才调用），
+        // 单槽时代跨项目 venv 注入错位的实锚。
+        #[allow(deprecated)]
+        let root = crate::project_root::root_uri_to_path(base.root_uri.as_ref());
         let Some(interp) = root
             .as_deref()
             .and_then(crate::pyright::find_python_interpreter)
@@ -80,15 +87,14 @@ impl LanguageServerAdapter for TyServerAdapter {
     }
 
     fn set_project_root(&self, root: &Path) {
-        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+        PROBE_ROOT.set(root);
     }
 
     async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
         use serde_json::json;
         let uri = crate::probe_uri_for_root(
             PROBE_ROOT
-                .lock()
-                .expect("PROBE_ROOT poisoned")
+                .get_last()
                 .as_deref()
                 .unwrap_or(Path::new(".")),
             self.languages(),

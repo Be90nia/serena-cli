@@ -4,9 +4,9 @@
 
 **Goal:** 用 Rust 复刻 solidlsp，产出单文件 `serena-cli.exe`：agent 经 bash 调用的 position-free 符号工具 CLI + 常驻 daemon（lazy-spawn / 空闲自杀）。
 
-**Architecture:** 7-crate workspace（`ls-runtime` → `lsp-core` → `ls-adapters`/`ls-registry` → `supervisor` → `daemon`/`cli`），唯一事实源为 `ARCHITECTURE.md` v0.1（锚 oraios/serena@`43ae0211`）。本计划的任务签名、类型名、错误码全部以它为准，冲突时以它为准并回改本计划。
+**Architecture:** 7-crate workspace（`ls-runtime` → `lsp-core` → `ls-adapters`/`ls-registry` → `supervisor` → `daemon`/`cli`），唯一事实源为 `ARCHITECTURE.md` v0.1（锚 oraios/serena@`7a296833`，演进 43ae0211 → c4dc91a7 → 7a296833 见 ARCHITECTURE.md 卷首）。本计划的任务签名、类型名、错误码全部以它为准，冲突时以它为准并回改本计划。
 
-**Tech Stack:** tokio / axum / clap(derive) / serde+serde_json / lsp-types 3.17 / async-trait / thiserror+anyhow / tracing / reqwest(blocking,rustls) / win32job / dunce / tempfile / ignore / regex / sha2 / zip+flate2 / toml —— 完整清单及**禁入清单**（dashmap、parking_lot、async-lsp、tower-lsp）见 ARCHITECTURE.md §8，不得增删。
+**Tech Stack:** tokio / axum / clap(derive) / serde+serde_json / lsp-types 0.97 / async-trait / thiserror+anyhow / tracing / reqwest(blocking,rustls) / win32job / dunce / tempfile / ignore / regex / sha2 / zip+flate2 / toml —— 完整清单及**禁入清单**（dashmap、parking_lot、async-lsp、tower-lsp）见 ARCHITECTURE.md §8，不得增删。
 
 ## Global Constraints
 

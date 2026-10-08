@@ -271,6 +271,10 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
     }
     let id = LanguageId::from_str_opt(lang)?;
     Some(match id {
+        // r8.5 adopt：devsense_php 是 T0 配置驱动（servers.toml npm 条目），无手写
+        // 单例——此处返回 None，调用方回落 Task21 双路径的 ensure_launch 支
+        // （table_hit 按 languages=["php_devsense"] 命中 devsense_php 条目）。
+        LanguageId::PhpDevsense => return None,
         LanguageId::Cpp => CLANGD.clone(),
         LanguageId::Rust => RUST_ANALYZER.clone(),
         LanguageId::Python => PYRIGHT.clone(),
@@ -399,6 +403,10 @@ pub fn lsp_language_id(lang: &str) -> String {
         // phpactor），didOpen 官方口径是 "php"（docker→dockerfile 同款显式映射，
         // 不赌 LS 对自名的宽容）。lua/scala/swift 恒等走 default 臂。
         "intelephense" => "php".to_string(),
+        // r8.5 adopt：devsense_php 同 intelephense——entry id 显式路由，didOpen
+        // 官方口径 "php"，不赌 LS 对自名 languageId 的宽容（lib.rs:711 内嵌
+        // 单测与 servers_toml_coverage doors_wired 双断言锚）。
+        "php_devsense" => "php".to_string(),
         // smoke R6：python 变体门 --lang pyright 按 entry id 显式路由（pgsql/mysql
         // 先例），didOpen 官方口径是 "python"——pyright 对自名 languageId 不识别，
         // didOpen 被吞后全部请求零应答（run 36577226543 帧实锚；intelephense→php
@@ -690,7 +698,8 @@ mod tests {
     #[test]
     fn w3_php_lua_scala_swift_t0_routing() {
         // T0：语言名 + intelephense 别名无手写 adapter（scala 除外，已 T2）。
-        for lang in ["php", "intelephense", "lua", "swift"] {
+        // r8.5：php_devsense 也走 T0（按 entry id 显式路由，无手写 adapter）。
+        for lang in ["php", "intelephense", "lua", "swift", "php_devsense"] {
             assert!(adapter_for(lang).is_none(), "{lang}: W3 三门全 T0");
         }
         assert!(
@@ -702,8 +711,14 @@ mod tests {
         assert!(config::spec_for("scala").is_some());
         assert!(config::spec_for("swift").is_some());
         assert!(config::spec_for("intelephense").is_some());
+        assert!(
+            config::spec_for("devsense_php").is_some(),
+            "r8.5 adopt: devsense_php 条目收录"
+        );
         // LSP didOpen languageId：仅 intelephense→php 显式映射，其余恒等。
+        // r8.5：devsense_php 也走"→php"映射（同 intelephense 理由）。
         assert_eq!(lsp_language_id("intelephense"), "php");
+        assert_eq!(lsp_language_id("php_devsense"), "php");
         assert_eq!(lsp_language_id("php"), "php");
         assert_eq!(lsp_language_id("lua"), "lua");
         assert_eq!(lsp_language_id("scala"), "scala");
@@ -726,6 +741,10 @@ mod tests {
         assert_eq!(
             LanguageId::from_str_opt("intelephense"),
             Some(LanguageId::Php)
+        );
+        assert_eq!(
+            LanguageId::from_str_opt("php_devsense"),
+            Some(LanguageId::PhpDevsense)
         );
     }
 

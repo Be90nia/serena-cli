@@ -34,6 +34,7 @@ pub mod doctor;
 pub mod edit_context;
 pub mod edit_tools;
 pub mod fs_tools;
+pub mod path_guard;
 pub mod root_finder;
 
 pub mod catalog;
@@ -2137,7 +2138,8 @@ impl Supervisor {
         );
     }
 
-    /// 首个语义工具（hover/def/refs/find-implementations）非空成功 → 关窗。
+    /// 首个语义工具（hover/def/refs/find-implementations/find-referencing-*/
+    /// edit-context）非空成功 → 关窗。
     fn mark_semantic_ready(&self, root: &Path) {
         if let Some(w) = self
             .ls_warmup
@@ -2163,6 +2165,29 @@ impl Supervisor {
         } else {
             Vec::new()
         }
+    }
+
+    /// 语义层曾非空成功（任一语义工具）→ 引用类空结果可信（真·无 caller）。
+    fn semantic_ok(&self, root: &Path) -> bool {
+        self.ls_warmup
+            .lock()
+            .unwrap()
+            .get(&key_root_identity(root))
+            .is_some_and(|w| w.semantic_ok)
+    }
+
+    /// find-referencing-*/edit-context 空 hits 的降级警示（bd serena-rust-e0hi/8vo9）。
+    /// 与 def/refs 的 we0 探针（documentSymbol 位置在符号内即降级）不同——引用类
+    /// 查询点恒在符号名上，该判据会把真·无 caller 永远误标、AI 永远在重试。此处
+    /// 判据只认「语义层曾成功」：semantic_ok 前，类型分析未就绪窗口（RA 30-60s）
+    /// refs 静默返空不可信；其后空即真值，不警示。workspace 加载错误无条件透出
+    ///（与 def/refs 同规则，结果本就不可信）。
+    fn referencing_empty_warnings(&self, root: &Path) -> Vec<String> {
+        let mut ws = self.workspace_error_warnings(root);
+        if !self.semantic_ok(root) {
+            ws.push(semantic_not_ready_message());
+        }
+        ws
     }
 
     /// 写工具收尾标记（bd serena-rust-0em）：file 进入写后一致性窗口。
@@ -3295,12 +3320,13 @@ impl Supervisor {
     ) -> ToolResult<()> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let abs = root.join(file);
+        let abs =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         edit_tools::replace_text_in_symbol(&session, root, &abs, symbol, old_text, new_text)
             .await
-            .map_err(|e| ToolError::BadArgs {
-                detail: format!("replace_text_in_symbol: {e}"),
-            })
+            // bd serena-rust-i4j：走 line_edit_err 保留 WriteConflict 变体 ——
+            // needle 失配是并发冲突不是参数错；其余错误 wire message 不变。
+            .map_err(line_edit_err("replace_text_in_symbol"))
     }
 
     /// `insert_text_before_symbol`：在 symbol 开头插入 text（Task 25）。
@@ -3315,12 +3341,11 @@ impl Supervisor {
     ) -> ToolResult<(u32, u32)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let abs = root.join(file);
+        let abs =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         edit_tools::insert_text_before_symbol(&session, root, &abs, symbol, text)
             .await
-            .map_err(|e| ToolError::BadArgs {
-                detail: format!("insert_text_before_symbol: {e}"),
-            })
+            .map_err(line_edit_err("insert_text_before_symbol"))
     }
 
     /// `insert_text_after_symbol`：在 symbol 末尾插入 text（Task 25）。
@@ -3334,12 +3359,11 @@ impl Supervisor {
     ) -> ToolResult<(u32, u32)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let abs = root.join(file);
+        let abs =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         edit_tools::insert_text_after_symbol(&session, root, &abs, symbol, text)
             .await
-            .map_err(|e| ToolError::BadArgs {
-                detail: format!("insert_text_after_symbol: {e}"),
-            })
+            .map_err(line_edit_err("insert_text_after_symbol"))
     }
 
     /// `delete_text_in_symbol`：在 symbol 体内删除 [start_line, end_line] 切片（1-based 含端，Task 25）。
@@ -3354,12 +3378,11 @@ impl Supervisor {
     ) -> ToolResult<()> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let abs = root.join(file);
+        let abs =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         edit_tools::delete_text_in_symbol(&session, root, &abs, symbol, start_line, end_line)
             .await
-            .map_err(|e| ToolError::BadArgs {
-                detail: format!("delete_text_in_symbol: {e}"),
-            })
+            .map_err(line_edit_err("delete_text_in_symbol"))
     }
     /// `symbol-body`：按符号名取函数/类体切片（PLAN Task 15）。
     ///
@@ -3435,7 +3458,8 @@ impl Supervisor {
         lang_override: Option<&str>,
     ) -> ToolResult<()> {
         let lang = resolve_lang_for_file(file, lang_override)?;
-        let path = root.join(file);
+        let path =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         let uri_str = path_to_uri_str(&path);
         let symbol = symbol.to_string();
         let new_body = new_body.to_string();
@@ -3790,7 +3814,8 @@ impl Supervisor {
 
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let path = root.join(file);
+        let path =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         let uri_str = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
@@ -3953,7 +3978,8 @@ impl Supervisor {
     ) -> ToolResult<SafeDeleteReport> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let path = root.join(file);
+        let path =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         let uri_str = path_to_uri_str(&path);
 
         let _gate = write_gate::acquire().await;
@@ -4092,7 +4118,8 @@ impl Supervisor {
     ) -> ToolResult<(u32, u32)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let abs = root.join(file);
+        let abs =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         edit_tools::insert_at_line(&session, root, &abs, line, content, expected_hash)
             .await
             .map_err(line_edit_err("insert_at_line"))
@@ -4108,12 +4135,10 @@ impl Supervisor {
         content: &str,
         lang_override: Option<&str>,
     ) -> ToolResult<serde_json::Value> {
-        if file.is_empty() || file.contains("..") {
-            return Err(ToolError::BadArgs {
-                detail: "invalid file path".into(),
-            });
-        }
-        let abs = root.join(file);
+        // bd serena-rust-5r7：`contains("..")` 挡不住绝对路径注入（join 换基），
+        // 统一走 root 界校验（词法 + canonical，含 symlink 语义）。
+        let abs =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         let _gate = write_gate::acquire().await;
         // 门内双检：并发两个 create 只成功一个（TOCTOU 防线）。
         if abs.exists() {
@@ -4161,7 +4186,8 @@ impl Supervisor {
     ) -> ToolResult<()> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let abs = root.join(file);
+        let abs =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         edit_tools::replace_lines(
             &session,
             root,
@@ -4188,7 +4214,8 @@ impl Supervisor {
     ) -> ToolResult<()> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
-        let abs = root.join(file);
+        let abs =
+            path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         edit_tools::delete_lines(&session, root, &abs, start_line, end_line, expected_hash)
             .await
             .map_err(line_edit_err("delete_lines"))
@@ -5320,14 +5347,20 @@ fn sanitize_timeout_args(mut args: serde_json::Value) -> serde_json::Value {
     args
 }
 
+/// 信封内「list 数组」键（按序探测）。items=refs/find-symbol/diagnostics 系既有
+/// 信封；hits=search；top=repo-map；entries=symbol-tree。顶层裸数组（overview/
+/// list-dir/find-file）截断后折进 items 信封词汇（bd serena-rust-1ve9）。
+const BUDGET_LIST_KEYS: [&str; 4] = ["items", "hits", "top", "entries"];
+
 /// AI-token 特性 G（plan-g-budget.md §Task1 / ai-token-features-design §10-G）：
-/// 工具响应 token 预算护栏。超出预算则截断顶层 `items` 数组到最大可容纳条数，
+/// 工具响应 token 预算护栏。超出预算则截断信封内的 list 数组到最大可容纳条数，
 /// 并写入 `truncated: true` + `original_count`；未超预算零改动（返回 false）。
 /// 返回值 = 是否发生截断。截断是 **success 语义**（wire/退出码不变，仅加标志）。
 ///
 /// 估算：4 字节 ≈ 1 token（BPE 粗略近似，soft limit）。
 /// delta 响应（有 `added`/`removed` 键）跳过截断——items 语义已归一为增量集，
-/// 按条截断会破坏增量对照关系，直接放行。
+/// 按条截断会破坏增量对照关系，直接放行。read-file（content 串，行号 clamp +
+/// content_hash 契约）/edit-context（body 串）等非 list 信封不在护栏范围。
 ///
 /// ponytail: 不做精确 BPE 计数——预算护栏是 soft limit，精确度不是核心。
 fn apply_budget(value: &mut serde_json::Value, max_tokens: usize) -> bool {
@@ -5340,8 +5373,30 @@ fn apply_budget(value: &mut serde_json::Value, max_tokens: usize) -> bool {
     if current_bytes <= budget_bytes {
         return false;
     }
-    let Some(items) = value.get_mut("items").and_then(|v| v.as_array_mut()) else {
-        return false; // 无 items 数组的响应（标量/树形）不在预算护栏范围
+    if value.is_array() {
+        // 顶层裸数组无处内嵌标志——折进既有 items 信封词汇后走同一截断管线。
+        let mut envelope = serde_json::json!({ "items": std::mem::take(value) });
+        let fired = truncate_envelope_list(&mut envelope, budget_bytes);
+        *value = envelope;
+        return fired;
+    }
+    truncate_envelope_list(value, budget_bytes)
+}
+
+/// 在信封对象内定位 [`BUDGET_LIST_KEYS`] 中的首个 list 数组，二分截断到预算内
+/// 最大条数，写入 `truncated`/`original_count`（字段沿用现名，wire 不改）。
+fn truncate_envelope_list(value: &mut serde_json::Value, budget_bytes: usize) -> bool {
+    // 查找（闭包只判 is_array，无引用逃逸 FnMut 边界）与借用（闭包外 get_mut）分离：
+    // &mut 数组引用不能从 find_map 闭包内返回（E0521）。
+    let key = BUDGET_LIST_KEYS
+        .iter()
+        .copied()
+        .find(|k| value.get_mut(*k).is_some_and(|v| v.is_array()));
+    let Some(key) = key else {
+        return false; // 无 list 数组的响应（标量/树形）不在预算护栏范围
+    };
+    let Some(items) = value.get_mut(key).and_then(|v| v.as_array_mut()) else {
+        return false; // 无 list 数组的响应（标量/树形）不在预算护栏范围
     };
     let original_count = items.len();
     // 二分查找预算内最大保留条数；+18 字节为 truncated/original_count 标志开销余量。
@@ -5349,7 +5404,7 @@ fn apply_budget(value: &mut serde_json::Value, max_tokens: usize) -> bool {
     let mut hi = items.len();
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        let trial = serde_json::json!({ "items": &items[..mid] });
+        let trial = serde_json::json!({ key: &items[..mid] });
         let trial_bytes = serde_json::to_vec(&trial).map(|v| v.len()).unwrap_or(0);
         if trial_bytes + 18 <= budget_bytes {
             lo = mid;
@@ -5573,13 +5628,28 @@ impl SupervisorTrait for Supervisor {
         // 统一在入口拦截 —— 否则 ensure_open 的 io NotFound 经 Core 冒成 INTERNAL，
         // AI 无法据错误码免重试。args 带 file 字段的工具（读/写/位置类）目标文件
         // 全部要求已存在（create-text-file 例外：新建语义，file 不存在是前置条件）。
-        if let Some(f) = args.get("file").and_then(|v| v.as_str())
-            && tool != "create-text-file"
-            && !root.join(f).is_file()
-        {
-            return Err(ToolError::BadArgs {
-                detail: format!("file not found: {f}"),
-            });
+        // bd serena-rust-5r7：写类工具（undo::WRITE_TOOLS）在存在性检查前先过
+        // root 界校验 —— 指向 root 外真实存在文件的写请求旧检查放行、会直写
+        // root 外；现在入口即 BAD_ARGS。读类入口不设界（读侧收口归 fs_tools::safe_join）。
+        if let Some(f) = args.get("file").and_then(|v| v.as_str()) {
+            if undo::WRITE_TOOLS.contains(&tool) {
+                // bd serena-rust-5r7 路径穿越：写类工具先过 root 界校验（词法 +
+                // canonical，symlink 语义见 path_guard）——穿越请求在拉起任何 LS
+                // 前即 BAD_ARGS 拒收。create-text-file 新建语义免下方存在性检查。
+                let abs = path_guard::guarded_join(root, f)
+                    .map_err(|detail| ToolError::BadArgs { detail })?;
+                if tool != "create-text-file" && !abs.is_file() {
+                    return Err(ToolError::BadArgs {
+                        detail: format!("file not found: {f}"),
+                    });
+                }
+            } else if !root.join(f).is_file() {
+                // 读/位置类维持原状（bd serena-rust-84n）：不存在 = 确定性参数错，
+                // 否则 ensure_open 的 io NotFound 经 Core 冒成 INTERNAL 不可免重试。
+                return Err(ToolError::BadArgs {
+                    detail: format!("file not found: {f}"),
+                });
+            }
         }
         // ==== IDE undo/redo：事务边界（契约设计第 2/3 条）====
         // 写类工具一次 execute_tool 调用 = 一个 undo 事务：rename-symbol 跨文件
@@ -6148,8 +6218,13 @@ impl Supervisor {
             "edit-context" => {
                 // B: 单次调用拿 body + callers + doc + tests（ai-token-features §10-B）。
                 let (file, symbol) = required_symbol_body_args(args)?;
-                let report = crate::edit_context::collect(self, root, &file, &symbol, lang).await;
-                serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
+                let (report, warnings) =
+                    crate::edit_context::collect(self, root, &file, &symbol, lang).await;
+                let mut value =
+                    serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))?;
+                // bd serena-rust-e0hi/8vo9：callers 空 + 语义未证就绪 → 降级警示字段。
+                attach_warning(&mut value, &warnings);
+                Ok(value)
             }
             "repo-map" => {
                 // E: workspace 级符号地图（ai-token-features §10-E）。
@@ -6253,19 +6328,29 @@ impl Supervisor {
                 let hits = self
                     .tool_referencing_symbols(root, &file, line, col, lang)
                     .await?;
+                let empty = hits.is_empty();
                 let grouped = args
                     .get("grouped")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if grouped {
+                let mut value = if grouped {
                     let page = args.get("page").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
                     let page_size =
                         args.get("page_size").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
                     let report = ref_tools::group_refs(hits, page, page_size);
-                    serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
+                    serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))?
                 } else {
-                    Ok(ref_symbol_hits_envelope(&hits, compact))
-                }
+                    ref_symbol_hits_envelope(&hits, compact)
+                };
+                // bd serena-rust-e0hi/8vo9：空 = 真无 caller 或语义未就绪，警示让 AI 可分。
+                let ws = if empty {
+                    self.referencing_empty_warnings(root)
+                } else {
+                    self.mark_semantic_ready(root);
+                    Vec::new()
+                };
+                attach_warning(&mut value, &ws);
+                Ok(value)
             }
             "find-referencing-code-snippets" => {
                 // O3：`symbol` 直查 —— 符号名解析为 (file, line, col)（LSP 0-based），
@@ -6297,10 +6382,20 @@ impl Supervisor {
                         lang,
                     )
                     .await?;
+                let empty = hits.is_empty();
                 let mut value = ref_snippet_hits_envelope(&hits, compact);
+                // bd serena-rust-e0hi/8vo9：空 = 真无 caller 或语义未就绪，警示让 AI 可分；
+                // resolution_note（--symbol 多命中提示）保序拼接在后。
+                let mut ws = if empty {
+                    self.referencing_empty_warnings(root)
+                } else {
+                    self.mark_semantic_ready(root);
+                    Vec::new()
+                };
                 if let Some(note) = resolution_note {
-                    attach_warning(&mut value, &[note]);
+                    ws.push(note);
                 }
+                attach_warning(&mut value, &ws);
                 Ok(value)
             }
             "replace-text-in-symbol" => {
@@ -6526,8 +6621,9 @@ impl Supervisor {
             }),
         }?;
         // AI-token 特性 G（§10-G）：execute_tool 末尾统一后处理。_max_tokens 按预算
-        // 截断 items（4 bytes ≈ 1 token，soft limit）；_compress 删 container/kind
-        // 冗余字段。两者与 _compact/_delta 同套私有约定（sanitize 不清）。
+        // 截断信封 list（items/hits/top/entries + 顶层裸数组折 items 信封，1ve9）；
+        // _compress 删 container/kind 冗余字段。两者与 _compact/_delta 同套私有约定
+        // （sanitize 不清）。
         // 偏离 plan：原建议逐分支改造为统一变量；实际 match 整体即 Result，
         // `?` 一行收口零分支改动（11 特性已改动各分支，最小侵入）。
         if let Some(max_tokens) = args.get("_max_tokens").and_then(|v| v.as_u64()) {
@@ -8036,6 +8132,46 @@ mod symbol_cache_tests {
             },
             container: None,
         }
+    }
+
+    /// bd serena-rust-e0hi/8vo9：引用类空结果降级判定——semantic_ok 未证就绪前
+    /// 警示（类型分析窗口 refs 静默返空不可信），证就绪后空即真值不警示。
+    #[tokio::test]
+    async fn referencing_empty_warnings_gate_on_semantic_flag() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/ref-degraded");
+
+        // 无记账（生产不可达：空 hits 必经 session_for → mark_ls_started）→
+        // 保守默认：未证就绪 → 警示。
+        assert_eq!(
+            sup.referencing_empty_warnings(root),
+            vec![semantic_not_ready_message()]
+        );
+
+        // LS 已启动、语义未证 → 仍警示。
+        sup.mark_ls_started(root);
+        assert_eq!(
+            sup.referencing_empty_warnings(root),
+            vec![semantic_not_ready_message()]
+        );
+
+        // 任一语义工具非空成功 → 空即真值（真·无 caller），不警示。
+        sup.mark_semantic_ready(root);
+        assert!(sup.referencing_empty_warnings(root).is_empty());
+    }
+
+    /// bd serena-rust-e0hi：空 refs 的 compact envelope + 降级警示 = AI 可分的
+    /// wire 形态（raw_count:0 不再裸奔）。
+    #[test]
+    fn empty_refs_envelope_carries_degraded_warning() {
+        let hits: Vec<ref_tools::RefSymbolHit> = Vec::new();
+        let mut value = ref_symbol_hits_envelope(&hits, true);
+        attach_warning(&mut value, &[semantic_not_ready_message()]);
+        assert_eq!(value["compact"], serde_json::json!(true));
+        assert_eq!(value["raw_count"], serde_json::json!(0));
+        let w = value["warning"].as_str().unwrap();
+        assert!(w.contains("not be ready"), "就绪性关键词: {w}");
+        assert!(w.contains("30-60s"), "预期窗口: {w}");
     }
 
     /// bd serena-rust-bxd O2/O4：暖机窗口开/关/过期三态。
@@ -9909,6 +10045,77 @@ mod search_symbol_tests {
         assert_eq!(v["added"].as_array().unwrap().len(), 100);
     }
 
+    /// 1ve9：search 形态（hits 数组）超预算 → 截断 + 真实 original_count。
+    #[test]
+    fn apply_budget_truncates_hits_envelope() {
+        let mut v = serde_json::json!({
+            "hits": (0..100)
+                .map(|i| serde_json::json!({"file": format!("f{i}.rs"), "line": i, "text": "x".repeat(20)}))
+                .collect::<Vec<_>>(),
+            "truncated": false,
+            "files_scanned": 7,
+        });
+        let truncated = apply_budget(&mut v, 50); // 200 字节预算
+        assert!(truncated, "超预算应发生截断");
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["original_count"], 100, "original_count 取截断前条数");
+        let hits = v["hits"].as_array().unwrap();
+        assert!(hits.len() < 100, "hits 应被截短，实际 {}", hits.len());
+        assert_eq!(v["files_scanned"], 7, "非 list 字段不动");
+    }
+
+    /// 1ve9：repo-map 形态（top 数组）超预算 → 截断。
+    #[test]
+    fn apply_budget_truncates_repo_map_top() {
+        let mut v = serde_json::json!({
+            "total_symbols": 100,
+            "top": (0..100)
+                .map(|i| serde_json::json!({"name": format!("s{i}"), "file": "a.rs", "kind": "function", "container": null}))
+                .collect::<Vec<_>>(),
+            "budget_bytes": 9999,
+        });
+        assert!(apply_budget(&mut v, 50));
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["original_count"], 100);
+        assert!(v["top"].as_array().unwrap().len() < 100);
+    }
+
+    /// 1ve9：overview/list-dir 形态（顶层裸数组）→ 截断后折进 items 信封（字段沿用现名）。
+    #[test]
+    fn apply_budget_wraps_top_level_array_into_items_envelope() {
+        let mut v = serde_json::Value::Array(
+            (0..100)
+                .map(|i| serde_json::json!({"name": format!("s{i}"), "kind": "function"}))
+                .collect(),
+        );
+        let truncated = apply_budget(&mut v, 50);
+        assert!(truncated);
+        assert!(v.is_object(), "超预算裸数组应折进信封，实际: {v}");
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["original_count"], 100);
+        assert!(v["items"].as_array().unwrap().len() < 100);
+    }
+
+    /// 1ve9：read-file 形态（content 串超预算、无 list 数组）→ 不截断不折信封
+    /// （行号 clamp 与 content_hash 写门契约不受预算护栏影响）。
+    #[test]
+    fn apply_budget_leaves_non_list_envelope_untouched() {
+        let mut v = serde_json::json!({"content": "x".repeat(4096), "total_lines": 128});
+        assert!(!apply_budget(&mut v, 50));
+        assert!(v.get("truncated").is_none());
+        assert!(v.get("original_count").is_none());
+        assert_eq!(v["content"].as_str().unwrap().len(), 4096);
+    }
+
+    /// 1ve9：预算内裸数组零改动（不折信封，wire 形态保持）。
+    #[test]
+    fn apply_budget_passes_through_small_top_level_array() {
+        let mut v = serde_json::Value::Array(vec![serde_json::json!({"name": "s"})]);
+        assert!(!apply_budget(&mut v, 10000));
+        assert!(v.is_array(), "预算内不得折信封");
+        assert!(v.get("truncated").is_none());
+    }
+
     #[test]
     fn apply_compress_removes_container_and_kind() {
         let mut v = serde_json::json!({
@@ -10497,5 +10704,116 @@ mod wave1_tuning_channel_tests {
             configuration_reply_from_spec(&replies, &msg),
             serde_json::json!([])
         );
+    }
+}
+
+#[cfg(test)]
+mod path_traversal_tests {
+    //! bd serena-rust-5r7：写类工具路径穿越拒收。纪律：不拉 LS ——
+    //! execute_tool 入口 containment 检查先于 dispatch/tool 内 session_for，
+    //! 穿越请求在任何 LS 启动前即 BAD_ARGS；helper 自身的词法/canonical
+    //! 语义（绝对注入/混合分隔符/symlink）由 path_guard.rs 单测覆盖。
+
+    use super::*;
+
+    #[tokio::test]
+    async fn every_write_tool_rejects_traversal_at_entry() {
+        let sup = Supervisor::direct().await.expect("supervisor");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        for tool in undo::WRITE_TOOLS {
+            let result = sup
+                .execute_tool(
+                    tool,
+                    root,
+                    json!({ "file": "../outside.txt", "content": "x", "start_line": 1, "end_line": 1 }),
+                    None,
+                )
+                .await;
+            let err = result.expect_err("穿越必须被拒");
+            match err {
+                ToolError::BadArgs { detail } => assert!(
+                    detail.contains("escapes project root"),
+                    "tool={tool}: detail={detail}"
+                ),
+                other => panic!("tool={tool} 应为 BAD_ARGS，实得 {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn traversal_to_existing_outside_file_rejected() {
+        // 真穿透形态：目标在 root 外但真实存在 —— 旧入口 is_file() 检查放行、
+        // 写工具直写 root 外；修后入口 containment 即拒。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sibling.txt"), "old\n").unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("main.rs"), "fn main() {}\n").unwrap();
+        let sup = Supervisor::direct().await.expect("supervisor");
+        let result = sup
+            .execute_tool(
+                "replace-lines",
+                proj.to_str().unwrap(),
+                json!({ "file": "../sibling.txt", "start_line": 1, "end_line": 1, "content": "hacked" }),
+                None,
+            )
+            .await;
+        match result {
+            Err(ToolError::BadArgs { detail }) => {
+                assert!(detail.contains("escapes project root"), "{detail}")
+            }
+            other => panic!("应为 BAD_ARGS，实得 {other:?}"),
+        }
+        // 盘上未被改写。
+        assert_eq!(std::fs::read_to_string(dir.path().join("sibling.txt")).unwrap(), "old\n");
+    }
+
+    #[tokio::test]
+    async fn create_text_file_rejects_traversal_without_touching_disk() {
+        let sup = Supervisor::direct().await.expect("supervisor");
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        // 入口路径（execute_tool）。
+        let via_entry = sup
+            .execute_tool(
+                "create-text-file",
+                proj.to_str().unwrap(),
+                json!({ "file": "../../evil.txt", "content": "x" }),
+                None,
+            )
+            .await;
+        assert!(matches!(via_entry, Err(ToolError::BadArgs { .. })), "{via_entry:?}");
+        // 直调工具层（绕过入口的 --direct 形态）也有 per-site guard。
+        let via_tool = sup
+            .tool_create_text_file(&proj, "../../evil2.txt", "x", None)
+            .await;
+        assert!(matches!(via_tool, Err(ToolError::BadArgs { .. })), "{via_tool:?}");
+        // root 外（含 root 旁两级）无任何落盘。
+        assert!(!dir.path().join("evil.txt").exists());
+        assert!(!dir.path().parent().unwrap().join("evil.txt").exists());
+        assert!(!dir.path().parent().unwrap().join("evil2.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_tool_accepts_in_root_file_unchanged() {
+        // 无回归：root 内合法相对路径照常通过入口（仅形态冒烟，语义链路由
+        // e2e_write.rs 的真 LS 用例覆盖）。
+        let sup = Supervisor::direct().await.expect("supervisor");
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("a.rs"), "fn main() {}\n").unwrap();
+        let result = sup
+            .execute_tool(
+                "create-text-file",
+                dir.path().to_str().unwrap(),
+                json!({ "file": "proj/b.rs", "content": "fn b() {}\n" }),
+                None,
+            )
+            .await;
+        assert!(result.is_ok(), "root 内新建应放行: {result:?}");
+        assert!(proj.join("b.rs").is_file());
     }
 }

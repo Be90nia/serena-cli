@@ -704,7 +704,9 @@ mod tests {
         let victim = base.path().join("victim");
         std::fs::create_dir_all(&victim).unwrap();
         // {cache_root}/{id} 是指向根外的软链 → canonicalize 解析后前缀失配，拒删。
-        std::fs::symlink(&victim, root.join("html")).unwrap();
+        // 注：新 std 的 aarch64-apple-darwin 已收走 std::fs::symlink，unix 测试用
+        // std::os::unix::fs::symlink（Windows host 编译面不编译本测试，两态皆绿）。
+        std::os::unix::fs::symlink(&victim, root.join("html")).unwrap();
         assert!(ensure_within_cache_root(&root, &root.join("html")).is_err());
     }
 

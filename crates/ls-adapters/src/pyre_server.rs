@@ -13,18 +13,19 @@
 //! - 不解析 .pyre_configuration.toml；同基于 LSP 标准 auto-discovery。
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use async_trait::async_trait;
 use ls_runtime::process::{LaunchInfo, TransportKind};
 use lsp_types::InitializeParams;
 
 use crate::{
-    LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error, which_no_unc,
+    LanguageId, LanguageServerAdapter, ProjectCtx, ProjectRootSlot, RequestHooks,
+    not_installed_error, which_no_unc,
 };
 
-/// 当前会话项目 root。同构于 pyright.rs —— Python LSP 系共享探测链。
-static PROBE_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+/// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6）。同构于 pyright.rs
+/// —— Python LSP 系共享探测链。
+static PROBE_ROOT: ProjectRootSlot = ProjectRootSlot::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PyreServerAdapter;
@@ -68,15 +69,14 @@ impl LanguageServerAdapter for PyreServerAdapter {
     }
 
     fn set_project_root(&self, root: &Path) {
-        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+        PROBE_ROOT.set(root);
     }
 
     async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
         use serde_json::json;
         let uri = crate::probe_uri_for_root(
             PROBE_ROOT
-                .lock()
-                .expect("PROBE_ROOT poisoned")
+                .get_last()
                 .as_deref()
                 .unwrap_or(Path::new(".")),
             self.languages(),

@@ -42,7 +42,8 @@ use lsp_types::InitializeParams;
 use serde_json::{Value, json};
 
 use crate::{
-    LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error, which_no_unc,
+    LanguageId, LanguageServerAdapter, ProjectCtx, ProjectRootSlot, RequestHooks,
+    not_installed_error, which_no_unc,
 };
 
 /// 主 LS 就绪探针超时（documentSymbol 对真实 .vue）。
@@ -67,9 +68,10 @@ const PROBE_FALLBACK: &str = "file:///__vue_ls_ready_probe__";
 /// 懒式按需打开等真撞上大仓库再说。
 const MAX_VUE_FILES: usize = 200;
 
-/// 当前会话项目 root。adapter 是零字段单例存不了实例状态 —— 会话级数据放静态槽，
-/// 由 supervisor::session_for 在 `on_server_ready` 前经 `set_project_root` 写入。
-static PROBE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6）。adapter 是零字段
+/// 单例存不了实例状态 —— 会话级数据放静态槽，由 supervisor::session_for 在
+/// `on_server_ready` 前经 `set_project_root` 写入（读侧无键，走 get_last 相邻语义）。
+static PROBE_ROOT: ProjectRootSlot = ProjectRootSlot::new();
 
 /// 当前伴生 TS LS 会话（hybrid 语义通道，见 trait `semantic_session`）。key = root。
 /// 持有一份强引用；清理时机：`on_session_ready` 覆盖 / 监视任务两分支（伴生死 →
@@ -327,7 +329,7 @@ impl LanguageServerAdapter for VueAdapter {
     }
 
     fn set_project_root(&self, root: &Path) {
-        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+        PROBE_ROOT.set(root);
     }
 
     fn semantic_session(&self, root: &Path) -> Option<Arc<lsp_core::session::Session>> {
@@ -344,11 +346,7 @@ impl LanguageServerAdapter for VueAdapter {
     ) -> anyhow::Result<()> {
         let install = resolve_install()?;
         let node = node_on_path()?;
-        let root = PROBE_ROOT
-            .lock()
-            .expect("PROBE_ROOT poisoned")
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = PROBE_ROOT.get_last().unwrap_or_else(|| PathBuf::from("."));
 
         // 1. 伴生 TS LS：spawn（保留 child 供监视）→ 独立 Session 握手。
         let launch = LaunchInfo {

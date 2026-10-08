@@ -24,7 +24,6 @@
 //! - 不注入 .editorconfig 读取 —— 用户 workspace 自管。
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,7 +31,8 @@ use ls_runtime::process::{LaunchInfo, TransportKind};
 use lsp_types::InitializeParams;
 
 use crate::{
-    LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error, which_no_unc,
+    LanguageId, LanguageServerAdapter, ProjectCtx, ProjectRootSlot, RequestHooks,
+    not_installed_error, which_no_unc,
 };
 
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(60); // csharp_ls 启动慢
@@ -40,9 +40,10 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(60); // csharp_ls 启�
 /// root 未设置 / 无候选文件时的退路：旧版虚拟探针 URI（不触发项目索引，仅保底）。
 const PROBE_FALLBACK: &str = "file:///__csharp_ls_ready_probe__";
 
-/// 当前会话项目 root。adapter 是零字段单例（`Copy`）存不了实例状态 —— 会话级数据
-/// 放静态槽，由 supervisor::session_for 在 `on_server_ready` 前经 `set_project_root` 写入。
-static PROBE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6）。adapter 是零字段
+/// 单例（`Copy`）存不了实例状态 —— 会话级数据放静态槽，由 supervisor::session_for
+/// 在 `on_server_ready` 前经 `set_project_root` 写入（读侧无键，走 get_last 相邻语义）。
+static PROBE_ROOT: ProjectRootSlot = ProjectRootSlot::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CsharpLsAdapter;
@@ -85,7 +86,7 @@ impl LanguageServerAdapter for CsharpLsAdapter {
     }
 
     fn set_project_root(&self, root: &Path) {
-        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+        PROBE_ROOT.set(root);
     }
 
     async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
@@ -117,7 +118,7 @@ impl CsharpLsAdapter {
     /// `on_server_ready` 将发出的探针 URI：root 下真实小文件的 file URI；root 未设置
     /// 或无候选文件时退虚拟 URI。
     fn probe_uri(&self) -> String {
-        let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
+        let root = PROBE_ROOT.get_last();
         match root {
             Some(root) => crate::probe_uri_for_root(&root, self.languages(), PROBE_FALLBACK),
             None => PROBE_FALLBACK.to_string(),

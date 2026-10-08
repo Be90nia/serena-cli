@@ -25,3 +25,7 @@ smoke-logs/
 stress-logs/
 __pycache__/
 
+# smoke fixture 的 .NET 构建中间产物（csharp/omnisharp fixture 本机冒烟时生成，不入库）
+scripts/smoke_fixtures/**/obj/
+scripts/smoke_fixtures/**/bin/
+

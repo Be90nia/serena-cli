@@ -20,6 +20,13 @@ pub enum CoreError {
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 
+    /// 会话未就绪：请求等就绪门醒来后 state 仍是 Uninitialized/Initializing
+    ///（start 内 set-state 与 notify_waiters 之间的竞态窗口）。wire 映射
+    /// `LS_NOT_READY`（retryable，ARCH §6.3/§5）——此前误走 `Io` 兜底冒充
+    /// INTERNAL，`LsNotReady` 沦为死码（bd serena-rust-iyz）。
+    #[error("language server not ready: {cause}")]
+    NotReady { cause: String },
+
     /// LS 返回 JSON-RPC error 且不在 client 内部消化的白名单内。
     /// `code` 字段对应 LSP ErrorCodes；调用方可按 code 判定语义。
     #[error("rpc error {code}: {message}")]

@@ -1,31 +1,29 @@
 //! E: repo-map 全库符号地图（ai-token-features-design §10-E）。
 //!
-//! Aider PageRank 在 LSP 之上：1KB JSON 给 AI 全库 API 面 — top N 符号按调用
-//! 热度排序，省 AI 反复 find-symbol。
+//! bd serena-rust-fj17 降级版：**按文件 + 顶层符号列表全展开，不依赖 refs 计数**。
+//! 原简化 PageRank（per-symbol `tool_referencing_symbols` 计数）对 direct_refs=0
+//! 的小项目全空，且 `tool_symbol_tree` 的 `session_for` 冷启动失败会把整工具传播成
+//! `{budget_bytes:0, top:[], total_symbols:0}`（实测全 7 crate 0 信息响应）。
 //!
-//! 算法简化版（plan-e-repo-map.md §1）：
-//! 1) `tool_symbol_tree` 拉所有文件 symbols（Phase 3.1 缓存命中免 LS 往返）。
-//! 2) 对候选（top_n*2 上限）的每个 symbol 走 `tool_find_symbol` 拿 def range →
-//!    `tool_referencing_symbols` 数直接引用。
-//! 3) sort by direct_refs desc, truncate top_n。
+//! 现算法：主源 = `tool_symbol_tree`（documentSymbol 语法级，3.1 缓存兜底）拉平；
+//! LS 层零符号（冷窗口 / 会话失败 / 空缓存）→ 纯文本顶层定义行扫描兜底，保证任何
+//! 有源码的项目非空。符号清单本身已足够指示 API 面。
 //!
-//! ponytail: 不引入 page-rank 库 — 直方 + 同文件热度足够指示 API 中心度；
-//! 万级文件再换库。
+//! ponytail: 不做引用计数/热度排序——等 LS 语义层稳定后再加回来。
 
 use serde::Serialize;
+
 use std::path::Path;
 
 use crate::Supervisor;
 
-/// repo-map 单条：单个符号的 API 中心度画像。
+/// repo-map 单条：一个符号的定位画像。
 #[derive(Debug, Serialize)]
 pub struct RepoMapEntry {
     pub name: String,
     pub container: Option<String>,
     pub file: String,
     pub kind: String,
-    pub weight: f64,
-    pub direct_refs: usize,
 }
 
 /// repo-map 工具响应。
@@ -36,7 +34,7 @@ pub struct RepoMapReport {
     pub budget_bytes: usize,
 }
 
-/// 候选扫描上限（防止 RA/clangd 大项目炸内存 / 拉太久）。
+/// 文件数保险丝（万级文件目录不拖垮扫描；与 symbol-tree 同量级）。
 const CANDIDATE_SCAN_LIMIT: usize = 5000;
 
 /// repo-map 主入口。`lang = None` → 走 multi-lang 自动探测。
@@ -46,126 +44,144 @@ pub async fn build(
     lang: Option<&str>,
     top_n: usize,
 ) -> RepoMapReport {
-    // 1) 拿全 workspace 符号树（Phase 3.1 缓存兜底 + 5k 文件保险丝）。
-    let tree = match sup
+    // 1) LS documentSymbol 全库树（3.1 缓存兜底）。Err 不再整工具失败——降级路径
+    //    接管（fj17：`session_for().await?` 曾把 LS 失败传播成全空响应）。
+    let tree = sup
         .tool_symbol_tree(root, ".", lang, CANDIDATE_SCAN_LIMIT)
         .await
-    {
-        Ok(v) => v,
-        Err(_) => {
-            return RepoMapReport {
-                total_symbols: 0,
-                top: vec![],
-                budget_bytes: 0,
-            };
-        }
-    };
-
-    // 2) 拉平 tree.entries[].symbols[] → (file, name, container, kind)。
-    // 预算 = top_n*2：超过即停止 refs 查询，控制 LS 往返。
-    let candidate_cap = top_n.saturating_mul(2);
-    let entries_val = tree.get("entries").and_then(|v| v.as_array());
-    let mut all_syms: Vec<(String, String, Option<String>, String)> = Vec::new();
-    if let Some(entries) = entries_val {
-        for entry in entries {
-            let Some(file) = entry.get("file").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(syms) = entry.get("symbols").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for s in syms {
-                let name = s
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if name.is_empty() {
-                    continue;
-                }
-                let container = s
-                    .get("container")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let kind = s
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                all_syms.push((file.to_string(), name, container, kind));
-                if all_syms.len() >= candidate_cap {
-                    break;
-                }
-            }
-            if all_syms.len() >= candidate_cap {
-                break;
-            }
-        }
+        .ok();
+    let mut top = flatten_symbols(tree);
+    // 2) LS 层零符号 → 纯文本顶层定义扫描兜底（保证任何项目非空）。
+    if top.is_empty() {
+        top = text_scan_top_level(root);
     }
-    let total = all_syms.len();
-
-    // 3) 对每个候选查 refs 数（走 find_symbol 拿 def range → referencing_symbols）。
-    // find_symbol 缓存 + symbol-tree 都吃 Phase 3.1 缓存层，二次调用零成本。
-    let mut ranked: Vec<RepoMapEntry> = Vec::with_capacity(all_syms.len());
-    for (file, name, container, kind) in all_syms {
-        let direct_refs = count_refs(sup, root, &file, &name, lang).await;
-        ranked.push(RepoMapEntry {
-            name,
-            container,
-            file,
-            kind,
-            weight: direct_refs as f64,
-            direct_refs,
-        });
-    }
-
-    // 4) 排序 + 截断。
-    ranked.sort_by_key(|e| std::cmp::Reverse(e.direct_refs));
-    ranked.truncate(top_n);
-
-    let budget_bytes = serde_json::to_vec(&ranked).map(|v| v.len()).unwrap_or(0);
+    let total_symbols = top.len();
+    top.truncate(top_n);
+    let budget_bytes = serde_json::to_vec(&top).map(|v| v.len()).unwrap_or(0);
     RepoMapReport {
-        total_symbols: total,
-        top: ranked,
+        total_symbols,
+        top,
         budget_bytes,
     }
 }
 
-/// 走 `find_symbol(query=name)` 拿候选 SymbolHit，再用 `range.start` 作为
-/// `tool_referencing_symbols` 的 line/col 锚点。返回直接引用计数。
-///
-/// 失败 = 0（静默跳过：单符号 refs 查询失败不影响整体排序；这条契约与
-/// search 工具的「失败 → 字段缺失而非整工具失败」一致）。
-async fn count_refs(
-    sup: &Supervisor,
-    root: &Path,
-    file: &str,
-    name: &str,
-    lang: Option<&str>,
-) -> usize {
-    let hits = match sup.tool_find_symbol(root, name, 50, lang).await {
-        // warnings（失败 lang）在 repo_map 计数场景无挂载点，忽略 —— 计数尽力而为。
-        Ok((h, _)) => h,
-        Err(_) => return 0,
+/// 拉平 symbol-tree `entries[].symbols[]` 为符号列表（保持文件扫描顺序；children
+/// 以 container 标注嵌套，全展开）。
+fn flatten_symbols(tree: Option<serde_json::Value>) -> Vec<RepoMapEntry> {
+    let Some(entries) = tree
+        .as_ref()
+        .and_then(|t| t.get("entries"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
     };
-    // 在 hits 里挑 file 路径一致的第一个（uri → file_path 同款 URI 解码逻辑
-    // 这里走 file 名 suffix 匹配：symbol-tree 给的是相对 path，find_symbol
-    // 给的是绝对 uri；落宽松匹配 — 同名同 basename 即视为同一符号）。
-    let target_basename = file.rsplit(['/', '\\']).next().unwrap_or(file);
-    let hit = hits.iter().find(|h| {
-        let hit_basename = h.uri.rsplit(['/', '\\']).next().unwrap_or(&h.uri);
-        hit_basename == target_basename
-    });
-    let Some(hit) = hit else { return 0 };
-    let line = hit.range.start.line;
-    let col = hit.range.start.character;
-    match sup
-        .tool_referencing_symbols(root, file, line, col, lang)
-        .await
-    {
-        Ok(refs) => refs.len(),
-        Err(_) => 0,
+    let mut out = Vec::new();
+    for entry in entries {
+        let Some(file) = entry.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(syms) = entry.get("symbols").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for s in syms {
+            let Some(name) = s
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|n| !n.is_empty())
+            else {
+                continue;
+            };
+            out.push(RepoMapEntry {
+                name: name.to_string(),
+                container: s.get("container").and_then(|v| v.as_str()).map(String::from),
+                file: file.to_string(),
+                kind: s
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
     }
+    out
+}
+
+/// 顶层定义行启发式：零缩进 + 修饰符前缀剥离 + 定义关键字 + 标识符。覆盖
+/// rust/py/ts/go/java/c++ 常见形态；缩进行（嵌套项/方法）与注释行不算顶层。
+fn top_level_def(line: &str) -> Option<(&'static str, String)> {
+    let rest = line.trim_end();
+    if rest.starts_with(' ') || rest.starts_with('\t') {
+        return None;
+    }
+    // 带括号形态必须排在裸词前（否则 "pub" 先剥掉 "pub(crate)" 的前缀）。
+    const MODIFIERS: [&str; 10] = [
+        "pub(crate)", "pub(super)", "pub", "export", "default", "public", "private",
+        "protected", "async", "abstract",
+    ];
+    let mut rest = rest;
+    while let Some(r) = MODIFIERS
+        .iter()
+        .find_map(|m| rest.strip_prefix(m).and_then(|r| r.strip_prefix(' ')))
+    {
+        rest = r;
+    }
+    const DEFS: [(&str, &str); 12] = [
+        ("fn ", "function"),
+        ("func ", "function"),
+        ("fun ", "function"),
+        ("def ", "function"),
+        ("function ", "function"),
+        ("struct ", "struct"),
+        ("class ", "class"),
+        ("interface ", "interface"),
+        ("enum ", "enum"),
+        ("trait ", "trait"),
+        ("impl ", "impl"),
+        ("type ", "type"),
+    ];
+    DEFS.iter().find_map(|(kw, kind)| {
+        let tail = rest.strip_prefix(kw)?;
+        let name: String = tail
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some((*kind, name))
+    })
+}
+
+/// LS 层零符号时的纯文本兜底：逐源码文件扫顶层定义行（无 LS 依赖）。
+/// 注释行（`/// fn x` / `# def x`）因行首前缀字符不命中关键字，天然跳过。
+fn text_scan_top_level(root: &Path) -> Vec<RepoMapEntry> {
+    let mut out = Vec::new();
+    for entry in crate::fs_tools::filtered_walker(root).build() {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if crate::resolve_lang_for_file(&rel, None).is_err() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some((kind, name)) = top_level_def(line) {
+                out.push(RepoMapEntry {
+                    name,
+                    container: None,
+                    file: rel.clone(),
+                    kind: kind.to_string(),
+                });
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -253,5 +269,74 @@ mod tests {
         let report = build(&sup, Path::new("/nonexistent_xyz_qq"), Some("rust"), 20).await;
         assert_eq!(report.total_symbols, 0);
         assert!(report.top.is_empty());
+    }
+
+    /// fj17：direct_refs=0 小 fixture 非空——LS 层零符号（tree=None）时文本兜底接管。
+    #[test]
+    fn text_scan_captures_top_level_defs_and_skips_nested() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("a.rs"),
+            "pub fn alpha() {}\n\
+             struct Beta;\n\
+             fn outer() {\n    fn nested() {}\n}\n\
+             // fn documented() {}\n\
+             async fn gamma() {}\n\
+             pub(crate) fn delta() {}\n\
+             use std::fmt;\n",
+        )
+        .expect("write fixture");
+        std::fs::write(tmp.path().join("notes.txt"), "fn not_source() {}\n").expect("write txt");
+
+        let out = text_scan_top_level(tmp.path());
+        let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+        for expected in ["alpha", "Beta", "gamma", "delta"] {
+            assert!(names.contains(&expected), "缺 {expected}，实际 {names:?}");
+        }
+        assert!(!names.contains(&"nested"), "缩进嵌套不算顶层: {names:?}");
+        assert!(
+            !names.contains(&"documented"),
+            "注释行不算定义: {names:?}"
+        );
+        assert!(
+            !names.contains(&"not_source"),
+            "非源码扩展名不入扫: {names:?}"
+        );
+        assert!(out.iter().all(|e| e.container.is_none()));
+        let alpha = out.iter().find(|e| e.name == "alpha").unwrap();
+        assert_eq!((alpha.file.as_str(), alpha.kind.as_str()), ("a.rs", "function"));
+    }
+
+    /// flatten：entries[].symbols[] 拉平、空名剔除、tree=None 空。
+    #[test]
+    fn flatten_symbols_pairs_file_with_symbols() {
+        let tree = serde_json::json!({
+            "entries": [
+                {"file": "a.rs", "symbols": [
+                    {"name": "alpha", "kind": "function", "container": null},
+                    {"name": "meth", "kind": "method", "container": "alpha"},
+                ]},
+                {"file": "b.rs", "symbols": [{"name": "", "kind": "unknown"}]},
+            ]
+        });
+        let out = flatten_symbols(Some(tree));
+        assert_eq!(out.len(), 2, "空名剔除: {out:?}");
+        assert_eq!(out[0].file, "a.rs");
+        assert_eq!(out[0].name, "alpha");
+        assert!(out[0].container.is_none());
+        assert_eq!(out[1].container.as_deref(), Some("alpha"));
+        assert!(flatten_symbols(None).is_empty());
+        assert!(flatten_symbols(Some(serde_json::json!({"entries": []}))).is_empty());
+    }
+
+    /// 修饰符剥离顺序：带括号形态先于裸词（否则 pub 先剥掉 pub(crate) 前缀）。
+    #[test]
+    fn top_level_def_strips_parenthesized_modifier_first() {
+        let (kind, name) = top_level_def("pub(crate) fn delta() {}").expect("pub(crate) fn");
+        assert_eq!((kind, name.as_str()), ("function", "delta"));
+        let (kind, name) = top_level_def("export default class Foo {").expect("export class");
+        assert_eq!((kind, name.as_str()), ("class", "Foo"));
+        assert!(top_level_def("    fn indented() {}").is_none());
+        assert!(top_level_def("use std::fmt;").is_none());
     }
 }

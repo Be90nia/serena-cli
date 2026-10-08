@@ -380,6 +380,7 @@ pub fn not_found_tool(name: &str) -> Response {
         message: format!("unknown tool: {name}"),
         ls: None,
         retryable: false,
+        hint: None,
     };
     (
         StatusCode::NOT_FOUND,
@@ -444,6 +445,7 @@ async fn batch_handler(State(state): State<AppState>, Json(req): Json<BatchReque
             },
             ls: None,
             retryable: false,
+            hint: None,
         };
         return (
             StatusCode::OK, // 工具级失败走 200（A5）；batch 尺寸违规同契约
@@ -496,6 +498,7 @@ async fn run_batch(state: &AppState, calls: Vec<BatchCall>) -> Vec<BatchResult> 
                         message: format!("batch task failed: {e}"),
                         ls: None,
                         retryable: false,
+                        hint: None,
                     }),
                 },
             )),

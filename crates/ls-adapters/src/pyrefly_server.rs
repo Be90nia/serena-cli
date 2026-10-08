@@ -41,8 +41,8 @@ use lsp_types::InitializeParams;
 use serde_json::{Value, json};
 
 use crate::{
-    LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, declare_work_done_progress,
-    not_installed_error, which_no_unc,
+    LanguageId, LanguageServerAdapter, ProjectCtx, ProjectKey, ProjectRootSlot, RequestHooks,
+    declare_work_done_progress, not_installed_error, which_no_unc,
 };
 
 /// 版本 pin（= servers.toml [servers.python_pyrefly].uvx，禁随意改）。
@@ -56,9 +56,10 @@ const INDEX_WAIT: Duration = Duration::from_secs(30);
 /// root 未设置时的退路：虚拟探针 URI（ty/pyright 同款）。
 const PROBE_FALLBACK: &str = "file:///__pyrefly_ready_probe__";
 
-/// 当前会话项目 root（零字段单例存不了实例状态 —— 会话级数据放静态槽，由
-/// supervisor::session_for 在 `on_session_ready` 前经 `set_project_root` 写入）。
-static PROBE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6；零字段单例存不了
+/// 实例状态 —— 会话级数据放静态槽，由 supervisor::session_for 在 `on_session_ready`
+/// 前经 `set_project_root` 写入）。
+static PROBE_ROOT: ProjectRootSlot = ProjectRootSlot::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PyreflyServerAdapter;
@@ -91,29 +92,43 @@ fn ensure_workspace_pyrefly_config(root: &Path) {
 /// quirk②：server→client `workspace/configuration` 应答——每项回
 /// `{pythonPath, pyrefly: {diagnosticMode: "workspace"}}`（pyrefly 收到才开始索引）。
 /// ↖ mirror: `workspace_configuration_handler`（pyrefly_server.py@7a296833 :470-490）
-fn configuration_reply(msg: JsonRpc) -> Option<Value> {
+/// root 由注册方捕获（见 on_session_ready）——会话生命周期内不被全局 last 翻动。
+fn configuration_reply(root: &Path, msg: JsonRpc) -> Option<Value> {
     let items = msg.params.as_ref()?.get("items")?.as_array()?.len();
     let config = json!({
-        "pythonPath": cached_python_path(),
+        "pythonPath": cached_python_path_for(root),
         "pyrefly": { "diagnosticMode": "workspace" },
     });
     Some(json!(vec![config; items]))
 }
 
-/// pythonPath 冷启动解析缓存（audit 竞锁 #8）：configuration handler 在该 LS 的
-/// 入站读泵内同步执行，`find_python_interpreter` 的 PATH/venv 磁盘探测会阻塞全部
-/// 入站帧分发（含 pending 请求响应）——进程内解析一次后 handler 只读。
-/// ponytail: 与 PROBE_ROOT 同款单 root 前提；多 root 键化重构时一并迁会话级状态。
-static PYTHON_PATH_CACHE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
-    root.as_deref()
-        .and_then(crate::pyright::find_python_interpreter)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "python".to_string())
-});
+/// pythonPath per-project 解析缓存（audit 竞锁 #8 + bd serena-rust-4y6）：
+/// configuration handler 在该 LS 的入站读泵内同步执行，`find_python_interpreter`
+/// 的 PATH/venv 磁盘探测会阻塞全部入站帧分发（含 pending 请求响应）——每项目
+/// 进程内解析一次后 handler 只读。键 = 项目 root（ProjectKey 身份归一）：
+/// 修 LazyLock 单例把首项目 venv 冻结给后续会话的 token 污染，新项目首问各自
+/// 解析、同项目稳定命中。探测在锁外执行（同项目并发首问可能重复探测一次，
+/// 幂等无害，最多产生一条重复条目、取首个命中）。
+static PYTHON_PATH_CACHE: Mutex<Vec<(ProjectKey, String)>> = Mutex::new(Vec::new());
 
-fn cached_python_path() -> String {
-    std::sync::LazyLock::force(&PYTHON_PATH_CACHE).clone()
+fn cached_python_path_for(root: &Path) -> String {
+    let key = ProjectKey::new(root);
+    if let Some((_, hit)) = PYTHON_PATH_CACHE
+        .lock()
+        .expect("PYTHON_PATH_CACHE poisoned")
+        .iter()
+        .find(|(k, _)| *k == key)
+    {
+        return hit.clone();
+    }
+    let resolved = crate::pyright::find_python_interpreter(root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "python".to_string());
+    PYTHON_PATH_CACHE
+        .lock()
+        .expect("PYTHON_PATH_CACHE poisoned")
+        .push((key, resolved.clone()));
+    resolved
 }
 
 /// uvx 缓存内入口解析：PATH 有 `pyrefly`（uv tool install 形态）优先，否则
@@ -178,7 +193,7 @@ impl LanguageServerAdapter for PyreflyServerAdapter {
     }
 
     fn set_project_root(&self, root: &Path) {
-        *PROBE_ROOT.lock().expect("PROBE_ROOT poisoned") = Some(root.to_path_buf());
+        PROBE_ROOT.set(root);
     }
 
     async fn on_session_ready(
@@ -186,9 +201,15 @@ impl LanguageServerAdapter for PyreflyServerAdapter {
         session: &std::sync::Arc<lsp_core::session::Session>,
     ) -> anyhow::Result<()> {
         // quirk②：configuration 应答注册（sass 先例——LS 在 initialized 后才发请求）。
+        // bd serena-rust-4y6：注册期捕获本会话 root（set_project_root 刚写入，
+        // get_last 相邻一致），应答期不再回查全局 last —— 本会话的 configuration
+        // 应答在其生命周期内不被后续会话的 set 翻动，错位窗收缩到注册瞬间。
+        let session_root = PROBE_ROOT.get_last().unwrap_or_else(|| PathBuf::from("."));
         session
             .client()
-            .on_server_request("workspace/configuration", configuration_reply);
+            .on_server_request("workspace/configuration", move |msg| {
+                configuration_reply(&session_root, msg)
+            });
 
         // quirk④：等初始索引（progress begin → drain 清空，30s 封顶）。
         // 超时仍在飞 → warn 放行（上游 `_indexing_complete.wait(30)` 超时分支
@@ -202,11 +223,7 @@ impl LanguageServerAdapter for PyreflyServerAdapter {
         }
 
         // 就绪探针：真实 .py 优先（ty/pyright 同款；兼触发 pyrefly 文档装载），失败只放行。
-        let root = PROBE_ROOT
-            .lock()
-            .expect("PROBE_ROOT poisoned")
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = PROBE_ROOT.get_last().unwrap_or_else(|| PathBuf::from("."));
         let probe_uri = crate::probe_uri_for_root(&root, &[LanguageId::Python], PROBE_FALLBACK);
         let probe = session
             .request::<Value>(
@@ -234,15 +251,32 @@ impl LanguageServerAdapter for PyreflyServerAdapter {
 mod tests {
     use super::*;
 
+    /// 缓存/槽是进程级静态：并行测试互相插入条目会污染 cache_len 断言，全程持锁
+    /// 串行（gopls/typescript PROBE_ROOT_TEST_LOCK 同款）。
+    static PYREFLY_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(test)]
+    fn python_path_cache_len() -> usize {
+        PYTHON_PATH_CACHE
+            .lock()
+            .expect("PYTHON_PATH_CACHE poisoned")
+            .len()
+    }
+
     #[test]
     fn configuration_reply_serves_python_path_and_workspace_mode() {
+        let _seq = PYREFLY_CACHE_TEST_LOCK.lock().expect("test lock poisoned");
+        PYTHON_PATH_CACHE
+            .lock()
+            .expect("PYTHON_PATH_CACHE poisoned")
+            .clear();
         // ↖ mirror workspace_configuration_handler：每 item 一份 config 拷贝。
         let msg = JsonRpc::request(
             1,
             "workspace/configuration",
             json!({ "items": [{ "section": "python" }, { "section": "pyrefly" }] }),
         );
-        let reply = configuration_reply(msg).expect("reply for items");
+        let reply = configuration_reply(Path::new("."), msg).expect("reply for items");
         let arr = reply.as_array().expect("array");
         assert_eq!(arr.len(), 2);
         for item in arr {
@@ -251,24 +285,41 @@ mod tests {
         }
         // 缺 items → None（默认 null 成功应答路径在 client 层）。
         let msg = JsonRpc::request(2, "workspace/configuration", json!({}));
-        assert_eq!(configuration_reply(msg), None);
+        assert_eq!(configuration_reply(Path::new("."), msg), None);
+        PYTHON_PATH_CACHE
+            .lock()
+            .expect("PYTHON_PATH_CACHE poisoned")
+            .clear();
     }
 
     #[test]
-    fn python_path_served_from_cold_start_cache() {
-        // audit 竞锁 #8：首读解析并冻结；换 root 后读数必须不变——handler 只读
-        // 缓存，不得在入站泵内重新探测磁盘（每次 configuration 询问一次
-        // PATH/venv 扫描 = 冷启动窗口首查超时放大根因）。
-        let first = cached_python_path();
-        PyreflyServerAdapter.set_project_root(std::path::Path::new("Z:/pyrefly-cache-probe-root"));
+    fn python_path_cache_is_per_project() {
+        // bd serena-rust-4y6：换 root 必须独立解析（不得复用首项目冻结值 =
+        // LazyLock token 污染修复点）；同 root 稳定命中（audit 竞锁 #8：
+        // handler 只读缓存，不得每次 configuration 重新扫盘）。
+        let _seq = PYREFLY_CACHE_TEST_LOCK.lock().unwrap();
+        PYTHON_PATH_CACHE.lock().unwrap().clear();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let first = cached_python_path_for(dir_a.path());
         assert_eq!(
-            cached_python_path(),
+            cached_python_path_for(dir_a.path()),
             first,
-            "pythonPath must be frozen at first resolution"
+            "同 root 二读必须命中缓存"
         );
-        let msg = JsonRpc::request(3, "workspace/configuration", json!({ "items": [{}] }));
-        let reply = configuration_reply(msg).expect("reply");
-        assert_eq!(reply[0]["pythonPath"], json!(first));
+        assert_eq!(python_path_cache_len(), 1, "同 root 不得产生第二条目");
+        let _second = cached_python_path_for(dir_b.path());
+        assert_eq!(
+            python_path_cache_len(),
+            2,
+            "换 root 必须独立解析（token 污染修复点）"
+        );
+        // 首项目缓存值未被翻动。
+        assert_eq!(cached_python_path_for(dir_a.path()), first);
+        PYTHON_PATH_CACHE
+            .lock()
+            .expect("PYTHON_PATH_CACHE poisoned")
+            .clear();
     }
 
     #[test]

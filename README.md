@@ -6,7 +6,7 @@ English | [简体中文](README.zh-CN.md)
 
 `serena-rust` gives an LLM agent the ability to navigate, search, and edit a codebase by **symbol name** (functions, types, fields) instead of by line number. It speaks the Language Server Protocol natively, so the same tool works across Rust, TypeScript, Python, Go, C/C++, C#, and Java without per-language adapters.
 
-This is a focused reimplementation of [Serena](https://github.com/oraios/serena) anchored at upstream commit `43ae0211`, kept current with the subset of features a CLI-based agent actually consumes (no MCP, no Python, no LSP server multiplexing beyond the standard one-session-per-root model).
+This is a focused reimplementation of [Serena](https://github.com/oraios/serena) anchored at upstream commit `7a296833`, kept current with the subset of features a CLI-based agent actually consumes (no MCP, no Python, no LSP server multiplexing beyond the standard one-session-per-root model).
 
 ## Why CLI + skill, not MCP
 
@@ -201,17 +201,15 @@ Measured on `feature/solidlsp-phase0-1`, 2026-09-16, Windows 11 / i9-10900F, no 
 
 7-crate Cargo workspace:
 
-- `crates/lsp-core` — JSON-RPC framing, request/response client with id normalization, `ContentModified` retry
-- `crates/runtime` — managed LSP process spawn, 3-pump topology (mirror of upstream `ls_process.py`)
-- `crates/transport` — stdio / TCP transport
-- `crates/registry` — `LanguageServerId` ↔ file extension table
+- `crates/lsp-core` — JSON-RPC framing, request/response client with id normalization, `ContentModified` retry, managed LSP process spawn + stdio/TCP transport (3-pump topology, mirror of upstream `ls_process.py`)
+- `crates/ls-registry` — `LanguageServerId` ↔ file extension table
 - `crates/ls-adapters` — per-LS launch args + readiness probes (rust-analyzer / clangd / pyright / gopls / typescript / csharp-ls / jdtls)
 - `crates/supervisor` — `Supervisor` trait + `DaemonSupervisor` impl: per-key load gate, session cache, tool dispatch, write gate, symbol cache
 - `crates/daemon` — HTTP front (axum), 9-error-code wire contract, singleton lock, idle reaper, graceful shutdown
 - `crates/cli` — clap subcommands, `--json` mode, `shell` JSONL session, `install`, management commands
 - `crates/ls-runtime` — `deps.rs` (download/SHA), `install.rs` (auto-install flow), `servers.toml` adapter
 
-The single source of architectural truth is [`ARCHITECTURE.md`](ARCHITECTURE.md). The 9 error codes (`internal`, `not_found`, `invalid_request`, `unauthorized`, `rpc_error`, `timeout`, `ls_spawn_failed`, `ls_not_installed`, `unsupported`) are a wire contract — do not rename, do not split, do not merge.
+The single source of architectural truth is [`ARCHITECTURE.md`](ARCHITECTURE.md). The 9 error codes (`BAD_ARGS`, `LS_NOT_INSTALLED`, `LS_SPAWN_FAILED`, `LS_NOT_READY`, `LS_TERMINATED`, `LS_TIMEOUT`, `RPC_ERROR`, `WRITE_CONFLICT`, `INTERNAL`) are a wire contract — do not rename, do not split, do not merge.
 
 ## Limitations
 
@@ -252,7 +250,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Acknowledgements
 
-- [oraios/serena](https://github.com/oraios/serena) — the original Python MCP server this reimplementation is modeled on. Anchored at upstream commit `43ae0211`.
+- [oraios/serena](https://github.com/oraios/serena) — the original Python MCP server this reimplementation is modeled on. Anchored at upstream commit `7a296833`.
 - [helix-editor/helix](https://github.com/helix-editor/helix) — the `find_lsp_workspace` algorithm in `crates/supervisor/src/root.rs` is a direct translation.
 - The Cargo dependency tree (jsonrpc-core, tokio, axum, lsp-types, ...) — see `Cargo.lock`.
 

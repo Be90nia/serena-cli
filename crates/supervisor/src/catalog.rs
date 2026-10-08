@@ -29,7 +29,7 @@ pub fn catalog() -> serde_json::Value {
                     "_index_timeout_ms": {"type": "number", "required": false, "description": "per-call override (private)"},
                     "_compact": {"type": "bool", "required": false, "default": true, "description": "compact envelope (private)"},
                     "_delta": {"type": "bool", "required": false, "default": false, "description": "incremental delta (private)"},
-                    "_max_tokens": {"type": "number", "required": false, "description": "soft budget on items (private)"},
+                    "_max_tokens": {"type": "number", "required": false, "description": "soft budget on list output (private)"},
                     "_compress": {"type": "bool", "required": false, "description": "strip container/kind (private)"}
                 }
             },
@@ -220,7 +220,7 @@ pub fn catalog() -> serde_json::Value {
             },
             "repo-map": {
                 "args": {
-                    "top_n": {"type": "number", "required": false, "default": 20, "description": "E: top symbols by ref count"}
+                    "top_n": {"type": "number", "required": false, "default": 20, "description": "E: per-file top-level symbol map (top N)"}
                 }
             },
             "warm": {
