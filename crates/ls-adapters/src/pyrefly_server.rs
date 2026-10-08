@@ -120,13 +120,23 @@ fn resolve_launch() -> anyhow::Result<Vec<OsString>> {
             "install pyrefly (`uv tool install pyrefly` or `pip install pyrefly`) or the uv runtime (`uvx` on PATH)",
         )
     })?;
-    Ok(vec![
-        uvx.into_os_string(),
+    Ok(uvx_launch_argv_pinned(&uvx))
+}
+
+/// uvx 分支 argv 构造（纯函数，版本钉单一事实源）。
+fn uvx_launch_argv_pinned(uvx: &OsString) -> Vec<OsString> {
+    vec![
+        uvx.into(),
         "--from".into(),
         format!("pyrefly=={PYREFLY_VERSION}").into(),
         "pyrefly".into(),
         "lsp".into(),
-    ])
+    ]
+}
+
+#[cfg(test)]
+fn uvx_launch_argv() -> Vec<OsString> {
+    uvx_launch_argv_pinned(&std::ffi::OsString::from("uvx"))
 }
 
 #[async_trait]
@@ -250,23 +260,18 @@ mod tests {
 
     #[test]
     fn launch_prefers_entry_then_uvx_from() {
-        // 环境门：无 pyrefly/uvx 的机器（CI runner 裸 env）跳过——resolve 依赖 PATH。
-        if std::env::var_os("PATH").is_none_or(|p| {
-            !["pyrefly", "pyrefly.exe", "uvx", "uvx.exe"]
-                .iter()
-                .any(|b| std::env::split_paths(&p).any(|d| d.join(b).is_file()))
-        }) {
-            return;
-        }
-        // 形状锁：uvx 路径四段 argv（resolve 结果依赖环境 PATH，锁 --from 分支形状）。
-        let cmd = resolve_launch().expect("launch resolvable (pyrefly or uvx on PATH)");
-        if cmd[0].to_string_lossy().ends_with("uvx")
-            || cmd[0].to_string_lossy().ends_with("uvx.exe")
-        {
-            assert_eq!(cmd[1], "--from");
-            assert_eq!(cmd[2].to_string_lossy(), "pyrefly==1.2.0");
-            assert_eq!(cmd[3].to_string_lossy(), "pyrefly");
-            assert_eq!(cmd[4].to_string_lossy(), "lsp");
+        // 形状锁：uvx 路径四段 argv——经纯函数构造，不依赖环境 PATH
+        // （并发 set_var 测试进程内互踩，env 依赖断言已在 CI 假红一次）。
+        let cmd = uvx_launch_argv();
+        assert_eq!(cmd[0].to_string_lossy(), "uvx");
+        assert_eq!(cmd[1], "--from");
+        assert_eq!(cmd[2].to_string_lossy(), "pyrefly==1.2.0");
+        assert_eq!(cmd[3].to_string_lossy(), "pyrefly");
+        assert_eq!(cmd[4].to_string_lossy(), "lsp");
+        // PATH 真跑仅作宽容冒烟：并发 set_var 测试可能瞬时清空 PATH，
+        // Err = 环境竞态窗口，跳过不判失败。
+        if let Ok(cmd) = resolve_launch() {
+            assert!(!cmd.is_empty());
         }
     }
 
