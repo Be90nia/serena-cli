@@ -1,10 +1,14 @@
 # smoke_langs.toml —— 45 门语言 CI 冒烟矩阵清单（Phase 0 基建，serena-rust）。
 #
 # 三栏对账锚（上游 73 门，详见 local/agent-reports/ci-infra-45lang.md）：
-#   本矩阵（langs20 R6 终账 2026-09-30）：74 门 = 60 真门 + 14 SKIP 冻结（haskell R6 回场：spawn 静默死 crystal 同签名）（crystal/
-#   nix/elixir/fsharp/nextflow/matlab/wolfram 存量 7 + langs20 批新收 4：angular/
-#   groovy/gdscript/msl + R3/R5 回场 2：nextflow（didChangeConfiguration 注入缺口）/
-#   qml（qmlls 两 strike 无 handler）+ R5 回场 1：al（裸 .al 休眠需 BC 工程上下文，
+#   本矩阵（R7 终账 2026-10-08）：74 门 = 62 真门 + 12 SKIP 冻结（R7 批 bd
+#   serena-rust-8g4 复活 2：nextflow（did_change_config T0 通道落地，BUDGET SKIP
+#   死因消失）/angular（angular.rs T2 三服务器编排 + npm 四包条目落地，HOST SKIP
+#   死因消失））（crystal/
+#   nix/elixir/fsharp/matlab/wolfram 存量 6 + langs20 批新收 4：angular/
+#   groovy/gdscript/msl + R3/R5 回场 2：nextflow（didChangeConfiguration 注入缺口，
+#   R7 复活）/qml（qmlls 两 strike 无 handler）+ R5 回场 1：al（裸 .al 休眠需 BC 工
+#   程上下文，
 #   install 链已全绿）。langs20 批六门 SKIP 转真门存活：java（Adoptium JRE 25 +
 #   alternatives）、bsl（update-alternatives 切 21）、haskell（HLS 2.15.0.0 配对
 #   runner ghcup GHC 9.14.1 + 版本配对断言）、latex（texlab 单二进制裸 .tex 即出
@@ -265,15 +269,12 @@ install_macos = "echo \"export PATH=\\\"$JAVA_HOME_21_arm64/bin:\\$PATH\\\"\" > 
 [[lang]]
 id = "nextflow"
 via = "serena-download"
+install = "java -version 2>&1 | head -1 >&2 && $SERENA_CLI install nextflow"
 pin = "servers.toml"
 fixture = "nextflow/main.nf"
 lang_flag = "nextflow"
 budget_secs = 420
-skip_class = "BUDGET"
-skip_reason = "nextflow LS answers documentSymbol with [] unless the CLIENT injects workspace/didChangeConfiguration after initialized: upstream adapter sends a config-change notification whose error-reporting/exclude/plugin settings differ from what the server holds, which alone triggers the async workspace scan ($/progress under the initialize token) — a post-initialized notification channel T0 lacks; requests answered before the scan completes see an empty AST cache; adapter W-wave, not smoke-layer fixable"
-skip_evidence = "run 36649455255 record.jsonl: 工程组 fixture（main.nf + nextflow.config）下 documentSymbol 仍 5 attempts 全 []（LS 活着应答非瞬态）；↖ mirror nextflow_language_server.py@7a296833 L86 'workspace scan is asynchronous and reported via $/progress under the initialize token; requests answered before it ends see an empty AST cache' + L292 'does not index anything on initialized; it (re-)scans the workspace only when a configuration change arrives … Without this notification, every symbol request answers with an empty result'（2026-09-30 全文复核）"
-verified = "never"
-remark = "langs20 R1 转 R2 回 SKIP：工程组 fixture（R1 假设的死因）已证不足——真卡点 = client 侧 didChangeConfiguration 注入 + scan 完成等待，均为会话层 quirk（upstream _flush_deferred_workspace_scan 注释：首个 didOpen 还会 re-defer 扫描，1s debounce 只在无 pending change 的回合跑）；T0 框架出 post-initialized 通知通道或 W-wave 适配器即转真门，fixture 工程组维持"
+remark = "R7 复活转真门（bd serena-rust-8g4）：did_change_config 注入缺口已闭合——[servers.nextflow].did_change_config 已落 servers.toml，supervisor 在 initialized 后对 T0/T2 一体推送触发 LS 异步 workspace scan，nextflow.rs 另挂 $/progress 扫描等待（180s 上限，crates/ls-adapters/src/nextflow.rs:9-12/151-155）；java 运行时 runner 预装，-version 打印留 install.out 证据。旧 SKIP 证据归档（2026-09-30 R2）：run 36649455255 record.jsonl 工程组 fixture 下 documentSymbol 5 attempts 全 []（LS 活着应答非瞬态）+ ↖ mirror nextflow_language_server.py@7a296833 L86/L292（scan 异步、无 didChangeConfiguration 不索引）——死因是 client 无 post-initialized 通知通道，非装法非 fixture"
 
 [[lang]]
 id = "elixir"
@@ -808,15 +809,12 @@ remark = "langs20 批收编（上游 luau_lsp.py@7a296833 luau-lsp 单二进制�
 [[lang]]
 id = "angular"
 via = "serena-download"
-pin = "-"
+install = "$SERENA_CLI install angular && cd \"$SERENA_FXDIR\" && npm install --no-save --no-audit --no-fund --silent"
+pin = "servers.toml"
 fixture = "angular/app.component.ts"
 lang_flag = "angular"
-budget_secs = 300
-skip_class = "HOST"
-skip_reason = "ngserver alone cannot pass any smoke probe: documentSymbol not implemented at all (upstream returns null/-32601 for every file type), and hover/definition/diagnostics all answer null for bare .ts even with @angular/core resolvable — upstream needs tri-server orchestration (ngserver + companion typescript-language-server + HTML companion), which the single-process T0 launch model does not support (angular 不入 servers.toml 断言在案)"
-skip_evidence = "本机裸探针 2026-09-30（@angular/language-server 22.2.0，npm 实装 + probe.py）：initialize 应答正常，但 documentSymbol=null、hover=null（7 组合：裸 .ts/@Component fixture × 绝对/相对 probeLocations × server-request 自动应答开/关）、definition=null、diagnostics 15s 零推送；无 --tsProbeLocations 时 initialize 超时无应答；↖ mirror angular_language_server.py@7a296833 模块注释 'ngserver does not implement textDocument/documentSymbol for any file type' + .ts hover 路由伴随 TS server 实锚"
-verified = "never"
-remark = "npm 包本身存在可装（@angular/language-server 22.2.0，registry 实锚）——SKIP 因果 = 探针词表（documentSymbol/hover/diagnostics 底线）在 ngserver 单进程形态全空，且 T0 npm_args 静态串无法携带 tsProbeLocations 动态路径；rust 侧 LanguageId 无 angular 值、servers.toml 零条目维持（coverage 测试 not-in-table 断言）；T0 支持伴随进程编排（vue 双服务器先例的三角版）或探针词表扩展即转真门"
+budget_secs = 420
+remark = "R7 复活转真门（bd serena-rust-8g4；npm 装法三平台同构 = typescript/vue 先例，不设平台行）：T2 三服务器编排适配器（angular.rs：主会话 tsls 挂 @angular/language-service 插件 + ngserver/.html 伴生 + vscode-html 伴生，复用 html 门缓存）+ [servers.angular] npm 四包条目（21.2.10/21.2.10/5.9.3/5.1.3）落地，HOST 死因「单进程 T0 无 tri-server 编排」消失；fixture 补 tsconfig.json + package.json（angular.rs 硬前提：root tsconfig + @angular/core 可解析，install 行 npm install 注入）；.html documentSymbol 伴生未装时返 None non-fatal（上游同款），底线走 .ts 主会话。旧 SKIP 证据归档（2026-09-30 本机裸探针）：@angular/language-server 22.2.0 documentSymbol/hover/definition 全 null（7 组合）、无 --tsProbeLocations 时 initialize 超时 + ↖ mirror angular_language_server.py@7a296833 'ngserver does not implement textDocument/documentSymbol for any file type'"
 
 [[lang]]
 id = "groovy"
@@ -878,4 +876,6 @@ remark = "mSL = mIRC Scripting Language（.mrc），与 Xcode/macOS 无关；R4 
 # （R1-R4 CI 轮次 FAIL 逐门修复：haskell 终局 = HLS 2.15.0.0 配对 runner ghcup
 # 9.14.1 + 版本配对断言）；al 于 R2 转真门、R5 封顶回 SKIP（裸 .al 休眠需 BC 工程
 # 上下文，install 链已全绿）；nextflow/qml 于 R1 转、R2/R3 回 SKIP（会话层协议
-# 缺口 / qmlls 构建 capability 两 strike）。R6 终账 74 = 60 真门 + 14 SKIP。
+# 缺口 / qmlls 构建 capability 两 strike）；R7 批（bd serena-rust-8g4）nextflow
+# 复活转真门（did_change_config T0 通道落地，会话层死因消失，旧证据归档门块
+# remark）。R7 终账 74 = 62 真门 + 12 SKIP。

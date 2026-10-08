@@ -85,8 +85,8 @@ def load():
 def test_ledger_invariants():
     doors, real, skips = load()
     assert len(doors) == 74, f"door count drifted: {len(doors)}"
-    assert len(real) == 60, f"real door count drifted: {len(real)}"
-    assert len(skips) == 14, f"skip door count drifted: {len(skips)}"
+    assert len(real) == 62, f"real door count drifted: {len(real)}"
+    assert len(skips) == 12, f"skip door count drifted: {len(skips)}"
     # verified=never 是账本既有纪律（头部注释"强制"），但 haskell 门块历史缺该键
     # ——冻结门不改（非目标），此处仅记录性核对，缺键 >1 即真漂移。
     missing = [d["id"] for d in skips if d.get("verified") != "never"]

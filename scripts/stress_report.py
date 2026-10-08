@@ -9,6 +9,13 @@ sentinel-c*-*.txt（KEY=VALUE 哨兵），写
 门清单 = smoke_shard.py 的 LPT 分片（单一事实源 import 复用，不复制装箱）；
 裁决行 id 可能是 manifest id 或 lang_flag（php 门记 intelephense），两者都映射回 id。
 flaky 判据 = 同一门任一轮 FAIL 之后存在 PASS 轮（跨轮稳定性信号）。
+PASS 行含整门耗时 `(... <N>s via=...)`（smoke_one.sh 输出），逐门入
+"Per-door wall time" 表（min/median/p95/max；bd serena-rust-8g4 性能基线）。
+
+聚合模式：stress_report.py --aggregate <logs-root> <out.md>
+扫 <logs-root>/stress-logs-<plat>-s<N>/cycle-*.md（CI artifact 下载解压形态，
+目录名 .+ 非贪婪到末段 -s<N>），出 per-platform per-door 耗时表
+（median/p95/min/max）——local/agent-reports/perf-baseline.md 的生成器。
 """
 
 import os
@@ -20,7 +27,10 @@ sys.path.insert(0, SELF_DIR)
 import smoke_shard  # noqa: E402
 
 VERDICT_RE = re.compile(r"^(PASS|FAIL|SKIP)\s+(\S+)")
+# PASS <id> (<N>s ...) | PASS <id> (fallback:<spec> <N>s ...)
+DURATION_RE = re.compile(r"^PASS\s+\S+\s+\((?:fallback:\S+ )?(\d+)s ")
 SENTINEL_RE = re.compile(r"^([a-z_]+)=(.*)$")
+AGG_DIR_RE = re.compile(r"stress-logs-(.+)-s(\d+)$")
 
 
 def flag_to_id_map(langs_path):
@@ -36,7 +46,51 @@ def flag_to_id_map(langs_path):
     return m
 
 
+def read_durations(cycle_files, to_id, known_doors):
+    """cycle-N.md PASS 行耗时 → {door: [secs per cycle]}。"""
+    durations = {d: [] for d in known_doors}
+    for cyc in sorted(cycle_files):
+        with open(cycle_files[cyc], encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.startswith("PASS"):
+                    continue
+                m = DURATION_RE.match(line)
+                if not m:
+                    continue
+                door = to_id.get(line.split()[1])
+                if door in durations:
+                    durations[door].append(int(m.group(1)))
+    return durations
+
+
+def median_p95(xs):
+    """最近邻 p95（样本小无插值）；xs 需已排序。"""
+    median = xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs) // 2 - 1] + xs[len(xs) // 2]) // 2
+    p95 = xs[min(len(xs) - 1, int(round(0.95 * (len(xs) - 1))))]
+    return median, p95
+
+
+def time_table(durations):
+    """per-door 耗时表行（n/min/median/p95/max；无 PASS 样本的门不列）。"""
+    lines = []
+    samples = []
+    for door in sorted(durations):
+        xs = sorted(durations[door])
+        if not xs:
+            continue
+        samples.append(xs)
+        median, p95 = median_p95(xs)
+        lines.append(f"| {door} | {len(xs)} | {xs[0]} | {median} | {p95} | {xs[-1]} |")
+    if samples:
+        flat = sorted(x for xs in samples for x in xs)
+        median, p95 = median_p95(flat)
+        lines.append(f"| **all** | {len(flat)} | {flat[0]} | {median} | {p95} | {flat[-1]} |")
+    return lines
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--aggregate":
+        return aggregate(sys.argv[2], sys.argv[3])
     if len(sys.argv) != 4:
         sys.exit(__doc__)
     log_dir, plat, shard = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -121,6 +175,19 @@ def main():
     ap("")
     ap(f"PASS cell total: {pass_total} / ({len(shard_ids)} doors × {n_cycles} cycles)")
     ap("")
+
+    # per-door 整门耗时（PASS 行 `<N>s`；smoke_one.sh 已输出，此处解析——8g4 性能基线）
+    durations = read_durations(cycle_files, to_id, shard_ids)
+    time_rows = time_table(durations)
+    ap("## Per-door wall time (s)")
+    ap("")
+    if time_rows:
+        ap("| door | n | min | median | p95 | max |")
+        ap("|---|---|---|---|---|---|")
+        lines.extend(time_rows)
+    else:
+        ap("（无 PASS 样本）")
+    ap("")
     ap("## Flaky (FAIL → later PASS)")
     ap("")
     if flaky:
@@ -158,6 +225,64 @@ def main():
     with open(out, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines))
     print(out)
+
+
+def aggregate(logs_root, out_path):
+    """--aggregate：跨 shard/platform 合并 per-door 耗时 → perf 基线表。
+
+    目录形态 = CI artifact 下载解压名 stress-logs-<plat>-s<N>（plat 含 '-'，
+    贪婪到末段 -s<N>）。每平台一张表 + 门级样本说明；文件 = local/agent-reports/
+    perf-baseline.md 的机器生成节。
+    """
+    langs_path = os.environ.get("SMOKE_LANGS", os.path.join(SELF_DIR, "smoke_langs.toml"))
+    to_id = flag_to_id_map(langs_path)
+    all_doors = [lid for _, lid in smoke_shard.load_doors(langs_path)]
+
+    per_plat = {}  # plat -> {door: [secs]}
+    for name in sorted(os.listdir(logs_root)):
+        m = AGG_DIR_RE.fullmatch(name)
+        if not m or not os.path.isdir(os.path.join(logs_root, name)):
+            continue
+        plat = m.group(1)
+        cycle_files = {}
+        d = os.path.join(logs_root, name)
+        for p in os.listdir(d):
+            cm = re.fullmatch(r"cycle-(\d+)\.md", p)
+            if cm:
+                cycle_files[int(cm.group(1))] = os.path.join(d, p)
+        if not cycle_files:
+            continue
+        acc = per_plat.setdefault(plat, {})
+        for door, xs in read_durations(cycle_files, to_id, all_doors).items():
+            acc.setdefault(door, []).extend(xs)
+
+    lines = [
+        "# Per-door wall time — cross-shard aggregate (s)",
+        "",
+        "来源 = stress-ls 各 (platform, shard) job 的 cycle-*.md PASS 行整门耗时",
+        "（install + 首启 + 探针全含）。生成："
+        "`stress_report.py --aggregate <artifacts-root> <out.md>`。",
+        "",
+    ]
+    for plat in sorted(per_plat):
+        ap = lines.append
+        ap(f"## {plat}")
+        ap("")
+        rows = time_table(per_plat[plat])
+        if rows:
+            ap("| door | n | min | median | p95 | max |")
+            ap("|---|---|---|---|---|---|")
+            lines.extend(rows)
+        else:
+            ap("（无 PASS 样本）")
+        ap("")
+    if not per_plat:
+        lines.append("（logs-root 下无 stress-logs-<plat>-s<N>/cycle-*.md）")
+        lines.append("")
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines))
+    print(out_path)
+    return 0
 
 
 if __name__ == "__main__":

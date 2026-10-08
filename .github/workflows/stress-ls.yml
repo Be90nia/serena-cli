@@ -7,7 +7,10 @@
 #   - 片内循环：stress_loop.sh while SECONDS < 上限（cycle_secs input，默认
 #     18000s = 5h；机制验证 dispatch 600s）。每轮（cycle）裁决落 stress-logs/
 #     cycle-N.md，哨兵（LS 进程数 / daemon RSS / 残留 lock / 缓存 MB）每轮前后
-#     各采一次；job 末尾 stress_report.py 出 verdict 矩阵 + flaky 清单 + 趋势。
+#     各采一次；job 末尾 stress_report.py 出 verdict 矩阵 + flaky 清单 + 趋势 +
+#     per-door 耗时表（--aggregate 聚合跨 job 出性能基线，bd serena-rust-8g4）。
+#   - churn job（可选，with_churn 开关）：多语言单 workspace 并发竞锁场景
+#     （stress_churn.sh，bd serena-rust-8g4），与分片 job 并行，产物独立上传。
 #   - 超时：单轮时长 = 片预算（LPT 均衡 ~25-40min）＜ 335min job 上限（5h 循环
 #     + 45min 上传余量；循环上限已内建 -2700s 保护）。
 # 平台 pin 具体镜像（ubuntu-24.04 / windows-2025 / macos-15 arm64）——门分类
@@ -24,6 +27,14 @@ on:
         description: "片内压测循环秒数：机制验证 600，全量 5h 用默认 18000"
         type: number
         default: 18000
+      with_churn:
+        description: "追加多语言并发 churn job（bd serena-rust-8g4 竞锁实测面）"
+        type: boolean
+        default: false
+      churn_secs:
+        description: "churn 压测窗口秒数"
+        type: number
+        default: 300
 
 permissions:
   contents: read
@@ -118,3 +129,43 @@ jobs:
           "$SERENA_CLI" stop-all || true
           # windows 门失败路径可能残留锁住的 fixture 目录（node LS 持锁）——job 末尾兜底清
           rm -rf .smoke-tmp 2>/dev/null || true
+
+  churn:
+    # 多语言并发 churn（bd serena-rust-8g4）：单 workspace 8 语言 fixture × N 个
+    # CLI 进程混合操作（读/写/undo 交错）共享同一 daemon——竞锁实测面。可选
+    # （with_churn 开关）；与 stress 分片 job 并行跑，产物独立上传。
+    needs: [build-cli]
+    if: ${{ inputs.with_churn }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    env:
+      SERENA_CLI: ${{ github.workspace }}/bin/${{ matrix.os == 'windows-2025' && 'serena-cli.exe' || 'serena-cli' }}
+      CHURN_LOG_DIR: ${{ github.workspace }}/churn-logs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: serena-cli-${{ matrix.os }}
+          path: bin/
+      - name: prepare cli
+        run: |
+          chmod +x "$SERENA_CLI" || true
+          "$SERENA_CLI" --version
+      - name: churn (os=${{ matrix.os }} secs=${{ inputs.churn_secs }})
+        run: scripts/stress_churn.sh --duration ${{ inputs.churn_secs }} --log-dir "$CHURN_LOG_DIR"
+      - name: upload churn logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: churn-logs-${{ matrix.os }}
+          path: churn-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: hygiene stop-all
+        if: always()
+        run: |
+          "$SERENA_CLI" stop-all || true
