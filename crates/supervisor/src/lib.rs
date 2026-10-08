@@ -708,16 +708,30 @@ impl Supervisor {
     /// 卸载指定实例：先 shutdown session（5s 超时转 kill），再从池中移除。
     /// 返回 Ok(true) 表示真的卸了；Ok(false) 表示 key 不存在。
     ///
-    /// P2-0bq: evict 也清理 `load_gates` / `pull_diag_supported` 两张旁表——
-    /// 二者只 insert 不 remove，LRU 反复驱逐同 (root, lang) 会按驱逐次数单调累积。
+    /// P2-0bq: evict 也清理 `pull_diag_supported` 旁表——只 insert 不 remove，
+    /// LRU 反复驱逐同 (root, lang) 会按驱逐次数单调累积。
+    ///
+    /// audit 竞锁 #5：`load_gates` **不再**随 evict 删除——慢路径持旧 gate guard
+    /// 冷启动期间（jdtls 可达分钟级），删表项会让第三个调用者新建 gate 立即放行，
+    /// 同 key 双 spawn 并发。保留表项 = 后续调用者与在飞慢路径同门串行；表项上界
+    /// = 曾冷启动过的 distinct (root, lang) 数（每条一个 `Arc<Mutex<()>>`，本裁决
+    /// 后不随驱逐次数增长，量级可忽略）。
+    ///
+    /// audit 内存 F3：`version_seen` 按 root 归一清理——(root, uri)→bool 条目原先
+    /// 永不回收，长命 daemon 逐文件累积。
+    ///
     /// `diag_cache` 按 (root, uri) 键与 session 解耦，刻意保留（文件级诊断跨世代
     /// 仍有效；新一轮 session 第一条 pushDiagnostics 会覆写/清空对应条目）。
     pub async fn evict(&self, key: &Key) -> ToolResult<bool> {
         let session = self.instances.lock().unwrap().remove(key);
         self.last_used.lock().unwrap().remove(key);
-        self.load_gates.lock().unwrap().remove(key);
         self.pull_diag_supported.lock().unwrap().remove(key);
         self.launch_exe.lock().unwrap().remove(key);
+        let evicted_root = key_root_identity(&key.root);
+        self.version_seen
+            .lock()
+            .unwrap()
+            .retain(|(root, _), _| key_root_identity(root) != evicted_root);
         match session {
             Some(s) => {
                 s.shutdown().await;
@@ -837,7 +851,6 @@ impl Supervisor {
             project_root: key.root.clone(),
         };
         let t2 = ls_registry::adapter_for(lang);
-        eprintln!("[HANGPROBE] probing t2={}", t2.is_some());
         let launch = match &t2 {
             Some(adapter) => adapter.launch_info(&ctx).await.map_err(|e| {
                 let msg = format!("{e:#}");
@@ -1137,7 +1150,8 @@ impl Supervisor {
         // （session_for 只探测主会话）→ 从所选会话的 serverCapabilities 现查；
         // TLS 支持 LSP 3.17 pull（.vue 的 tsserver 类型诊断即经此取出）。
         let hybrid_companion = ls_registry::adapter_for(lang.as_str()).is_some_and(|a| {
-            a.semantic_session(root)
+            // key.root = canonical 形态，与伴生槽键一致（audit 竞锁 #7）。
+            a.semantic_session(&key.root)
                 .is_some_and(|s| Arc::ptr_eq(&s, &session))
         });
         let supports_pull = if hybrid_companion {
@@ -1356,11 +1370,16 @@ impl Supervisor {
         file: &str,
         lang: &str,
     ) -> ToolResult<Arc<Session>> {
+        // 伴生槽 key = `Supervisor::key` 的 canonical 形态（set_project_root 写入）；
+        // 请求 root 必须过同款归一再比较，否则 Windows 大小写/分隔符差异静默失配
+        // → 伴生路由恒 None，.html/.vue/.astro 语义静默回落主会话（audit 竞锁 #7，
+        // 「路径大小写双重身份」缺陷类）。
+        let slot_root = Self::key(root, lang).root;
         // per-file 重路由优先（angular `.html` references → ngserver 伴生，↖ mirror
         // 上游路由表；调用于 references 类工具，method 恒 references）。
         if let Some(adapter) = ls_registry::adapter_for(lang)
             && let Some(s) =
-                adapter.session_for_file(root, Path::new(file), "textDocument/references")
+                adapter.session_for_file(&slot_root, Path::new(file), "textDocument/references")
         {
             return Ok(s);
         }
@@ -1376,7 +1395,7 @@ impl Supervisor {
             });
         if is_ts_like
             && let Some(adapter) = ls_registry::adapter_for(lang)
-            && let Some(s) = adapter.semantic_session(root)
+            && let Some(s) = adapter.semantic_session(&slot_root)
         {
             return Ok(s);
         }
@@ -1393,8 +1412,10 @@ impl Supervisor {
         file: &str,
         method: &str,
     ) -> ToolResult<Arc<Session>> {
+        // 伴生槽按 canonical root 键（audit 竞锁 #7），归一后再比较。
+        let slot_root = Self::key(root, lang).root;
         if let Some(adapter) = ls_registry::adapter_for(lang)
-            && let Some(s) = adapter.session_for_file(root, Path::new(file), method)
+            && let Some(s) = adapter.session_for_file(&slot_root, Path::new(file), method)
         {
             return Ok(s);
         }
@@ -1406,8 +1427,11 @@ impl Supervisor {
     /// 仅位置类语义请求（hover / signature-help）经此；结构类（documentSymbol）
     /// 与写类仍走主会话。
     async fn semantic_session_or_main(&self, root: &Path, lang: &str) -> ToolResult<Arc<Session>> {
+        // 伴生槽按 canonical root 键（audit 竞锁 #7），归一后再比较；回落主会话
+        // 仍传原始 root（session_for 自行 canonicalize）。
+        let slot_root = Self::key(root, lang).root;
         if let Some(adapter) = ls_registry::adapter_for(lang)
-            && let Some(s) = adapter.semantic_session(root)
+            && let Some(s) = adapter.semantic_session(&slot_root)
         {
             return Ok(s);
         }
@@ -5563,6 +5587,10 @@ impl SupervisorTrait for Supervisor {
         // 快照落盘（commit 含 prune 与清空 redo 链）；失败 → 丢弃本调用已记快照。
         // TXN_UID task-local 隔离并发调用（batch 每条独立 task）。
         let txn_uid = undo::next_uid();
+        // audit 竞锁 #10 / 内存 F8 前半：execute_tool future 被取消（客户端断连
+        // drop handler future）时 commit/abort 均不执行 → PENDING/TOUCHED 的 uid
+        // 条目永久泄漏。守卫 drop 未收口即兜底 abort，取消路径账本必清。
+        let txn = undo::TxnGuard::new(txn_uid);
         let result = undo::TXN_UID
             .scope(txn_uid, self.dispatch_tool(tool, root, &args, lang))
             .await;
@@ -5575,9 +5603,16 @@ impl SupervisorTrait for Supervisor {
                     // 的 prune 交错。guard 活到 commit 完成：落盘毫秒级串行化，正确性
                     // 优先。commit_at 自身不加门（非重入门），顺序保证全靠此处。
                     let _gate = write_gate::acquire().await;
-                    undo::commit(root, txn_uid).await?;
+                    // commit_at 先取走 PENDING 再落盘（audit 内存 F8）：IO 失败时
+                    // 条目已被 drain，settle 后向上报错不会二次泄漏。
+                    let committed = undo::commit(root, txn_uid).await;
+                    txn.settle();
+                    committed?;
                 }
-                Err(_) => undo::abort(txn_uid),
+                Err(_) => {
+                    undo::abort(txn_uid);
+                    txn.settle();
+                }
             }
         }
         result
@@ -6902,13 +6937,19 @@ async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
     })?;
     let tmp = tempfile::NamedTempFile::new_in(dir)?;
-    let tmp_path = tmp.into_temp_path().keep()?;
+    // audit 内存 F2：TempPath 守卫活到 rename 成功——写失败（磁盘满）与 future
+    // 取消（客户端断连）路径由 Drop 统一清 `.tmp*` 残留，不再在用户项目目录留下
+    // 孤儿临时文件；rename 成功后 keep() 解除删除。
+    let tmp_path = tmp.into_temp_path();
     tokio::fs::write(&tmp_path, content).await?;
 
     let mut attempt = 0;
     loop {
         match tokio::fs::rename(&tmp_path, path).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                let _ = tmp_path.keep();
+                return Ok(());
+            }
             Err(e) if attempt < 5 => {
                 // Windows ERROR_SHARING_VIOLATION(32) / ERROR_ACCESS_DENIED(5) 常见于杀软/索引器；
                 // 统一退避重试。
@@ -6917,8 +6958,7 @@ async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
                 let _ = e;
             }
             Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(e);
+                return Err(e); // tmp_path Drop 清理残留
             }
         }
     }
@@ -7714,38 +7754,75 @@ mod reclaim_idle_buffers_tests {
         let _ = sup.evict(&key).await;
     }
 
-    /// P2-0bq: evict 必须清理 `load_gates` / `pull_diag_supported` 两张旁表，
-    /// 否则 LRU 反复驱逐同 (root, lang) 按驱逐次数单调累积（gate 是 tokio Mutex，
-    /// pull_diag_supported 是 bool——虽小但每 key 一条，永不回收）。
-    ///
-    /// 这里直接构造一个 key，造表条目，evict，再断言两张表都已清掉。
+    /// audit 竞锁 #5 + P2-0bq：evict **保留** load_gates（慢路径持旧 gate guard
+    /// 冷启动期间删表项 → 第三调用者新建 gate 同 key 双 spawn），后续 load_gate_for
+    /// 必须拿到同一个 Arc gate 与在飞慢路径串行；pull_diag_supported 照旧清理
+    /// （只 insert 不 remove，按驱逐次数单调累积）。
     #[tokio::test]
-    async fn evict_removes_load_gates_and_pull_diag_supported() {
+    async fn evict_keeps_load_gate_and_clears_pull_diag_supported() {
         let sup = Supervisor::direct().await.unwrap();
         let key = Supervisor::key(Path::new("Z:/no/such/project"), "rust");
 
-        // 插 gate（任意 Arc<Mutex<()>>）+ pull 标记。
-        sup.load_gates
-            .lock()
-            .unwrap()
-            .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(())));
+        // 经 load_gate_for 建表项（同款 Arc），再插 pull 标记。
+        let gate_before = sup.load_gate_for(&key.root, &key.lang);
         sup.pull_diag_supported
             .lock()
             .unwrap()
             .insert(key.clone(), true);
 
-        // instances 没有该 key → evict 返 false 但仍清两表。
+        // instances 没有该 key → evict 返 false，但 pull 表照清、gate 照留。
         let removed = sup.evict(&key).await.expect("evict");
         assert!(!removed, "instances 没 key 时 evict 返 false");
 
+        let gate_after = sup.load_gate_for(&key.root, &key.lang);
         assert!(
-            !sup.load_gates.lock().unwrap().contains_key(&key),
-            "load_gates 必须清掉"
+            Arc::ptr_eq(&gate_before, &gate_after),
+            "load_gates 表项必须保留且同一 Arc（同 key 双 spawn 防线）"
         );
         assert!(
             !sup.pull_diag_supported.lock().unwrap().contains_key(&key),
             "pull_diag_supported 必须清掉"
         );
+    }
+
+    /// audit 内存 F3：evict 按 root 归一清理 version_seen——(root, uri)→bool 条目
+    /// 原先永不回收，长命 daemon 逐文件累积；同 root 清、异 root 不误伤。
+    #[tokio::test]
+    async fn evict_clears_version_seen_by_root_identity() {
+        let sup = Supervisor::direct().await.unwrap();
+        let key = Supervisor::key(Path::new("Z:/no/such/vs-project"), "rust");
+        let other = Supervisor::key(Path::new("Z:/no/such/other-project"), "go");
+
+        sup.version_seen
+            .lock()
+            .unwrap()
+            .insert((key.root.clone(), "file:///a.rs".to_string()), true);
+        sup.version_seen
+            .lock()
+            .unwrap()
+            .insert((other.root.clone(), "file:///b.go".to_string()), false);
+
+        // instances 无 key → 不触 shutdown，仍清表。
+        let removed = sup.evict(&key).await.expect("evict");
+        assert!(!removed);
+
+        {
+            let vs = sup.version_seen.lock().unwrap();
+            assert!(
+                !vs.keys()
+                    .any(|(r, _)| key_root_identity(r) == key_root_identity(&key.root)),
+                "被驱逐 root 的 version_seen 条目必须清理"
+            );
+            assert!(
+                vs.contains_key(&(other.root.clone(), "file:///b.go".to_string())),
+                "异 root 条目不得误伤"
+            );
+        }
+        // 清场：进程级表不给他用例留垃圾。
+        sup.version_seen
+            .lock()
+            .unwrap()
+            .remove(&(other.root.clone(), "file:///b.go".to_string()));
     }
 
     /// 修 P1 #2 节流验证：连续 32 次调用中前 31 次不应扫 sessions（只递增

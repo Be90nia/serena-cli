@@ -45,9 +45,7 @@ use lsp_core::framing::JsonRpc;
 use lsp_types::InitializeParams;
 use serde_json::{Value, json};
 
-use crate::{
-    LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error, which_no_unc,
-};
+use crate::{LanguageId, LanguageServerAdapter, ProjectCtx, RequestHooks, not_installed_error};
 
 /// 四包 pin（↖ mirror `DEFAULT_ANGULAR_LANGUAGE_SERVER_VERSION` 等，禁随意改）：
 /// @angular/language-server 21.2.10 + @angular/language-service 21.2.10 +
@@ -61,6 +59,12 @@ const CACHE_VERSION: &str = ANGULAR_LS_VERSION;
 
 /// 主 tsls 就绪探针超时（astro 同款）。
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 伴生握手段内预算（audit P2 #9）：on_session_ready 受 supervisor 30s 包裹，
+/// ng/html 握手在此各自封顶——包裹超时取消不再落在「已 spawn 未入槽/未挂 watch」
+/// 的半登记窗口（ngserver 孤儿根因）。超时 = 降级放行（缺失同款语义）。
+const NG_HANDSHAKE_BUDGET: Duration = Duration::from_secs(20);
+const HTML_HANDSHAKE_BUDGET: Duration = Duration::from_secs(5);
 
 /// 伴生进程退出监视轮询间隔（astro 同款）。
 const WATCH_POLL: Duration = Duration::from_millis(500);
@@ -133,11 +137,6 @@ fn resolve_install() -> anyhow::Result<PathBuf> {
              requires node/npm on PATH",
         ))
     }
-}
-
-fn node_on_path() -> anyhow::Result<PathBuf> {
-    which_no_unc("node")
-        .ok_or_else(|| anyhow::anyhow!("node not on PATH; required to run the angular LS stack"))
 }
 
 /// 向上探测 `node_modules/@angular/core`（monorepo hoist 布局；找到即停）。
@@ -372,12 +371,12 @@ impl LanguageServerAdapter for AngularAdapter {
         ]);
 
         // 1) ngserver 伴生：--stdio + 双 probe 指向 install node_modules。
-        let node = node_on_path()?;
-        let mut ng_cmd = vec![node.into_os_string()];
-        match bin_in(&install, "ngserver") {
-            Some(ng) => ng_cmd.push(ng.into_os_string()),
-            None => anyhow::bail!("ngserver missing in angular install"),
-        }
+        //    ngserver bin 放 cmd[0]（spawn 层对 .cmd 自动 cmd /c 包装——主 tsls/html
+        //    同款）。e2e 实锤：原 `[node, ngserver.cmd, ...]` 形态让 node 直接执行
+        //    批处理 → SyntaxError 即死，ngserver 在 Windows 上从未真正启动过。
+        let ng = bin_in(&install, "ngserver")
+            .ok_or_else(|| anyhow::anyhow!("ngserver missing in angular install"))?;
+        let mut ng_cmd = vec![ng.into_os_string()];
         ng_cmd.push("--stdio".into());
         ng_cmd.push("--tsProbeLocations".into());
         ng_cmd.push(node_modules(&install).into_os_string());
@@ -399,17 +398,57 @@ impl LanguageServerAdapter for AngularAdapter {
             .join(crate::html::CACHE_VERSION);
         let html_bin = bin_in(&html_dir, crate::html::BIN_REL);
 
-        let (ng_session, ng_child) = spawn_companion(
-            ng_launch,
-            ng_init_params(&root, &install)?,
-            "html",
-            "ngserver",
+        // 1) ngserver 伴生：握手段内预算封顶（audit P2 #9）。超时降级放行 =
+        //    ngserver 缺失同款语义（.html 语义空）；降级路径 Session::start future
+        //    drop → Job 句柄 drop → KILL_ON_JOB_CLOSE 灭树，无进程残留。
+        let (ng_session, ng_child) = match tokio::time::timeout(
+            NG_HANDSHAKE_BUDGET,
+            spawn_companion(
+                ng_launch,
+                ng_init_params(&root, &install)?,
+                "html",
+                "ngserver",
+            ),
         )
-        .await?;
+        .await
+        {
+            Ok(v) => v?,
+            Err(_) => {
+                tracing::warn!(
+                    "ngserver companion handshake exceeded {NG_HANDSHAKE_BUDGET:?}; \
+                     .html semantics stay empty"
+                );
+                return Ok(());
+            }
+        };
+
+        // 2) 立即登记 + 挂监视（本段无 await 点——外层 30s 包裹的取消不可能再落进
+        //    「已 spawn 未登记」窗口产生孤儿）。
+        //
+        //    监视传主会话弱引用（astro.rs:390-413 同款；audit P1 #1——原实现
+        //    Arc::downgrade(ng_session) 指向伴生自身，NG/HTML 槽内的强引用使
+        //    「主死 → 清槽」分支永不可达，主会话被驱逐后 ngserver+html 双 node
+        //    进程 + watcher 全部滞留至 daemon 退出）。
+        if let Ok(mut slot) = NG_COMPANION.lock() {
+            *slot = Some((root.clone(), std::sync::Arc::clone(&ng_session)));
+        }
         ng_session
             .client()
             .on_server_request("workspace/configuration", configuration_reply);
+        session
+            .client()
+            .on_server_request("workspace/configuration", configuration_reply);
 
+        // 监视：ngserver 伴生死 → 主 shutdown（.html 语义全灭，无继续价值）；
+        // 主会话死（驱逐/shutdown）→ 清槽 → 槽内 Arc 归零 → Job 灭树。
+        if let Some(child) = ng_child {
+            watch_companion(child, session, clear_companions);
+        }
+
+        // 3) vscode-html 伴生：复用 html 门缓存（serena-cli install html 先装；
+        //    未装/握手慢 → .html documentSymbol 空，non-fatal —— 上游
+        //    _stop_html_server 同语义；不挂退出监视——html 生死只降级 outline，
+        //    由上方主会话监视的清槽路径统一回收）。
         if let Some(html_exe) = html_bin {
             let html_launch = LaunchInfo {
                 cmd: vec![html_exe.into_os_string(), "--stdio".into()],
@@ -417,15 +456,18 @@ impl LanguageServerAdapter for AngularAdapter {
                 env: vec![],
                 transport: TransportKind::Stdio,
             };
-            match spawn_companion(
-                html_launch,
-                html_init_params(&root)?,
-                "html",
-                "vscode-html-ls",
+            match tokio::time::timeout(
+                HTML_HANDSHAKE_BUDGET,
+                spawn_companion(
+                    html_launch,
+                    html_init_params(&root)?,
+                    "html",
+                    "vscode-html-ls",
+                ),
             )
             .await
             {
-                Ok((html_session, _html_child)) => {
+                Ok(Ok((html_session, _html_child))) => {
                     html_session
                         .client()
                         .on_server_request("workspace/configuration", configuration_reply);
@@ -433,9 +475,15 @@ impl LanguageServerAdapter for AngularAdapter {
                         *slot = Some((root.clone(), html_session));
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(
                         "html companion unavailable; .html documentSymbol will be empty: {e}"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "html companion handshake exceeded {HTML_HANDSHAKE_BUDGET:?}; \
+                         .html documentSymbol will be empty"
                     );
                 }
             }
@@ -444,19 +492,6 @@ impl LanguageServerAdapter for AngularAdapter {
                 "vscode-html-language-server not installed (serena-cli install html); \
                  .html documentSymbol will be empty"
             );
-        }
-
-        // 3) 登记 ngserver 伴生 + 主会话 configuration 应答。
-        if let Ok(mut slot) = NG_COMPANION.lock() {
-            *slot = Some((root.clone(), std::sync::Arc::clone(&ng_session)));
-        }
-        session
-            .client()
-            .on_server_request("workspace/configuration", configuration_reply);
-
-        // 4) 监视：ngserver 伴生死 → 主 shutdown（.html 语义全灭，无继续价值）。
-        if let Some(child) = ng_child {
-            watch_companion(child, &ng_session, clear_companions);
         }
 
         // 5) 主 tsls 就绪探针：真实 .ts 优先（astro 同款），失败只 warn 放行。

@@ -125,6 +125,20 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// in_flight RAII 守卫（audit 竞锁 #10 后半）：handler 入口 fetch_add 后持有，
+/// Drop 即 -1——future 取消（客户端断连 drop handler future）时手动 fetch_sub
+/// 不执行会让排空窗口计数只增不减。/tools 与 /batch 共用。
+struct InFlightGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 async fn tools_post(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -137,6 +151,9 @@ async fn tools_post(
     state
         .in_flight
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let _in_flight = InFlightGuard {
+        counter: Arc::clone(&state.in_flight),
+    };
     crate::reaper::note_activity();
 
     // d3a：invocation_id 三级来源——body envelope > X-Invocation-Id header >
@@ -165,7 +182,7 @@ async fn tools_post(
         .replace(req.project_root.clone());
 
     let started = std::time::Instant::now();
-    let resp = match state
+    match state
         .supervisor
         .execute_tool(&name, &req.project_root, req.args, req.lang.as_deref())
         .await
@@ -239,11 +256,7 @@ async fn tools_post(
             };
             (status, Json(resp)).into_response()
         }
-    };
-    state
-        .in_flight
-        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    resp
+    }
 }
 
 /// 生成 invocation_id（d3a）：UUID v4 形状。std 熵源（时间纳秒 + pid +
@@ -441,15 +454,15 @@ async fn batch_handler(State(state): State<AppState>, Json(req): Json<BatchReque
     state
         .in_flight
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let _in_flight = InFlightGuard {
+        counter: Arc::clone(&state.in_flight),
+    };
     crate::reaper::note_activity();
     // batch 可混多项目；active_project 记最后一个请求的 root（「最近请求」语义同 tools_post）。
     if let Some(root) = req.calls.last().map(|c| c.project_root.clone()) {
         *state.active_project.lock().unwrap() = Some(root);
     }
     let results = run_batch(&state, req.calls).await;
-    state
-        .in_flight
-        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     (StatusCode::OK, Json(BatchResponse { results })).into_response()
 }
 

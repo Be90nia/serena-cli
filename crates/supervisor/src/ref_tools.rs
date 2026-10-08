@@ -78,6 +78,11 @@ async fn fetch_references(
     // 不阻断查询（hook 内部 warn 后放行）。
     if let Some(adapter) = ls_registry::adapter_for(&session.language_id()) {
         adapter.wait_for_cross_file_index(session).await;
+        // references 请求前的适配器钩子（audit 竞锁 #2 接线点）：nextflow 的延迟
+        // 工作区扫描 flush 在此真实触发——trait 钩子此前全仓零调用点（「机制存在≠
+        // 接线生效」第三例），扫描窗口内 references 静默空。默认实现为空，其余
+        // 语言零行为。
+        adapter.pre_references(session, file).await;
     }
     let uri = path_to_uri_str(file);
     let params = json!({

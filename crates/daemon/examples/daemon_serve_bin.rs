@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
             scan: std::time::Duration::from_secs(30),
             ls_idle: std::time::Duration::from_secs(600),
             global_idle: std::time::Duration::from_secs(900),
-            max_loaded_ls: 3,
+            max_loaded_ls: 6,
         },
     };
     daemon::serve::serve(cfg).await

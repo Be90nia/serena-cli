@@ -65,7 +65,7 @@ serena-cli.exe（Rust，单二进制，双模式）
 - **document sync 归 daemon 独占持有**：didOpen/didChange/didClose 由 daemon 统一发送；代理侧永远不直接碰 LSP 连接。写操作完成后 daemon 负责通知 + 失效对应文件的 symbol 缓存，其他代理下次查询自动看到新状态。
 - **内存闸门（语言服务器实例调度）**：内存大头是语言服务器进程（clangd/pyright 200MB-1GB、jdtls 可达 2GB），壳本身 ~20MB 可忽略。策略：
   1. 按需启动——项目注册不启动 LS，该语言文件首次被查询才拉起；
-  2. LRU 上限——同时最多 `max_loaded_ls`（默认 3）个 LS 实例，超限驱逐最久未用者；
+  2. LRU 上限——同时最多 `max_loaded_ls`（默认 6，`SERENA_MAX_LOADED_LS` 可调）个 LS 实例，超限驱逐最久未用者；
   3. 空闲卸载——单个 LS 实例 10 分钟无请求即 shutdown 释放；
   4. 单进程多项目——禁止一项目一进程；上游 ProjectServer 的项目缓存只进不出（`_loaded_projects_by_root` 无卸载），本设计显式改进此点。
   5. 边界——LS 是外部第三方进程（clangd=C++、pyright=TS/Node、gopls=Go、jdtls=Java/JVM），内部不可修改；内存控制仅限三手段：选型（同语言可换轻量实现，如 pyright→jedi）、启动参数（jdtls `-Xmx`、clangd `--limit-results`，参数表从 solidlsp 抄）、生命周期调度（上述 1-3）。solidlsp 本身也只做这三件事，从不改 LS 内部。

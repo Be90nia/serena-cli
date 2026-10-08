@@ -206,6 +206,44 @@ pub(crate) fn abort(uid: u64) {
         .lock()
         .expect("undo PENDING lock poisoned")
         .retain(|(u, _)| *u != uid);
+    // audit 内存 F8：TOUCHED 同款回收——恢复登记只属 undo/redo 路径，但 abort 语义
+    // 是"本事务账目全清"，两条旁表一起 retain 才对得上。
+    TOUCHED
+        .lock()
+        .expect("undo TOUCHED lock poisoned")
+        .retain(|(u, _)| *u != uid);
+}
+
+/// execute_tool 事务守卫（audit 竞锁 #10 / 内存 F8）：drop 时未 `settle()`（即
+/// commit/abort 均未走到）→ 兜底 [`abort`] 清掉本 uid 的 PENDING/TOUCHED 快照。
+/// 覆盖 future 取消路径——客户端断连时 hyper drop handler future，原实现
+/// commit/abort 双双不执行，快照滞留至进程退出。
+pub(crate) struct TxnGuard {
+    uid: u64,
+    settled: std::sync::atomic::AtomicBool,
+}
+
+impl TxnGuard {
+    pub(crate) fn new(uid: u64) -> Self {
+        Self {
+            uid,
+            settled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// 收口：commit（或显式 abort）已完成，豁免 drop 兜底。
+    pub(crate) fn settle(&self) {
+        self.settled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for TxnGuard {
+    fn drop(&mut self) {
+        if !self.settled.load(std::sync::atomic::Ordering::Relaxed) {
+            abort(self.uid);
+        }
+    }
 }
 
 /// 登记一次恢复写涉及的文件（undo_one/redo_one 整事务恢复成功后调用；

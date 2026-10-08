@@ -59,30 +59,33 @@ const GRACE_INTERVAL: Duration = Duration::from_millis(300);
 /// Token 长度（hex 字符数；128-bit → 32 hex chars）。
 const TOKEN_LEN: usize = 32;
 
-/// 内部：生成 128-bit hex token（用进程单调时钟 + pid 播种）。
+/// 内部：生成 128-bit hex token。audit 竞锁 #11：旧实现时间+pid+counter 明文
+/// 拼接（注释自认非加密），本机其他用户可预测；现经 `RandomState`（进程启动时
+/// OS 熵播种的 SipHash 密钥）双实例散列——等价 getrandom 语义，零新依赖。
 fn gen_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let cnt = COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let pid = std::process::id() as u64;
-    let cnt = COUNTER.fetch_add(1, Ordering::Relaxed);
-    // 拼 4 个 u64 → 32 hex chars（hash-like；非加密安全，足够本机 token 用途）
-    let mut bytes = [0u8; 32];
-    for (i, chunk) in [now, pid, cnt, now ^ cnt.wrapping_mul(0x9E37_79B9_7F4A_7C15)]
-        .iter()
-        .enumerate()
-    {
-        let bytes_8 = chunk.to_le_bytes();
-        bytes[i * 8..(i + 1) * 8].copy_from_slice(&bytes_8);
-    }
-    let mut hex = String::with_capacity(TOKEN_LEN);
-    for b in &bytes[..TOKEN_LEN / 2] {
-        hex.push_str(&format!("{b:02x}"));
-    }
-    hex
+    // 两个独立 RandomState 实例 = 两套互不相关的 OS 熵密钥；输入混 pid/时钟/
+    // 计数器保证跨进程、跨 daemon 重启不产出同值。
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u64(pid);
+    h1.write_u64(cnt);
+    let a = h1.finish();
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u64(now);
+    h2.write_u64(cnt);
+    let b = h2.finish();
+    let token = format!("{a:016x}{b:016x}");
+    debug_assert_eq!(token.len(), TOKEN_LEN, "128-bit → 32 hex chars");
+    token
 }
 
 fn boot_ms_now() -> u128 {

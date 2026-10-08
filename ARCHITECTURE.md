@@ -157,7 +157,7 @@ sequenceDiagram
     end
     D->>SUP: tools::find_symbol(ctx)
     SUP->>SUP: key=(canonical(root), lang)<br/>命中实例表？未命中→per-key 加载门→解析 adapter→deps.ensure（可能下载）→spawn（Job Object）→initialize→on_server_ready
-    Note over SUP: 命中且实例数≥max_loaded_ls(3)→LRU 驱逐最久未用
+    Note over SUP: 命中且实例数≥max_loaded_ls(6，SERENA_MAX_LOADED_LS 可调)→LRU 驱逐最久未用
     SUP->>SES: find_symbol(pattern)
     SES->>SES: docsync.ensure_open(file?)<br/>mtime 对账，必要时 didOpen/didChange ↖ mirror: LSPFileBuffer._open_in_ls
     SES->>LS: workspace/symbol {query}（经 writer task）

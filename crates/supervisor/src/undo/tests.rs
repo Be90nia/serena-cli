@@ -522,3 +522,67 @@ async fn touched_files_registered_on_restore_and_drained_by_take() {
     // 作用域外 take（--direct / 无 uid）：恒空，不误取他事务登记。
     assert!(take_touched().is_empty(), "out-of-scope take is empty");
 }
+
+/// audit 竞锁 #10 / 内存 F8：execute_tool future 取消（drop 未收口）→ TxnGuard
+/// 兜底 abort，PENDING/TOUCHED 的 uid 条目不滞留至进程退出。
+#[test]
+fn txn_guard_drop_without_settle_cleans_pending_and_touched() {
+    let u = uid();
+    PENDING.lock().expect("pending").push((
+        u,
+        Entry {
+            path: PathBuf::from("Z:/no/such/x.txt"),
+            before: Some("old".into()),
+            created: false,
+            after: "new".into(),
+            after_sha256: sha256_hex(b"new"),
+        },
+    ));
+    TOUCHED.lock().expect("touched").push((
+        u,
+        TouchedFile {
+            path: "Z:/no/such/x.txt".into(),
+            created: false,
+        },
+    ));
+    {
+        let _txn = TxnGuard::new(u);
+        assert!(
+            PENDING.lock().unwrap().iter().any(|(v, _)| *v == u),
+            "entry alive while guard held"
+        );
+    } // drop 未 settle → 兜底 abort
+    assert!(
+        !PENDING.lock().unwrap().iter().any(|(v, _)| *v == u),
+        "PENDING must be cleaned on cancel path"
+    );
+    assert!(
+        !TOUCHED.lock().unwrap().iter().any(|(v, _)| *v == u),
+        "TOUCHED must be cleaned on cancel path"
+    );
+}
+
+/// settle（commit / 显式 abort 已收口）后 drop 不再动账目——守卫只兜底取消路径，
+/// 不重复处置正常路径的账本。
+#[test]
+fn txn_guard_settled_drop_is_noop() {
+    let u = uid();
+    PENDING.lock().unwrap().push((
+        u,
+        Entry {
+            path: PathBuf::from("Z:/no/such/y.txt"),
+            before: None,
+            created: true,
+            after: "v".into(),
+            after_sha256: sha256_hex(b"v"),
+        },
+    ));
+    let txn = TxnGuard::new(u);
+    txn.settle();
+    drop(txn);
+    assert!(
+        PENDING.lock().unwrap().iter().any(|(v, _)| *v == u),
+        "settled guard must not touch entries"
+    );
+    abort(u); // 清场，不给其他用例留垃圾
+}

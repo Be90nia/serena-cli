@@ -93,17 +93,27 @@ fn ensure_workspace_pyrefly_config(root: &Path) {
 /// ↖ mirror: `workspace_configuration_handler`（pyrefly_server.py@7a296833 :470-490）
 fn configuration_reply(msg: JsonRpc) -> Option<Value> {
     let items = msg.params.as_ref()?.get("items")?.as_array()?.len();
-    let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
-    let python_path = root
-        .as_deref()
-        .and_then(crate::pyright::find_python_interpreter)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "python".to_string());
     let config = json!({
-        "pythonPath": python_path,
+        "pythonPath": cached_python_path(),
         "pyrefly": { "diagnosticMode": "workspace" },
     });
     Some(json!(vec![config; items]))
+}
+
+/// pythonPath 冷启动解析缓存（audit 竞锁 #8）：configuration handler 在该 LS 的
+/// 入站读泵内同步执行，`find_python_interpreter` 的 PATH/venv 磁盘探测会阻塞全部
+/// 入站帧分发（含 pending 请求响应）——进程内解析一次后 handler 只读。
+/// ponytail: 与 PROBE_ROOT 同款单 root 前提；多 root 键化重构时一并迁会话级状态。
+static PYTHON_PATH_CACHE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let root = PROBE_ROOT.lock().expect("PROBE_ROOT poisoned").clone();
+    root.as_deref()
+        .and_then(crate::pyright::find_python_interpreter)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "python".to_string())
+});
+
+fn cached_python_path() -> String {
+    std::sync::LazyLock::force(&PYTHON_PATH_CACHE).clone()
 }
 
 /// uvx 缓存内入口解析：PATH 有 `pyrefly`（uv tool install 形态）优先，否则
@@ -242,6 +252,23 @@ mod tests {
         // 缺 items → None（默认 null 成功应答路径在 client 层）。
         let msg = JsonRpc::request(2, "workspace/configuration", json!({}));
         assert_eq!(configuration_reply(msg), None);
+    }
+
+    #[test]
+    fn python_path_served_from_cold_start_cache() {
+        // audit 竞锁 #8：首读解析并冻结；换 root 后读数必须不变——handler 只读
+        // 缓存，不得在入站泵内重新探测磁盘（每次 configuration 询问一次
+        // PATH/venv 扫描 = 冷启动窗口首查超时放大根因）。
+        let first = cached_python_path();
+        PyreflyServerAdapter.set_project_root(std::path::Path::new("Z:/pyrefly-cache-probe-root"));
+        assert_eq!(
+            cached_python_path(),
+            first,
+            "pythonPath must be frozen at first resolution"
+        );
+        let msg = JsonRpc::request(3, "workspace/configuration", json!({ "items": [{}] }));
+        let reply = configuration_reply(msg).expect("reply");
+        assert_eq!(reply[0]["pythonPath"], json!(first));
     }
 
     #[test]

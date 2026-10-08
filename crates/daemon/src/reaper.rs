@@ -2,12 +2,15 @@
 //!
 //! 常驻 tokio task，30s 巡检（测试可调到 100ms 级）：
 //! - 单 LS 10min 未用 → 卸载
-//! - 超 `max_loaded_ls=3` → LRU 驱逐（卸最久未用的）
+//! - 超 `max_loaded_ls`（默认 6，env 可调）→ LRU 驱逐（卸最久未用的）
 //! - 全局 15min 空闲 → ShutdownDraining：503 + Retry-After（http 层）→
 //!   删 lock → exit 0（排空窗口由 http 层 wait_drain 承担，此处不重复等）
 //!
 //! bd j8b：两个 idle 阈值环境变量可配（`intervals_from_env`），0 = 永不
 //! （自杀/驱逐）；缺省与 Default 一致，默认行为不变。
+//! audit 竞锁 #3：`SERENA_MAX_LOADED_LS` 可配 max_loaded_ls——angular 场景下
+//! 同 workspace 单实例表就达 (angular)+(typescript)+(python)+(go) = 4 条，旧默认
+//! 3 会陷入 LRU 冷启动循环。
 //!
 //! ponytail: 全部状态复用 supervisor.last_used + daemon AppState.draining，
 //! 不另建 reaper 私有状态表。
@@ -40,7 +43,7 @@ impl Default for ReaperIntervals {
             scan: Duration::from_secs(30),
             ls_idle: Duration::from_secs(10 * 60),
             global_idle: Duration::from_secs(15 * 60),
-            max_loaded_ls: 3,
+            max_loaded_ls: 6,
         }
     }
 }
@@ -68,6 +71,8 @@ fn parse_secs(raw: Option<&str>, var: &str, default: u64) -> u64 {
 /// 生产 intervals：idle 阈值环境变量可配（bd j8b）。
 /// - `SERENA_IDLE_TIMEOUT_SECS`：全局 idle 自杀阈值（缺省 = Default 的 900；0 = 永不自杀）
 /// - `SERENA_LS_IDLE_EVICTION_SECS`：单 LS 空闲驱逐阈值（缺省 = Default 的 600；0 = 永不驱逐）
+/// - `SERENA_MAX_LOADED_LS`：LRU 驱逐线（audit 竞锁 #3；缺省 = Default 的 6；
+///   0 非法——会陷入持续驱逐，回默认）
 pub fn intervals_from_env() -> ReaperIntervals {
     let base = ReaperIntervals::default();
     ReaperIntervals {
@@ -83,7 +88,31 @@ pub fn intervals_from_env() -> ReaperIntervals {
             "SERENA_LS_IDLE_EVICTION_SECS",
             base.ls_idle.as_secs(),
         )),
+        max_loaded_ls: parse_count(
+            std::env::var("SERENA_MAX_LOADED_LS").ok().as_deref(),
+            "SERENA_MAX_LOADED_LS",
+            base.max_loaded_ls,
+        ),
         ..base
+    }
+}
+
+/// 环境变量正整数解析（audit 竞锁 #3，同 parse_secs 的宽容回退语义）：
+/// 缺失 → 默认；非数字/空串/0（持续驱逐无意义）→ warn 后用默认。
+fn parse_count(raw: Option<&str>, var: &str, default: usize) -> usize {
+    match raw.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) if n > 0 => n,
+        _ => {
+            if raw.is_some() {
+                tracing::warn!(
+                    env = var,
+                    value = raw.unwrap_or(""),
+                    default,
+                    "invalid value; using default"
+                );
+            }
+            default
+        }
     }
 }
 
@@ -299,7 +328,8 @@ mod tests {
         assert_eq!(iv.scan, Duration::from_secs(30));
         assert_eq!(iv.ls_idle, Duration::from_secs(600));
         assert_eq!(iv.global_idle, Duration::from_secs(900));
-        assert_eq!(iv.max_loaded_ls, 3);
+        // audit 竞锁 #3：angular 场景同 workspace 单实例表 4 条，默认 6 留余量。
+        assert_eq!(iv.max_loaded_ls, 6);
     }
 
     /// bd j8b：env 秒数解析——缺失/非法（负数、非数字、空串）回默认，0 合法。
@@ -313,6 +343,23 @@ mod tests {
         assert_eq!(parse_secs(Some("-1"), "X", 900), 900, "负数非法 → 默认");
         assert_eq!(parse_secs(Some("abc"), "X", 900), 900);
         assert_eq!(parse_secs(Some(""), "X", 900), 900);
+    }
+
+    /// audit 竞锁 #3：max_loaded_ls env 解析——缺失回默认；正整数生效；
+    /// 0/非数字/空串非法回默认（0 会陷入持续驱逐，与 idle 阈值的 0=永不 语义相反）。
+    #[test]
+    fn parse_count_defaults_on_missing_or_invalid() {
+        assert_eq!(parse_count(None, "X", 6), 6);
+        assert_eq!(parse_count(Some("8"), "X", 6), 8);
+        assert_eq!(parse_count(Some(" 4 "), "X", 6), 4, "允许首尾空白");
+        assert_eq!(
+            parse_count(Some("0"), "X", 6),
+            6,
+            "0 = 持续驱逐，非法 → 默认"
+        );
+        assert_eq!(parse_count(Some("-2"), "X", 6), 6);
+        assert_eq!(parse_count(Some("abc"), "X", 6), 6);
+        assert_eq!(parse_count(Some(""), "X", 6), 6);
     }
 
     /// bd j8b：global_idle=0 → 永不自杀（覆盖原 400ms 触发窗后仍不 draining）。
