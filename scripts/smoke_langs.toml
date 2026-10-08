@@ -38,6 +38,10 @@
 #   runner 事实锚 = actions/runner-images images/{macos/macos-15-arm64,
 #   windows/Windows2025}-Readme.md（Rustup 1.29/PowerShell 7.6/R 4.6.1/Ruby 3.3/
 #   Python 3.12+3.14/JAVA_HOME_21+25 双平台预装）。
+#   runner_remark（bd serena-rust-kwva，linux 侧版本账）：linux 门跑 ubuntu-24.04
+#   （stress-ls.yml / ls-smoke.yml 硬 pin；镜像漂移会破上面的门分类锚，升 pin 前
+#   先对账 runner-images Readme）；m0-ci.yml 门禁用 ubuntu-latest（随 GitHub 漂移，
+#   2026-10 时点 = 24.04，仅 cargo test 门禁无门分类依赖，允许漂）。
 #   ── W1-W5 接入模板（加一门 = 两步）──────────────────────────────────────
 # 1. 本清单加一个 [[lang]] 块（字段见下）；
 # 2. scripts/smoke_fixtures/ 放一个最小 fixture（1 个具名符号，底线= documentSymbol 非空）。

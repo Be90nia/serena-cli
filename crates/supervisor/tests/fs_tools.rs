@@ -21,7 +21,7 @@ async fn read_file_full_returns_all_lines() {
     let d = dir("full");
     let p = d.join("a.txt");
     fs::write(&p, "l1\nl2\nl3\nl4\nl5\n").unwrap();
-    let r = fs_tools::read_file(&d, "a.txt", None, None).await.unwrap();
+    let r = fs_tools::read_file(&d, "a.txt", None, None, true).await.unwrap();
     assert_eq!(r.content, "l1\nl2\nl3\nl4\nl5");
     assert_eq!(r.total_lines, 5);
     assert_eq!(r.start_line, 1);
@@ -33,7 +33,7 @@ async fn read_file_slice_by_line_range() {
     let d = dir("slice");
     let p = d.join("a.txt");
     fs::write(&p, "l1\nl2\nl3\nl4\nl5\n").unwrap();
-    let r = fs_tools::read_file(&d, "a.txt", Some(2), Some(4))
+    let r = fs_tools::read_file(&d, "a.txt", Some(2), Some(4), true)
         .await
         .unwrap();
     assert_eq!(r.content, "l2\nl3\nl4");
@@ -42,10 +42,37 @@ async fn read_file_slice_by_line_range() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn read_file_end_line_beyond_eof_clamps() {
+    // bd mfxg：默认 clamp —— end_line 超 EOF 收到末行，不再 BAD_ARGS。
+    let d = dir("clamp");
+    fs::write(d.join("a.txt"), "l1\nl2\n").unwrap();
+    let r = fs_tools::read_file(&d, "a.txt", Some(1), Some(99), true)
+        .await
+        .unwrap();
+    assert_eq!(r.content, "l1\nl2");
+    assert_eq!(r.end_line, 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_file_no_clamp_keeps_strict_bounds() {
+    // bd 66al：--no-clamp 恢复严格越界 BAD_ARGS。
+    let d = dir("noclamp");
+    fs::write(d.join("a.txt"), "l1\nl2\n").unwrap();
+    let err = fs_tools::read_file(&d, "a.txt", Some(1), Some(99), false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, fs_tools::FsError::BadArgs { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn read_file_out_of_range_returns_bad_args() {
     let d = dir("oor");
     fs::write(d.join("a.txt"), "l1\nl2\n").unwrap();
-    let err = fs_tools::read_file(&d, "a.txt", Some(1), Some(99))
+    // start 超 EOF 任何模式下都是 BAD_ARGS。
+    let err = fs_tools::read_file(&d, "a.txt", Some(9), None, true)
         .await
         .unwrap_err();
     assert!(
@@ -60,7 +87,7 @@ async fn read_file_escape_root_rejected() {
     // 路径必须解析后落在 root 外（用绝对路径跨 root）。
     let other = std::env::temp_dir().join("serena-t23-other-not-exist");
     let _ = fs::create_dir_all(&other);
-    let err = fs_tools::read_file(&d, other.to_str().unwrap(), None, None)
+    let err = fs_tools::read_file(&d, other.to_str().unwrap(), None, None, true)
         .await
         .unwrap_err();
     assert!(
@@ -115,10 +142,34 @@ async fn find_file_glob_matches_names() {
     fs::write(d.join("src/test.py"), "").unwrap();
     fs::write(d.join("README.md"), "").unwrap();
 
+    // bd 75k3：含通配符的 pattern 按相对路径匹配 —— `*.rs` 不跨目录，src/ 下的
+    // 文件不命中。
     let hits = fs_tools::find_file(&d, "*.rs", None, 100).unwrap();
+    assert_eq!(hits.len(), 0, "top-level glob must not cross dirs: {hits:?}");
+    // `**/*.rs` 递归任意深度。
+    let hits = fs_tools::find_file(&d, "**/*.rs", None, 100).unwrap();
     assert_eq!(hits.len(), 2, "got {hits:?}");
     assert!(hits.iter().any(|p| p.ends_with("main.rs")), "got {hits:?}");
     assert!(hits.iter().any(|p| p.ends_with("lib.rs")), "got {hits:?}");
+    // 纯文件名（无通配符）保持任意深度文件名匹配。
+    let hits = fs_tools::find_file(&d, "main.rs", None, 100).unwrap();
+    assert_eq!(hits.len(), 1, "got {hits:?}");
+    // 限定一层目录的 glob。
+    let hits = fs_tools::find_file(&d, "src/*.py", None, 100).unwrap();
+    assert_eq!(hits.len(), 1, "got {hits:?}");
+    assert!(hits[0].ends_with("src/test.py"), "got {hits:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn find_file_top_level_glob_matches_root_files() {
+    let d = dir("find-top");
+    fs::create_dir_all(d.join("src")).unwrap();
+    fs::write(d.join("top.rs"), "").unwrap();
+    fs::write(d.join("src/nested.rs"), "").unwrap();
+
+    let hits = fs_tools::find_file(&d, "*.rs", None, 100).unwrap();
+    assert_eq!(hits.len(), 1, "got {hits:?}");
+    assert_eq!(hits[0], "top.rs");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -77,7 +77,7 @@ async fn find_referencing_symbols_returns_callers_with_containers() {
     }
 
     // 在 foo.h:1 "foo" 第一次出现处（col=5，0-based=4）。
-    let hits = sup
+    let (hits, _raw_snip) = sup
         .tool_referencing_symbols(&root, "foo.h", 0, 4, None)
         .await
         .expect("refs syms");
@@ -108,7 +108,7 @@ async fn find_referencing_code_snippets_returns_snippets() {
         let _ = sup.tool_overview(&root, f, None).await.expect("overview");
     }
 
-    let hits = sup
+    let (hits, _truncated, _raw_snip) = sup
         .tool_referencing_code_snippets(&root, "foo.h", 0, 4, 2, 50, None)
         .await
         .expect("refs snips");

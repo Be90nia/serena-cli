@@ -72,8 +72,17 @@ pub struct ClangdRelease {
 }
 
 /// clangd 版本（写死。MVP 阶段不加 update 流程）。
+///
+/// bd 1sx5（18.1.5 → 19.1.7）兼容性说明：LLVM 19.1.x 起 Linux/macOS x64 的
+/// release 资产换用新式命名 `LLVM-<ver>-<OS>-<ARCH>.tar.xz`（旧式
+/// `clang+llvm-<ver>-<triple>` 在这些目标不再发布；Windows x64 仍保留旧式）。
+/// 顶层目录 = 包文件名——release/19.x 分支 `.github/workflows/release-binaries.yml`
+/// :117 生成 basename、:208 `BOOTSTRAP_CPACK_PACKAGE_FILE_NAME` 用同名打 CPack 包
+/// （CPack 顶层目录 = 包名，18.1.5 旧式包同机制先例），bin 路径随之 `<包名>/bin/clangd`。
+/// clangd 协议面（documentSymbol 探针 / hover / diagnosticProvider pull）在 19.x
+/// 无破坏性变更；sha256 仍留空（见下），首启走 `--allow-unsigned-sha` 越狱或系统包管理器。
 #[allow(dead_code)]
-const CLANGD_VERSION: &str = "18.1.5";
+const CLANGD_VERSION: &str = "19.1.7";
 
 /// clangd (Os, Arch) → (url, sha256) 矩阵。
 ///
@@ -87,24 +96,24 @@ pub fn clangd_release_for(os: Os, arch: Arch) -> Option<ClangdRelease> {
     let _ = os; // 矩阵键；当前 4 条目均 x86_64/aarch64 显式列出
     match (os, arch) {
         (Os::Windows, Arch::X86_64) => Some(ClangdRelease {
-            url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.5/clang+llvm-18.1.5-x86_64-pc-windows-msvc.tar.xz",
+            url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/clang+llvm-19.1.7-x86_64-pc-windows-msvc.tar.xz",
             sha256: "",
-            binary_path: "clang+llvm-18.1.5-x86_64-pc-windows-msvc/bin/clangd.exe",
+            binary_path: "clang+llvm-19.1.7-x86_64-pc-windows-msvc/bin/clangd.exe",
         }),
         (Os::Linux, Arch::X86_64) => Some(ClangdRelease {
-            url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.5/clang+llvm-18.1.5-x86_64-linux-gnu-ubuntu-22.04.tar.xz",
+            url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-Linux-X64.tar.xz",
             sha256: "",
-            binary_path: "clang+llvm-18.1.5-x86_64-linux-gnu-ubuntu-22.04/bin/clangd",
+            binary_path: "LLVM-19.1.7-Linux-X64/bin/clangd",
         }),
         (Os::Macos, Arch::X86_64) => Some(ClangdRelease {
-            url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.5/clang+llvm-18.1.5-x86_64-apple-darwin.tar.xz",
+            url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-macOS-X64.tar.xz",
             sha256: "",
-            binary_path: "clang+llvm-18.1.5-x86_64-apple-darwin/bin/clangd",
+            binary_path: "LLVM-19.1.7-macOS-X64/bin/clangd",
         }),
         (Os::Macos, Arch::Aarch64) => Some(ClangdRelease {
-            url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.5/clang+llvm-18.1.5-aarch64-apple-darwin.tar.xz",
+            url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-macOS-ARM64.tar.xz",
             sha256: "",
-            binary_path: "clang+llvm-18.1.5-aarch64-apple-darwin/bin/clangd",
+            binary_path: "LLVM-19.1.7-macOS-ARM64/bin/clangd",
         }),
         (Os::Windows, Arch::Aarch64) | (Os::Linux, Arch::Aarch64) => None,
     }
@@ -155,8 +164,8 @@ pub struct RustAnalyzerRelease {
 
 /// 用户安装失败时的 hint（ARCHITECTURE §6 `ToolError::NotInstalled.hint`）。
 pub fn clangd_install_hint() -> &'static str {
-    "install clangd 18.1.5 from https://github.com/llvm/llvm-project/releases/tag/llvmorg-18.1.5 \
-     or via system package manager (apt: clangd-18, brew: llvm@18, choco: llvm)"
+    "install clangd 19.1.7 from https://github.com/llvm/llvm-project/releases/tag/llvmorg-19.1.7 \
+     or via system package manager (apt: clangd-19, brew: llvm@19, choco: llvm)"
 }
 
 /// 验证下载字节的 sha256（hex 格式，64 字符）。
@@ -381,8 +390,33 @@ mod tests {
     #[test]
     fn install_hint_mentions_version() {
         let hint = clangd_install_hint();
-        assert!(hint.contains("18.1.5"));
+        assert!(hint.contains("19.1.7"));
         assert!(hint.contains("install"));
+    }
+
+    /// bd 1sx5：版本钉单测——CLANGD_VERSION 与矩阵 URL/binary_path 三处同版
+    /// （升版只改一处会在此红）。无本机 clangd 也可跑的纯常量断言。
+    #[test]
+    fn clangd_version_pinned_across_matrix() {
+        assert_eq!(CLANGD_VERSION, "19.1.7");
+        for (os, arch) in [
+            (Os::Windows, Arch::X86_64),
+            (Os::Linux, Arch::X86_64),
+            (Os::Macos, Arch::X86_64),
+            (Os::Macos, Arch::Aarch64),
+        ] {
+            let r = clangd_release_for(os, arch).expect("4 主流平台必须有条目");
+            assert!(
+                r.url.contains("llvmorg-19.1.7"),
+                "URL 必须钉 19.1.7: {}",
+                r.url
+            );
+            assert!(
+                r.binary_path.contains("19.1.7"),
+                "binary_path 顶层目录必须含版本（CPack 包名 = 顶层目录）: {}",
+                r.binary_path
+            );
+        }
     }
 
     #[test]
@@ -422,8 +456,8 @@ mod tests {
                  §2.9 已知 unknown）。若此断言失败 = 有人填了假值，违反 §2.9。",
             );
             assert!(
-                r.url.contains("llvm.org-18.1.5") || r.url.contains("llvm-project"),
-                "clangd URL 锚必须为 llvm-project 18.1.5"
+                r.url.contains("llvm.org-19.1.7") || r.url.contains("llvm-project"),
+                "clangd URL 锚必须为 llvm-project 19.1.7"
             );
         }
     }

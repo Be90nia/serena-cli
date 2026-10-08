@@ -124,7 +124,14 @@ const TOOL_NAMES: &[&str] = &[
     "create-text-file",
     "undo",
     "redo",
+    // recipe 批1 地基三原子命令。
+    "test",
+    "diff",
+    "find-test",
     "status",
+    "project-info",
+    "change-history",
+    "recipe",
     "stop-all",
     "install",
     "uninstall",
@@ -899,8 +906,8 @@ mod tests {
 
     #[test]
     fn position_shapes_consistent() {
-        assert!(!POSITION_TOOLS.is_empty());
-        assert!(!PATH_FIRST_TOOLS.is_empty());
+        // 1.89 clippy const_is_empty：const 表上 .is_empty() 恒 false 被拒——改 len 断言。
+        assert!(POSITION_TOOLS.len() + PATH_FIRST_TOOLS.len() > 0);
         for s in POSITION_TOOLS {
             assert!(TOOL_NAMES.contains(&s.tool), "{} not in TOOL_NAMES", s.tool);
             assert!(!s.line_args.is_empty());

@@ -417,6 +417,83 @@ pub fn path_to_uri(path: &Path) -> Result<Uri> {
     })
 }
 
+/// LS 返回的 `file://` URI → 本地路径（bd avw / audit-secdesign S7 的 lsp-core
+/// 侧归一原语）：percent-decode + Windows 盘符大写 + dunce canonicalize（失败退
+/// 词法形态）。凡把 **LS 提供的 uri** 变成磁盘路径再读/写的消费方，必须经本函数
+/// 归一后走 [`uri_in_root`] 做 containment 过滤——LS 是半信任面，恶意/异常 uri
+/// （绝对路径注入、`..` 穿越、盘符小写绕过前缀比对）不得触发越权读。
+pub fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    use percent_encoding::percent_decode_str;
+    let stripped = uri.strip_prefix("file://")?;
+    // Windows: `file:///C:/foo` → `C:/foo`（保留 `//server/share` UNC 形态）。
+    let decoded = percent_decode_str(stripped).decode_utf8().ok()?;
+    let mut s = if cfg!(windows) && decoded.starts_with('/') && !decoded.starts_with("//") {
+        decoded[1..].to_string()
+    } else {
+        decoded.to_string()
+    };
+    // 盘符小写归一（RA 推 `file:///d:/` 小写盘符的 Windows 双重身份教训）：
+    // 存在路径 canonicalize 会纠 case，此兜底保证不存在的词法路径也能对上前缀。
+    if cfg!(windows)
+        && s.as_bytes().get(1) == Some(&b':')
+        && s.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+    {
+        s[..1].make_ascii_uppercase();
+    }
+    let path = std::path::PathBuf::from(s);
+    Some(dunce::canonicalize(&path).unwrap_or_else(|_| lexically_normalize(&path)))
+}
+
+/// 词法归一：解析 `.`/`..` 组件（canonicalize 只对存在的路径生效，LS uri 指向
+/// 不存在文件时 containment 靠它拒绝 `..` 穿越）。
+fn lexically_normalize(p: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// [`uri_to_path`] 的 containment 门：LS uri 归一后的路径是否落在 `root` 内。
+/// 双侧 canonicalize（失败退词法归一形态），Windows 前缀比对大小写不敏感
+/// （路径/盘符双重身份）；`root == path` 视为在内。根自身非绝对 → false（调用方
+/// 传错 root 不得静默放行）。
+pub fn uri_in_root(uri: &str, root: &Path) -> bool {
+    if !root.is_absolute() {
+        return false;
+    }
+    let Some(path) = uri_to_path(uri) else {
+        return false;
+    };
+    let root_canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    contains_norm(&lexically_normalize(&path), &lexically_normalize(&root_canon))
+}
+
+/// 前缀包含比对：分隔符统一 `/`，Windows 不分大小写（盘符/路径双重身份），
+/// 边界守卫保证 `/proj-evil` 不命中 root `/proj`。
+fn contains_norm(path: &Path, root: &Path) -> bool {
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    let (p, r) = (norm(path), norm(root));
+    if p == r {
+        return true;
+    }
+    p.strip_prefix(&r).is_some_and(|rest| rest.starts_with('/'))
+}
+
 fn make_did_open(uri: &Uri, text: &str, version: i64, language_id: &str) -> Value {
     json!({
         "textDocument": {
@@ -495,4 +572,64 @@ fn evict_lru_idle_locked(
         map.remove(uri);
     }
     to_close
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// bd avw：percent-decode + Windows 盘符大写归一（supervisor uri_to_path
+    /// 既有单测的形态对齐版）。
+    #[test]
+    fn uri_to_path_decodes_percent_and_normalizes() {
+        let p = uri_to_path("file:///d%3A/proj/foo%20bar/a.rs").expect("file uri");
+        let s = p.to_string_lossy().replace('\\', "/");
+        assert!(!s.contains('%'), "percent 序列必须解码: {s}");
+        assert!(s.ends_with("foo bar/a.rs"), "got: {s}");
+        if cfg!(windows) {
+            assert!(s.starts_with("D:/"), "盘符必须大写: {s}");
+        }
+    }
+
+    #[test]
+    fn uri_to_path_rejects_non_file_scheme() {
+        assert!(uri_to_path("https://x/a.rs").is_none());
+        assert!(uri_to_path("untitled:untitled-1").is_none());
+    }
+
+    /// bd avw：containment 门——root 内放行；兄弟目录共享前缀拒；`..` 穿越
+    /// （目标不存在、canonicalize 失效的词法路径）拒；非绝对 root 恒拒。
+    #[test]
+    fn uri_in_root_contains_and_rejects_escape() {
+        let base = std::env::temp_dir();
+        let root_dir = base.join("serena_avw_test");
+        let inside = root_dir.join("a.rs");
+        std::fs::create_dir_all(&root_dir).unwrap();
+        std::fs::write(&inside, b"x").unwrap();
+        let in_uri = path_to_uri_str(&inside);
+        assert!(
+            uri_in_root(&in_uri, &root_dir),
+            "root 内文件必须在: {in_uri}"
+        );
+
+        // 兄弟目录共享前缀（…/serena_avw_test2）不得命中 root（…/serena_avw_test）。
+        let sibling_uri = path_to_uri_str(&base.join("serena_avw_test2/a.rs"));
+        assert!(
+            !uri_in_root(&sibling_uri, &root_dir),
+            "兄弟目录（共享前缀）必须拒: {sibling_uri}"
+        );
+
+        // `..` 穿越且目标不存在（canonicalize 失效 → 词法归一兜底拒收）。
+        let escape_uri =
+            path_to_uri_str(&root_dir.join("../../serena_avw_escape/x"));
+        assert!(
+            !uri_in_root(&escape_uri, &root_dir),
+            "穿越路径归一后落在 root 外必须拒: {escape_uri}"
+        );
+
+        // root 非绝对 → 恒 false。
+        assert!(!uri_in_root(&in_uri, Path::new("relative/root")));
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
 }

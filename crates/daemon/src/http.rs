@@ -102,6 +102,8 @@ pub struct ObsState {
     recent_agents: Arc<std::sync::Mutex<VecDeque<String>>>,
     /// 同一 invocation_id 的历史出现次数（retry_count 差分）+ 首见序（FIFO 驱逐）。
     seen: Arc<std::sync::Mutex<SeenInvocations>>,
+    /// bd xwi：当前日志代内已追加行数（轮转判据之一，轮转后清零）。
+    log_lines: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Default)]
@@ -246,7 +248,7 @@ async fn tools_post(
     state
         .in_flight
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let _in_flight = InFlightGuard {
+    let in_flight = InFlightGuard {
         counter: Arc::clone(&state.in_flight),
     };
     crate::reaper::note_activity();
@@ -283,11 +285,39 @@ async fn tools_post(
     let cold_start = state.start_ts.elapsed() < COLD_START_WINDOW;
     let wait_gen = req.args.get("wait_gen").and_then(|v| v.as_u64());
     let cache_before = state.supervisor.cache_hits_total();
-    match state
-        .supervisor
-        .execute_tool(&name, &req.project_root, req.args, req.lang.as_deref())
+    // bd wy1：写类工具（undo::WRITE_TOOLS）断连 detach —— handler future 随客户端
+    // 断开被 drop 时，半途取消会让 TxnGuard 兜底 abort，已落盘的写丢账（Q4 根因）。
+    // spawn 进运行时独立执行（JoinHandle drop 仅 detach 不取消），事务 commit/abort
+    // 必然收口；正常路径 handler 照常 await 结果返回响应，断连客户端重连后经
+    // undo/diff 可见该账。InFlightGuard 随任务转移：断连后计数保持到任务真正完成，
+    // 排空/空闲自杀判定仍以实际执行为准。
+    let exec = {
+        let sup = Arc::clone(&state.supervisor);
+        let tool = name.clone();
+        let root = req.project_root.clone();
+        let args = req.args;
+        let lang = req.lang.clone();
+        async move { sup.execute_tool(&tool, &root, args, lang.as_deref()).await }
+    };
+    let result = if supervisor::undo::is_write_tool(&name) {
+        match tokio::spawn(async move {
+            let _detached = in_flight;
+            exec.await
+        })
         .await
-    {
+        {
+            Ok(r) => r,
+            // 仅任务体 panic 时走到；写门/事务自身的错误已在 r 内。
+            Err(e) => Err(supervisor::ToolError::Protocol {
+                tool: name.clone(),
+                reason: format!("detached write task failed: {e}"),
+            }),
+        }
+    } else {
+        let _held = in_flight;
+        exec.await
+    };
+    match result {
         Ok(mut data) => {
             if let Some(prev) = prev_project.filter(|p| *p != req.project_root) {
                 let switch = format!("project switched: {prev} -> {}", req.project_root);
@@ -429,6 +459,62 @@ struct InvocationRecord<'a> {
     cold_start: bool,
 }
 
+/// bd xwi：invocations.jsonl 封顶轮转参数。单代大小/条数任一越限即轮转；
+/// 留 `KEEP` 代历史（`.1` 最新 … `.N` 最旧），最旧删除。磁盘上界 =
+/// `(KEEP+1) × 100MB`。
+const INVOCATION_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024;
+/// 条数封顶（超短行的极端场景兜底）。
+const INVOCATION_LOG_MAX_LINES: u64 = 1_000_000;
+/// 保留的轮转代数（.1 ~ .2）。
+const INVOCATION_LOG_KEEP: u32 = 2;
+/// 轮转探测节流窗：每 N 次追加才做一次 metadata 探测（高频工具调用下
+/// 每条都 stat 是纯浪费；8MB 增量粒度足够，越限滞后 ≤ 一个节流窗）。
+const INVOCATION_LOG_CHECK_EVERY: u64 = 4096;
+
+/// 第 i 代轮转文件路径（`invocations.jsonl.1` …）。
+fn invocation_log_gen(path: &std::path::Path, i: u32) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(format!(".{i}"));
+    std::path::PathBuf::from(s)
+}
+
+/// 轮转：当前代后移一代，最旧删除。失败只 warn——日志轮转绝不影响工具执行。
+/// 逐代先 remove 再 rename：消费端（tail -f 等）占住旧代时 Windows rename
+/// 会共享冲突，remove 失败也不阻断后续代次位移。
+pub(crate) fn rotate_invocation_log(path: &std::path::Path, keep: u32) {
+    let _ = std::fs::remove_file(invocation_log_gen(path, keep));
+    for i in (1..keep).rev() {
+        let _ = std::fs::rename(invocation_log_gen(path, i), invocation_log_gen(path, i + 1));
+    }
+    if let Err(e) = std::fs::rename(path, invocation_log_gen(path, 1)) {
+        eprintln!(
+            "[serena] invocation log rotate failed (path={:?}): {e}; append continues",
+            path
+        );
+    } else {
+        tracing::info!(path = %path.display(), keep, "invocation log rotated");
+    }
+}
+
+/// 越限即轮转（bd xwi）。返回是否轮转了。
+/// 大小判据读 metadata（对启动时接管超大旧文件也成立）；条数由调用方累计。
+pub(crate) fn rotate_invocation_log_if_oversized(
+    path: &std::path::Path,
+    max_bytes: u64,
+    keep: u32,
+) -> bool {
+    let oversized = std::fs::metadata(path).map(|m| m.len() >= max_bytes).unwrap_or(false);
+    if oversized {
+        rotate_invocation_log(path, keep);
+    }
+    oversized
+}
+
+/// serve 启动时的生产参数轮转检查（bd xwi：接管超大旧日志）。
+pub(crate) fn rotate_invocation_log_at_startup(path: &std::path::Path) {
+    rotate_invocation_log_if_oversized(path, INVOCATION_LOG_MAX_BYTES, INVOCATION_LOG_KEEP);
+}
+
 /// 追加一条工具调用记录到重放日志（d3a）。JSONL，行首键即 invocation_id
 /// （`grep <id> invocations.jsonl` 即索引）。写失败只 warn 不影响工具执行。
 /// bd e1p/dt1：尾部追加 cache_hit/wait_gen/pending/cold_start/retry_count——
@@ -440,6 +526,21 @@ fn log_invocation(state: &AppState, rec: InvocationRecord<'_>) {
         .record(rec.invocation_id, rec.tool, rec.error_code);
     if state.invocation_log_path.as_os_str().is_empty() {
         return;
+    }
+    // bd xwi：封顶轮转。代内行数达节流窗倍数才探测一次；大小或条数任一
+    // 越限即轮转（本代行数计数随之清零）。
+    let lines = state.obs.log_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if lines % INVOCATION_LOG_CHECK_EVERY == 0 {
+        let oversized = std::fs::metadata(&state.invocation_log_path)
+            .map(|m| m.len() >= INVOCATION_LOG_MAX_BYTES)
+            .unwrap_or(false);
+        if oversized || lines >= INVOCATION_LOG_MAX_LINES {
+            rotate_invocation_log(&state.invocation_log_path, INVOCATION_LOG_KEEP);
+            state
+                .obs
+                .log_lines
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     let line = json!({
         "invocation_id": rec.invocation_id,
@@ -457,7 +558,7 @@ fn log_invocation(state: &AppState, rec: InvocationRecord<'_>) {
         "cold_start": rec.cold_start,
         "retry_count": retry_count,
     });
-    if let Err(e) = std::fs::OpenOptions::new()
+    if let Err(e) = crate::lockfile::secure_open()
         .create(true)
         .append(true)
         .open(&state.invocation_log_path)
@@ -473,11 +574,15 @@ fn log_invocation(state: &AppState, rec: InvocationRecord<'_>) {
 /// `GET /status`：纯诊断查询。不刷 activity 时钟——idle 监控脚本轮询 status
 /// 不能让 15min idle 自杀永不触发（bd b40）；真正的负载信号是 in_flight 计数。
 async fn status_get(State(state): State<AppState>) -> Response {
-    let loaded = state
-        .supervisor
-        .loaded_entries()
+    // bd b09i：结构化 {lang, sessions}——同 lang 多 (root,lang) 键折叠计数，
+    // 替代旧 ["rust x3"] 字符串形态。
+    let mut by_lang: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for k in state.supervisor.loaded_entries() {
+        *by_lang.entry(k.lang.to_string()).or_insert(0) += 1;
+    }
+    let loaded = by_lang
         .into_iter()
-        .map(|k| k.lang.to_string())
+        .map(|(lang, sessions)| crate::dto::LoadedLs { lang, sessions })
         .collect::<Vec<_>>();
     let resp = StatusResponse {
         uptime_secs: state.uptime_secs(),
@@ -490,6 +595,11 @@ async fn status_get(State(state): State<AppState>) -> Response {
         invocation_count: state.obs.invocation_count(),
         recent_errors: state.obs.recent_errors_snapshot(),
         recent_agents: state.obs.recent_agents_snapshot(),
+        // bd ulq：版本与 binary 路径自检。
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        binary_path: std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string()),
     };
     (StatusCode::OK, Json(resp)).into_response()
 }
@@ -605,6 +715,9 @@ async fn batch_handler(State(state): State<AppState>, Json(req): Json<BatchReque
     state
         .in_flight
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    // bd wy1 注：batch 的计数 guard 不随写任务转移（整批一把，per-call 转移要
+    // 穿 run_batch 两层泛型）——断连时计数提前归零只损观测精度；写账完整性由
+    // execute_batch_call 内层 spawn 独立保证。
     let _in_flight = InFlightGuard {
         counter: Arc::clone(&state.in_flight),
     };
@@ -662,15 +775,27 @@ async fn execute_batch_call(
     sup: &Arc<dyn supervisor::SupervisorTrait>,
     call: BatchCall,
 ) -> BatchResult {
-    match sup
-        .execute_tool(
-            &call.tool,
-            &call.project_root,
-            call.args,
-            call.lang.as_deref(),
-        )
-        .await
-    {
+    // bd wy1：写类调用同样 detach —— batch_handler 的 run_batch JoinSet 在
+    // 客户端断连（handler drop）时 abort 内含任务，写工具半途取消丢账；
+    // tokio::spawn 的独立任务不受 JoinSet abort 影响，跑完 commit/abort 收口。
+    let sup2 = Arc::clone(sup);
+    let tool = call.tool.clone();
+    let root = call.project_root.clone();
+    let lang = call.lang.clone();
+    let args = call.args;
+    let exec = async move { sup2.execute_tool(&tool, &root, args, lang.as_deref()).await };
+    let r = if supervisor::undo::is_write_tool(&call.tool) {
+        match tokio::spawn(exec).await {
+            Ok(r) => r,
+            Err(e) => Err(supervisor::ToolError::Protocol {
+                tool: call.tool.clone(),
+                reason: format!("detached write task failed: {e}"),
+            }),
+        }
+    } else {
+        exec.await
+    };
+    match r {
         Ok(value) => BatchResult {
             tool: call.tool,
             ok: true,
@@ -753,6 +878,19 @@ mod tests {
                 delay: None,
                 echo: true,
                 result: tokio::sync::Mutex::new(None),
+            }
+        }
+        /// bd wy1：慢写任务 + 完成信号 —— 断连 detach 测试用。
+        fn detached_write_probe(
+            tx: tokio::sync::mpsc::Sender<&'static str>,
+        ) -> Self {
+            Self {
+                delay: Some(std::time::Duration::from_millis(150)),
+                echo: false,
+                result: tokio::sync::Mutex::new(Some(Box::new(move || {
+                    let _ = tx.try_send("done");
+                    Ok(json!("replace-body"))
+                }))),
             }
         }
     }
@@ -1199,7 +1337,11 @@ mod tests {
         assert_eq!(status, AxStatus::OK);
         let body = body.expect("json body");
         assert!(body["uptime_secs"].is_u64());
-        assert_eq!(body["loaded_ls"], json!(["rust"]));
+        assert_eq!(
+            body["loaded_ls"],
+            json!([{ "lang": "rust", "sessions": 1 }]),
+            "bd b09i：结构化 lang/sessions 对象"
+        );
         assert_eq!(body["draining"], false);
     }
 
@@ -1316,6 +1458,29 @@ mod tests {
     }
 
     /// 真实计数路径：请求执行中 in_flight==1，完成后归零。
+    #[tokio::test]
+    async fn write_tool_survives_client_disconnect() {
+        // bd wy1：写类请求的 handler 被取消（模拟客户端断连 drop）时，detach 的
+        // 执行任务必须跑完（commit/abort 收口），不能被一起取消丢账。
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let st = state("secret", MockSupervisor::detached_write_probe(tx));
+        let router = router(st);
+        let req = req_post(
+            "/tools/replace-body",
+            Some("secret"),
+            json!({"project_root": "D:/x", "args": {}}),
+        );
+        let handle = tokio::spawn(router.oneshot(req));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        handle.abort(); // 模拟断连：axum drop handler future
+        let done = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        assert_eq!(
+            done,
+            Ok(Some("done")),
+            "断连后 detach 的写任务必须跑完并发完成信号"
+        );
+    }
+
     #[tokio::test]
     async fn inflight_tracks_active_tool_call() {
         let st = state(
@@ -1529,5 +1694,100 @@ mod tests {
         let agents = body["recent_agents"].as_array().expect("agents ring");
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0], "err-agen", "invocation_id 前 8 字符前缀");
+    }
+
+    // ---- bd xwi：invocations.jsonl 封顶轮转 ----
+
+    #[test]
+    fn invocation_log_rotate_shifts_generations_and_drops_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations.jsonl");
+        std::fs::write(&log, "gen0\n").unwrap();
+        std::fs::write(invocation_log_gen(&log, 1), "gen1\n").unwrap();
+        std::fs::write(invocation_log_gen(&log, 2), "gen2\n").unwrap();
+        rotate_invocation_log(&log, 2);
+        assert!(!log.exists(), "当前代轮转后腾空待续写");
+        assert_eq!(
+            std::fs::read_to_string(invocation_log_gen(&log, 1)).unwrap(),
+            "gen0\n",
+            "旧当前代 → .1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(invocation_log_gen(&log, 2)).unwrap(),
+            "gen1\n",
+            "旧 .1 → .2"
+        );
+        // keep=2：旧 .2 已删，无 .3。
+        assert!(!invocation_log_gen(&log, 3).exists(), "最旧代必须删除");
+    }
+
+    #[test]
+    fn invocation_log_oversize_rotates_and_small_file_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations.jsonl");
+        std::fs::write(&log, "x".repeat(64)).unwrap();
+        assert!(
+            !rotate_invocation_log_if_oversized(&log, 128, 2),
+            "未越限不轮转"
+        );
+        assert!(log.exists(), "未轮转当前代保留");
+        assert!(
+            rotate_invocation_log_if_oversized(&log, 32, 2),
+            "越限（含启动接管 164MB 旧文件场景）即轮转"
+        );
+        assert!(!log.exists());
+        assert_eq!(
+            std::fs::read_to_string(invocation_log_gen(&log, 1)).unwrap().len(),
+            64
+        );
+    }
+
+    /// log_invocation 的条数封顶轮转：走真实 HTTP 路径把代内行数推到
+    /// 「节流窗倍数且 ≥ MAX_LINES」的第一个触发点，断言旧代进 .1、新请求
+    /// 续写新当前代、计数清零。
+    #[tokio::test]
+    async fn invocation_log_rotates_after_line_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations.jsonl");
+        std::fs::write(&log, "old gen\n").unwrap();
+        let st = state_with_log("secret", MockSupervisor::ok(json!(null)), log.clone());
+        // 触发条件 = lines % CHECK_EVERY == 0 && lines >= MAX_LINES，
+        // 预置 counter 到满足两者的最小值减一，单次请求即命中。
+        let target = (INVOCATION_LOG_MAX_LINES / INVOCATION_LOG_CHECK_EVERY + 1)
+            * INVOCATION_LOG_CHECK_EVERY;
+        st.obs
+            .log_lines
+            .store(target - 1, std::sync::atomic::Ordering::Relaxed);
+        let (status, _) = oneshot_json(
+            router(st.clone()),
+            req_post_invocation(
+                "/tools/hover",
+                Some("secret"),
+                "rot-agent-1",
+                json!({"project_root": "D:/x", "args": {}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK);
+        assert_eq!(
+            std::fs::read_to_string(invocation_log_gen(&log, 1)).unwrap(),
+            "old gen\n",
+            "越限轮转：旧当前代整体进 .1"
+        );
+        let cur = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            cur.lines().count(),
+            1,
+            "轮转后新当前代只有本次请求一条"
+        );
+        assert!(
+            cur.contains("\"invocation_id\""),
+            "新当前代是合法 JSONL 记录"
+        );
+        assert_eq!(
+            st.obs.log_lines.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "轮转后代内行数计数清零"
+        );
     }
 }

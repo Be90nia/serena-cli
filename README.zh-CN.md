@@ -22,7 +22,7 @@
 
 ## 覆盖范围
 
-### CLI 命令（59 个）
+### CLI 命令（63 个）
 
 读取 / 导航（7 个）：`overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -34,11 +34,28 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 撤销 / 重做（2 个）：`undo`（`--steps N`、`--list`）· `redo` —— 事务级快照栈：每次写成功前记录旧状态；跨文件操作（如 rename 改多文件）是一个事务、整体回滚。事务中新建的文件 undo 时删除。冲突门：事务之后文件在磁盘上被改动过，undo 拒绝执行而不是覆盖。快照栈存于用户缓存目录（重启/升级不丢），上限 20 事务 / 200 MB / 30 天。
 
+测试 / 对照 / 找测试（3 个）：`test <target> [name]`（cargo/npm 后端按路径自动选，失败解析为 JSON 清单）· `diff [txn-id] [--patch]`（写事务写前写后对照；`--patch` 输出 unified diff）· `find-test <sym>`（启发式链：tests/ 镜像 → 测试目录/命名 → `mod tests` → LS refs）
+
 补全（1 个）：`completion`（支持 `--limit` 与按文件后缀的 trigger 推断）
 
 管理（8 个）：`status` · `stop-all` · `install <lang>` · `uninstall <lang>` · `ls-use <lang或id> <path>` · `ls-list` · `ls-remove <id>` · `shell`（JSONL stdin/stdout 会话）
 
 长尾（19 个）：`defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker`
+
+### recipe 工作流（8 个）
+
+`recipe <名称> [参数]` —— 一次调用在 daemon 侧跑多步管道（规划见 `local/recipe-plan.md` §2）。读步无事务；每个写步独立 undo 事务。单步出错即停，**逆序回滚已完成的写步**（回到 recipe 执行前状态），报告 `{failed_step, completed_steps, txn_ids, undo_results}`。单步截断（`truncated:true`）不是错误，管道继续。
+
+| recipe | 输入 | 步骤 |
+|---|---|---|
+| `fix-bug` | `<file> <sym> [--new-body T]` | 上下文（tldr + callers + verify 前）→ replace-body → verify 后；无 `--new-body` 只跑分析链 |
+| `add-feature` | `<name> [--target F]` | define-feature（报告 / stub 文本）→ stub 落盘；可选测试（`--tests-file` + `--tests`） |
+| `rename` | `<file> <sym> --to N` | impact → 单文件 LSP rename（跨文件 edits 计入 `skipped`）→ verify |
+| `add-test` | `<sym> [--run]` | find-test → 命中即报告（已有测试）；未命中在定义文件 EOF 追加 `mod tests` 模板（已存在则显式跳过） |
+| `refactor-extract` | `<file> <sym> --as N` | smart-edit 整符号抽取 → verify |
+| `refactor-rename` | `<sym> --to N` | impact → workspace rename → verify（定义文件） |
+| `review-diff` | `[txn-id]` | diff + 关联测试 + 聚合 review 报告 |
+| `explore` | `<path>` | tldr → repo-map → 近期活动 |
 
 **位置基线约定**：接受 `line`/`col` 的命令（按位置寻址：`def`、`refs`、`hover`、`find-implementations`、`rename-symbol`、`find-referencing-*`、`containing-symbol`、`defining-symbol`、`signature-help`、`code-action`、`document-highlight`、`completion`、`format-range`、`inlay-hint`、`call-hierarchy prepare`、`type-hierarchy prepare`、`moniker`）在 CLI 表面为 **1-based** —— 内部转换为 LSP 的 0-based `Position`（`normalize_positions`，bd serena-rust-7xv）；传 `0` 属于用法错误。行范围与行编辑类命令（`read-file`、`insert-at-line`、`replace-lines`、`delete-lines`、`delete-text-in-symbol`）为 **1-based 含端点**。每条命令的 `--help` 中也各自注明了这一点。
 

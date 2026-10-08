@@ -16,6 +16,13 @@
 
 set -u -o pipefail
 
+# BASH_SOURCE/SECONDS/pipefail 语义依赖 bash——被 POSIX sh 拉起时立刻显式失败，
+# 不留"随机行号语法错"的残局（shebang 已钉 env bash，此 guard 兜 cron/sh -c 路径）。
+[ -n "${BASH_VERSION:-}" ] || {
+    echo "stress_loop.sh requires bash (run via bash, not sh)" >&2
+    exit 1
+}
+
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERENA_CLI="${SERENA_CLI:-serena-cli}"
 SMOKE_LOG_DIR="${SMOKE_LOG_DIR:-$PWD/stress-logs}"

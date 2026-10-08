@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 /// wire 协议版本（d3a）。9 错误码 + `{ok,data|error}` 契约 = v1。
+/// bump 判据与字段级变更点见 ARCHITECTURE §6.3（wire v1 错误码表）与 docs/rpc-catalog.json
+/// ——改字段/错误码前先读那两处，bump 后客户端按此字符串协商。
 pub const WIRE_PROTOCOL_VERSION: &str = "1";
 
 /// 编排兼容证据（d3a / orca review §2.1）：调用方环境自述，仅入重放日志。
@@ -112,12 +114,24 @@ pub struct StatusRecentError {
     pub code: WireErrorCode,
 }
 
+/// bd b09i：加载中的 LS 结构化条目。sessions = 该 lang 的实例池键数
+/// （(project_root, lang) 各占一键 = 一个 LS 进程；daemon 数据模型里 worker 与
+/// session 同物，不再拆语义不明的第二个数字）。替代旧 `["rust x3"]` 字符串形态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoadedLs {
+    pub lang: String,
+    pub sessions: u32,
+}
+
 /// `GET /status` 响应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub uptime_secs: u64,
     pub pid: u32,
-    pub loaded_ls: Vec<String>,
+    /// bd b09i：结构化形态（wire 替换评估结论：CLI/daemon 同仓同发——升级硬步骤
+    /// 已含 stop-all——且 status 是观测面；旧字符串形态不兼容保留）。
+    #[serde(default)]
+    pub loaded_ls: Vec<LoadedLs>,
     pub draining: bool,
     /// 最近一次工具请求的 project_root（daemon 启动时不带 project，为 None）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,6 +152,14 @@ pub struct StatusResponse {
     /// 无调用时省略）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_agents: Vec<String>,
+    /// bd ulq：daemon 编译期版本（CARGO_PKG_VERSION）。客户端比对磁盘上新装
+    /// CLI 版本即知 daemon 是否还在跑旧 binary（升级后 lazy-spawn 前提失效类
+    /// 问题的自检锚）。旧 daemon 响应缺字段 → `#[serde(default)]` 兜底。
+    #[serde(default)]
+    pub daemon_version: String,
+    /// bd ulq：daemon 进程自身 binary 路径（current_exe 解析失败省略）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
 }
 
 /// 把 supervisor 的 `ToolError` 翻译成 wire error。
@@ -171,8 +193,14 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
                 WireErrorCode::RpcError,
                 format!("server cancelled {method}"),
             ),
-            // `Io` / `Framing` 走 INTERNAL 兜底（调用方无法按 IO/Framing 区分重试）。
-            other => (WireErrorCode::Internal, format!("{}: {:?}", other, other)),
+            // bd serena-rust-4kh：Io / Framing 曾与未知变体共用 `{:?}` debug 兜底，
+            // 同码 INTERNAL 下「重读文件可解」(Io) 与「LS 流损坏须重启」(Framing)
+            // 不可分辨（审计 F8 / sec-S5 共治）。wire v1 码集不变，只拆 message 臂。
+            supervisor::CoreErrorWire::Io(e) => (WireErrorCode::Internal, format!("io error: {e}")),
+            supervisor::CoreErrorWire::Framing { detail } => (
+                WireErrorCode::Internal,
+                format!("framing error: {detail}; the LS stream is corrupt, restart the daemon"),
+            ),
         },
         // Δ 43ae021：从 Launch 兜底拆出 Serialize/Protocol —— 确定性失败（daemon 序列化
         // bug、LS 违反协议语义）不再伪装成 retryable 的 LS_SPAWN_FAILED 诱发无意义重试。
@@ -209,11 +237,16 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
 }
 
 /// ARCH §6.3 表的 CLI exit code 列。
+///
+/// bd 719：retryable 工具错（LS_TIMEOUT/LS_TERMINATED/LS_SPAWN_FAILED/LS_NOT_READY
+/// 瞬态）单独成桶 exit 5 —— 全折叠为 1 时 agent 必须读 body 才知道可重试；
+/// 非 retryable 维持既有契约（BadArgs=2 / WriteConflict=1 / Internal=3）不变。
 pub fn wire_error_code_to_exit(code: WireErrorCode) -> u8 {
     match code {
         WireErrorCode::BadArgs => 2,
         WireErrorCode::WriteConflict => 1,
         WireErrorCode::Internal => 3,
+        other if other.retryable() => 5,
         _ => 1,
     }
 }
@@ -221,6 +254,20 @@ pub fn wire_error_code_to_exit(code: WireErrorCode) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd 719：retryable → 5（瞬态可重试桶）；非 retryable 既有契约不变。
+    #[test]
+    fn wire_error_code_to_exit_buckets_retryable() {
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::BadArgs), 2);
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::WriteConflict), 1);
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::Internal), 3);
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::LsNotInstalled), 1);
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::RpcError), 1);
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::LsTimeout), 5);
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::LsTerminated), 5);
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::LsSpawnFailed), 5);
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::LsNotReady), 5);
+    }
 
     #[test]
     fn tool_request_roundtrip() {
@@ -478,6 +525,31 @@ mod tests {
         assert!(w.retryable);
     }
 
+    /// bd serena-rust-4kh：Io / Framing 不再走 `{:?}` debug 兜底——码集不变
+    /// （INTERNAL），但 message 人类可读且两条处置路径（重读 vs 重启）可分辨。
+    #[test]
+    fn io_and_framing_core_errors_get_distinct_readable_messages() {
+        let io = supervisor::ToolError::Core(supervisor::CoreErrorWire::Io(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+        ));
+        let w = wire_error_from_tool_error(&io);
+        assert_eq!(w.code, WireErrorCode::Internal);
+        assert!(!w.retryable);
+        assert!(w.message.starts_with("io error: "), "got: {}", w.message);
+        assert!(w.message.contains("gone"), "cause must survive: {}", w.message);
+
+        let fr = supervisor::ToolError::Core(supervisor::CoreErrorWire::Framing {
+            detail: "missing CONTENT_LENGTH".into(),
+        });
+        let w = wire_error_from_tool_error(&fr);
+        assert_eq!(w.code, WireErrorCode::Internal);
+        assert!(
+            w.message.starts_with("framing error: ") && w.message.contains("restart"),
+            "got: {}",
+            w.message
+        );
+    }
+
     /// bd 7tk：空环省略键（hint 字段同款 skip 语义）；计数键恒在。
     #[test]
     fn status_obs_fields_skip_when_rings_empty() {
@@ -491,19 +563,22 @@ mod tests {
             invocation_count: 0,
             recent_errors: vec![],
             recent_agents: vec![],
+            daemon_version: "0.2.0".into(),
+            binary_path: None,
         };
         let j = serde_json::to_value(&resp).unwrap();
         assert!(j.get("recent_errors").is_none(), "empty ring must omit key");
         assert!(j.get("recent_agents").is_none(), "empty ring must omit key");
         assert_eq!(j["in_flight"], 0);
         assert_eq!(j["invocation_count"], 0);
+        assert!(j.get("binary_path").is_none(), "None 路径省略键");
+        assert_eq!(j["daemon_version"], "0.2.0");
     }
-
     /// bd 7tk：旧 daemon 响应（只有 5 个旧字段）→ 新客户端 default 兜底反序列化。
     #[test]
     fn status_legacy_response_without_obs_fields_deserializes() {
         let resp: StatusResponse = serde_json::from_str(
-            r#"{"uptime_secs":9,"pid":42,"loaded_ls":["rust"],"draining":false}"#,
+            r#"{"uptime_secs":9,"pid":42,"loaded_ls":[],"draining":false}"#,
         )
         .unwrap();
         assert_eq!(resp.in_flight, 0);
@@ -518,7 +593,7 @@ mod tests {
         let resp = StatusResponse {
             uptime_secs: 3,
             pid: 4,
-            loaded_ls: vec!["rust".into()],
+            loaded_ls: vec![crate::dto::LoadedLs { lang: "rust".into(), sessions: 3 }],
             draining: false,
             active_project: Some("D:/proj".into()),
             in_flight: 2,
@@ -529,6 +604,8 @@ mod tests {
                 code: WireErrorCode::LsTimeout,
             }],
             recent_agents: vec!["orca-ab12".into()],
+            daemon_version: "0.2.0".into(),
+            binary_path: Some("D:/bin/serena-cli.exe".into()),
         };
         let j = serde_json::to_string(&resp).unwrap();
         assert!(j.contains("\"code\":\"LS_TIMEOUT\""), "got: {j}");

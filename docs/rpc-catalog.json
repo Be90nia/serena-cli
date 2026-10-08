@@ -3,6 +3,21 @@
   "note": "read-time schema; execute_tool args 仍是自由 serde_json::Value",
   "title": "serena-rust RPC params catalog",
   "tools": {
+    "batch-read": {
+      "args": {
+        "budget_tokens": {
+          "default": 2000,
+          "description": "soft aggregate output budget; reading stops and marks truncated/skipped",
+          "required": false,
+          "type": "number"
+        },
+        "files": {
+          "description": "bd qre0: array of repo-relative paths to read in one call (cap 50)",
+          "required": true,
+          "type": "array"
+        }
+      }
+    },
     "call-hierarchy": {
       "args": {
         "col": {
@@ -103,6 +118,20 @@
         }
       }
     },
+    "create-text-file": {
+      "args": {
+        "content": {
+          "description": "full file content",
+          "required": true,
+          "type": "string"
+        },
+        "file": {
+          "description": "target path relative to project root; must NOT exist",
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
     "def": {
       "args": {
         "_compact": {
@@ -198,6 +227,20 @@
         }
       }
     },
+    "diff": {
+      "args": {
+        "patch": {
+          "description": "emit unified diff consumable by patch -p1 / git apply",
+          "required": false,
+          "type": "boolean"
+        },
+        "txn_id": {
+          "description": "undo txn id (default: most recent active txn)",
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
     "document-highlight": {
       "args": {
         "col": {
@@ -239,6 +282,7 @@
       "args": {
         "max_results": {
           "default": 200,
+          "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set",
           "required": false,
           "type": "number"
         },
@@ -288,6 +332,12 @@
           "required": false,
           "type": "bool"
         },
+        "_debug_raw": {
+          "default": false,
+          "description": "bd aap4: true (or SERENA_DEBUG_RAW=1) → attach raw_lsp_response 200B snapshot on silent-empty with non-null LS response",
+          "required": false,
+          "type": "bool"
+        },
         "col": {
           "required": true,
           "type": "number"
@@ -307,6 +357,7 @@
         },
         "max_results": {
           "default": 50,
+          "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set",
           "required": false,
           "type": "number"
         }
@@ -317,6 +368,12 @@
         "_compact": {
           "default": true,
           "description": "(private)",
+          "required": false,
+          "type": "bool"
+        },
+        "_debug_raw": {
+          "default": false,
+          "description": "bd aap4: true (or SERENA_DEBUG_RAW=1) → attach raw_lsp_response 200B snapshot on silent-empty with non-null LS response",
           "required": false,
           "type": "bool"
         },
@@ -364,14 +421,84 @@
           "required": false,
           "type": "bool"
         },
+        "format": {
+          "default": "full",
+          "description": "bd 51ib: brief = 'name file:line:col' strings (cheapest); full = default compact wire; json = full-fidelity",
+          "required": false,
+          "type": "string"
+        },
+        "kind": {
+          "description": "bd w2b5: comma-separated kind filter (fn, method, class, struct, enum, interface, module, namespace, package, field, property, variable, constant, file)",
+          "required": false,
+          "type": "string"
+        },
         "limit": {
           "default": 50,
+          "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set",
           "required": false,
           "type": "number"
         },
         "query": {
           "required": true,
           "type": "string"
+        }
+      }
+    },
+    "find-test": {
+      "args": {
+        "symbol": {
+          "description": "symbol name to locate tests for",
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "recipe": {
+      "args": {
+        "name": {
+          "description": "recipe: fix-bug|add-feature|rename|add-test|refactor-extract|refactor-rename|review-diff|explore",
+          "required": true,
+          "type": "string"
+        },
+        "pos": {
+          "description": "positional args; fix-bug/rename/refactor-extract = [file, sym], add-feature = [name], add-test/refactor-rename = [sym], explore = [path], review-diff = [txn-id]",
+          "required": false,
+          "type": "array"
+        },
+        "new_body": {
+          "description": "fix-bug: replacement function body (absent = analyze-only chain)",
+          "required": false,
+          "type": "string"
+        },
+        "to": {
+          "description": "rename / refactor-rename: new name",
+          "required": false,
+          "type": "string"
+        },
+        "as": {
+          "description": "refactor-extract: new fn name",
+          "required": false,
+          "type": "string"
+        },
+        "target": {
+          "description": "add-feature: stub target file (.rs)",
+          "required": false,
+          "type": "string"
+        },
+        "tests_file": {
+          "description": "add-feature: test file path (with tests)",
+          "required": false,
+          "type": "string"
+        },
+        "tests": {
+          "description": "add-feature: test code (with tests_file)",
+          "required": false,
+          "type": "string"
+        },
+        "run": {
+          "description": "add-test: run test backend after writing template",
+          "required": false,
+          "type": "bool"
         }
       }
     },
@@ -490,9 +617,21 @@
     },
     "insert-text-after-symbol": {
       "args": {
+        "auto_indent": {
+          "default": true,
+          "description": "bd bt3h: indent continuation lines to the host symbol's indentation (set false to disable)",
+          "required": false,
+          "type": "bool"
+        },
         "file": {
           "required": true,
           "type": "string"
+        },
+        "format_on_write": {
+          "default": false,
+          "description": "bd ou83: format the file after a successful write",
+          "required": false,
+          "type": "bool"
         },
         "symbol": {
           "required": true,
@@ -506,9 +645,21 @@
     },
     "insert-text-before-symbol": {
       "args": {
+        "auto_indent": {
+          "default": true,
+          "description": "bd bt3h: indent continuation lines to the host symbol's indentation (set false to disable)",
+          "required": false,
+          "type": "bool"
+        },
         "file": {
           "required": true,
           "type": "string"
+        },
+        "format_on_write": {
+          "default": false,
+          "description": "bd ou83: format the file after a successful write",
+          "required": false,
+          "type": "bool"
         },
         "symbol": {
           "required": true,
@@ -528,6 +679,7 @@
         },
         "max_entries": {
           "default": 500,
+          "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set",
           "required": false,
           "type": "number"
         },
@@ -591,6 +743,12 @@
           "description": "repo-relative path",
           "required": true,
           "type": "string"
+        },
+        "summary": {
+          "default": false,
+          "description": "bd kq6e: true → {summary, symbols} object with one-line kind histogram; default keeps bare array wire",
+          "required": false,
+          "type": "bool"
         }
       }
     },
@@ -605,12 +763,21 @@
           "required": true,
           "type": "string"
         },
+        "no_clamp": {
+          "default": false,
+          "description": "bd 66al: true → strict bounds (end_line beyond EOF = BAD_ARGS); default clamps to EOF (bd mfxg)",
+          "required": false,
+          "type": "bool"
+        },
         "start_line": {
           "description": "1-based inclusive",
           "required": false,
           "type": "number"
         }
       }
+    },
+    "redo": {
+      "args": {}
     },
     "refs": {
       "args": {
@@ -711,6 +878,12 @@
           "required": true,
           "type": "string"
         },
+        "format_on_write": {
+          "default": false,
+          "description": "bd ou83: run textDocument/formatting on the file after a successful write and apply edits to disk (all write tools accept this)",
+          "required": false,
+          "type": "bool"
+        },
         "new_text": {
           "required": true,
           "type": "string"
@@ -729,7 +902,7 @@
       "args": {
         "top_n": {
           "default": 20,
-          "description": "E: per-file top-level symbol map (top N)",
+          "description": "E: per-file top-level symbol map (top N); bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set",
           "required": false,
           "type": "number"
         }
@@ -760,8 +933,21 @@
           "required": false,
           "type": "bool"
         },
+        "distinct_symbols": {
+          "default": false,
+          "description": "bd zpzw: keep first hit per enriched symbol name (symbol=null rows kept)",
+          "required": false,
+          "type": "bool"
+        },
+        "format": {
+          "default": "full",
+          "description": "bd 51ib: brief = 'file:line:col: text' strings; full/json = default response (adds bd rsqq summary header)",
+          "required": false,
+          "type": "string"
+        },
         "max_results": {
           "default": 100,
+          "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set",
           "required": false,
           "type": "number"
         },
@@ -807,6 +993,12 @@
           "required": true,
           "type": "string"
         },
+        "meta": {
+          "default": false,
+          "description": "bd b72k: true → aggregate object (doc/signature/location/prev_line/next_line); default keeps bare body string",
+          "required": false,
+          "type": "bool"
+        },
         "symbol": {
           "required": true,
           "type": "string"
@@ -819,10 +1011,47 @@
           "required": true,
           "type": "string"
         },
-        "max_files": {
-          "default": 200,
+        "files_only": {
+          "default": false,
+          "description": "bd 6ooi: true → file list only, zero LS calls",
+          "required": false,
+          "type": "bool"
+        },
+        "grep": {
+          "description": "bd 6ooi: keep symbols whose name contains this substring (case-insensitive); entries with no matches omitted",
+          "required": false,
+          "type": "string"
+        },
+        "max_depth": {
+          "description": "bd 6ooi: keep symbols with containment-chain depth < N (top level = 0)",
           "required": false,
           "type": "number"
+        },
+        "max_files": {
+          "default": 200,
+          "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set",
+          "required": false,
+          "type": "number"
+        },
+        "top_level": {
+          "default": false,
+          "description": "bd vro3: true → top-level symbols only per file (range-containment filter)",
+          "required": false,
+          "type": "bool"
+        }
+      }
+    },
+    "test": {
+      "args": {
+        "name": {
+          "description": "test name filter (cargo test positional / npm passthrough)",
+          "required": false,
+          "type": "string"
+        },
+        "target": {
+          "description": "test target: crate/test dir or test file path (relative to project root or absolute)",
+          "required": true,
+          "type": "string"
         }
       }
     },
@@ -855,6 +1084,20 @@
         }
       }
     },
+    "undo": {
+      "args": {
+        "list": {
+          "description": "list undo stack overview instead of rolling back",
+          "required": false,
+          "type": "boolean"
+        },
+        "steps": {
+          "description": "number of transactions to roll back (default 1)",
+          "required": false,
+          "type": "number"
+        }
+      }
+    },
     "warm": {
       "args": {
         "lang": {
@@ -870,37 +1113,6 @@
       }
     },
     "workspace-diagnostic": {
-      "args": {}
-    },
-    "create-text-file": {
-      "args": {
-        "file": {
-          "description": "target path relative to project root; must NOT exist",
-          "required": true,
-          "type": "string"
-        },
-        "content": {
-          "description": "full file content",
-          "required": true,
-          "type": "string"
-        }
-      }
-    },
-    "undo": {
-      "args": {
-        "steps": {
-          "description": "number of transactions to roll back (default 1)",
-          "required": false,
-          "type": "number"
-        },
-        "list": {
-          "description": "list undo stack overview instead of rolling back",
-          "required": false,
-          "type": "boolean"
-        }
-      }
-    },
-    "redo": {
       "args": {}
     }
   },

@@ -27,6 +27,7 @@
 //!   （N 最小）开始整事务淘汰。
 
 use std::cmp::Reverse;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -123,6 +124,40 @@ tokio::task_local! {
     /// 当前事务 uid。execute_tool 用 `scope` 包裹工具执行；scope 外（--direct
     /// 调试路径）读到 0 = 不记账。
     pub(crate) static TXN_UID: u64;
+
+    /// A3b #3（bd i4a1/wlrr）：--dry-run 干跑开关。execute_tool 对写类工具以
+    /// `scope_dry_run` 包裹 dispatch；recorded_write 命中时不落盘、不记 undo 快照，
+    /// 把 (path → new_content) 收进 [`PREVIEW`]，由 execute_tool 收尾附进返回。
+    static DRY_RUN: bool;
+
+    /// dry-run 期间 collected 将写内容（随 DRY_RUN scope 同生共死）。
+    static PREVIEW: std::cell::RefCell<Vec<(String, String)>>;
+}
+
+/// dry-run scope：不进 undo 事务（无 TxnGuard commit/abort），recorded_write 全部
+/// 转预览收集。返回 (工具输出, 预览) —— 预览必须在 scope 内取走（TaskLocalFuture
+/// drop 即销毁），调用方不得再自行 take_preview。
+///
+/// fut 必须 Box::pin：dispatch_tool 的 future 巨大（全工具 match 单体），再叠两层
+/// TaskLocalFuture 直接内嵌会在全量测试并行下把 poll 栈压过临界（实测
+/// STATUS_STACK_OVERFLOW，bd A3b 票4 收口时修）。
+pub(crate) async fn scope_dry_run<F: Future>(fut: F) -> (F::Output, Vec<(String, String)>) {
+    DRY_RUN
+        .scope(
+            true,
+            PREVIEW.scope(std::cell::RefCell::new(Vec::new()), Box::pin(async move {
+                let out = fut.await;
+                let preview = PREVIEW.with(|p| p.borrow_mut().drain(..).collect());
+                (out, preview)
+            })),
+        )
+        .await
+}
+
+/// 当前是否处于 --dry-run 干跑（scope 外恒 false）。写工具内的盘面自证步骤
+/// （readback 比对）在干跑下没有前提，调用方据此跳过。
+pub(crate) fn is_dry_run() -> bool {
+    DRY_RUN.try_with(|v| *v).unwrap_or(false)
 }
 
 /// 分配本调用的事务 uid（execute_tool 开局调用）。
@@ -143,12 +178,23 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// 项目根 → undo 存储目录：`default_cache_root()/undo/{project_hash}`。
-/// canonicalize 失败（项目目录被删）→ BAD_ARGS，不落盘（补充契约 9）。
+/// bd serena-rust-ej5：canonicalize 失败（挪盘瞬窗/目录权限变化）不再 BAD_ARGS
+/// 整栈孤儿——退回对原始路径串做 sha256（无 canonicalize 也有确定性键）；彻底
+/// 删除的目录仍 BAD_ARGS 不落盘（补充契约 9：连原路径串都拿不到才算不存在）。
 pub(crate) fn store_for(root: &Path) -> Result<PathBuf, ToolError> {
-    let canon = dunce::canonicalize(root).map_err(|e| ToolError::BadArgs {
-        detail: format!("project root not found ({}): {e}", root.display()),
-    })?;
-    let hash = sha256_hex(canon.to_string_lossy().as_bytes());
+    let hash_source = match dunce::canonicalize(root) {
+        Ok(canon) => canon.to_string_lossy().into_owned(),
+        Err(e) if root.exists() => {
+            tracing::warn!(root = %root.display(), error = %e, "canonicalize failed; hashing raw path for undo store");
+            root.to_string_lossy().into_owned()
+        }
+        Err(e) => {
+            return Err(ToolError::BadArgs {
+                detail: format!("project root not found ({}): {e}", root.display()),
+            });
+        }
+    };
+    let hash = sha256_hex(hash_source.as_bytes());
     Ok(ls_runtime::install::default_cache_root()
         .join("undo")
         .join(&hash[..16]))
@@ -170,11 +216,26 @@ pub(crate) const WRITE_TOOLS: &[&str] = &[
     "create-text-file",
 ];
 
+/// 写类工具判据（bd wy1：daemon 断连 detach 用）。名单本体保持 crate 内，
+/// 跨 crate（daemon http 层）只暴露这个谓词。
+pub fn is_write_tool(tool: &str) -> bool {
+    WRITE_TOOLS.contains(&tool)
+}
+
 /// 写点统一收口：快照旧内容 → 原子写 → 成功后入待落盘栈。
 ///
 /// 与 [`crate::atomic_write`] 同签名同错误面（io::Error），调用点仅换函数名。
 /// 无事务上下文（uid=0，--direct 路径）退化为裸 atomic_write。
 pub(crate) async fn recorded_write(path: &Path, new_content: &str) -> std::io::Result<()> {
+    // A3b #3：--dry-run 干跑 —— 不落盘、不记 undo 快照，将写内容转预览收集
+    // （execute_tool 收尾取走附进返回）。
+    if is_dry_run() {
+        PREVIEW.with(|p| {
+            p.borrow_mut()
+                .push((path.display().to_string(), new_content.to_owned()))
+        });
+        return Ok(());
+    }
     let uid = TXN_UID.try_with(|v| *v).unwrap_or(0);
     if uid == 0 {
         return crate::atomic_write(path, new_content).await;
@@ -446,7 +507,7 @@ async fn remove_all_undone(store: &Path) {
 
 /// undo 单事务：冲突门（盘 sha == after_sha256，整事务拒绝）→ 恢复 before /
 /// 删除 created 文件 → rename 为 undone-{N}。
-async fn undo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
+pub(crate) async fn undo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
     let dir = store.join(format!("txn-{n}"));
     let manifest = read_manifest(&dir).await?;
     // 冲突门：先全量校验，任一文件不匹配则整事务拒绝（契约设计第 4 条）。
@@ -591,6 +652,91 @@ async fn read_manifest(dir: &Path) -> Result<Manifest, ToolError> {
             &dir.display().to_string(),
             &format!("manifest corrupt: {e}"),
         )
+    })
+}
+
+// ==== recipe `diff` 数据源（只读：不进写门、不产生事务） ====
+
+/// 单事务快照（[`read_txn`] 返回形态；字段对 recipe 层公开）。
+#[derive(Debug)]
+pub(crate) struct TxnSnapshot {
+    pub txn_id: u64,
+    pub timestamp: u64,
+    pub files: Vec<TxnFileSnapshot>,
+}
+
+/// 单文件写前写后内容（内嵌直读，旁路文件读回；created 的 before=None）。
+#[derive(Debug)]
+pub(crate) struct TxnFileSnapshot {
+    pub path: String,
+    pub created: bool,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+/// 读事务快照：`None` = 最近活跃事务；显式 id 双形态（txn-N / undone-N）都可读。
+/// 活跃栈空 / 指定 id 缺失 → BAD_ARGS（确定性用法错，非存储损坏）。
+pub(crate) async fn read_txn(root: &Path, txn_id: Option<u64>) -> Result<TxnSnapshot, ToolError> {
+    read_txn_at(&store_for(root)?, txn_id).await
+}
+
+/// [`read_txn`] 的存储路径注入版（单测用）。
+pub(crate) async fn read_txn_at(
+    store: &Path,
+    txn_id: Option<u64>,
+) -> Result<TxnSnapshot, ToolError> {
+    let (dir, resolved_n) = match txn_id {
+        Some(n) => {
+            let active = store.join(format!("txn-{n}"));
+            if active.is_dir() {
+                (active, n)
+            } else {
+                let undone = store.join(format!("undone-{n}"));
+                if undone.is_dir() {
+                    (undone, n)
+                } else {
+                    return Err(ToolError::BadArgs {
+                        detail: format!("txn-{n} not found in undo store {}", store.display()),
+                    });
+                }
+            }
+        }
+        None => {
+            let n = top_active(store)
+                .await
+                .map_err(|e| ToolError::Core(lsp_core::error::CoreError::Io(e)))?
+                .ok_or_else(|| ToolError::BadArgs {
+                    detail: "no undo transactions: run a write tool first".into(),
+                })?;
+            (store.join(format!("txn-{n}")), n)
+        }
+    };
+    let m = read_manifest(&dir).await?;
+    let mut files = Vec::with_capacity(m.files.len());
+    for f in m.files {
+        // created 文件 before/before_file 双 None → before=None；旁路文件走
+        // side_content 读回（丢失 = 存储损坏，沿用 WriteConflict 语义）。
+        let before = if f.before.is_none() && f.before_file.is_none() {
+            None
+        } else {
+            Some(side_content(&dir, &f.before, &f.before_file, "before").await?)
+        };
+        let after = if f.after.is_none() && f.after_file.is_none() {
+            None
+        } else {
+            Some(side_content(&dir, &f.after, &f.after_file, "after").await?)
+        };
+        files.push(TxnFileSnapshot {
+            path: f.path,
+            created: f.created,
+            before,
+            after,
+        });
+    }
+    Ok(TxnSnapshot {
+        txn_id: resolved_n,
+        timestamp: m.timestamp,
+        files,
     })
 }
 

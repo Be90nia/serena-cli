@@ -289,6 +289,18 @@ impl Client {
         guard.extend(methods.into_iter().map(Into::into));
     }
 
+    /// 测试观察口（bd xht）：生产注册路径（Session::start →
+    /// set_content_modified_retry）的白名单快照，防 RETRY_ON_CONTENT_MODIFIED
+    /// 注册点被删/常量漂移后「机制存在≠接线生效」复发。
+    #[cfg(test)]
+    pub(crate) fn retry_methods_for_test(&self) -> std::collections::HashSet<String> {
+        self.inner
+            .content_modified_retry_methods
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
     /// 注册通知 handler（method 精确匹配）。同 method 多次注册后者覆盖前者。
     pub fn on_notification<F>(&self, method: impl Into<String>, f: F)
     where

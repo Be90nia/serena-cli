@@ -20,7 +20,7 @@ Trade-off: you lose the "MCP auto-discovery" story. You gain `bash`-debuggabilit
 
 ## What it covers
 
-### CLI commands (59)
+### CLI commands (63)
 
 Read / navigate (7): `overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -32,11 +32,28 @@ Editing (11): `rename-symbol` · `safe-delete-symbol` · `replace-body` · `repl
 
 Undo / redo (2): `undo` (`--steps N`, `--list`) · `redo` — transactional snapshot stack: every successful write records the prior state; a multi-file edit (e.g. cross-file rename) is one transaction and rolls back as a whole. Files created by a transaction are deleted on undo. Conflict gate: if a file changed on disk after the transaction, undo refuses instead of overwriting. Stack lives in the user cache dir (survives restarts and upgrades), capped at 20 txns / 200 MB / 30 days.
 
+Test / diff / find-test (3): `test <target> [name]` (cargo/npm backends auto-selected; parses failures into a JSON list) · `diff [txn-id] [--patch]` (before/after of a write transaction; `--patch` emits a unified diff) · `find-test <sym>` (heuristic chain: tests/ mirrors → test dirs/naming → `mod tests` → LS refs)
+
 Completion (1): `completion` (with `--limit` and per-file-suffix trigger inference)
 
 Admin (8): `status` · `stop-all` · `install <lang>` · `uninstall <lang>` · `ls-use <lang-or-id> <path>` · `ls-list` · `ls-remove <id>` · `shell` (JSONL stdin/stdout session)
 
 Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker`
+
+### Recipe workflows (8)
+
+`recipe <name> [args]` — one call runs a multi-step pipeline server-side (planned in `local/recipe-plan.md` §2). Read steps are transaction-free; every write step is its own undo transaction. On a step error the recipe stops, rolls back completed write steps in reverse order (back to the pre-recipe state), and reports `{failed_step, completed_steps, txn_ids, undo_results}`. Per-step truncation (`truncated:true`) is not an error — the pipeline continues.
+
+| recipe | input | steps |
+|---|---|---|
+| `fix-bug` | `<file> <sym> [--new-body T]` | context (tldr + callers + verify before) → replace-body → verify after; without `--new-body` runs the analysis chain only |
+| `add-feature` | `<name> [--target F]` | define-feature (report / stub text) → stub write; optional tests via `--tests-file` + `--tests` |
+| `rename` | `<file> <sym> --to N` | impact → single-file LSP rename (cross-file edits land in `skipped`) → verify |
+| `add-test` | `<sym> [--run]` | find-test → hit means tests exist (report only); miss appends a `mod tests` template at EOF (explicit skip if one exists) |
+| `refactor-extract` | `<file> <sym> --as N` | smart-edit extract (whole-symbol) → verify |
+| `refactor-rename` | `<sym> --to N` | impact → workspace rename → verify (definition file) |
+| `review-diff` | `[txn-id]` | diff + related tests + aggregated review report |
+| `explore` | `<path>` | tldr → repo-map → recent activity |
 
 **Position baseline convention**: commands taking `line`/`col` (position-addressed: `def`, `refs`, `hover`, `find-implementations`, `rename-symbol`, `find-referencing-*`, `containing-symbol`, `defining-symbol`, `signature-help`, `code-action`, `document-highlight`, `completion`, `format-range`, `inlay-hint`, `call-hierarchy prepare`, `type-hierarchy prepare`, `moniker`) are **1-based** on the CLI surface — converted to LSP's 0-based `Position` internally (`normalize_positions`, bd serena-rust-7xv); passing `0` is a usage error. Line-range and line-editing commands (`read-file`, `insert-at-line`, `replace-lines`, `delete-lines`, `delete-text-in-symbol`) are **1-based inclusive**. Every command also states this in its `--help`.
 
@@ -114,6 +131,28 @@ cargo install --path crates/cli --locked
 serena-cli --help
 ```
 
+### Upgrade: stop the old daemon first
+
+`serena-cli` lazy-spawns a background daemon that stays resident (10 min idle LS
+reaping / 15 min daemon self-exit). **Run `serena-cli stop-all` before and after
+upgrading** — otherwise the post-upgrade CLI silently talks to the pre-upgrade
+daemon still holding the old binary: new subcommands report "not found", new
+wire fields look missing, and behavior "reverts" until you misread it as a
+broken release. Verify with `serena-cli status` (no daemon) before the first
+command of the new version.
+
+### Containerized deployment
+
+No official image is published (bd serena-rust-eo7c). The release asset for
+`x86_64-unknown-linux-musl` is a static binary — drop it into a scratch or
+alpine base directly. Everything `serena-cli` spawns lives inside your
+container: each language server is a separate process tree (node/python/JVM
+runtimes included), so the image must carry the runtimes for every language
+you intend to serve. Recommended sandboxing: run the container rootless
+(podman `--userns=keep-id`) and/or wrap LS launches in `bubblewrap` — language
+servers are third-party binaries downloaded and executed on demand, which is
+an untrusted-code boundary, not just a local tool.
+
 ### First-run language server setup
 
 `serena-cli install <lang>` walks `servers.toml` — for each supported language it tries:
@@ -138,6 +177,17 @@ serena-cli ls-remove marksman                    # uninstall serena-managed cach
 ```
 
 Registration takes effect after a daemon restart (`serena-cli stop-all` or the idle timeout). Entries are plain TOML — hand-editing is fine; `ls-use` only rewrites its own `[servers.<id>]` block.
+
+### Config file locations
+
+Both user-level TOML files live in the same directory (bd serena-rust-0z9/xwh):
+
+| File | Windows | Unix |
+|---|---|---|
+| `external-servers.toml` (user LS registry, overrides builtin) | `%APPDATA%\serena\external-servers.toml` | `~/.config/serena/external-servers.toml` |
+| `config.toml` (user config) | `%APPDATA%\serena\config.toml` | `~/.config/serena/config.toml` |
+
+`doctor` does not print these paths in its output — when a hint says "configure via external-servers.toml / config.toml", come back to this table.
 
 ### Vendor-specific LS configuration (MATLAB)
 
@@ -182,6 +232,17 @@ For sustained work, use `serena-cli shell` (stdin/stdout JSONL) — keeps the da
 
 See [`skills/serena-cli/SKILL.md`](skills/serena-cli/SKILL.md) for the full token-discipline guide.
 
+### Reading `pending` in diagnostics responses
+
+Write tools attach a `post_write_diagnostics` snapshot, and `diagnostics` returns `{items, pending}`. The `pending` flag is the freshness verdict (bd serena-rust-i52y):
+
+- `pending: false` — the LS confirmed this generation: **`items` is authoritative** (empty items = clean).
+- `pending: true` — the wait window closed before the LS pushed a new diagnostic generation (large-project reanalysis, slow or restarting LS). **Empty `items` does NOT mean "no errors"** — the snapshot may be stale. Follow up with an explicit `diagnostics <file>` (or `--wait-gen N`) before trusting a clean result.
+
+The wire field name is frozen (v1 contract); this section is the normative definition.
+
+Write-tool receipts slim the snapshot when it carries no items (bd tfa3): unconfirmed (empty items + `pending: true`) compresses to the string `"post_write_diagnostics": "pending"`; LS-confirmed clean (empty items + `pending: false`) omits the key entirely; non-empty snapshots are attached in full. The `diagnostics` tool response itself is never slimmed.
+
 ## Performance baseline
 
 Measured on `feature/solidlsp-phase0-1`, 2026-09-16, Windows 11 / i9-10900F, no competing rust-analyzer:
@@ -215,6 +276,7 @@ The single source of architectural truth is [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
 | Limitation | Impact | When to revisit |
 |---|---|---|
+| `doctor` network probe hardcodes `github.com:443` | Behind a registry mirror/proxy the `net` check reports MISS even when LS install sources are reachable — it is advisory, not a gate (bd serena-rust-5uf; a `SERENA_NETWORK_PROBE_HOST` override is planned, not yet implemented) | When the probe host becomes configurable (fix wave A) |
 | SHA-256 download matrix for non-clangd LS is partial | `install` works for verified entries; unverified entries fall back to PATH probe | When CI needs hermetic installs — populate `local/ls-download-matrix.md` from upstream SolidLSP source |
 | No monorepo multi-root support | Each `serena-cli` invocation scopes to one workspace root | Add `additionalWorkspaceFolders` (Phase 4 stretch) |
 | No `$/progress` notification buffering | Long-running tools block until complete | When tools like refactor cross 30s boundaries |

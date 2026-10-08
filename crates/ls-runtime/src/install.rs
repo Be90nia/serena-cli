@@ -285,6 +285,16 @@ impl DownloadInstaller {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
         }
+        // bd lmoc（audit-cross-platform F-M04）：归档成员可携带 com.apple.quarantine
+        // 扩展属性（tar/zip pax 头透传），带属性的二进制首启会撞 Gatekeeper 弹窗 /
+        // 直接拒启。清属性尽力而为：属性不存在时 xattr 非零退出 = 正常路径，不报错。
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("xattr")
+                .args(["-d", "com.apple.quarantine"])
+                .arg(&exe)
+                .status();
+        }
 
         Ok(InstallOutcome::Ready(Launch::Process {
             exe,

@@ -81,12 +81,12 @@ struct Cli {
     #[arg(long, global = true, value_name = "MS")]
     index_timeout: Option<u32>,
 
-    /// G（§10-G）：响应 token 预算（4 bytes ≈ 1 token，soft limit）。集合型响应超出
-    /// 时截断 items 并标 truncated:true（success 语义，退出码不变）。
+    /// 限制响应大小（soft limit，约 4 字节 ≈ 1 token）。集合型响应超限时截断
+    /// 条目并标 `truncated:true`（仍是成功，退出码不变）。
     #[arg(long, global = true, value_name = "N")]
     max_tokens: Option<u64>,
 
-    /// G（§10-G）：签名压缩——删响应中 container/container_name/kind 冗余字段。
+    /// 精简输出：删掉 container/container_name/kind 等冗余字段，省 token。
     #[arg(long, global = true)]
     compress: bool,
 
@@ -94,6 +94,12 @@ struct Cli {
     /// 幂等重放与跨 agent 排障（daemon 重放日志按此索引）。
     #[arg(long, global = true, value_name = "ID")]
     invocation_id: Option<String>,
+
+    /// A3b #3（bd i4a1/wlrr）：写类命令干跑——执行完整定位/计算/校验但不落盘、
+    /// 不进 undo 事务；成功返回附 dry_run:true 与 would_write[{file,content}]
+    /// 将写内容预览。仅写类命令消费，读类忽略。
+    #[arg(long, global = true)]
+    dry_run: bool,
 
     /// 子命令；`--daemon` 模式下可省略。
     #[command(subcommand)]
@@ -115,6 +121,15 @@ enum Cmd {
         /// 保险丝：最多扫描文件数（超出截断并标 truncated）。
         #[arg(long, value_name = "N", default_value_t = 200)]
         max_files: usize,
+        /// 只列符号名含此子串的条目（大小写不敏感；bd 6ooi）。
+        #[arg(long, value_name = "PATTERN")]
+        grep: Option<String>,
+        /// 只保留包含链深度 < N 的符号（顶层=0；bd 6ooi）。
+        #[arg(long, value_name = "N")]
+        max_depth: Option<usize>,
+        /// 只列文件清单（零 LS 调用；bd 6ooi）。
+        #[arg(long, default_value_t = false)]
+        files_only: bool,
     },
     /// 跳转到符号定义（textDocument/definition）。line/col 为 1-based。
     Def { file: String, line: u32, col: u32 },
@@ -143,6 +158,10 @@ enum Cmd {
         /// 上限。
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// 输出形态（bd 51ib）：brief = `"name file:line:col"` 单串（最省）；
+        /// full（默认）= 既有紧凑 wire；json = 全字段形态。
+        #[arg(long, value_enum, default_value_t = OutFormat::Full)]
+        format: OutFormat,
         /// J（§11-J）：返上次调用以来增量（added/removed）而非全集；首次返全集。
         #[arg(long)]
         delta: bool,
@@ -180,6 +199,13 @@ enum Cmd {
         /// 大小写敏感（默认不敏感）。
         #[arg(long, default_value_t = false)]
         case_sensitive: bool,
+        /// 同符号多行命中只留首条（zpzw；需命中带所属符号，未装饰行全保留）。
+        #[arg(long, default_value_t = false)]
+        distinct_symbols: bool,
+        /// 输出形态（bd 51ib）：brief = grep 风格 `file:line:col: text` 单串；
+        /// full（默认）= 既有全形态（search 无紧凑裁剪层，full 与 json 同形）。
+        #[arg(long, value_enum, default_value_t = OutFormat::Full)]
+        format: OutFormat,
     },
     /// 按行范围读文件（1-based 含端）。
     ReadFile {
@@ -210,9 +236,13 @@ enum Cmd {
         page: usize,
         #[arg(long, default_value_t = 20)]
         page_size: usize,
+        /// 静默空时附 LS 原始响应 200B 快照（aap4；或 SERENA_DEBUG_RAW=1）。
+        #[arg(long, default_value_t = false)]
+        debug_raw: bool,
     },
+    // bd serena-rust-bxd（内部追踪号，不入 --help）
     /// 所有引用 + 每个 ref 前后 N 行。line/col 为 1-based。
-    /// `--symbol <NAME>` 直查（bd serena-rust-bxd）：免两步 find-symbol 拿坐标；
+    /// `--symbol <NAME>` 直查：免两步 find-symbol 拿坐标；
     /// 给了 --symbol 则 FILE/LINE/COL 可省（内部解析首命中，命中多个时 warning
     /// 提示用了哪个，零命中 rc=2）。
     FindReferencingCodeSnippets {
@@ -228,6 +258,9 @@ enum Cmd {
         /// 上限。
         #[arg(long, default_value_t = 20)]
         max_results: u32,
+        /// 静默空时附 LS 原始响应 200B 快照（aap4；或 SERENA_DEBUG_RAW=1）。
+        #[arg(long, default_value_t = false)]
+        debug_raw: bool,
     },
     /// 取符号体切片（position-free；documentSymbol 定位）。
     SymbolBody { file: String, symbol: String },
@@ -247,13 +280,15 @@ enum Cmd {
     /// 预热 LS + 索引（ai-token §13-M）：开工前一发，首个真实工具调用免吃冷启动。
     /// 超时返 partial:true（LS 已启动、索引未确认），不阻塞。
     Warm {
-        /// 要预热的语言（rust / typescript / python / ...）。
-        lang: String,
+        /// 要预热的语言。缺省时按项目根清单探测（Cargo.toml/pyproject.toml/
+        /// tsconfig.json/package.json）；探测失败 rc=2。
+        lang: Option<String>,
         /// 就绪等待上限（秒）。
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
-    /// 阻塞到就绪（bd serena-rust-55m / bxd）：循环探测。`--stage symbol` =
+    // bd serena-rust-55m / bxd（内部追踪号，不入 --help）
+    /// 阻塞到就绪：循环探测。`--stage symbol` =
     /// overview 首符号非空即就绪（符号索引层，秒级）；`--stage semantic`（默认，
     /// 保持现行为）= hover contents 非空（类型分析层；未就绪响应带 we0 warning，
     /// 解析即判据）。就绪 exit 0；超时 exit 4。探测间隔 500ms 起指数退避到 2s
@@ -288,16 +323,21 @@ enum Cmd {
         new_text: String,
     },
     /// 在 symbol 开头插入 text。
+    /// 文本可走位置参数或 `--with`（与 replace-body 同形）。
     InsertTextBeforeSymbol {
         file: String,
         symbol: String,
-        text: String,
+        text: Option<String>,
+        #[arg(long = "with")]
+        with: Option<String>,
     },
-    /// 在 symbol 末尾插入 text。
+    /// 在 symbol 末尾插入 text。文本可走位置参数或 `--with`。
     InsertTextAfterSymbol {
         file: String,
         symbol: String,
-        text: String,
+        text: Option<String>,
+        #[arg(long = "with")]
+        with: Option<String>,
     },
     /// 在 symbol 体内删除 [start_line, end_line] 切片（1-based 含端）。
     DeleteTextInSymbol {
@@ -309,20 +349,26 @@ enum Cmd {
     /// 安全删除符号：无引用才删；有引用拒删并列出引用位置。
     SafeDeleteSymbol { file: String, symbol: String },
     /// 在 line（1-based）前插入内容，原行下移；line = 总行数+1 即追加。
+    /// 文本可走位置参数或 `--with`。
     InsertAtLine {
         file: String,
         line: u32,
-        text: String,
+        text: Option<String>,
+        #[arg(long = "with")]
+        with: Option<String>,
         /// 可选：上次 read-file 返回的全文 hash，不符拒写。
         #[arg(long)]
         expected_hash: Option<String>,
     },
     /// 用新内容替换 [start_line, end_line]（1-based 含端）。
+    /// 文本可走位置参数或 `--with`。
     ReplaceLines {
         file: String,
         start_line: u32,
         end_line: u32,
-        text: String,
+        text: Option<String>,
+        #[arg(long = "with")]
+        with: Option<String>,
         /// 可选：上次 read-file 返回的全文 hash，不符拒写。
         #[arg(long)]
         expected_hash: Option<String>,
@@ -337,10 +383,20 @@ enum Cmd {
         expected_hash: Option<String>,
     },
     /// 新建文件（已存在 = 参数错）。写入自动进 undo 事务（created=true）。
+    /// 内容可走位置参数、`--with`、`--stdin` 或 `--content-file`（bd 4nqk：
+    /// 多行内容 shell 引号难写干净，stdin/文件退路 bash 友好）。
     CreateTextFile {
         file: String,
         /// 文件完整内容。
-        content: String,
+        content: Option<String>,
+        #[arg(long = "with")]
+        with: Option<String>,
+        /// 从 stdin 读全文（与其他内容来源互斥）。
+        #[arg(long)]
+        stdin: bool,
+        /// 从文件读全文（与其他内容来源互斥）。
+        #[arg(long, value_name = "PATH")]
+        content_file: Option<String>,
     },
     /// 回滚最近的写事务（IDE undo）。project_root 由 --project 或 cwd 定位。
     Undo {
@@ -353,6 +409,60 @@ enum Cmd {
     },
     /// 重放最近被 undo 的事务（IDE redo）。
     Redo,
+    /// 运行测试（cargo/npm 后端按路径自动选；只读源码，产物不进 undo 栈）。
+    Test {
+        /// 测试目标：crate/test 目录或测试文件路径（相对项目根或绝对）。
+        file: String,
+        /// 测试名过滤器（cargo test 位置参数 / npm 透传）。
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// 写事务写前写后对照（读 undo store；缺省 = 最近活跃事务）。
+    Diff {
+        /// 事务号（缺省 = 最近活跃事务；显式 id 也可读已回滚的 undone 事务）。
+        #[arg(value_name = "TXN_ID")]
+        txn_id: Option<u64>,
+        /// 输出 unified diff（patch -p1 / git apply 可直接消费）。
+        #[arg(long)]
+        patch: bool,
+    },
+    /// 按启发式链找符号的测试（tests/ 镜像 → 测试目录/命名 → super:: 单测 → LS refs）。
+    FindTest {
+        /// 符号名。
+        symbol: String,
+    },
+    /// 预定义工作流编排（计划 §2 批4：8 recipe 单入口）。写步各自独立 undo
+    /// 事务；单步失败即停并逆序回滚已完成的写步（报告含 undo 结果）。
+    Recipe {
+        /// recipe 名：fix-bug|add-feature|rename|add-test|refactor-extract|refactor-rename|review-diff|explore
+        name: String,
+        /// 位置参数：fix-bug/rename/refactor-extract = <file> <sym>；add-feature
+        /// = <name>；add-test/refactor-rename = <sym>；explore = <path>；
+        /// review-diff = [txn-id]。
+        #[arg(value_name = "ARG")]
+        args: Vec<String>,
+        /// fix-bug：替换后的新函数体（缺省 = 只跑分析链，不写）。
+        #[arg(long)]
+        new_body: Option<String>,
+        /// rename / refactor-rename：新名。
+        #[arg(long)]
+        to: Option<String>,
+        /// refactor-extract：抽取出的新 fn 名。
+        #[arg(long = "as", value_name = "NEW")]
+        as_name: Option<String>,
+        /// add-feature：stub 落盘目标文件（.rs）。
+        #[arg(long, value_name = "FILE")]
+        target: Option<String>,
+        /// add-feature：测试文件（与 --tests 同给才启用测试步）。
+        #[arg(long, value_name = "FILE")]
+        tests_file: Option<String>,
+        /// add-feature：测试代码全文。
+        #[arg(long)]
+        tests: Option<String>,
+        /// add-test：写模板后跑一次测试后端。
+        #[arg(long)]
+        run: bool,
+    },
     /// 代码补全（textDocument/completion）—— AI-friendly 字段裁剪 + 自动推断 trigger。
     /// line/col 为 1-based（与 def/refs 同基线；CLI 层统一转 LSP 0-based）。
     Completion {
@@ -448,8 +558,27 @@ enum Cmd {
     Moniker { file: String, line: u32, col: u32 },
     /// workspace 级 pull diagnostics（workspace/diagnostic）。
     WorkspaceDiagnostic,
+    /// 项目元信息（bd v3yv）：project root + git branch/HEAD + daemon/LS 加载状态。
+    /// 纯探测语义（同 status）：永不 lazy-spawn。
+    ProjectInfo {
+        /// 项目根（缺省顺序：--project > daemon active_project > 当前目录）。
+        #[arg(long, value_name = "ROOT")]
+        project: Option<PathBuf>,
+    },
     /// daemon 状态（uptime / pid / loaded LS）。
     Status,
+    /// 变更历史（bd zyrg）：git log --follow 包装；--symbol 走 `-L :sym:file`
+    /// 符号级跟踪。git 缺失 / 非 repo → exit 3 + stderr 原因。
+    ChangeHistory {
+        /// 仓库内相对路径（git 风格，正斜杠）。
+        file: String,
+        /// 符号名（函数/方法）；提供时忽略 --follow，走 git -L 符号级历史。
+        #[arg(long)]
+        symbol: Option<String>,
+        /// 最大条数。
+        #[arg(long, default_value_t = 20)]
+        max: usize,
+    },
     /// 停掉 daemon（draining + 删 lock）。
     StopAll,
     /// 安装 servers.toml 配置驱动 LS（PATH 探测 → 下载 → sha256 校验 → 落地缓存）。
@@ -472,7 +601,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// 注册/覆盖/列出/移除用户自装 LS（写 external-servers.toml；bd serena-rust-4ux）。
+    // bd serena-rust-4ux（内部追踪号，不入 --help）
+    /// 注册/覆盖/列出/移除用户自装 LS（写 external-servers.toml）。
     /// 已知语言/id → 继承内置条目，仅改指你的二进制；未知 id → `--lang <LANG>
     /// --ext .<ext>` 注册全新语言。注册在 daemon 重启后生效。
     LsUse {
@@ -526,7 +656,8 @@ enum Cmd {
         #[arg(long)]
         fix: bool,
     },
-    /// 静态自审即将在 shell 执行的命令串（bd serena-rust-8ot）。默认 warn-only
+    // bd serena-rust-8ot（内部追踪号，不入 --help）
+    /// 静态自审即将在 shell 执行的命令串。默认 warn-only
     /// （有 finding 也 exit 0）；`--strict` 下存在 error 级 finding → exit 2。
     LintShell {
         /// 待检查的命令串（与 --cmd-stdin 二选一）。
@@ -576,13 +707,48 @@ async fn cli_main() -> ExitCode {
         }
     }
 
-    let mut cli = Cli::parse();
+    // l5nv：`?query` → find-symbol query；`cmd? …` → cmd …（短输入糖）。
+    // 首个位置参数命中 '?' 形态才重写 argv 重解析；其余路径与原生 parse 等价。
+    let raw_argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut cli = match rewrite_shorthand_argv(raw_argv) {
+        Some(argv) => Cli::try_parse_from(std::iter::once("serena-cli".to_string()).chain(argv))
+            .unwrap_or_else(|e| e.exit()),
+        None => Cli::parse(),
+    };
 
     // 行号契约统一（bd serena-rust-7xv）：position 型子命令的 line/col 以 1-based
     // 收入，此处一次性就地转 LSP 0-based —— `--direct` 进程内直调与 HTTP 转发两条
     // 路径共用转换结果，supervisor / lsp-core 不感知。0 = 用法错（BAD_ARGS，exit 2）。
     if let Some(sub) = cli.cmd.as_mut()
         && let Err(detail) = normalize_positions(sub)
+    {
+        eprintln!("BAD_ARGS: {detail}");
+        return ExitCode::from(2);
+    }
+
+    // bd serena-rust-74b3：warm 缺省 LANG 按项目根清单探测（显式 --lang 优先）。
+    if let Some(Cmd::Warm { lang, .. }) = cli.cmd.as_mut()
+        && lang.is_none()
+    {
+        let root = resolve_project_root(cli.project.clone());
+        match detect_project_lang(&root) {
+            Some(detected) => {
+                eprintln!("[hint] warm: no --lang given; detected `{detected}` from project manifests");
+                *lang = Some(detected.to_string());
+            }
+            None => {
+                eprintln!(
+                    "warm: no --lang and no known project manifest (Cargo.toml / pyproject.toml / tsconfig.json / package.json) under {}; pass --lang",
+                    root.display()
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // bd serena-rust-8cx5：单文本写工具 `--with` 别名归一（与 replace-body 对齐）。
+    if let Some(sub) = cli.cmd.as_mut()
+        && let Err(detail) = resolve_with_alias(sub)
     {
         eprintln!("BAD_ARGS: {detail}");
         return ExitCode::from(2);
@@ -623,6 +789,19 @@ async fn cli_main() -> ExitCode {
     // ---- 管理命令：只走 lock/HTTP，不需要 project ----
     match &cli.cmd {
         Some(Cmd::Status) => return cmd_status(&lock_path).await,
+        // change-history：纯本地 git log 包装（不碰 daemon/LS）。
+        Some(Cmd::ChangeHistory {
+            file,
+            symbol,
+            max,
+        }) => {
+            let project_root = resolve_project_root(cli.project.clone());
+            return cmd_change_history(&project_root, file, symbol.as_deref(), *max);
+        }
+        // project-info：纯探测（读 lock + GET /status + 本地 .git 解析），不碰 LS。
+        Some(Cmd::ProjectInfo { project }) => {
+            return cmd_project_info(&lock_path, project.clone()).await;
+        }
         Some(Cmd::StopAll) => return cmd_stop_all(&lock_path).await,
         // lint-shell：纯本地静态分析，不碰 daemon/lock。
         Some(Cmd::LintShell {
@@ -725,8 +904,11 @@ async fn cli_main() -> ExitCode {
         return cmd_shell(&cli).await;
     }
     // ---- 默认：转发模式（lazy-spawn；draining 窗口自愈 g0m）----
+    // bd serena-rust-cwt：工具级退出码经 Ok(n) 正常返回（tracing 等 Drop 收尾
+    // 有机会 flush），只有传输层失败才落 rc=3。
     match forward_with_draining_retry(&cli, &lock_path).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(n) => ExitCode::from(n),
         Err(e) => {
             eprintln!("{e}");
             ExitCode::from(3)
@@ -866,7 +1048,8 @@ where
 }
 
 /// forward_or_spawn + draining 自愈包装（g0m）。转发模式的实际入口。
-async fn forward_with_draining_retry(cli: &Cli, lock_path: &Path) -> Result<(), String> {
+/// Ok = wire 码退出码（0 成功）；Err = 传输层失败文本（main 统一 rc=3）。
+async fn forward_with_draining_retry(cli: &Cli, lock_path: &Path) -> Result<u8, String> {
     retry_on_draining(
         || forward_or_spawn(cli, lock_path),
         DRAINING_RETRY_WINDOW,
@@ -883,6 +1066,15 @@ async fn forward_with_draining_retry(cli: &Cli, lock_path: &Path) -> Result<(), 
 enum WaitStage {
     Symbol,
     Semantic,
+}
+
+/// 51ib：读类工具输出档位（find-symbol / search `--format`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum OutFormat {
+    Brief,
+    Full,
+    Json,
 }
 
 /// wait-ready 超时上限（秒），默认 120s。
@@ -992,6 +1184,9 @@ fn hover_probe_positions(data: &serde_json::Value, file_text: Option<&str>) -> V
 
 /// 默认探测目标：项目内首个源文件（扩展名经 ls-registry 识别即算）。
 /// 浅深度优先（深度 ≤4），跳过 VCS/构建/依赖目录；找不到返回 None。
+/// bd serena-rust-tjlm：清单/配置类"非源码"（toml/json/yaml 等）默认排除——
+/// 它们是已注册语言但常排在真源码之前（Cargo.toml < src/*.rs），对应 LS 未装时
+/// wait-ready 默认探针会陷入 LS_NOT_INSTALLED 死循环；`--file` 显式指定不受限。
 fn find_first_source_file(root: &Path) -> Option<PathBuf> {
     const SKIP: [&str; 10] = [
         ".git",
@@ -1005,6 +1200,13 @@ fn find_first_source_file(root: &Path) -> Option<PathBuf> {
         ".idea",
         ".vscode",
     ];
+    fn probeable(p: &Path) -> bool {
+        const SKIP_EXTS: [&str; 7] = ["toml", "json", "yaml", "yml", "lock", "ini", "cfg"];
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| !SKIP_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or(true)
+    }
     fn walk(dir: &Path, depth: u8) -> Option<PathBuf> {
         if depth > 4 {
             return None;
@@ -1023,7 +1225,7 @@ fn find_first_source_file(root: &Path) -> Option<PathBuf> {
                 {
                     return Some(hit);
                 }
-            } else if ls_registry::file_detect::detect_language(&p).is_some() {
+            } else if probeable(&p) && ls_registry::file_detect::detect_language(&p).is_some() {
                 return Some(p);
             }
         }
@@ -1067,6 +1269,47 @@ async fn probe_tool_call(
             .unwrap_or(serde_json::Value::Null)),
         _ => Err(payload.get("error").cloned().unwrap_or(payload).to_string()),
     }
+}
+
+/// l5nv：短输入糖——argv 首个位置参数 `?query` → `find-symbol query`（后续 token
+/// 不动，如 `?clamp --format brief`），`cmd?` → `cmd`（剥尾 '?'，如 `list-dir? crates`）。
+/// 返回 None = 无需重写（原样 parse）。取值型全局旗的值不算位置参数；
+/// `--flag=value` 同 token 带值；`--` 终结符后不做糖。
+fn rewrite_shorthand_argv(mut argv: Vec<String>) -> Option<Vec<String>> {
+    const VALUE_FLAGS: [&str; 6] = [
+        "--project",
+        "--lang",
+        "--request-timeout",
+        "--index-timeout",
+        "--max-tokens",
+        "--invocation-id",
+    ];
+    let mut i = 0;
+    while i < argv.len() {
+        let tok = argv[i].clone();
+        if tok == "--" {
+            return None;
+        }
+        if tok.starts_with('-') && tok.len() > 1 {
+            // 未知旗跳自身即可（未知旗 clap 报错，与糖无关）；取值旗连值一起跳。
+            i += if VALUE_FLAGS.contains(&tok.as_str()) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        if tok.len() > 1 && tok.starts_with('?') {
+            argv.splice(i..i + 1, vec!["find-symbol".into(), tok[1..].to_string()]);
+            return Some(argv);
+        }
+        if tok.len() > 1 && tok.ends_with('?') {
+            argv[i] = tok.trim_end_matches('?').to_string();
+            return Some(argv);
+        }
+        return None;
+    }
+    None
 }
 
 /// `wait-ready` 子命令（bd serena-rust-55m / bxd）：阻塞到所选档位就绪。
@@ -1198,6 +1441,45 @@ async fn cmd_wait_ready(
                     Err(e) => eprintln!("probe error (keep waiting): {e}"),
                 }
             }
+        } else if stage == WaitStage::Symbol {
+            // oab：RA 大项目首文件 documentSymbol 可能仍在爬升而全局符号索引已起
+            // —— overview 空 ≠ 符号层未就绪（假阴性死等）。find-symbol(探针文件
+            // 词干) 兜底判据（b8sp 同思路：判据素材取自探针文件自身，不依赖单文件
+            // documentSymbol）。0 命中/出错 = 继续等，不造假阳性。
+            let stem = probe_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            if !stem.is_empty() {
+                match probe_tool_call(
+                    &client,
+                    &base,
+                    &token,
+                    &root,
+                    "find-symbol",
+                    json!({"query": stem, "limit": 1}),
+                    lang.as_deref(),
+                )
+                .await
+                {
+                    Ok(data)
+                        if data
+                            .get("raw_count")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            > 0 =>
+                    {
+                        eprintln!(
+                            "ready (symbol, find-symbol `{stem}`) in {}s",
+                            started.elapsed().as_secs()
+                        );
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("probe find-symbol error (keep waiting): {e}"),
+                }
+            }
         }
         if Instant::now() >= deadline {
             eprintln!("wait-ready: not ready within {timeout_secs}s");
@@ -1221,7 +1503,7 @@ async fn cmd_wait_ready(
 }
 
 /// 转发模式：探活 → 转发；死 lock → lazy-spawn --daemon → 轮询就绪 → 转发。
-async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<(), ForwardFailure> {
+async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<u8, ForwardFailure> {
     let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
     let base = match entry {
         Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
@@ -1483,8 +1765,25 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
     Some(match cmd {
         // 本地管理命令已在 main 提前 return；到达此处即编程错误。
         Some(Cmd::Overview { file, .. }) => ("overview", json!({"file": file})),
-        Some(Cmd::SymbolTree { dir, max_files }) => {
-            ("symbol-tree", json!({"dir": dir, "max_files": max_files}))
+        Some(Cmd::SymbolTree {
+            dir,
+            max_files,
+            grep,
+            max_depth,
+            files_only,
+        }) => {
+            // 6ooi：三开关缺省不传（wire args 零新键，与默认行为逐字节一致）。
+            let mut a = json!({"dir": dir, "max_files": max_files});
+            if let Some(g) = grep {
+                a["grep"] = json!(g);
+            }
+            if let Some(d) = max_depth {
+                a["max_depth"] = json!(d);
+            }
+            if *files_only {
+                a["files_only"] = json!(true);
+            }
+            ("symbol-tree", a)
         }
         Some(Cmd::Def { file, line, col }) => {
             ("def", json!({"file": file, "line": line, "col": col}))
@@ -1498,9 +1797,15 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
         Some(Cmd::Diagnostics { file, wait_gen }) => {
             ("diagnostics", json!({"file": file, "wait_gen": wait_gen}))
         }
-        Some(Cmd::FindSymbol { query, limit, .. }) => {
-            ("find-symbol", json!({"query": query, "limit": limit}))
-        }
+        Some(Cmd::FindSymbol {
+            query,
+            limit,
+            format,
+            ..
+        }) => (
+            "find-symbol",
+            json!({"query": query, "limit": limit, "format": format}),
+        ),
         Some(Cmd::FindImplementations {
             file, line, col, ..
         }) => (
@@ -1522,6 +1827,8 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             max_results,
             comments_only,
             case_sensitive,
+            distinct_symbols,
+            format,
         }) => (
             "search",
             json!({
@@ -1530,6 +1837,8 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
                 "max_results": max_results,
                 "comments_only": comments_only,
                 "case_sensitive": case_sensitive,
+                "distinct_symbols": distinct_symbols,
+                "format": format,
             }),
         ),
         Some(Cmd::ReadFile {
@@ -1555,6 +1864,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             grouped,
             page,
             page_size,
+            debug_raw,
         }) => (
             "find-referencing-symbols",
             json!({
@@ -1564,6 +1874,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
                 "grouped": grouped,
                 "page": page,
                 "page_size": page_size,
+                "_debug_raw": debug_raw,
             }),
         ),
         Some(Cmd::FindReferencingCodeSnippets {
@@ -1573,11 +1884,13 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             symbol,
             context_lines,
             max_results,
+            debug_raw,
         }) => {
             // --symbol 直查：位置可省，supervisor 端解析符号名转坐标（O3）。
             let mut a = json!({
                 "context_lines": context_lines,
                 "max_results": max_results,
+                "_debug_raw": debug_raw,
             });
             if let Some(name) = symbol {
                 a["symbol"] = json!(name);
@@ -1620,13 +1933,14 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             "replace-text-in-symbol",
             json!({"file": file, "symbol": symbol, "old_text": old_text, "new_text": new_text}),
         ),
-        Some(Cmd::InsertTextBeforeSymbol { file, symbol, text }) => (
+        Some(Cmd::InsertTextBeforeSymbol { file, symbol, text, .. }) => (
             "insert-text-before-symbol",
-            json!({"file": file, "symbol": symbol, "text": text}),
+            // --with 别名已由 resolve_with_alias 落回 text（cli_main 必经）。
+            json!({"file": file, "symbol": symbol, "text": text.as_deref().expect("resolved by resolve_with_alias")}),
         ),
-        Some(Cmd::InsertTextAfterSymbol { file, symbol, text }) => (
+        Some(Cmd::InsertTextAfterSymbol { file, symbol, text, .. }) => (
             "insert-text-after-symbol",
-            json!({"file": file, "symbol": symbol, "text": text}),
+            json!({"file": file, "symbol": symbol, "text": text.as_deref().expect("resolved by resolve_with_alias")}),
         ),
         Some(Cmd::DeleteTextInSymbol {
             file,
@@ -1646,9 +1960,15 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             line,
             text,
             expected_hash,
+            ..
         }) => (
             "insert-at-line",
-            json!({"file": file, "line": line, "content": text, "expected_hash": expected_hash}),
+            json!({
+                "file": file,
+                "line": line,
+                "content": text.as_deref().expect("resolved by resolve_with_alias"),
+                "expected_hash": expected_hash,
+            }),
         ),
         Some(Cmd::ReplaceLines {
             file,
@@ -1656,13 +1976,14 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             end_line,
             text,
             expected_hash,
+            ..
         }) => (
             "replace-lines",
             json!({
                 "file": file,
                 "start_line": start_line,
                 "end_line": end_line,
-                "content": text,
+                "content": text.as_deref().expect("resolved by resolve_with_alias"),
                 "expected_hash": expected_hash,
             }),
         ),
@@ -1835,13 +2156,46 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             ("moniker", json!({"file": file, "line": line, "col": col}))
         }
         Some(Cmd::WorkspaceDiagnostic) => ("workspace-diagnostic", json!({})),
-        Some(Cmd::CreateTextFile { file, content }) => (
+        Some(Cmd::CreateTextFile { file, content, .. }) => (
             "create-text-file",
-            json!({"file": file, "content": content}),
+            json!({"file": file, "content": content.as_deref().expect("resolved by resolve_with_alias")}),
         ),
         Some(Cmd::Undo { steps, list }) => ("undo", json!({"steps": steps, "list": list})),
         Some(Cmd::Redo) => ("redo", json!({})),
+        Some(Cmd::Test { file, name }) => {
+            let mut a = json!({"target": file});
+            if let Some(n) = name
+                && !n.is_empty()
+            {
+                a["name"] = json!(n);
+            }
+            ("test", a)
+        }
+        Some(Cmd::Diff { txn_id, patch }) => {
+            let mut a = json!({});
+            if let Some(n) = txn_id {
+                a["txn_id"] = json!(n);
+            }
+            if *patch {
+                a["patch"] = json!(true);
+            }
+            ("diff", a)
+        }
+        Some(Cmd::FindTest { symbol }) => ("find-test", json!({"symbol": symbol})),
+        Some(Cmd::Recipe { name, args, new_body, to, as_name, target, tests_file, tests, run }) => {
+            let mut a = json!({ "name": name, "pos": args });
+            if let Some(v) = new_body { a["new_body"] = json!(v); }
+            if let Some(v) = to { a["to"] = json!(v); }
+            if let Some(v) = as_name { a["as"] = json!(v); }
+            if let Some(v) = target { a["target"] = json!(v); }
+            if let Some(v) = tests_file { a["tests_file"] = json!(v); }
+            if let Some(v) = tests { a["tests"] = json!(v); }
+            if *run { a["run"] = json!(true); }
+            ("recipe", a)
+        }
         Some(Cmd::Status)
+        | Some(Cmd::ProjectInfo { .. })
+        | Some(Cmd::ChangeHistory { .. })
         | Some(Cmd::StopAll)
         | Some(Cmd::Install { .. })
         | Some(Cmd::Uninstall { .. })
@@ -1875,17 +2229,22 @@ fn inject_private_args(args: &mut serde_json::Value, cli: &Cli) {
         if cli.compress {
             obj.insert("_compress".into(), serde_json::json!(true));
         }
+        if cli.dry_run {
+            obj.insert("dry_run".into(), serde_json::json!(true));
+        }
     }
 }
 
 /// 按子命令转发 HTTP。
+/// Ok(0) = 工具成功；Ok(n) = 工具失败（wire 码 → exit 码，消息已打 stderr）；
+/// Err = 传输层失败（bd serena-rust-cwt：退出码经返回值传递，不用 process::exit）。
 async fn forward(
     cli: &Cli,
     base: &str,
     token: &mut String,
     lock_path: &Path,
     lang: Option<&str>,
-) -> Result<(), ForwardFailure> {
+) -> Result<u8, ForwardFailure> {
     let client = http_client();
     let (tool, mut args) = tool_request(&cli.cmd)
         .expect("handled earlier: local commands returned before forward");
@@ -1969,19 +2328,20 @@ async fn forward(
                 );
             }
             print_json(data).map_err(|e| e.to_string())?;
-            Ok(())
+            Ok(0)
         }
         _ => {
             let err = payload.get("error").cloned().unwrap_or(payload);
             eprintln!("tool error: {err}");
             // Δ 43ae021：exit 码按 wire code 取（ARCH §6.3 / dto::wire_error_code_to_exit），
             // 不再一律 1 —— Internal→3、BadArgs→2，agent 据此免重试确定性失败。
+            // bd serena-rust-cwt：不再 std::process::exit —— 那会跳 Drop，
+            // tracing subscriber / reqwest 缓冲来不及 flush（错误链零线索）；
+            // 改为把退出码作为 Ok 值回传，正常走 main 的收尾路径。
             let code = err
                 .get("code")
                 .and_then(|c| serde_json::from_value::<daemon::dto::WireErrorCode>(c.clone()).ok());
-            std::process::exit(i32::from(
-                code.map_or(1u8, daemon::dto::wire_error_code_to_exit),
-            ));
+            Ok(code.map_or(1u8, daemon::dto::wire_error_code_to_exit))
         }
     }
 }
@@ -2589,6 +2949,8 @@ fn cmd_ls_remove(id: &str) -> ExitCode {
 /// workspace 内时 `cargo metadata` 失败（"current package believes it's in a
 /// workspace"），RA FetchWorkspaceError 令 def/refs/hover 等语义工具静默返空
 /// ——在此提前暴露根因。检查目标 = `--project` 或 cwd。
+/// bd serena-rust-0x0：非 cargo 项目（npm/pyproject 等）按其清单单独判读，
+/// 不再误跑 cargo metadata 报"cargo 不可执行"噪音。
 fn check_cargo_metadata(project_root: &Path) -> supervisor::doctor::Check {
     let mk = |status: supervisor::doctor::Status, detail: String, hint: Option<String>| {
         supervisor::doctor::Check {
@@ -2600,6 +2962,36 @@ fn check_cargo_metadata(project_root: &Path) -> supervisor::doctor::Check {
             hint,
         }
     };
+    // 非 cargo 清单探测（根直接子级）：命中 → 报清单类型并跳过 cargo 分支。
+    const NON_CARGO: [(&str, &str); 4] = [
+        ("package.json", "npm/node"),
+        ("pyproject.toml", "python (PEP 621)"),
+        ("requirements.txt", "python (pip)"),
+        ("go.mod", "go modules"),
+    ];
+    if !project_root.join("Cargo.toml").is_file() {
+        if let Some((manifest, kind)) = NON_CARGO
+            .iter()
+            .find(|(f, _)| project_root.join(f).is_file())
+        {
+            return mk(
+                supervisor::doctor::Status::Ok,
+                format!("非 cargo 项目（{kind}，{manifest}）；跳过 cargo metadata"),
+                None,
+            );
+        }
+        // Cargo.toml 缺席且无已知清单：多语言混装项目里 marker 可能只是不在此层
+        // —— Warn 提示而非 Miss，避免对目录式项目误报。
+        return mk(
+            supervisor::doctor::Status::Warn,
+            "no Cargo.toml / package.json / pyproject.toml at project root".into(),
+            Some(
+                "Rust 项目请确认 Cargo.toml 在 --project 指向的目录；\
+                 其他语言项目可忽略（LS 语义可用性以实际工具调用为准）"
+                    .into(),
+            ),
+        );
+    }
     // ponytail: 无超时——std Command 无内建超时；--no-deps 冷缓存秒级，与网络探活同级可接受。
     match std::process::Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -2666,38 +3058,63 @@ async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path, project_root: &Path
         }
     } else {
         print!("{}", supervisor::doctor::format_text(&report));
+        // bd serena-rust-0z9 / xwh：用户可写配置路径就地可见（与 README
+        // "Config file locations" 同源；--json 模式不加行，保持可解析）。
+        if let Some(p) = ls_registry::config::external_servers_path() {
+            println!("config: external servers (ls-use registry) — {}", p.display());
+        }
+        if let Some(p) = ls_registry::config::user_config_path() {
+            println!("config: user overrides (config.toml) — {}", p.display());
+        }
     }
     ExitCode::from(report.exit_code())
 }
 
-/// bd serena-rust-abi：loaded_ls 同 lang 多 session 折叠计数（`["rust","rust","rust"]`
-/// → `["rust x3"]`）。session 池按 (project_root, lang) 键控，daemon 生命周期内
-/// 服务过的多 project 各占一条；仅显示层消歧义，status wire 不动。
-fn dedup_loaded_ls(body: &mut serde_json::Value) {
-    let Some(arr) = body.get_mut("loaded_ls").and_then(|v| v.as_array_mut()) else {
-        return;
-    };
-    let mut counts = std::collections::BTreeMap::new();
-    for lang in arr.iter().filter_map(|v| v.as_str()) {
-        *counts.entry(lang.to_owned()).or_insert(0usize) += 1;
-    }
-    *arr = counts
-        .into_iter()
-        .map(|(lang, n)| {
-            if n > 1 {
-                json!(format!("{lang} x{n}"))
-            } else {
-                json!(lang)
-            }
-        })
-        .collect();
-}
+/// bd serena-rust-0x0：doctor workspace 检查的非 cargo 清单分支（不拉 cargo，
+/// 纯 fs 探测路径可单测）。
+#[cfg(test)]
+mod doctor_workspace_tests {
+    use super::*;
 
+    #[test]
+    fn workspace_check_reports_non_cargo_manifests_without_running_cargo() {
+        let tmp =
+            std::env::temp_dir().join(format!("serena-doctor-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("package.json"), "{}").unwrap();
+        let c = check_cargo_metadata(&tmp);
+        assert_eq!(c.status, supervisor::doctor::Status::Ok);
+        assert!(c.detail.contains("npm/node"), "{}", c.detail);
+
+        let py = std::env::temp_dir()
+            .join(format!("serena-doctor-ws-py-{}", std::process::id()));
+        std::fs::create_dir_all(&py).unwrap();
+        std::fs::write(py.join("pyproject.toml"), "[project]").unwrap();
+        let c = check_cargo_metadata(&py);
+        assert_eq!(c.status, supervisor::doctor::Status::Ok);
+        assert!(c.detail.contains("python"), "{}", c.detail);
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&py).ok();
+    }
+
+    #[test]
+    fn workspace_check_warns_on_manifest_less_root() {
+        let tmp =
+            std::env::temp_dir().join(format!("serena-doctor-ws-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let c = check_cargo_metadata(&tmp);
+        assert_eq!(c.status, supervisor::doctor::Status::Warn);
+        assert!(c.detail.contains("no Cargo.toml"), "{}", c.detail);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+}
 /// `status` 子命令。
 ///
 /// bd 30m：纯探测语义——只读 lock + TCP 探活 + GET /status，**永不 lazy-spawn**
 /// （哨兵/无残留基线依赖 status 无副作用：daemon 不在时报 not-running 而非拉起；
 /// 回归测试 `status_tests::status_absent_daemon_never_spawns`）。
+/// bd b09i：daemon 侧已结构化 loaded_ls（{lang, sessions}），CLI 直透不再折叠。
 async fn cmd_status(lock_path: &Path) -> ExitCode {
     let entry = match daemon::lockfile::read(lock_path) {
         Ok(Some(e)) if probe(e.port) => e,
@@ -2715,8 +3132,7 @@ async fn cmd_status(lock_path: &Path) -> ExitCode {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            let mut body: serde_json::Value = resp.json().await.unwrap_or(json!(null));
-            dedup_loaded_ls(&mut body);
+            let body: serde_json::Value = resp.json().await.unwrap_or(json!(null));
             print_json(&body).expect("print status");
             ExitCode::SUCCESS
         }
@@ -2724,6 +3140,172 @@ async fn cmd_status(lock_path: &Path) -> ExitCode {
             eprintln!("status probe failed: {other:?}");
             ExitCode::from(3)
         }
+    }
+}
+
+/// `project-info` 子命令（bd v3yv）：git 风格项目元信息 + daemon/LS 加载状态。
+///
+/// 纯探测语义（同 `status`）：读 lock + TCP 探活 + GET /status + 本地 .git 解析，
+/// **永不 lazy-spawn**。git meta 只读 `.git/HEAD`（分支 + 短 sha；worktree 链接与
+/// packed-refs 兜底解析），不跑 git 子进程。
+async fn cmd_project_info(lock_path: &Path, project: Option<PathBuf>) -> ExitCode {
+    let daemon_entry = daemon::lockfile::read(lock_path).unwrap_or(None);
+    let daemon_online = daemon_entry
+        .as_ref()
+        .map(|e| probe(e.port))
+        .unwrap_or(false);
+
+    // status 拉取（loaded_ls / active_project / daemon_version / pid）。
+    let mut status: Option<serde_json::Value> = None;
+    if let (Some(e), true) = (&daemon_entry, daemon_online) {
+        let client = http_client();
+        if let Ok(resp) = client
+            .get(format!("http://127.0.0.1:{}/status", e.port))
+            .header("X-Serena-Token", &e.token)
+            .timeout(MGMT_TIMEOUT)
+            .send()
+            .await
+            && resp.status().is_success()
+            && let Ok(body) = resp.json::<serde_json::Value>().await
+        {
+            status = Some(body);
+        }
+    }
+
+    // root 解析顺序：--project > daemon active_project > 当前目录。
+    let root = project
+        .or_else(|| {
+            status
+                .as_ref()
+                .and_then(|s| s["active_project"].as_str())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    let mut out = json!({
+        "project_root": root.display().to_string(),
+        "daemon": {
+            "running": daemon_online,
+            "version": status.as_ref().and_then(|s| s["daemon_version"].as_str()),
+            "pid": status.as_ref().and_then(|s| s["pid"].as_u64()),
+        },
+        // loaded = daemon 在线且该 root 有至少一门 LS 会话（加载状态）。
+        "ls_loaded": status
+            .as_ref()
+            .map(|s| s["loaded_ls"].as_array().is_some_and(|a| !a.is_empty()))
+            .unwrap_or(false),
+        "loaded_ls": status
+            .as_ref()
+            .and_then(|s| s["loaded_ls"].as_array())
+            .cloned()
+            .unwrap_or_default(),
+    });
+
+    // git 风格 meta：分支 + HEAD 短 sha（.git 目录直读，不跑子进程）。
+    let dotgit = root.join(".git");
+    let head_text = if dotgit.is_dir() {
+        std::fs::read_to_string(dotgit.join("HEAD")).ok()
+    } else {
+        None
+    };
+    if let Some(head) = head_text {
+        let branch = head
+            .trim()
+            .strip_prefix("ref: refs/heads/")
+            .unwrap_or("(detached)")
+            .to_string();
+        let sha = resolve_git_head_sha(&dotgit, head.trim());
+        let mut git = json!({ "branch": branch });
+        if let Some(sha) = sha {
+            git["head"] = json!(sha.chars().take(9).collect::<String>());
+        }
+        out["git"] = git;
+    }
+
+    print_json(&out).expect("print project-info");
+    ExitCode::SUCCESS
+}
+
+/// `change-history` 子命令（bd zyrg）：文件/符号级变更历史。
+///
+/// `git log` 包装：默认 `--follow`（跨 rename 追踪），`--symbol` 走 `-L :sym:file`
+/// 符号级历史。记录头用 `\x01<H>\t<ct>\t<s>` 切分（subject 可含任意字符，同
+/// supervisor ct_recent_activity 的 porcelain 形态）。git 缺失 / 非 repo /
+/// 超时 → exit 3 + stderr 原因，不静默。
+fn cmd_change_history(root: &Path, file: &str, symbol: Option<&str>, max: usize) -> ExitCode {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(root).arg("log").arg("-n").arg(max.to_string());
+    match symbol {
+        Some(sym) => {
+            // arg 分开传："-L :sym:file" 合成单 argv 会让 git 把值解析成
+            // " :sym:file"（前导空格），:funcname:file 匹配直接 fatal。
+            cmd.arg("-L").arg(format!(":{sym}:{file}"));
+        }
+        None => {
+            cmd.arg("--follow");
+        }
+    }
+    // --pretty 必须在 `--`（pathspec 分隔）之前，否则被吃成 pathspec。
+    cmd.arg("--pretty=format:%x01%H%x09%ct%x09%s");
+    if symbol.is_none() {
+        cmd.arg("--").arg(file);
+    }
+    let out = match cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("git log spawn failed: {e} (git not on PATH?)");
+            return ExitCode::from(3);
+        }
+    };
+    if !out.status.success() {
+        eprintln!("git log failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        return ExitCode::from(3);
+    }
+    // -L 模式 format 行后附 patch 体；\x01 切分天然只取记录头，patch 忽略。
+    let commits: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .split('\x01')
+        .filter_map(|rec| {
+            let head = rec.lines().next()?;
+            let mut parts = head.splitn(3, '\t');
+            let sha = parts.next()?.trim();
+            if sha.is_empty() {
+                return None;
+            }
+            let ts = parts.next()?.parse::<u64>().unwrap_or(0);
+            Some(json!({ "sha": sha, "committed_at": ts, "subject": parts.next().unwrap_or_default() }))
+        })
+        .collect();
+    let mut out_json = json!({ "file": file, "commits": commits });
+    if let Some(sym) = symbol {
+        out_json["symbol"] = json!(sym);
+    }
+    print_json(&out_json).expect("print change-history");
+    ExitCode::SUCCESS
+}
+
+/// 解析 HEAD 指向的 commit sha：直接 ref 文件 → packed-refs 兜底 → detached sha。
+fn resolve_git_head_sha(dotgit: &Path, head: &str) -> Option<String> {
+    if let Some(sha) = head.strip_prefix("ref: ") {
+        let ref_file = dotgit.join(sha);
+        if let Ok(s) = std::fs::read_to_string(ref_file) {
+            return Some(s.trim().to_string());
+        }
+        // packed-refs：`<sha> <refname>` 行匹配。
+        let packed = std::fs::read_to_string(dotgit.join("packed-refs")).ok()?;
+        let needle = format!(" {sha}");
+        packed
+            .lines()
+            .find(|l| l.ends_with(&needle))
+            .and_then(|l| l.split_whitespace().next())
+            .map(str::to_string)
+    } else {
+        // detached HEAD：HEAD 本身就是 sha。
+        Some(head.to_string())
     }
 }
 
@@ -3075,11 +3657,10 @@ where
             .await
             .map_err(|e| format!("status: {e}"))?;
         let status = resp.status();
-        let mut data: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+        let data: serde_json::Value = resp.json().await.unwrap_or(json!(null));
         if !status.is_success() {
             return Err(format!("daemon transport {status}: {data}"));
         }
-        dedup_loaded_ls(&mut data);
         return Ok(data);
     }
 
@@ -3130,7 +3711,13 @@ where
         // IDE undo/redo（事务版快照栈）+ 新建文件 —— supervisor 侧 tool 层实现。
         | "create-text-file"
         | "undo"
-        | "redo" => cmd,
+        | "redo"
+        // recipe 批1 地基三原子命令。
+        | "test"
+        | "diff"
+        | "find-test"
+        // recipe 批4 编排层单入口。
+        | "recipe" => cmd,
         other => return Err(format!("unknown cmd: {other}")),
     };
     let body = json!({
@@ -3210,6 +3797,287 @@ fn resolve_project_root(raw: Option<PathBuf>) -> PathBuf {
     dunce::canonicalize(&p).unwrap_or(p)
 }
 
+/// bd serena-rust-74b3：项目清单 → 主语言（warm 缺省 LANG 探测）。
+/// 只看项目根直接子级；命中序 = 表序（多清单项目取先者）。package.json 单独
+/// 出现也报 typescript —— ts/js 同走 tsserver（ls-registry LanguageId 归并）。
+fn detect_project_lang(root: &Path) -> Option<&'static str> {
+    const MANIFESTS: &[(&str, &str)] = &[
+        ("Cargo.toml", "rust"),
+        ("pyproject.toml", "python"),
+        ("tsconfig.json", "typescript"),
+        ("package.json", "typescript"),
+    ];
+    MANIFESTS
+        .iter()
+        .find_map(|(f, lang)| root.join(f).is_file().then_some(*lang))
+}
+
+#[cfg(test)]
+mod warm_lang_detect_tests {
+    use super::*;
+
+    #[test]
+    fn detect_project_lang_prefers_manifest_order_and_none_without() {
+        let tmp = std::env::temp_dir().join(format!("serena-warm-detect-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(detect_project_lang(&tmp), None, "空目录探测不到");
+
+        std::fs::write(tmp.join("pyproject.toml"), "[project]").unwrap();
+        assert_eq!(detect_project_lang(&tmp), Some("python"));
+
+        std::fs::write(tmp.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(
+            detect_project_lang(&tmp),
+            Some("rust"),
+            "表序 = Cargo.toml 先于 pyproject.toml"
+        );
+
+        // 子目录里的清单不算（防误探 monorepo 子包）。
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("sub").join("package.json"), "{}").unwrap();
+        assert_eq!(detect_project_lang(&tmp), Some("rust"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+}
+
+/// bd serena-rust-8cx5：`--with` 别名归一（合并/冲突/缺失三态）+ clap 端到端解析。
+#[cfg(test)]
+mod with_alias_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_with_alias_merges_alias_into_positional() {
+        let mut cmd = Cmd::InsertTextAfterSymbol {
+            file: "a.rs".into(),
+            symbol: "f".into(),
+            text: None,
+            with: Some("body".into()),
+        };
+        resolve_with_alias(&mut cmd).unwrap();
+        let Cmd::InsertTextAfterSymbol { text, .. } = &cmd else {
+            panic!("variant changed")
+        };
+        assert_eq!(text.as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn resolve_with_alias_keeps_positional_shape() {
+        let mut cmd = Cmd::InsertAtLine {
+            file: "a.rs".into(),
+            line: 1,
+            text: Some("t".into()),
+            with: None,
+            expected_hash: None,
+        };
+        resolve_with_alias(&mut cmd).unwrap();
+        let Cmd::InsertAtLine { text, .. } = &cmd else {
+            panic!("variant changed")
+        };
+        assert_eq!(text.as_deref(), Some("t"), "旧形状（裸位置参数）不破");
+    }
+
+    #[test]
+    fn resolve_with_alias_rejects_both_and_neither() {
+        let mut both = Cmd::ReplaceLines {
+            file: "a.rs".into(),
+            start_line: 1,
+            end_line: 2,
+            text: Some("a".into()),
+            with: Some("b".into()),
+            expected_hash: None,
+        };
+        assert!(resolve_with_alias(&mut both).is_err(), "双给必拒");
+
+        let mut neither = Cmd::CreateTextFile {
+            file: "a.rs".into(),
+            content: None,
+            with: None,
+            stdin: false,
+            content_file: None,
+        };
+        assert!(resolve_with_alias(&mut neither).is_err(), "全缺必拒");
+    }
+
+    #[test]
+    fn clap_parses_with_flag_on_insert_text_after_symbol() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "serena-cli",
+            "--project",
+            ".",
+            "insert-text-after-symbol",
+            "a.rs",
+            "f",
+            "--with",
+            "x",
+        ])
+        .unwrap();
+        let Some(Cmd::InsertTextAfterSymbol { text, with, .. }) = cli.cmd else {
+            panic!("expected insert-text-after-symbol");
+        };
+        assert!(text.is_none() && with.as_deref() == Some("x"));
+    }
+
+    #[test]
+    fn create_content_file_source_resolves() {
+        // bd 4nqk：--content-file 读文件落 content（多行内容 bash 引号退路）。
+        let p = std::env::temp_dir().join(format!(
+            "serena-a3a-cf-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, "line1\nline2\n").unwrap();
+        let mut cmd = Cmd::CreateTextFile {
+            file: "a.rs".into(),
+            content: None,
+            with: None,
+            stdin: false,
+            content_file: Some(p.to_string_lossy().to_string()),
+        };
+        resolve_with_alias(&mut cmd).unwrap();
+        let Cmd::CreateTextFile { content, .. } = &cmd else {
+            panic!("variant changed")
+        };
+        assert_eq!(content.as_deref(), Some("line1\nline2\n"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn create_rejects_two_sources() {
+        let mut both = Cmd::CreateTextFile {
+            file: "a.rs".into(),
+            content: Some("x".into()),
+            with: None,
+            stdin: true,
+            content_file: None,
+        };
+        assert!(resolve_with_alias(&mut both).is_err(), "双来源必拒");
+    }
+
+    #[test]
+    fn clap_parses_sweep_a3a_flags() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["serena-cli", "find-symbol", "x", "--format", "brief"])
+            .unwrap();
+        let Some(Cmd::FindSymbol { format, .. }) = cli.cmd else {
+            panic!("expected find-symbol");
+        };
+        assert_eq!(format, OutFormat::Brief);
+
+        let cli = Cli::try_parse_from(["serena-cli", "search", "p", "--distinct-symbols"]).unwrap();
+        let Some(Cmd::Search {
+            distinct_symbols,
+            format,
+            ..
+        }) = cli.cmd
+        else {
+            panic!("expected search");
+        };
+        assert!(distinct_symbols);
+        assert_eq!(format, OutFormat::Full, "默认 full 行为不变");
+
+        let cli = Cli::try_parse_from([
+            "serena-cli",
+            "symbol-tree",
+            ".",
+            "--grep",
+            "foo",
+            "--max-depth",
+            "2",
+            "--files-only",
+        ])
+        .unwrap();
+        let Some(Cmd::SymbolTree {
+            grep,
+            max_depth,
+            files_only,
+            ..
+        }) = cli.cmd
+        else {
+            panic!("expected symbol-tree");
+        };
+        assert_eq!(grep.as_deref(), Some("foo"));
+        assert_eq!(max_depth, Some(2));
+        assert!(files_only);
+
+        let cli = Cli::try_parse_from([
+            "serena-cli",
+            "find-referencing-symbols",
+            "a.rs",
+            "1",
+            "1",
+            "--debug-raw",
+        ])
+        .unwrap();
+        let Some(Cmd::FindReferencingSymbols { debug_raw, .. }) = cli.cmd else {
+            panic!("expected find-referencing-symbols");
+        };
+        assert!(debug_raw);
+    }
+}
+
+#[cfg(test)]
+mod shorthand_tests {
+    use super::rewrite_shorthand_argv;
+
+    #[test]
+    fn query_form_maps_to_find_symbol() {
+        let out = rewrite_shorthand_argv(vec!["?clamp".into()]).unwrap();
+        assert_eq!(out, vec!["find-symbol".to_string(), "clamp".to_string()]);
+    }
+
+    #[test]
+    fn cmd_suffix_form_strips_question() {
+        let out = rewrite_shorthand_argv(vec!["list-dir?".into(), "crates".into()]).unwrap();
+        assert_eq!(out, vec!["list-dir".to_string(), "crates".to_string()]);
+    }
+
+    #[test]
+    fn global_value_flag_value_is_skipped() {
+        let out = rewrite_shorthand_argv(vec![
+            "--project".into(),
+            ".".into(),
+            "?x".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "--project".to_string(),
+                ".".to_string(),
+                "find-symbol".to_string(),
+                "x".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn bool_flag_then_shorthand_rewrites() {
+        let out = rewrite_shorthand_argv(vec!["--json".into(), "?q".into()]).unwrap();
+        assert_eq!(
+            out,
+            vec!["--json".to_string(), "find-symbol".to_string(), "q".to_string()]
+        );
+    }
+
+    #[test]
+    fn plain_subcommand_and_bare_question_untouched() {
+        assert!(rewrite_shorthand_argv(vec!["status".into()]).is_none());
+        assert!(rewrite_shorthand_argv(vec!["find-symbol".into(), "x".into()]).is_none());
+        // 裸 `?`（len=1）不做糖，原样交 clap 报错。
+        assert!(rewrite_shorthand_argv(vec!["?".into()]).is_none());
+    }
+
+    #[test]
+    fn terminator_disables_sugar() {
+        assert!(rewrite_shorthand_argv(vec!["--".into(), "?x".into()]).is_none());
+    }
+}
+
 /// 按 file 后缀推断 LSP `textDocument/completion` 的 triggerCharacter。
 /// 仅当 agent 显式不传 trigger 时启用（C++ / Rust / TS / JS / Py 共 5 系）。
 /// ponytail: 这是文件后缀到 trigger 字符的固定映射表，新加 lang 时补一行即可，
@@ -3249,6 +4117,73 @@ fn json_escape(s: &str) -> String {
 // insert-at-line / replace-lines / delete-lines / delete-text-in-symbol）的行
 // 参数本来就是 1-based 且不映射 LSP Position，不在转换之列。shell JSONL 的
 // args 透传模式不在本契约内（另行约定）。
+
+/// bd serena-rust-8cx5：单文本写工具 `--with` 别名归一。位置参数与 `--with`
+/// 二选一，解析后统一落回原字段——wire args 键名不变，旧形状（裸位置参数）
+/// 不破；replace-body 本用 `--with`，其余写工具自此同形。位置参数在 clap 里
+/// 已成 Option，未解析就到 tool_request = 编程错误（cli_main 必先跑本函数）。
+fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
+    fn merge(pos: &mut Option<String>, alias: &mut Option<String>) -> Result<(), String> {
+        match (pos.take(), alias.take()) {
+            (Some(t), None) | (None, Some(t)) => {
+                *pos = Some(t);
+                Ok(())
+            }
+            (Some(_), Some(_)) => {
+                Err("provide the text positionally or via --with, not both".into())
+            }
+            (None, None) => Err("missing text: pass it positionally or via --with".into()),
+        }
+    }
+    match cmd {
+        Cmd::InsertTextBeforeSymbol { text, with, .. }
+        | Cmd::InsertAtLine { text, with, .. }
+        | Cmd::ReplaceLines { text, with, .. } => merge(text, with),
+        // bd 4nqk：内容四来源（位置 / --with / --stdin / --content-file）恰好一个。
+        Cmd::CreateTextFile {
+            content,
+            with,
+            stdin,
+            content_file,
+            ..
+        } => {
+            let from_file = match content_file.take() {
+                Some(p) => Some(
+                    std::fs::read_to_string(&p)
+                        .map_err(|e| format!("--content-file {p}: {e}"))?,
+                ),
+                None => None,
+            };
+            let from_stdin = if *stdin {
+                Some(
+                    std::io::read_to_string(std::io::stdin())
+                        .map_err(|e| format!("read stdin: {e}"))?,
+                )
+            } else {
+                None
+            };
+            let sources: [Option<String>; 4] =
+                [content.take(), with.take(), from_stdin, from_file];
+            let picked: Vec<String> = sources.into_iter().flatten().collect();
+            match picked.len() {
+                1 => {
+                    *content = picked.into_iter().next();
+                    Ok(())
+                }
+                0 => Err(
+                    "missing content: pass it positionally, --with, --stdin or --content-file"
+                        .into(),
+                ),
+                _ => Err(
+                    "provide the content via only one of positional / --with / --stdin / --content-file"
+                        .into(),
+                ),
+            }
+        }
+        Cmd::InsertTextAfterSymbol { text, with, .. } => merge(text, with),
+        _ => Ok(()),
+    }
+}
 
 /// 1-based (line, col) → LSP 0-based Position；0 为用法错误。
 fn to_lsp_pos(line: u32, col: u32) -> Result<(u32, u32), String> {
@@ -3407,27 +4342,6 @@ mod tests {
         assert_eq!(args, json!({"file": "a.rs"}));
     }
 
-    /// bd serena-rust-abi：loaded_ls 同 lang 折叠计数；单实例与跨 lang 保持原样。
-    #[test]
-    fn dedup_loaded_ls_folds_repeated_langs_with_count() {
-        let mut body = json!({"loaded_ls": ["rust", "rust", "rust"], "pid": 1});
-        dedup_loaded_ls(&mut body);
-        assert_eq!(body["loaded_ls"], json!(["rust x3"]));
-        assert_eq!(body["pid"], 1, "status 其余字段不动");
-
-        let mut body = json!({"loaded_ls": ["rust", "clangd"]});
-        dedup_loaded_ls(&mut body);
-        assert_eq!(
-            body["loaded_ls"],
-            json!(["clangd", "rust"]),
-            "单实例不加计数；输出按字典序（确定性）"
-        );
-
-        let mut body = json!({"uptime_secs": 5});
-        dedup_loaded_ls(&mut body);
-        assert_eq!(body, json!({"uptime_secs": 5}), "无 loaded_ls 键静默跳过");
-    }
-
     // ---- 行号契约（bd serena-rust-7xv）----
 
     #[test]
@@ -3500,7 +4414,8 @@ mod tests {
         let mut cmd = Cmd::InsertAtLine {
             file: "lib.rs".into(),
             line: 1,
-            text: "// foo".into(),
+            text: Some("// foo".into()),
+            with: None,
             expected_hash: None,
         };
         normalize_positions(&mut cmd).unwrap();
@@ -3968,6 +4883,39 @@ mod net_retry_tests {
         assert_eq!(hit, tmp.join("zmain.py"), "target/ 被跳过");
         std::fs::remove_dir_all(&tmp).ok();
     }
+
+    /// bd serena-rust-tjlm：清单类（Cargo.toml 排序先于 src/*.rs）不得当选默认
+    /// 探针；只含清单的目录返 None（提示用户 --file）。
+    #[test]
+    fn find_first_source_file_skips_manifest_class_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "serena-waitready-manifest-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(tmp.join("package.json"), "{}").unwrap();
+        std::fs::write(tmp.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        let hit = find_first_source_file(&tmp).unwrap();
+        assert_eq!(
+            hit,
+            tmp.join("src").join("main.rs"),
+            "Cargo.toml/package.json 必须让位给真源码"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+
+        let only = std::env::temp_dir().join(format!(
+            "serena-waitready-tomlonly-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&only).unwrap();
+        std::fs::write(only.join("Cargo.toml"), "[package]\n").unwrap();
+        assert!(
+            find_first_source_file(&only).is_none(),
+            "只有清单类文件 → None（等 --file 显式指定）"
+        );
+        std::fs::remove_dir_all(&only).ok();
+    }
 }
 
 /// bd 3ab：残留 daemon 探活兜底的纯函数锚（netstat 解析 / 告警文案 / 映像白名单）。
@@ -4202,5 +5150,87 @@ mod status_tests {
         assert_eq!(code, ExitCode::from(1));
         assert!(lock.exists(), "status 不得动死 lock");
         let _ = std::fs::remove_file(&lock);
+    }
+
+    /// bd v3yv：project-info 对不在的 daemon 同样纯探测（不 spawn、成功返回 meta）。
+    #[tokio::test]
+    async fn project_info_absent_daemon_never_spawns() {
+        let lock = std::env::temp_dir().join(format!(
+            "serena-projinfo-nospawn-{}.lock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&lock);
+
+        let code = cmd_project_info(&lock, None).await;
+
+        assert_eq!(code, ExitCode::SUCCESS, "daemon 不在也输出 meta（git + 空加载态）");
+        assert!(!lock.exists(), "project-info 不得 lazy-spawn");
+    }
+
+    /// bd zyrg：change-history 记录头解析——\x01 切分 + sha/epoch/subject 三段；
+    /// 空 sha 记录与畸形行跳过；-L 模式的 patch 体不混入。
+    #[test]
+    fn change_history_head_parse_skips_malformed_records() {
+        let raw = "\x01abc123\t1700000000\tfeat: first\n\x01\n\x01deadbeef\tnot-a-number\tbad ts\n\x1fe327fa5\t1700000001\tfix: second";
+        let commits: Vec<serde_json::Value> = raw
+            .split('\x01')
+            .filter_map(|rec| {
+                let head = rec.lines().next()?;
+                let mut parts = head.splitn(3, '\t');
+                let sha = parts.next()?.trim();
+                if sha.is_empty() {
+                    return None;
+                }
+                let ts = parts.next()?.parse::<u64>().unwrap_or(0);
+                Some(json!({ "sha": sha, "committed_at": ts, "subject": parts.next().unwrap_or_default() }))
+            })
+            .collect();
+        assert_eq!(commits.len(), 2, "空 sha 记录跳过: {commits:?}");
+        assert_eq!(commits[0]["sha"], "abc123");
+        assert_eq!(commits[0]["committed_at"], 1700000000);
+        assert_eq!(commits[0]["subject"], "feat: first");
+        // epoch 解析失败容忍为 0（不丢整条记录）。
+        assert_eq!(commits[1]["sha"], "deadbeef");
+        assert_eq!(commits[1]["committed_at"], 0);
+    }
+
+    /// bd v3yv：HEAD sha 解析三态——直接 ref 文件 / packed-refs 兜底 / detached。
+    #[test]
+    fn resolve_git_head_sha_covers_ref_packed_and_detached() {
+        let dotgit = std::env::temp_dir().join(format!(
+            "serena-git-sha-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dotgit.join("refs/heads")).unwrap();
+
+        // ① 直接 ref 文件。
+        std::fs::write(
+            dotgit.join("refs/heads/main"),
+            "36b0471abcdef0123456789abcdef0123456789\n",
+        )
+        .unwrap();
+        std::fs::write(dotgit.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let sha = resolve_git_head_sha(&dotgit, "ref: refs/heads/main").expect("ref file sha");
+        assert!(sha.starts_with("36b0471"), "got: {sha}");
+
+        // ② packed-refs 兜底（ref 文件不存在）。
+        std::fs::remove_file(dotgit.join("refs/heads/main")).unwrap();
+        std::fs::write(
+            dotgit.join("packed-refs"),
+            "# pack-refs with: peeled \n31bf612000000000000000000000000000000000 refs/heads/main\n",
+        )
+        .unwrap();
+        let sha = resolve_git_head_sha(&dotgit, "ref: refs/heads/main").expect("packed sha");
+        assert!(sha.starts_with("31bf612"), "got: {sha}");
+
+        // ③ detached HEAD。
+        let sha =
+            resolve_git_head_sha(&dotgit, "e327fa5000000000000000000000000000000000").expect("detached");
+        assert!(sha.starts_with("e327fa5"), "got: {sha}");
+        let _ = std::fs::remove_dir_all(&dotgit);
     }
 }

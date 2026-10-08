@@ -37,10 +37,30 @@ use crate::transport::stdio::{
     OnEof, OnMsg, Pumps, pump_with_priority, record_pump_with_priority, replay_pump_with_priority,
 };
 
-/// 握手超时上限（30s）。clangd 等 native LS 多在 1s 内回 initialize；但 node 系
+/// 握手预算默认值（30s）。clangd 等 native LS 多在 1s 内回 initialize；但 node 系
 /// LS（bash-language-server 实测）冷启动链 npm shim → node → tree-sitter WASM
 /// 首载可超 10s，10s 窗口下冷启动会假报 LS_TIMEOUT（retryable 且重试同死）。
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// 冷启动三段预算（bd 62z 拆分）：**握手段**（本值）→ 适配器就绪探针
+/// （adapter `on_server_ready`，各自带 READY_PROBE_TIMEOUT）→ 工具请求
+/// （supervisor `effective_tool_timeout`，servers.toml 按语言可调）。三段
+/// 串行、各自独立计时——大项目冷启动首条命令最坏 = 三段之和，观感「首条
+/// 60s 卡死」即握手段 + 探针段的叠加。握手段经 `SERENA_HANDSHAKE_TIMEOUT_SECS`
+/// 独立调整（非法/缺失回默认），与工具/探针段解耦。
+const HANDSHAKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
+
+/// 解析握手段预算（bd 62z）：`SERENA_HANDSHAKE_TIMEOUT_SECS`（纯函数供单测；
+/// 非数字/空串/0 → 回默认 30s——0 会让握手永不超时，挂死无界）。
+fn handshake_timeout() -> Duration {
+    parse_handshake_secs(std::env::var("SERENA_HANDSHAKE_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn parse_handshake_secs(raw: Option<&str>) -> Duration {
+    match raw.map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(n) if n > 0 => Duration::from_secs(n),
+        _ => HANDSHAKE_TIMEOUT_DEFAULT,
+    }
+}
 
 /// `shutdown` 请求超时（2s）。超时则放弃等回执直接走 kill 兜底。
 ///
@@ -462,7 +482,8 @@ impl Session {
                 }
             });
 
-        // 握手：发 initialize → 等响应（最多 HANDSHAKE_TIMEOUT）→ 发 initialized 通知。
+        // 握手：发 initialize → 等响应（最多握手段预算，见 HANDSHAKE_TIMEOUT_DEFAULT）
+        // → 发 initialized 通知。
         // 拿到 initialize 响应的 `capabilities` 子对象存入 Session（PLAN Phase 2.5，
         // supervisor 在 session_for 末尾读 `diagnosticProvider` 决定 pull/push）。
         match Self::handshake(&session, params).await {
@@ -514,16 +535,19 @@ impl Session {
             message: format!("initialize params serialize: {e}"),
         })?;
 
+        // 外层包裹是兜底上限而非冗余：request_at 的 Content-Modified 重试循环
+        // 内层超时可不止一次计时，外层保证整段 initialize 不越过握手段预算。
+        let hs_timeout = handshake_timeout();
         let resp: Value = time::timeout(
-            HANDSHAKE_TIMEOUT,
+            hs_timeout,
             session
                 .client
-                .request("initialize", params_json, HANDSHAKE_TIMEOUT),
+                .request("initialize", params_json, hs_timeout),
         )
         .await
         .map_err(|_| CoreError::Timeout {
             method: "initialize".into(),
-            secs: HANDSHAKE_TIMEOUT.as_secs(),
+            secs: hs_timeout.as_secs(),
         })??;
         // LSP 3.17 §initialize：响应是 InitializeResult { capabilities, serverInfo? }。
         // 提取 capabilities 子对象；缺则视为空能力（探测时一律 false）。
@@ -886,6 +910,54 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// bd xht：SERENA_REPLAY 是进程全局 env——本模块内用例共用一把锁串行化
+    /// （ls-adapters lib.rs REPLAY_ENV 先例）。
+    static REPLAY_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// 最小回放文件：只含 initialize 应答（Session::start 握手即 Ready）。
+    fn write_replay(dir: &Path) -> std::path::PathBuf {
+        let lines = [
+            r#"--> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"<-- {"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#,
+        ];
+        let path = dir.join("replay.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write replay");
+        path
+    }
+
+    /// bd xht（audit-ux-perf P-3）：生产注册路径回归——Session::start 必须把
+    /// init_params::RETRY_ON_CONTENT_MODIFIED 注册进 Client 白名单。注册点
+    /// （session.rs `set_content_modified_retry`）被删或常量漂移时本测红——
+    /// 防止「重试机制完整实现但白名单空」的接线失效复发（bd s3u 同款）。
+    #[tokio::test]
+    async fn start_registers_content_modified_retry_whitelist() {
+        let _env = REPLAY_ENV.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let replay = write_replay(dir.path());
+        // SAFETY: REPLAY_ENV 保证本进程内独占访问 SERENA_REPLAY，用完即清。
+        unsafe { std::env::set_var(ENV_REPLAY, &replay) };
+        let session = Session::start(
+            None,
+            crate::init_params::base_initialize_params(),
+        )
+        .await
+        .expect("replay session Ready");
+        unsafe { std::env::remove_var(ENV_REPLAY) };
+        let got = session.client.retry_methods_for_test();
+        let expected: std::collections::HashSet<String> = crate::init_params::RETRY_ON_CONTENT_MODIFIED
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "生产白名单常量不得为空（防御性：常量被清空时注册测也无意义）"
+        );
+        assert_eq!(
+            got, expected,
+            "Session::start 必须逐字注册 RETRY_ON_CONTENT_MODIFIED（多、少、改都算漂移）"
+        );
+    }
+
     #[test]
     fn language_id_override_by_extension_falls_back_to_default() {
         let mut table = std::collections::HashMap::new();
@@ -1050,5 +1122,20 @@ mod tests {
             !t.wait_drain(Duration::from_millis(50)).await,
             "end 不到应超时返 false"
         );
+    }
+
+    // ---- bd 62z：握手段预算独立解析 ----
+
+    #[test]
+    fn handshake_secs_defaults_on_missing_or_invalid() {
+        use std::time::Duration;
+        assert_eq!(parse_handshake_secs(None), Duration::from_secs(30));
+        assert_eq!(parse_handshake_secs(Some("45")), Duration::from_secs(45));
+        assert_eq!(parse_handshake_secs(Some(" 90 ")), Duration::from_secs(90));
+        // 0 = 握手永不超时，挂死无界 → 非法回默认（与 daemon parse_count 同语义）。
+        assert_eq!(parse_handshake_secs(Some("0")), Duration::from_secs(30));
+        assert_eq!(parse_handshake_secs(Some("-5")), Duration::from_secs(30));
+        assert_eq!(parse_handshake_secs(Some("abc")), Duration::from_secs(30));
+        assert_eq!(parse_handshake_secs(Some("")), Duration::from_secs(30));
     }
 }

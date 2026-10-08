@@ -11,18 +11,7 @@ use std::path::PathBuf;
 async fn main() -> anyhow::Result<()> {
     let lock_path: PathBuf = std::env::var("SERENA_DAEMON_LOCK")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            #[cfg(windows)]
-            {
-                let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-                PathBuf::from(base).join("serena").join("daemon.lock")
-            }
-            #[cfg(not(windows))]
-            {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                PathBuf::from(home).join(".serena").join("daemon.lock")
-            }
-        });
+        .unwrap_or_else(|_| daemon::serve::default_lock_path());
 
     let port: u16 = std::env::var("SERENA_DAEMON_PORT")
         .ok()

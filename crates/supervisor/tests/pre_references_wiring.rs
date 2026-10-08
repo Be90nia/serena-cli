@@ -132,7 +132,7 @@ async fn pre_references_flush_precedes_references_request() {
     );
     session.set_language_id("nextflow");
 
-    let refs = tokio::time::timeout(
+    let (refs, _raw_snip) = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         supervisor::ref_tools::find_referencing_symbols(&session, &dir, "a.nf", 0, 0),
     )

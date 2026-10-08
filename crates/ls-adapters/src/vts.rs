@@ -162,6 +162,9 @@ mod tests {
         let _seq = RESOLVE_TEST_LOCK
             .lock()
             .expect("RESOLVE_TEST_LOCK poisoned");
+        // bd 83f：跨 adapter 的 env 写互斥——本测的 PATH/LOCALAPPDATA 注入
+        // 与 deno/powershell 等并发 set_var 互踩（9ai 假红同根因）。
+        let _env = crate::ENV_TEST_LOCK.blocking_lock();
         let cache_dir = tempfile::tempdir().expect("tempdir");
         // default_cache_root = {LOCALAPPDATA}/serena/ls（unix ~/.local/share/serena/ls）
         // ——注入的是 LOCALAPPDATA/HOME 本体，布局要补 serena/ls 段（powershell.rs 同款）。

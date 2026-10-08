@@ -118,6 +118,13 @@ fn pses_session_files() -> (PathBuf, PathBuf) {
     )
 }
 
+/// PowerShell 单引号字面量包裹：内部 `'` 翻倍转义（`''`，pwsh 唯一的字面量
+/// 转义规则）。裸 format 路径含 `'`（用户名 O'Brien 类）时字符串提前终结、
+/// -Command 拼装坏（bd qal4）。
+fn ps_quote(s: impl std::fmt::Display) -> String {
+    format!("'{}'", s.to_string().replace('\'', "''"))
+}
+
 /// 拼 PSES 启动 argv（↖ mirror `_create_launch_command`）：
 /// `[pwsh, -NoLogo, -NoProfile, -Command, "& '<script>' ... -Stdio"]`。
 /// 路径一律单引号包裹（Windows temp/用户目录常含空格；pwsh -Command 再 tokenize）。
@@ -129,13 +136,13 @@ fn launch_command(
     session: &Path,
 ) -> Vec<String> {
     let command = format!(
-        "& '{}' -HostName SolidLSP -HostProfileId solidlsp -HostVersion 1.0.0 \
-         -BundledModulesPath '{}' -LogPath '{}' -LogLevel Information \
-         -SessionDetailsPath '{}' -Stdio",
-        script.display(),
-        bundled.display(),
-        log.display(),
-        session.display(),
+        "& {} -HostName SolidLSP -HostProfileId solidlsp -HostVersion 1.0.0 \
+         -BundledModulesPath {} -LogPath {} -LogLevel Information \
+         -SessionDetailsPath {} -Stdio",
+        ps_quote(script.display()),
+        ps_quote(bundled.display()),
+        ps_quote(log.display()),
+        ps_quote(session.display()),
     );
     vec![
         pwsh.to_string_lossy().into_owned(),
@@ -245,6 +252,23 @@ mod tests {
     }
 
     /// 含空格的路径必须被单引号包裹（pwsh -Command tokenize 破坏防护）。
+    /// bd qal4：路径含 `'` 时字面量提前终结 → 内部 `'` 翻倍转义 `''`。
+    #[test]
+    fn launch_command_escapes_single_quotes_in_paths() {
+        let cmd = launch_command(
+            Path::new("/usr/bin/pwsh"),
+            Path::new("/c/Users/O'Brien/PowerShellEditorServices/Start-EditorServices.ps1"),
+            Path::new("/c/cache"),
+            Path::new("/tmp/pses.log"),
+            Path::new("/tmp/session.json"),
+        );
+        let c = &cmd[4];
+        assert!(
+            c.contains("& '/c/Users/O''Brien/"),
+            "内部 ' 必须翻倍转义: {c}"
+        );
+    }
+
     #[test]
     fn launch_command_quotes_paths_with_spaces() {
         let cmd = launch_command(
@@ -275,6 +299,8 @@ mod tests {
     /// 无 panic。真机可能有 pwsh/缓存命中干扰，全部注入屏蔽。
     #[tokio::test]
     async fn launch_errors_when_pwsh_and_cache_missing() {
+        // bd 83f/9ai：环境变量改动全程持 crate 级共享锁（三单并发假红根因）。
+        let _env = crate::ENV_TEST_LOCK.lock().await;
         let cache_dir = tempfile::tempdir().unwrap();
         let empty_dir = tempfile::tempdir().unwrap();
         let path_original = std::env::var_os("PATH").unwrap_or_default();
@@ -286,7 +312,7 @@ mod tests {
         let home_original = std::env::var_os(home_key);
         let programfiles_original = std::env::var_os("PROGRAMFILES");
         let pf_dir = tempfile::tempdir().unwrap();
-        // SAFETY: 单线程 tokio test 内注入 + 末尾还原；真机 pwsh 位置表命中被
+        // SAFETY: ENV_TEST_LOCK 保证进程内独占 + 末尾还原；真机 pwsh 位置表命中被
         // PROGRAMFILES/tempdir 屏蔽。
         unsafe {
             std::env::set_var("PATH", empty_dir.path());
@@ -321,6 +347,8 @@ mod tests {
     /// -Command 引用缓存脚本、cwd = project root。
     #[tokio::test]
     async fn launch_uses_fake_pwsh_and_cached_script() {
+        // bd 83f/9ai：环境变量改动全程持 crate 级共享锁（三单并发假红根因）。
+        let _env = crate::ENV_TEST_LOCK.lock().await;
         let pwsh_name = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
         let pwsh_dir = tempfile::tempdir().unwrap();
         let fake_pwsh = pwsh_dir.path().join(pwsh_name);
@@ -352,7 +380,7 @@ mod tests {
             "HOME"
         };
         let home_original = std::env::var_os(home_key);
-        // SAFETY: 同 launch_errors_when_pwsh_and_cache_missing。
+        // SAFETY: 同 launch_errors_when_pwsh_and_cache_missing（ENV_TEST_LOCK 持有中）。
         unsafe {
             let mut new_path = pwsh_dir.path().as_os_str().to_os_string();
             if !path_original.is_empty() {

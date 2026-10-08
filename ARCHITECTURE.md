@@ -550,15 +550,15 @@ flowchart LR
 |---|---|---|---|
 | `BAD_ARGS` | 参数缺失/非法 | false | 2（usage） |
 | `LS_NOT_INSTALLED` | PATH 无服务器且无下载清单 | false（提示安装） | 1 |
-| `LS_SPAWN_FAILED` | 进程起不来（stderr 摘要进 message） | true | 1 |
-| `LS_NOT_READY` | 初始化中，稍后再试 | true | 1 |
-| `LS_TERMINATED` | 会话崩溃（supervisor 会懒重启，重试即触发） | true | 1 |
-| `LS_TIMEOUT` | 请求超时（双轨：普通 30s / 索引类 workspace/* 120s；per-LS `timeout_ms`/`index_timeout_ms` 与 CLI `--request-timeout`/`--index-timeout` 可覆盖。300s 是 CLI 转发总超时 `FORWARD_TIMEOUT`，非 per-LS 默认） | true | 1 |
+| `LS_SPAWN_FAILED` | 进程起不来（stderr 摘要进 message） | true | 5（bd 719） |
+| `LS_NOT_READY` | 初始化中，稍后再试 | true | 5（bd 719） |
+| `LS_TERMINATED` | 会话崩溃（supervisor 会懒重启，重试即触发） | true | 5（bd 719） |
+| `LS_TIMEOUT` | 请求超时（双轨：普通 30s / 索引类 workspace/* 120s；per-LS `timeout_ms`/`index_timeout_ms` 与 CLI `--request-timeout`/`--index-timeout` 可覆盖。300s 是 CLI 转发总超时 `FORWARD_TIMEOUT`，非 per-LS 默认） | true | 5（bd 719） |
 | `RPC_ERROR` | LS 返回 JSON-RPC error | case | 1 |
 | `WRITE_CONFLICT` | 盘上内容与 LSP 状态不符（§3.3 防线）；wire 附 `hint`（重读后重试指引，bd serena-rust-i4j） | false（需重读） | 1 |
 | `INTERNAL` | daemon 内部 bug（anyhow 兜底，含 chain 摘要） | false | 3 |
 
-HTTP 层错误保留给传输语义：`404` 未知工具名、`503` daemon 关停中。**工具级失败走 200 + `{ok:false}`**，让 CLI 的分支只看 JSON，不看状态码二次判错。CLI exit：0 成功 / 1 工具失败 / 2 用法错误 / 3 daemon 或传输故障（含 daemon 拉起失败）/ 4 `wait-ready` 超时（bd serena-rust-55m）。转发路径对 `503 DAEMON_DRAINING`（stop-all 后 reaper 收尾窗口）做客户端侧自愈：≤5s 窗口内每 300ms 重试一次完整链路（重新探活 + lazy-spawn），超窗仍 draining 则原样报错 rc=3（bd serena-rust-g0m）。
+HTTP 层错误保留给传输语义：`404` 未知工具名、`503` daemon 关停中。**工具级失败走 200 + `{ok:false}`**，让 CLI 的分支只看 JSON，不看状态码二次判错。CLI exit：0 成功 / 1 工具失败（非 retryable）/ 2 用法错误 / 3 daemon 或传输故障（含 daemon 拉起失败）/ 4 `wait-ready` 超时（bd serena-rust-55m）/ 5 retryable 工具失败（瞬态可直接重试，bd 719——此前与 1 合桶，agent 需读 body 才知可重试）。转发路径对 `503 DAEMON_DRAINING`（stop-all 后 reaper 收尾窗口）做客户端侧自愈：≤5s 窗口内每 300ms 重试一次完整链路（重新探活 + lazy-spawn），超窗仍 draining 则原样报错 rc=3（bd serena-rust-g0m）。
 
 ### 6.4 daemon 环境变量（bd serena-rust-j8b / 7rh）
 
@@ -569,6 +569,11 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 | `SERENA_IDLE_TIMEOUT_SECS` | `900` | 全局 idle 自杀阈值；`0` = 永不自杀（AI 批量任务保活） |
 | `SERENA_LS_IDLE_EVICTION_SECS` | `600` | 单 LS 空闲驱逐阈值；`0` = 永不驱逐（避免 90min 批量中反复冷启动） |
 | `SERENA_NO_TOKEN_ESTIMATE` | 未设 | 设 `1` 时工具成功响应不附 `~tokens` 估算字段 |
+
+**daemon 与 binary 的版本一致性（bd serena-rust-0mk）**：daemon 是 lazy-spawn 的常驻进程，
+升级只替换磁盘上的 exe、不杀已运行的 daemon——升级后 CLI 会静默连到持旧 binary 的 daemon
+（新子命令 not found / 新 wire 字段缺失，表象酷似"release 坏了"）。升级前后各 `stop-all`
+一次是硬步骤（README「Upgrade」节同款说明）；`stop-all` 的残留探活兜底见 bd serena-rust-3ab。
 
 ---
 

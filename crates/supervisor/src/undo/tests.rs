@@ -368,6 +368,26 @@ async fn project_hash_is_deterministic() {
     );
 }
 
+/// bd serena-rust-ej5：canonicalize 失败但目录仍在（挪盘瞬窗/权限变化）→
+/// 退回原始路径串哈希，老事务栈不孤儿；彻底删除仍 BAD_ARGS。
+#[tokio::test]
+async fn store_for_falls_back_to_raw_path_when_canonicalize_fails() {
+    // 目录在盘：fallback 分支与 canonicalize 分支都给 16-hex 确定性键。
+    let a = tmpdir("hash_fallback_a");
+    let h1 = store_for(&a).unwrap();
+    let h2 = store_for(&a).unwrap();
+    assert_eq!(h1, h2);
+    assert_eq!(h1.file_name().unwrap().to_string_lossy().len(), 16);
+
+    // 彻底删除：BAD_ARGS 契约保持。
+    let gone = std::env::temp_dir().join(format!("serena-undo-gone-{}", std::process::id()));
+    let err = store_for(&gone).unwrap_err();
+    assert!(
+        matches!(err, crate::ToolError::BadArgs { .. }),
+        "deleted root must stay BAD_ARGS, got {err:?}"
+    );
+}
+
 /// list：active/undone 状态、文件数、摘要齐备。
 #[tokio::test]
 async fn list_reports_stack_overview() {

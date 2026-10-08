@@ -158,6 +158,9 @@ fn catalog_private_prefixes_are_consistent_with_sanitize() {
         "_delta",
         "_max_tokens",
         "_compress",
+        // bd aap4：find-referencing-* 的原始 LSP 响应诊断开关（与 _max_tokens 同类，
+        // 仅 dispatch 消费，不进 sanitize_timeout_args 移除清单）。
+        "_debug_raw",
     ];
     let mut seen_private: BTreeSet<String> = BTreeSet::new();
     for (tool_name, def) in tools {

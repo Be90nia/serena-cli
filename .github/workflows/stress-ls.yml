@@ -35,6 +35,10 @@ on:
         description: "churn 压测窗口秒数"
         type: number
         default: 300
+  schedule:
+    # 周一 06:19 UTC（bd serena-rust-fjqn）：与 ls-smoke 周例会错开（02:37），
+    # 错峰分钟数同款防整点调度拥挤。18 job × 5h 由下方 concurrency 单飞护栏。
+    - cron: "19 6 * * 1"
 
 permissions:
   contents: read
@@ -61,6 +65,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89" # = rust-toolchain.toml（bd serena-rust-fc4i），防 stable 漂移
       - uses: actions/cache@v4
         with:
           path: |
@@ -115,8 +121,8 @@ jobs:
         run: |
           chmod +x "$SERENA_CLI" || true
           "$SERENA_CLI" --version
-      - name: stress loop (os=${{ matrix.os }} shard=${{ matrix.shard }} cycle_secs=${{ inputs.cycle_secs }})
-        run: scripts/stress_loop.sh --shard ${{ matrix.shard }} --cycle-secs ${{ inputs.cycle_secs }}
+      - name: stress loop (os=${{ matrix.os }} shard=${{ matrix.shard }} cycle_secs=${{ inputs.cycle_secs || 18000 }})
+        run: scripts/stress_loop.sh --shard ${{ matrix.shard }} --cycle-secs ${{ inputs.cycle_secs || 18000 }}
       - name: upload stress logs
         if: always()
         uses: actions/upload-artifact@v4

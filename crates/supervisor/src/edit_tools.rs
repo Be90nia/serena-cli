@@ -141,6 +141,36 @@ fn pos_to_byte(text: &str, line: u32, col: u32, enc: OffsetEncoding) -> EditResu
     })
 }
 
+/// 取 `range.start` 行的行首缩进（空白前缀；空行/顶格返回空串）。
+fn line_indent_of(text: &str, line_0based: u32) -> String {
+    text.lines()
+        .nth(line_0based as usize)
+        .map(|l| {
+            let ws_end = l.len() - l.trim_start().len();
+            l[..ws_end].to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// bd bt3h：auto-indent —— 多行 text 的第 2..n 行按 host 符号缩进补齐（首行原样，
+/// 它接在插入点所在行）。已带 host 缩进（或更深）的行、空行不动，避免双重缩进。
+fn auto_indent_text(text: &str, indent: &str) -> String {
+    if indent.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            if !line.is_empty() && !line.starts_with(indent) {
+                out.push_str(indent);
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// 修改文件 + atomic_write + didChange 全量同步（与 replace-body 一致）。
 ///
 /// didChange 走 `session.ensure_open` —— 它按 mtime 检测是否需重发，
@@ -185,17 +215,25 @@ pub async fn replace_text_in_symbol(
 
 /// `insert_text_after_symbol`：在 symbol 末尾（range.end）插入 text。
 /// 返回插入内容末尾的 `(end_line, end_col)`（1-based，col 按字符计）。
+/// bd bt3h：`auto_indent=true`（默认）时第 2..n 行按 host 符号起始行缩进补齐。
 pub async fn insert_text_after_symbol(
     session: &Arc<Session>,
     root: &Path,
     file: &Path,
     symbol: &str,
     text: &str,
+    auto_indent: bool,
 ) -> EditResult<(u32, u32)> {
     let _gate = write_gate::acquire("insert-text-after-symbol").await?;
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
+    // bd bt3h：插入点在符号末尾 —— 新内容层级与 host 符号起始行一致。
+    let text = if auto_indent {
+        auto_indent_text(text, &line_indent_of(&content, range.start.line))
+    } else {
+        text.to_string()
+    };
     let end_byte = pos_to_byte(
         &content,
         range.end.line,
@@ -209,17 +247,25 @@ pub async fn insert_text_after_symbol(
 }
 
 /// `insert_text_before_symbol`：在 symbol 开头（range.start）插入 text。
+/// bd bt3h：`auto_indent=true`（默认）时第 2..n 行按 host 符号起始行缩进补齐。
 pub async fn insert_text_before_symbol(
     session: &Arc<Session>,
     root: &Path,
     file: &Path,
     symbol: &str,
     text: &str,
+    auto_indent: bool,
 ) -> EditResult<(u32, u32)> {
     let _gate = write_gate::acquire("insert-text-before-symbol").await?;
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
+    // bd bt3h：插入点在符号起始行前 —— 新内容与 host 符号同层级。
+    let text = if auto_indent {
+        auto_indent_text(text, &line_indent_of(&content, range.start.line))
+    } else {
+        text.to_string()
+    };
     let start_byte = pos_to_byte(
         &content,
         range.start.line,
@@ -295,6 +341,46 @@ pub async fn delete_text_in_symbol(
     new_content.push_str(&content[..start_byte]);
     new_content.push_str(&content[end_byte..]);
     commit_change(session, file, root, &new_content).await
+}
+
+/// bd ou83：format-on-write —— 把 `textDocument/formatting` 的 TextEdit 落盘。
+/// 走写门 + undo 收口（与其它写工具同一公共写点）；edits 按 start 倒序应用避免
+/// 偏移漂移。返回应用条数。
+pub async fn apply_format_edits(
+    session: &Arc<Session>,
+    root: &Path,
+    file: &Path,
+    mut edits: Vec<lsp_types::TextEdit>,
+) -> EditResult<usize> {
+    if edits.is_empty() {
+        return Ok(0);
+    }
+    let _gate = write_gate::acquire("format-on-write").await?;
+    let _guard = session.ensure_open(file).await?;
+    let mut new_content = tokio::fs::read_to_string(file).await?;
+    edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+    for e in &edits {
+        let lo = pos_to_byte(
+            &new_content,
+            e.range.start.line,
+            e.range.start.character,
+            OffsetEncoding::Utf16,
+        )?;
+        let hi = pos_to_byte(
+            &new_content,
+            e.range.end.line,
+            e.range.end.character,
+            OffsetEncoding::Utf16,
+        )?;
+        if lo > hi || hi > new_content.len() {
+            return Err(EditError::BadArgs {
+                detail: format!("format edit range out of bounds: {:?}", e.range),
+            });
+        }
+        new_content.replace_range(lo..hi, &e.new_text);
+    }
+    commit_change(session, file, root, &new_content).await?;
+    Ok(edits.len())
 }
 
 // ============ 行级三件套（全文行级，非符号体内；1-based 含端）============

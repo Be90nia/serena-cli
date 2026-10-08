@@ -65,7 +65,7 @@ async fn fetch_references(
     file: &Path,
     line: u32,
     col: u32,
-) -> RefResult<Vec<Location>> {
+) -> RefResult<(Vec<Location>, Option<String>)> {
     let _guard = session
         .ensure_open(file)
         .await
@@ -98,7 +98,21 @@ async fn fetch_references(
         )
         .await
         .map_err(|e| RefError::Core(format!("references: {e}")))?;
-    Ok(crate::normalize_implementations(raw.as_ref()))
+    let locs = crate::normalize_implementations(raw.as_ref());
+    // aap4：静默空 + 原始响应非 null = LS 形态漂移疑点（响应有内容但没归一成
+    // Location），留 200B 快照供 raw_lsp_response 诊断；正常路径零开销。
+    let raw_snip = if locs.is_empty() {
+        raw.as_ref().filter(|v| !v.is_null()).map(raw_lsp_snippet)
+    } else {
+        None
+    };
+    Ok((locs, raw_snip))
+}
+
+/// aap4：原始 LSP 响应诊断快照——序列化后截前 200 字符（char 边界截断防劈 UTF-8）。
+fn raw_lsp_snippet(v: &serde_json::Value) -> String {
+    let s = v.to_string();
+    s.chars().take(200).collect()
 }
 
 async fn fetch_document_symbols(
@@ -295,7 +309,7 @@ async fn fetch_references_with_hybrid_companion(
         return primary;
     };
     match fetch_references(&companion, abs_file, line, col).await {
-        Ok(companion_refs) => merge_reference_locations(primary, companion_refs),
+        Ok((companion_refs, _raw_snip)) => merge_reference_locations(primary, companion_refs),
         Err(e) => {
             tracing::warn!(
                 file = %abs_file.display(),
@@ -307,13 +321,30 @@ async fn fetch_references_with_hybrid_companion(
     }
 }
 
+/// bd nl2w：`includeDeclaration:true` 拿回的引用集里含**定义点自身**（查询位置
+/// 就是定义名 token）——callers 影响分析会把它误当真 caller。过滤 (查询文件,
+/// 查询行) 上的出现位置；文件同判走小写比较（RA 推小写盘符 uri 的双重身份教训）
+/// 且分隔符归一（uri_to_path 保留 uri 正斜杠、canonicalize 产反斜杠，不归一则
+/// Windows 上 same_file 恒 false → 过滤器静默 no-op）。
+fn drop_self_reference(refs: Vec<Location>, abs_file: &Path, line: u32) -> Vec<Location> {
+    let norm = |p: &Path| p.to_string_lossy().to_lowercase().replace('\\', "/");
+    let self_path = norm(abs_file);
+    refs.into_iter()
+        .filter(|loc| {
+            let same_file =
+                uri_to_path(loc.uri.as_str()).is_some_and(|p| norm(&p) == self_path);
+            !(same_file && loc.range.start.line == line)
+        })
+        .collect()
+}
+
 pub async fn find_referencing_symbols(
     session: &Arc<Session>,
     root: &Path,
     file: &str,
     line: u32,
     col: u32,
-) -> RefResult<Vec<RefSymbolHit>> {
+) -> RefResult<(Vec<RefSymbolHit>, Option<String>)> {
     // hybrid 双服务器语言（astro）的 per-file 路由：ts/js 系文件的引用语义只在伴生
     // TS LS（↖ mirror: astro_language_server.py@7a296833 `request_references` 对
     // `_is_ts_file` 路由伴生；主 astro-ls 对 .ts 文件 references 恒空 —— 真机帧录制
@@ -324,10 +355,11 @@ pub async fn find_referencing_symbols(
     let canon_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let session = semantic_session_for_file(session, &canon_root, file);
     let abs_file = canon_root.join(file);
-    let refs = fetch_references(&session, &abs_file, line, col).await?;
+    let (refs, raw_snip) = fetch_references(&session, &abs_file, line, col).await?;
     let refs =
         fetch_references_with_hybrid_companion(&session, &canon_root, &abs_file, line, col, refs)
             .await;
+    let refs = drop_self_reference(refs, &abs_file, line);
 
     let mut by_file: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
     for loc in refs {
@@ -348,9 +380,19 @@ pub async fn find_referencing_symbols(
     let mut seen: HashSet<(String, String, u32, u32)> = HashSet::new();
     for (rel, positions) in by_file {
         let abs = canon_root.join(&rel);
-        let symbols = fetch_document_symbols(&session, &abs)
-            .await
-            .unwrap_or_default();
+        // bd 4lw：docSymbol 拉取失败不再静默 → container_name 全空（callers 归属
+        // 信息丢失）。位置本身仍输出（引用集不受影响），warn 留痕排障。
+        let symbols = match fetch_document_symbols(&session, &abs).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    file = %rel,
+                    error = %e,
+                    "documentSymbol failed during container attribution (bd 4lw); container_name will be empty"
+                );
+                Vec::new()
+            }
+        };
         for (line, col) in positions {
             let container = find_container_name(&symbols, line, col);
             let key = (rel.clone(), container.clone(), line, col);
@@ -364,7 +406,7 @@ pub async fn find_referencing_symbols(
             }
         }
     }
-    Ok(out)
+    Ok((out, raw_snip))
 }
 
 /// 单个分组容器：相同 (container_name, file) 的 refs 聚合。
@@ -428,6 +470,9 @@ pub fn group_refs(hits: Vec<RefSymbolHit>, page: usize, page_size: usize) -> Gro
     }
 }
 
+/// `find_referencing_code_snippets`：引用 + 前后 N 行片段。第二返回值 = `truncated`
+/// （bd 8ft：命中数顶到 `max_results` 上限时置位，响应可标 `truncated:true`）；
+/// 第三返回值 = aap4 原始 LSP 响应 200B 快照（仅静默空 + 响应非 null 时 Some）。
 pub async fn find_referencing_code_snippets(
     session: &Arc<Session>,
     root: &Path,
@@ -436,20 +481,23 @@ pub async fn find_referencing_code_snippets(
     col: u32,
     context_lines: u32,
     max_results: usize,
-) -> RefResult<Vec<RefSnippetHit>> {
+) -> RefResult<(Vec<RefSnippetHit>, bool, Option<String>)> {
     let canon_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let session = semantic_session_for_file(session, &canon_root, file);
     let abs_file = canon_root.join(file);
-    let refs = fetch_references(&session, &abs_file, line, col).await?;
+    let (refs, raw_snip) = fetch_references(&session, &abs_file, line, col).await?;
     let refs =
         fetch_references_with_hybrid_companion(&session, &canon_root, &abs_file, line, col, refs)
             .await;
+    let refs = drop_self_reference(refs, &abs_file, line);
 
     let mut cache: HashMap<String, String> = HashMap::new();
     let mut out = Vec::new();
+    let mut truncated = false;
     let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
     for loc in refs {
         if out.len() >= max_results {
+            truncated = true;
             break;
         }
         let abs = match uri_to_path(loc.uri.as_str()) {
@@ -494,7 +542,7 @@ pub async fn find_referencing_code_snippets(
             snippet,
         });
     }
-    Ok(out)
+    Ok((out, truncated, raw_snip))
 }
 
 #[cfg(test)]
@@ -581,6 +629,38 @@ mod tests {
     }
 
     #[test]
+    fn drop_self_reference_drops_same_file_only_on_query_line() {
+        let refs = vec![
+            loc("file:///D:/proj/a.rs", 3, 4), // 定义点自身 → 删
+            loc("file:///D:/proj/a.rs", 7, 0), // 同文件别处 → 留
+            loc("file:///D:/proj/b.rs", 3, 4), // 异文件同行 → 留
+        ];
+        let out = drop_self_reference(refs, Path::new("D:/proj/a.rs"), 3);
+        let keys: Vec<(String, u32)> = out
+            .iter()
+            .map(|l| (l.uri.as_str().to_string(), l.range.start.line))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![("file:///D:/proj/a.rs".into(), 7), ("file:///D:/proj/b.rs".into(), 3)]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drop_self_reference_matches_backslash_abs_path_against_uri() {
+        // A3b #1：canonicalize 产反斜杠 abs_file，uri_to_path 保留 uri 正斜杠——
+        // 分隔符不归一则 same_file 恒 false，定义点过滤器在 Windows 静默 no-op。
+        let refs = vec![
+            loc("file:///D:/proj/a.rs", 3, 4),
+            loc("file:///D:/proj/a.rs", 7, 0),
+        ];
+        let out = drop_self_reference(refs, Path::new(r"D:\proj\a.rs"), 3);
+        assert_eq!(out.len(), 1, "反斜杠 abs_file 必须命中正斜杠 uri 的定义点");
+        assert_eq!(out[0].range.start.line, 7);
+    }
+
+    #[test]
     fn merge_reference_locations_dedupes_overlapping() {
         let primary = vec![loc("file:///w/a.astro", 3, 4), loc("file:///w/b.ts", 5, 6)];
         let companion = vec![
@@ -660,5 +740,18 @@ mod tests {
             "svelte",
             Path::new("src/utils/fmt.ts")
         ));
+    }
+
+    #[test]
+    fn raw_lsp_snippet_caps_at_200_chars_without_splitting_utf8() {
+        let long = serde_json::json!({ "k": "x".repeat(500) });
+        let s = raw_lsp_snippet(&long);
+        assert_eq!(s.chars().count(), 200, "截到 200 字符");
+        assert!(s.starts_with("{\"k\":\"xxx"));
+        // 多字节字符不劈（char 边界截断）。
+        let wide = serde_json::json!("中文".repeat(300));
+        let s = raw_lsp_snippet(&wide);
+        assert_eq!(s.chars().count(), 200);
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
     }
 }

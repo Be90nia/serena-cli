@@ -30,21 +30,34 @@ pub fn catalog() -> serde_json::Value {
                     "_compact": {"type": "bool", "required": false, "default": true, "description": "compact envelope (private)"},
                     "_delta": {"type": "bool", "required": false, "default": false, "description": "incremental delta (private)"},
                     "_max_tokens": {"type": "number", "required": false, "description": "soft budget on list output (private)"},
-                    "_compress": {"type": "bool", "required": false, "description": "strip container/kind (private)"}
+                    "_compress": {"type": "bool", "required": false, "description": "strip container/kind (private)"},
+                    "summary": {"type": "bool", "required": false, "default": false, "description": "bd kq6e: true → {summary, symbols} object with one-line kind histogram; default keeps bare array wire"}
                 }
             },
             "symbol-tree": {
                 "args": {
                     "dir": {"type": "string", "required": true},
-                    "max_files": {"type": "number", "required": false, "default": 200}
+                    "max_files": {"type": "number", "required": false, "default": 200, "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"},
+                    "top_level": {"type": "bool", "required": false, "default": false, "description": "bd vro3: true → top-level symbols only per file (range-containment filter)"},
+                    "grep": {"type": "string", "required": false, "description": "bd 6ooi: keep symbols whose name contains this substring (case-insensitive); entries with no matches omitted"},
+                    "max_depth": {"type": "number", "required": false, "description": "bd 6ooi: keep symbols with containment-chain depth < N (top level = 0)"},
+                    "files_only": {"type": "bool", "required": false, "default": false, "description": "bd 6ooi: true → file list only, zero LS calls"}
                 }
             },
             "find-symbol": {
                 "args": {
                     "query": {"type": "string", "required": true},
-                    "limit": {"type": "number", "required": false, "default": 50},
+                    "limit": {"type": "number", "required": false, "default": 50, "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"},
+                    "kind": {"type": "string", "required": false, "description": "bd w2b5: comma-separated kind filter (fn, method, class, struct, enum, interface, module, namespace, package, field, property, variable, constant, file)"},
+                    "format": {"type": "string", "required": false, "default": "full", "description": "bd 51ib: brief = 'name file:line:col' strings (cheapest); full = default compact wire; json = full-fidelity"},
                     "_compact": {"type": "bool", "required": false, "default": true, "description": "(private)"},
                     "_delta": {"type": "bool", "required": false, "default": false, "description": "(private)"}
+                }
+            },
+            "batch-read": {
+                "args": {
+                    "files": {"type": "array", "required": true, "description": "bd qre0: array of repo-relative paths to read in one call (cap 50)"},
+                    "budget_tokens": {"type": "number", "required": false, "default": 2000, "description": "soft aggregate output budget; reading stops and marks truncated/skipped"}
                 }
             },
             "signature-help": {
@@ -200,15 +213,18 @@ pub fn catalog() -> serde_json::Value {
                 "args": {
                     "pattern": {"type": "string", "required": true},
                     "path_glob": {"type": "string", "required": false},
-                    "max_results": {"type": "number", "required": false, "default": 100},
+                    "max_results": {"type": "number", "required": false, "default": 100, "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"},
                     "case_sensitive": {"type": "bool", "required": false, "default": false},
-                    "comments_only": {"type": "bool", "required": false, "default": false, "description": "I: filter to comment lines only"}
+                    "comments_only": {"type": "bool", "required": false, "default": false, "description": "I: filter to comment lines only"},
+                    "distinct_symbols": {"type": "bool", "required": false, "default": false, "description": "bd zpzw: keep first hit per enriched symbol name (symbol=null rows kept)"},
+                    "format": {"type": "string", "required": false, "default": "full", "description": "bd 51ib: brief = 'file:line:col: text' strings; full/json = default response (adds bd rsqq summary header)"}
                 }
             },
             "symbol-body": {
                 "args": {
                     "file": {"type": "string", "required": true},
-                    "symbol": {"type": "string", "required": true}
+                    "symbol": {"type": "string", "required": true},
+                    "meta": {"type": "bool", "required": false, "default": false, "description": "bd b72k: true → aggregate object (doc/signature/location/prev_line/next_line); default keeps bare body string"}
                 }
             },
             "edit-context": {
@@ -220,7 +236,7 @@ pub fn catalog() -> serde_json::Value {
             },
             "repo-map": {
                 "args": {
-                    "top_n": {"type": "number", "required": false, "default": 20, "description": "E: per-file top-level symbol map (top N)"}
+                    "top_n": {"type": "number", "required": false, "default": 20, "description": "E: per-file top-level symbol map (top N); bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"}
                 }
             },
             "warm": {
@@ -248,21 +264,22 @@ pub fn catalog() -> serde_json::Value {
                 "args": {
                     "file": {"type": "string", "required": true},
                     "start_line": {"type": "number", "required": false, "description": "1-based inclusive"},
-                    "end_line": {"type": "number", "required": false, "description": "1-based inclusive"}
+                    "end_line": {"type": "number", "required": false, "description": "1-based inclusive"},
+                    "no_clamp": {"type": "bool", "required": false, "default": false, "description": "bd 66al: true → strict bounds (end_line beyond EOF = BAD_ARGS); default clamps to EOF (bd mfxg)"}
                 }
             },
             "list-dir": {
                 "args": {
                     "path": {"type": "string", "required": true},
                     "max_depth": {"type": "number", "required": false},
-                    "max_entries": {"type": "number", "required": false, "default": 500}
+                    "max_entries": {"type": "number", "required": false, "default": 500, "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"}
                 }
             },
             "find-file": {
                 "args": {
                     "name_pattern": {"type": "string", "required": true},
                     "path_glob": {"type": "string", "required": false},
-                    "max_results": {"type": "number", "required": false, "default": 200}
+                    "max_results": {"type": "number", "required": false, "default": 200, "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"}
                 }
             },
             "find-referencing-symbols": {
@@ -273,7 +290,8 @@ pub fn catalog() -> serde_json::Value {
                     "grouped": {"type": "bool", "required": false, "default": false},
                     "page": {"type": "number", "required": false, "default": 1, "description": "pagination, used when grouped=true"},
                     "page_size": {"type": "number", "required": false, "default": 20},
-                    "_compact": {"type": "bool", "required": false, "default": true, "description": "(private)"}
+                    "_compact": {"type": "bool", "required": false, "default": true, "description": "(private)"},
+                    "_debug_raw": {"type": "bool", "required": false, "default": false, "description": "bd aap4: true (or SERENA_DEBUG_RAW=1) → attach raw_lsp_response 200B snapshot on silent-empty with non-null LS response"}
                 }
             },
             "find-referencing-code-snippets": {
@@ -282,8 +300,9 @@ pub fn catalog() -> serde_json::Value {
                     "line": {"type": "number", "required": true},
                     "col": {"type": "number", "required": true},
                     "context_lines": {"type": "number", "required": false, "default": 3},
-                    "max_results": {"type": "number", "required": false, "default": 50},
-                    "_compact": {"type": "bool", "required": false, "default": true, "description": "(private)"}
+                    "max_results": {"type": "number", "required": false, "default": 50, "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"},
+                    "_compact": {"type": "bool", "required": false, "default": true, "description": "(private)"},
+                    "_debug_raw": {"type": "bool", "required": false, "default": false, "description": "bd aap4: true (or SERENA_DEBUG_RAW=1) → attach raw_lsp_response 200B snapshot on silent-empty with non-null LS response"}
                 }
             },
             "replace-text-in-symbol": {
@@ -291,21 +310,26 @@ pub fn catalog() -> serde_json::Value {
                     "file": {"type": "string", "required": true},
                     "symbol": {"type": "string", "required": true},
                     "old_text": {"type": "string", "required": true},
-                    "new_text": {"type": "string", "required": true}
+                    "new_text": {"type": "string", "required": true},
+                    "format_on_write": {"type": "bool", "required": false, "default": false, "description": "bd ou83: run textDocument/formatting on the file after a successful write and apply edits to disk (all write tools accept this)"}
                 }
             },
             "insert-text-after-symbol": {
                 "args": {
                     "file": {"type": "string", "required": true},
                     "symbol": {"type": "string", "required": true},
-                    "text": {"type": "string", "required": true}
+                    "text": {"type": "string", "required": true},
+                    "auto_indent": {"type": "bool", "required": false, "default": true, "description": "bd bt3h: indent continuation lines to the host symbol's indentation (set false to disable)"},
+                    "format_on_write": {"type": "bool", "required": false, "default": false, "description": "bd ou83: format the file after a successful write"}
                 }
             },
             "insert-text-before-symbol": {
                 "args": {
                     "file": {"type": "string", "required": true},
                     "symbol": {"type": "string", "required": true},
-                    "text": {"type": "string", "required": true}
+                    "text": {"type": "string", "required": true},
+                    "auto_indent": {"type": "bool", "required": false, "default": true, "description": "bd bt3h: indent continuation lines to the host symbol's indentation (set false to disable)"},
+                    "format_on_write": {"type": "bool", "required": false, "default": false, "description": "bd ou83: format the file after a successful write"}
                 }
             },
             "delete-text-in-symbol": {
@@ -361,6 +385,36 @@ pub fn catalog() -> serde_json::Value {
             },
             "redo": {
                 "args": {}
+            },
+            "test": {
+                "args": {
+                    "target": {"type": "string", "required": true, "description": "test target: crate/test dir or test file path (relative to project root or absolute)"},
+                    "name": {"type": "string", "required": false, "description": "test name filter (cargo test positional / npm passthrough)"}
+                }
+            },
+            "diff": {
+                "args": {
+                    "txn_id": {"type": "number", "required": false, "description": "undo txn id (default: most recent active txn)"},
+                    "patch": {"type": "boolean", "required": false, "description": "emit unified diff consumable by patch -p1 / git apply"}
+                }
+            },
+            "find-test": {
+                "args": {
+                    "symbol": {"type": "string", "required": true, "description": "symbol name to locate tests for"}
+                }
+            },
+            "recipe": {
+                "args": {
+                    "name": {"type": "string", "required": true, "description": "recipe: fix-bug|add-feature|rename|add-test|refactor-extract|refactor-rename|review-diff|explore"},
+                    "pos": {"type": "array", "required": false, "description": "positional args; fix-bug/rename/refactor-extract = [file, sym], add-feature = [name], add-test/refactor-rename = [sym], explore = [path], review-diff = [txn-id]"},
+                    "new_body": {"type": "string", "required": false, "description": "fix-bug: replacement function body (absent = analyze-only chain)"},
+                    "to": {"type": "string", "required": false, "description": "rename / refactor-rename: new name"},
+                    "as": {"type": "string", "required": false, "description": "refactor-extract: new fn name"},
+                    "target": {"type": "string", "required": false, "description": "add-feature: stub target file (.rs)"},
+                    "tests_file": {"type": "string", "required": false, "description": "add-feature: test file path (with tests)"},
+                    "tests": {"type": "string", "required": false, "description": "add-feature: test code (with tests_file)"},
+                    "run": {"type": "boolean", "required": false, "description": "add-test: run test backend after writing template"}
+                }
             }
         }
     })

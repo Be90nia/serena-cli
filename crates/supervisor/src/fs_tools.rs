@@ -107,21 +107,31 @@ fn safe_join(root: &Path, sub: &str) -> FsResult<PathBuf> {
 /// - `start_line=Some(s), end_line=None`：s..末；
 /// - `start_line=None, end_line=Some(e)`：1..e；
 /// - `start_line=Some(s), end_line=Some(e)`：s..e（含 e）。
+///
+/// `clamp=true`（默认，bd mfxg）：`end_line` 超 EOF 自动收到末行（6 行文件传
+/// 20 = 读到 EOF）；`clamp=false`（--no-clamp，bd 66al）保留严格越界 BAD_ARGS，
+/// 供客户端探测文件真实长度。
 pub async fn read_file(
     root: &Path,
     file: &str,
     start_line: Option<u32>,
     end_line: Option<u32>,
+    clamp: bool,
 ) -> FsResult<ReadReport> {
     let canon_path = safe_join(root, file)?;
     let text = tokio::fs::read_to_string(&canon_path).await?;
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
     let s = start_line.unwrap_or(1);
-    let e = end_line.unwrap_or(total as u32);
+    let raw_e = end_line.unwrap_or(total as u32);
+    let e = if clamp {
+        raw_e.min(total as u32)
+    } else {
+        raw_e
+    };
     if s == 0 || e == 0 || s as usize > total || e as usize > total {
         return Err(FsError::BadArgs {
-            detail: format!("line range {s}..{e} out of bounds (total: {total})"),
+            detail: format!("line range {s}..{raw_e} out of bounds (total: {total})"),
         });
     }
     if s > e {
@@ -191,7 +201,9 @@ pub fn list_dir(
 
 /// 按文件名 glob 跨目录找文件。
 ///
-/// - `name_pattern`：glob 风格（`*` `?` `[...]`），匹配文件名（非相对路径）；
+/// - `name_pattern`：glob 风格（`*` `?` `[...]`）。**含通配符时按相对 root 的
+///   路径匹配**（bd 75k3：`*` 不跨目录 → `*.rs` 只顶层，`**/*.rs` 才递归，
+///   `src/*.rs` 限一层）；**纯文件名**（无 `*?[{:}`）保持任意深度文件名匹配。
 /// - `path_glob`：可选，匹配相对 root 的文件路径；
 /// - `max_results`：默认 200。
 pub fn find_file(
@@ -205,6 +217,13 @@ pub fn find_file(
         detail: format!("invalid name pattern `{name_pattern}`"),
         source: e.into(),
     })?;
+    // bd 75k3：`*` 不得吞 `/`（shell 语义），`**` 才递归。
+    const PATH_GLOB_OPTS: glob::MatchOptions = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    let name_is_path_glob = name_pattern.contains(['*', '?', '[', '{']);
     let path_filter = match path_glob {
         Some(g) => Some(glob::Pattern::new(g).map_err(|e| FsError::Glob {
             detail: format!("invalid path_glob `{g}`"),
@@ -228,7 +247,12 @@ pub fn find_file(
             .to_string_lossy()
             .replace('\\', "/");
         let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !pattern.matches(name) {
+        let matched = if name_is_path_glob {
+            pattern.matches_with(&rel, PATH_GLOB_OPTS)
+        } else {
+            pattern.matches(name)
+        };
+        if !matched {
             continue;
         }
         if path_filter.as_ref().is_some_and(|pf| !pf.matches(&rel)) {

@@ -36,7 +36,10 @@ impl Default for ServeConfig {
     }
 }
 
-/// `%LOCALAPPDATA%/serena/daemon.lock`（非 Windows 落 `~/.serena/daemon.lock`）。
+/// lock 路径：Windows `%LOCALAPPDATA%/serena/daemon.lock`；Unix 优先
+/// `$XDG_RUNTIME_DIR/serena/daemon.lock`（runtime dir 是 tmpfs + 0700，lock 含
+/// token 落这里比家目录更严，bd t5ji），未设 XDG_RUNTIME_DIR 回落
+/// `~/.serena/daemon.lock`（既有布局，老升级路径不受影响）。
 pub fn default_lock_path() -> PathBuf {
     #[cfg(windows)]
     {
@@ -45,9 +48,17 @@ pub fn default_lock_path() -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".serena").join("daemon.lock")
+        unix_lock_path(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), std::env::var("HOME").ok().as_deref())
     }
+}
+
+/// `default_lock_path` 的 Unix 分支纯函数（参数注入供单测，不碰进程 env）。
+#[cfg(not(windows))]
+fn unix_lock_path(runtime_dir: Option<&std::ffi::OsStr>, home: Option<&str>) -> PathBuf {
+    if let Some(runtime) = runtime_dir {
+        return PathBuf::from(runtime).join("serena").join("daemon.lock");
+    }
+    PathBuf::from(home.unwrap_or(".")).join(".serena").join("daemon.lock")
 }
 
 /// 工具调用重放日志（d3a）：daemon.lock 同目录 `invocations.jsonl`。
@@ -65,6 +76,9 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     if let Some(parent) = cfg.lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // bd xwi：启动接管超大旧日志（实证 164MB 场景）先轮转再续写，避免
+    // 单代无上界。失败只影响本轮不轮转，不拦 daemon 启动。
+    crate::http::rotate_invocation_log_at_startup(&default_invocation_log_path());
     // bind 先于 lock 仲裁：端口的 OS 排他性是第一道仲裁，bind 输家直接退出、
     // 不触碰 lock——lock 只由 bind 赢家创建/接管。否则"动过 lock 却起不来"
     // 的进程会删掉真主人的 lock，制造无 lock 孤儿 + 空 token 403（bd y2y）。
@@ -119,13 +133,38 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     tracing::info!("daemon listening on {addr}");
     // graceful shutdown 桥接：/shutdown POST 在 http::shutdown_post 中调
     // state.shutdown_notify.notify_waiters()，此处 await notified 触发退出。
+    // Ctrl-C/SIGINT（bd 1cv2）：tokio::signal::ctrl_c 三平台统一覆盖
+    // （Unix SIGINT；Windows SetConsoleCtrlHandler），走与 /shutdown 同一套
+    // signal_shutdown 收尾。
+    let signal_state = state.clone();
     let shutdown_signal = state.shutdown_notify.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown_signal.notified().await })
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = shutdown_signal.notified() => {}
+                _ = tokio::signal::ctrl_c() => signal_shutdown(&signal_state).await,
+            }
+        })
         .await?;
     // axum 退 → 等 reaper 完成 finish_shutdown（删 lock + 卸 LS）→ 返回。
     let _ = reaper.await;
     Ok(())
+}
+
+/// Ctrl-C / SIGINT 收尾（bd 1cv2）：与 /shutdown 同一套 draining 协议——置
+/// draining（新请求拿 503 DAEMON_DRAINING）→ 排空窗口 → 广播停机通知；reaper
+/// 被 notify 唤醒后走 finish_shutdown（删 lock + 卸 LS + exit 0）。
+pub async fn signal_shutdown(state: &AppState) {
+    if state
+        .draining
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        // /shutdown 或 idle 自杀已在收尾：其自身路径会 notify，这里不重复排空。
+        return;
+    }
+    tracing::info!("SIGINT/Ctrl-C received; entering ShutdownDraining");
+    state.wait_drain().await;
+    state.shutdown_notify.notify_waiters();
 }
 
 /// 把 lock 回填最终端口（bind 成功后调；M1 端口固定所以基本 no-op）。
@@ -133,4 +172,34 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 pub fn backfill_lock(lock_path: &Path, entry: &LockEntry) -> anyhow::Result<()> {
     lockfile::write_final(lock_path, entry)?;
     Ok(())
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    /// bd t5ji：XDG_RUNTIME_DIR 优先（tmpfs 0700，lock 含 token），缺省回
+    /// ~/.serena（既有布局）。纯函数注入，不碰进程 env。
+    #[test]
+    fn unix_lock_path_prefers_xdg_runtime_dir() {
+        use std::ffi::OsStr;
+        let with_xdg = unix_lock_path(Some(OsStr::new("/run/user/1000")), Some("/home/u"));
+        assert_eq!(
+            with_xdg,
+            PathBuf::from("/run/user/1000/serena/daemon.lock"),
+            "XDG_RUNTIME_DIR 设置时必须优先"
+        );
+        let without_xdg = unix_lock_path(None, Some("/home/u"));
+        assert_eq!(
+            without_xdg,
+            PathBuf::from("/home/u/.serena/daemon.lock"),
+            "未设 XDG_RUNTIME_DIR 回落家目录"
+        );
+        let nothing = unix_lock_path(None, None);
+        assert_eq!(
+            nothing,
+            PathBuf::from("./.serena/daemon.lock"),
+            "全缺省落到 cwd（既有 unwrap_or 语义）"
+        );
+    }
 }

@@ -47,7 +47,7 @@ pub async fn build(
     // 1) LS documentSymbol 全库树（3.1 缓存兜底）。Err 不再整工具失败——降级路径
     //    接管（fj17：`session_for().await?` 曾把 LS 失败传播成全空响应）。
     let tree = sup
-        .tool_symbol_tree(root, ".", lang, CANDIDATE_SCAN_LIMIT)
+        .tool_symbol_tree(root, ".", lang, CANDIDATE_SCAN_LIMIT, false, None, None, false)
         .await
         .ok();
     let mut top = flatten_symbols(tree);

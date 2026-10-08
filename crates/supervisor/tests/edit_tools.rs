@@ -68,7 +68,7 @@ async fn insert_text_before_symbol_adds_prefix() {
         .await
         .expect("overview");
 
-    sup.tool_edit_insert_before_symbol(&root, "demo.cpp", "main", "// header comment\n", None)
+    sup.tool_edit_insert_before_symbol(&root, "demo.cpp", "main", "// header comment\n", true, None)
         .await
         .expect("insert before");
 
@@ -94,7 +94,7 @@ async fn insert_text_after_symbol_adds_suffix() {
         .await
         .expect("overview");
 
-    sup.tool_edit_insert_after_symbol(&root, "demo.cpp", "keep_me", " // tail comment", None)
+    sup.tool_edit_insert_after_symbol(&root, "demo.cpp", "keep_me", " // tail comment", true, None)
         .await
         .expect("insert after");
 
@@ -235,7 +235,7 @@ async fn concurrent_writes_serialize_in_order() {
     let b2 = std::sync::Arc::clone(&barrier);
     let t1 = tokio::spawn(async move {
         b1.wait();
-        sup2.tool_edit_insert_after_symbol(&root2, "demo.cpp", "old_value", " // t1", None)
+        sup2.tool_edit_insert_after_symbol(&root2, "demo.cpp", "old_value", " // t1", true, None)
             .await
             .expect("t1 insert");
     });
@@ -243,7 +243,7 @@ async fn concurrent_writes_serialize_in_order() {
     let root3 = root.clone();
     let t2 = tokio::spawn(async move {
         b2.wait();
-        sup3.tool_edit_insert_before_symbol(&root3, "demo.cpp", "old_value", "// t2\n", None)
+        sup3.tool_edit_insert_before_symbol(&root3, "demo.cpp", "old_value", "// t2\n", true, None)
             .await
             .expect("t2 insert");
     });

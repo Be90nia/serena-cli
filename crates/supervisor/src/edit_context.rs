@@ -64,7 +64,7 @@ fn looks_like_test_file(file: &str) -> bool {
 
 /// 从 `tool_symbol_body` 缓存层找匹配符号的 range（line 0-based），为 BodyRange 提供
 /// 起止行号。缓存命中/miss 都能命中——`tool_symbol_body` 写缓存时已把全部符号平铺入库。
-fn range_from_symbol_cache(
+pub(crate) fn range_from_symbol_cache(
     sup: &Supervisor,
     root: &Path,
     file: &str,
@@ -77,14 +77,18 @@ fn range_from_symbol_cache(
         .map(|h| (h.range.start.line, h.range.end.line))
 }
 
-/// 找符号名在 body 第一行的列偏移（0-based）。RA `references` 要求光标在符号名
-/// 自身上才有结果。ponytail: 直接字符串扫描，未走 LSP。失败 fallback 0。
-fn column_of_symbol_on_line(body_text: &str, line_0based: u32, symbol: &str) -> u32 {
+/// 在 body 文本内定位符号名 token（相对 body 首行的行偏移 + 0-based 列）。
+///
+/// bd syra：symbol range 常把 `///` doc 注释包进 body（RA documentSymbol range 从
+/// doc 行起）——旧实现只在 body 第一行找名字，找不到就 fallback 列 0，hover/references
+/// 落在 doc 注释/`pub` 关键字上，doc 字段抓到的是关键字的 hover。改为扫描全文首个
+/// 含名字的行（= 签名行），hover/ref 查询点即 fn name token。找不到 fallback (0,0)。
+fn locate_name_in_body(body_text: &str, symbol: &str) -> (u32, u32) {
     body_text
         .lines()
-        .nth(line_0based as usize)
-        .and_then(|line| line.find(symbol).map(|c| c as u32))
-        .unwrap_or(0)
+        .enumerate()
+        .find_map(|(i, line)| line.find(symbol).map(|c| (i as u32, c as u32)))
+        .unwrap_or((0, 0))
 }
 
 /// `edit-context` 聚合入口。任一段失败不影响其他字段。
@@ -120,11 +124,13 @@ pub async fn collect(
     }
 
     // 2) callers + tests：refs 反查。RA `references` 要求光标在符号名上才返回真引用，
-    //    用 column_of_symbol_on_line 找 body 第一行 symbol 列偏移作为查点。
+    //    用 locate_name_in_body 找 body 内符号名 token（签名行）作为查点 —— bd syra：
+    //    旧实现查 body 第一行（doc 注释行）会落在关键字上。
     if let Some(body) = report.body.as_ref() {
-        let query_col = column_of_symbol_on_line(&body.text, body_line_0based, symbol);
-        if let Ok(callers) = sup
-            .tool_referencing_symbols(root, file, body_line_0based, query_col, lang)
+        let (name_off, name_col) = locate_name_in_body(&body.text, symbol);
+        let name_line = body_line_0based + name_off;
+        if let Ok((callers, _raw_snip)) = sup
+            .tool_referencing_symbols(root, file, name_line, name_col, lang)
             .await
         {
             let tests: Vec<RefSymbolHit> = callers
@@ -149,11 +155,12 @@ pub async fn collect(
         }
     }
 
-    // 3) doc：hover 同位置拿 doc_string。
+    // 3) doc：hover 同位置（fn name token）拿 doc_string —— bd syra：hover 必须
+    //    打在符号名上，打在 doc 注释/`pub` 关键字上会抓到关键字的文档。
     if let Some(body) = report.body.as_ref() {
-        let query_col = column_of_symbol_on_line(&body.text, body_line_0based, symbol);
+        let (name_off, name_col) = locate_name_in_body(&body.text, symbol);
         if let Ok(Some(hover)) = sup
-            .tool_hover(root, file, body_line_0based, query_col, lang)
+            .tool_hover(root, file, body_line_0based + name_off, name_col, lang)
             .await
         {
             report.doc = extract_hover_doc(&hover.contents);
@@ -228,6 +235,20 @@ mod tests {
         // "test" 是子串但不构成测试文件（无 /tests/、_test.、_spec. 等）
         assert!(!looks_like_test_file("src/contest.rs"));
         assert!(!looks_like_test_file("src/protest.rs"));
+    }
+
+    #[test]
+    fn locate_name_in_body_skips_doc_comment_first_line() {
+        // bd syra：body 首行是 doc 注释（不含符号名）→ 必须落到签名行，不能 fallback 列 0。
+        let body = "/// Compute the sum.\n///\npub fn sum_slice(xs: &[i64]) -> i64 {\n    0\n}\n";
+        let (off, col) = locate_name_in_body(body, "sum_slice");
+        assert_eq!(off, 2, "name token lives on the signature line");
+        assert_eq!(col, 7, "after `pub fn `");
+        // 名字就在首行（无 doc）→ (0, 列)。
+        let (off, col) = locate_name_in_body("fn main() {}", "main");
+        assert_eq!((off, col), (0, 3));
+        // 全文无名字 → fallback (0,0)。
+        assert_eq!(locate_name_in_body("fn other() {}", "missing"), (0, 0));
     }
 
     #[test]
@@ -318,12 +339,19 @@ mod tests {
         );
         assert!(body.start_line >= 1 && body.end_line >= body.start_line);
         assert_eq!(report.symbol, "add");
-        // callers：lib.rs 的 add 至少有声明自身（includeDeclaration: true）。
+        // callers：demo() 内的真实调用（bd nl2w/A3b #1：定义点自身已被
+        // drop_self_reference 过滤——旧断言"至少含声明自身"是在 Windows 过滤器
+        // no-op 状态下写的，过滤器生效后 add 无真实调用即恒空，fixture 已补 demo）。
+        // RefSymbolHit.line 0-based：add 定义在 lib.rs 0-based 第 0 行。
         let callers = report.callers.as_ref().expect("callers must be Some");
         assert!(
             !callers.is_empty(),
-            "callers 必须非空（至少含声明自身）；raw_count={}",
+            "callers 必须含 demo 内的真实调用；raw_count={}",
             callers.len()
+        );
+        assert!(
+            callers.iter().all(|c| c.line != 0),
+            "定义点自身必须被过滤；got: {callers:?}"
         );
         // doc：hover 拿到 pub fn 签名（任一字符串）。
         assert!(report.doc.is_some(), "doc 必须 Some（hover 必有响应）");

@@ -127,21 +127,10 @@ impl Default for ProjectRootSlot {
 /// initialize_patches 无 ctx/root 入参，params 的 URI 是唯一本会话 root 来源；
 /// 无键静态槽在该时机读到的是**上一个**会话的 root（set_project_root 在
 /// initialize 之后才调用）—— 跨项目 venv/monorepo 探测错位的实锚。
-/// 语义镜像 supervisor::uri_to_path：percent-decode + Windows 盘符大写归一。
+/// bd avw：归一实现收敛到 lsp-core 单源（percent-decode + Windows 盘符大写 +
+/// canonicalize/词法归一），containment 门同源（`docsync::uri_in_root`）。
 pub(crate) fn root_uri_to_path(uri: Option<&lsp_types::Uri>) -> Option<PathBuf> {
-    let stripped = uri?.as_str().strip_prefix("file://")?;
-    // Windows: `file:///C:/foo` → `C:/foo`
-    let s = if cfg!(windows) && stripped.starts_with('/') {
-        &stripped[1..]
-    } else {
-        stripped
-    };
-    let decoded = percent_encoding::percent_decode_str(s).decode_utf8().ok()?;
-    let mut s = decoded.into_owned();
-    if cfg!(windows) && s.len() >= 2 && s.as_bytes()[1] == b':' {
-        s[..1].make_ascii_uppercase();
-    }
-    Some(PathBuf::from(s.replace('\\', "/")))
+    lsp_core::docsync::uri_to_path(uri?.as_str())
 }
 
 #[cfg(test)]

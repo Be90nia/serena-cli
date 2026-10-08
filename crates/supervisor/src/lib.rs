@@ -38,6 +38,9 @@ pub mod path_guard;
 pub mod root_finder;
 
 pub mod catalog;
+mod ct;
+pub mod recipe;
+pub mod recipe_ops;
 pub mod ref_tools;
 pub mod repo_map;
 pub mod undo;
@@ -809,12 +812,25 @@ impl Supervisor {
 
     /// 缓存命中前的装态复验:登记的 LS exe 已不在盘上(被卸载/半包)→ 会话失效,
     /// 驱逐后走冷启动重新探测(未装则报 LS_NOT_INSTALLED)。无登记条目(防御:
-    /// 理论上 spawn 必登记)→ 视为有效不拦。
+    /// 理论上 spawn 必登记)→ 视为有效不拦。bd serena-rust-bua（审计 A3）：除
+    /// exe 在盘外还须会话未 Failed——Failed 会话残留登记时 respawn 不得复用。
     fn launch_exe_valid(&self, key: &Key) -> bool {
-        match self.launch_exe.lock().unwrap().get(key) {
-            Some(exe) => exe.is_file(),
-            None => true,
-        }
+        let exe = self.launch_exe.lock().unwrap().get(key).cloned();
+        let state = self.instances.lock().unwrap().get(key).map(|s| s.state());
+        Self::reuse_allowed(exe.as_deref(), state.as_ref())
+    }
+
+    /// 复用判定纯函数（可单测，Session 无法在测试里构造成 Failed）：exe 在盘
+    /// （无登记=有效）且 会话未 Failed。
+    fn reuse_allowed(
+        exe: Option<&Path>,
+        state: Option<&lsp_core::session::SessionState>,
+    ) -> bool {
+        exe.is_none_or(Path::is_file)
+            && !matches!(
+                state,
+                Some(lsp_core::session::SessionState::Failed(_))
+            )
     }
 
     /// 拿到/创建 (root, lang) 对应的 Session，同 key 只允许一次冷启动。
@@ -1021,9 +1037,13 @@ impl Supervisor {
         // documentSymbol 通用探针仍然生效。
         if let Some(adapter) = &t2 {
             adapter.set_project_root(&key.root);
-            if let Err(e) =
-                tokio::time::timeout(Duration::from_secs(30), adapter.on_session_ready(&session))
-                    .await
+            // bd serena-rust-62z：外层包裹预算取 adapter 自报值（jdtls 90s /
+            // csharp-ls 60s 不再被硬编码 30s 截断）；内部探针超时仍先于外层触发。
+            if let Err(e) = tokio::time::timeout(
+                adapter.ready_probe_budget(),
+                adapter.on_session_ready(&session),
+            )
+            .await
             {
                 tracing::warn!(adapter = adapter.id(), error = %e, "on_server_ready probe failed/timed out; continuing");
             }
@@ -1072,6 +1092,48 @@ impl Supervisor {
         self.mark_ls_started(&key.root);
         self.touch(&key);
         Ok(session)
+    }
+
+    /// bd ou83：format-on-write 收尾（默认关）。写类工具成功后对目标文件跑一次
+    /// formatting 并落盘；LS 不可用 / 格式化失败不回滚写结果（debug/warn 留痕）。
+    /// 返回应用编辑条数（0 = 未执行或无需格式化）。
+    async fn format_on_write_for(&self, root: &Path, file: &str, lang: Option<&str>) -> usize {
+        let edits = match self.tool_format(root, file, None, None, lang).await {
+            Ok(e) if !e.is_empty() => e,
+            Ok(_) => return 0,
+            Err(e) => {
+                tracing::debug!(
+                    file,
+                    error = %e,
+                    "format-on-write: formatting unavailable (bd ou83); write kept"
+                );
+                return 0;
+            }
+        };
+        let Ok(lang_s) = resolve_lang_for_file(file, lang) else {
+            return 0;
+        };
+        let session = match self.session_for(root, lang_s.as_str()).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(file, error = %e, "format-on-write: session unavailable; write kept");
+                return 0;
+            }
+        };
+        let abs = match path_guard::guarded_join(root, file) {
+            Ok(p) => p,
+            Err(detail) => {
+                tracing::debug!(file, detail, "format-on-write: path guard rejected; write kept");
+                return 0;
+            }
+        };
+        match edit_tools::apply_format_edits(&session, root, &abs, edits).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(file, error = %e, "format-on-write failed; write result kept");
+                0
+            }
+        }
     }
 
     /// 写工具收尾：拉一次 file-level 诊断快照；挂进写工具响应 `post_write_diagnostics`。
@@ -1546,7 +1608,7 @@ impl Supervisor {
             .request("textDocument/codeAction", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::CodeAction> = serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "code-action");
         Ok(parsed)
     }
 
@@ -1578,7 +1640,7 @@ impl Supervisor {
             .request("textDocument/formatting", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::TextEdit> = serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "format");
         Ok(parsed)
     }
 
@@ -1618,7 +1680,7 @@ impl Supervisor {
             .request("textDocument/rangeFormatting", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::TextEdit> = serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "format-range");
         Ok(parsed)
     }
 
@@ -1649,7 +1711,7 @@ impl Supervisor {
             .request("textDocument/inlayHint", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::InlayHint> = serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "inlay-hint");
         Ok(parsed)
     }
 
@@ -1677,8 +1739,7 @@ impl Supervisor {
             .request("textDocument/documentHighlight", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::DocumentHighlight> =
-            serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "document-highlight");
         Ok(parsed)
     }
 
@@ -1700,7 +1761,7 @@ impl Supervisor {
             .request("textDocument/foldingRange", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::FoldingRange> = serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "folding-range");
         Ok(parsed)
     }
 
@@ -1752,7 +1813,7 @@ impl Supervisor {
             .request("textDocument/codeLens", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::CodeLens> = serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "code-lens");
         Ok(parsed)
     }
 
@@ -1775,7 +1836,7 @@ impl Supervisor {
             .request("textDocument/documentLink", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::DocumentLink> = serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "document-link");
         Ok(parsed)
     }
 
@@ -1804,8 +1865,7 @@ impl Supervisor {
             .request("textDocument/prepareCallHierarchy", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::CallHierarchyItem> =
-            serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "call-hierarchy:prepare");
         Ok(parsed)
     }
 
@@ -1825,8 +1885,7 @@ impl Supervisor {
             .request("callHierarchy/incomingCalls", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::CallHierarchyIncomingCall> =
-            serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "call-hierarchy:incoming");
         Ok(parsed)
     }
 
@@ -1845,8 +1904,7 @@ impl Supervisor {
             .request("callHierarchy/outgoingCalls", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::CallHierarchyOutgoingCall> =
-            serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "call-hierarchy:outgoing");
         Ok(parsed)
     }
 
@@ -1874,8 +1932,7 @@ impl Supervisor {
             .request("textDocument/prepareTypeHierarchy", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::TypeHierarchyItem> =
-            serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "type-hierarchy:prepare");
         Ok(parsed)
     }
 
@@ -1894,8 +1951,7 @@ impl Supervisor {
             .request("typeHierarchy/supertypes", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::TypeHierarchyItem> =
-            serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "type-hierarchy:supertypes");
         Ok(parsed)
     }
 
@@ -1914,8 +1970,7 @@ impl Supervisor {
             .request("typeHierarchy/subtypes", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::TypeHierarchyItem> =
-            serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "type-hierarchy:subtypes");
         Ok(parsed)
     }
 
@@ -1943,7 +1998,7 @@ impl Supervisor {
             .request("textDocument/moniker", params, TOOL_TIMEOUT)
             .await?;
         let raw = resp.unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::Moniker> = serde_json::from_value(raw).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(raw, "moniker");
         Ok(parsed)
     }
 
@@ -1989,7 +2044,7 @@ impl Supervisor {
             return Ok(Vec::new());
         };
         let items = raw.get("items").cloned().unwrap_or(serde_json::Value::Null);
-        let parsed: Vec<lsp_types::Diagnostic> = serde_json::from_value(items).unwrap_or_default();
+        let (parsed, _degraded) = parse_lsp_items(items, "workspace-diagnostic");
         Ok(parsed)
     }
 
@@ -2377,12 +2432,23 @@ impl Supervisor {
     /// 逐文件走 `tool_overview` —— 天然复用 3.1 缓存（同文件二次 symbol-tree/overview
     /// 免 LS 往返）；目录扫描走 3.3 `filtered_walker`（venv/node_modules/target 等内置
     /// ignore + gitignore）。`max_files` 保险丝（默认 200）：超限截断并标 `truncated`。
+    ///
+    /// bd vro3：`top_level=true` 时每文件只保留顶层符号（范围包含过滤），整文件嵌套
+    /// 树 → 顶层条目（盲测 F.3 实测 1309 → ~130 tok）；默认 false 行为不变。
+    /// bd 6ooi：`grep`（名子串，大小写不敏感）/ `max_depth`（包含链深度上限，
+    /// 顶层=0）/ `files_only`（只列文件，零 LS 调用）三开关；均默认 None/false
+    /// 行为不变，过滤后 symbols 空的文件条目整个省略（skip_if）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn tool_symbol_tree(
         &self,
         root: &Path,
         dir: &str,
         lang: Option<&str>,
         max_files: usize,
+        top_level: bool,
+        grep: Option<&str>,
+        max_depth: Option<usize>,
+        files_only: bool,
     ) -> ToolResult<serde_json::Value> {
         if dir.is_empty() {
             return Err(ToolError::BadArgs {
@@ -2428,6 +2494,20 @@ impl Supervisor {
 
         // 逐文件聚合：缓存命中走 cache_get 拿克隆（无 LS 调用，可同步直接结果）；
         // 缓存未命中走 LS 文档符号查询。
+        // 6ooi：files_only 到此为止——文件清单即产物，零 LS 调用。
+        if files_only {
+            let entries: Vec<serde_json::Value> = files
+                .iter()
+                .map(|f| serde_json::json!({ "file": f }))
+                .collect();
+            return Ok(serde_json::json!({
+                "dir": dir,
+                "files_scanned": files.len(),
+                "truncated": truncated,
+                "entries": entries,
+                "errors": [],
+            }));
+        }
         //
         // 修 P1 #3 fan-out（合 P0 修复 audit）：按语言分桶（mixed-lang 目录下不同
         // 扩展名各自走自己的 LS，如 .py → pyright / .rs → rust-analyzer，绝不混
@@ -2466,6 +2546,11 @@ impl Supervisor {
                         let cached = cache_arc.lock().unwrap().get(&cache_key).cloned();
                         match cached {
                             Some(symbols) if !symbols.is_empty() => {
+                                let symbols = if top_level {
+                                    top_level_symbols(symbols)
+                                } else {
+                                    symbols
+                                };
                                 entries.push((
                                     idx,
                                     serde_json::json!({ "file": file, "symbols": symbols }),
@@ -2502,6 +2587,11 @@ impl Supervisor {
                     let cached = cache_arc.lock().unwrap().get(&cache_key).cloned();
                     match cached {
                         Some(symbols) if !symbols.is_empty() => {
+                            let symbols = if top_level {
+                                top_level_symbols(symbols)
+                            } else {
+                                symbols
+                            };
                             entries.push((
                                 idx,
                                 serde_json::json!({ "file": file, "symbols": symbols }),
@@ -2529,13 +2619,13 @@ impl Supervisor {
                 for idx in miss_indices {
                     if !serial_mode {
                         while set.len() >= MAX_INFLIGHT {
-                            drain_one(&mut set, &mut entries, &mut errors).await;
+                            drain_one(&mut set, &mut entries, &mut errors, top_level).await;
                         }
                     } else {
                         // >30 文件：先 drain 上一轮再启下一个，串行推进；
                         // 并行度退化到 1 = 单文件 didOpen 间歇 > 单 documentSymbol。
                         while !set.is_empty() {
-                            drain_one(&mut set, &mut entries, &mut errors).await;
+                            drain_one(&mut set, &mut entries, &mut errors, top_level).await;
                         }
                     }
                     let file = files[idx].clone();
@@ -2557,7 +2647,7 @@ impl Supervisor {
                     });
                 }
                 while !set.is_empty() {
-                    drain_one(&mut set, &mut entries, &mut errors).await;
+                    drain_one(&mut set, &mut entries, &mut errors, top_level).await;
                 }
             }
 
@@ -2565,7 +2655,10 @@ impl Supervisor {
             entries.sort_by_key(|(idx, _)| *idx);
         }
 
-        let final_entries: Vec<serde_json::Value> = entries.into_iter().map(|(_, v)| v).collect();
+        let final_entries: Vec<serde_json::Value> = entries
+            .into_iter()
+            .filter_map(|(_, v)| filter_tree_entry(v, grep, max_depth))
+            .collect();
 
         serde_json::to_value(serde_json::json!({
             "dir": dir,
@@ -2692,7 +2785,7 @@ impl Supervisor {
             tokio::fs::read_to_string(&target_path)
                 .await
                 .map_err(|e| ToolError::BadArgs {
-                    detail: format!("read {}: {e}", target_path.display()),
+                    detail: format!("read {def_file}: {e}"),
                 })?;
         let source = DefiningSymbolLocation {
             file: def_file.clone(),
@@ -2801,7 +2894,6 @@ impl Supervisor {
             // langs 非空（空集已在上方返 BadArgs）⇒ failures 非空。
             return Err(combined_all_failed_error(failures));
         }
-        let mut warnings = failure_warnings(&failures);
         let query = query.to_string();
         let mut tasks = Vec::with_capacity(sessions.len());
         for session in sessions {
@@ -2840,9 +2932,22 @@ impl Supervisor {
                 merged.extend(v);
             }
         }
-        // 部分失败不写缓存：warning 只在本次调用产生（命中路径不过 session_for，
-        // 无法重现），缓存部分结果会让重查静默丢失失败信息 —— 宁重查不可错缓存
-        // （对齐空集不缓存纪律）。
+        // bd qvv9（AI-6）：部分失败 warning 的取舍 —— 查询已被其它 lang 回答
+        // （merged 非空）时，NotInstalled 的安装广告是纯噪声（169B/call，盲测 18%
+        // 调用全噪声）；空结果时 warning 解释「为什么空」（x67 可见性语义保留）。
+        // 非 NotInstalled（LS 崩溃/协议错）恒透出 —— 部分结果可能不完整。
+        // 注：--lang 指定时 langs={override}，跨语言失败本就不进 failures。
+        let any_hard_failure = failures
+            .iter()
+            .any(|(_, e)| !matches!(e, ToolError::NotInstalled { .. }));
+        let mut warnings = if merged.is_empty() || any_hard_failure {
+            failure_warnings(&failures)
+        } else {
+            Vec::new()
+        };
+        // 空结果路径不写缓存：warning 只在本次调用产生（命中路径不过 session_for，
+        // 无法重现），缓存会让重查静默丢失败信息 —— 宁重查不可错缓存。非空结果
+        // （qvv9 过滤后 warnings 恒空）正常入缓存。
         // bd serena-rust-0em（B 层）：写后 RA workspace/symbol 索引刷新无保证时延
         // （裸探针实测 0.12s~5s+），且写后可能**缺条目**（命中集缩水，基线对照实测）。
         // 结果先过磁盘一致性校验 + 写后窗口检测，检出 stale/缺失 → documentSymbol
@@ -2893,12 +2998,17 @@ impl Supervisor {
             return Ok(());
         }
         let mut fresh_tables: HashMap<std::path::PathBuf, Vec<SymbolHit>> = HashMap::new();
+        // bd 3mt：轮询期请求失败不再纯 debug 吞掉 —— 每文件首个失败 warn 一条
+        // （轮询窗口内偶发失败是 LS 追赶的常态，逐条 warn 会刷屏），总数进最终
+        // Err 回执（execute_tool 落到结果顶层 warning），排障有计数可循。
+        let mut request_failures: usize = 0;
+        let mut failure_warned: std::collections::HashSet<String> = std::collections::HashSet::new();
         for n_rounds in 0..REALIGN_ROUNDS {
             for uri in &targets {
                 // 小写 uri（归一键）反推出的 path 中段大小写可能失真 —— 必须
                 // canonicalize 还原磁盘真实大小写，否则 path_to_uri 生成的 uri 与
                 // RA 记账（canonical）不一致 → RA 拒绝请求（日志实锤）。
-                let Some(path) = uri_to_path(uri).and_then(|p| dunce::canonicalize(p).ok()) else {
+                let Some(path) = uri_to_path(uri).and_then(|p| normalize_long_path(&p)) else {
                     continue;
                 };
                 if fresh_tables.contains_key(&path) {
@@ -2920,16 +3030,34 @@ impl Supervisor {
                     continue;
                 };
                 let params = json!({ "textDocument": { "uri": curi.as_str() } });
-                let Ok(resp) = session
+                let resp = match session
                     .request::<Option<DocumentSymbolResponse>>(
                         "textDocument/documentSymbol",
                         params,
                         INDEX_TIMEOUT,
                     )
                     .await
-                else {
-                    tracing::debug!(uri, round = n_rounds, "realign docsym request failed");
-                    continue;
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        request_failures += 1;
+                        if failure_warned.insert(uri.clone()) {
+                            tracing::warn!(
+                                uri,
+                                round = n_rounds,
+                                error = %e,
+                                "realign docsym request failed (bd 3mt); later retries at debug"
+                            );
+                        } else {
+                            tracing::debug!(
+                                uri,
+                                round = n_rounds,
+                                error = %e,
+                                "realign docsym request failed"
+                            );
+                        }
+                        continue;
+                    }
                 };
                 let flat = flatten_symbols(resp, curi.as_str(), lang.as_str());
                 // docsym 自身也过磁盘校验 —— 旧 parse tree（RA 分析未跟上 didChange）
@@ -2960,8 +3088,15 @@ impl Supervisor {
             tokio::time::sleep(Duration::from_millis(REALIGN_ROUND_MS)).await;
         }
         Err(format!(
-            "symbol index stale for {} file(s) after recent write; results may be misaligned, retry find-symbol shortly",
-            targets.len()
+            "symbol index stale for {} file(s) after recent write; results may be misaligned, retry find-symbol shortly{}",
+            targets.len(),
+            if request_failures > 0 {
+                format!(
+                    "; {request_failures} realign docsym request(s) failed (details in daemon log)"
+                )
+            } else {
+                String::new()
+            }
         ))
     }
     /// `Location[]`，lsp-types 在 capability 上声明多形态——M0 只解 `Option<Location>`）。
@@ -2983,7 +3118,7 @@ impl Supervisor {
 
         // offsets.rs 换算：M0 固定 utf-16（clangd 默认 + base init_params 首选 utf-16）。
         // M1 走 Session 协商结果（`capabilities.positionEncoding`）。本任务不引入新 API。
-        let pos = lsp_position_from_byte(&path, line, col, OffsetEncoding::Utf16).await?;
+        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
 
         let params = json!({
             "textDocument": { "uri": uri.clone() },
@@ -3017,7 +3152,7 @@ impl Supervisor {
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
-        let pos = lsp_position_from_byte(&path, line, col, OffsetEncoding::Utf16).await?;
+        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
 
         let params = json!({
             "textDocument": { "uri": uri.clone() },
@@ -3049,7 +3184,7 @@ impl Supervisor {
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
-        let pos = lsp_position_from_byte(&path, line, col, OffsetEncoding::Utf16).await?;
+        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
 
         let params = json!({
             "textDocument": { "uri": uri.clone() },
@@ -3088,7 +3223,7 @@ impl Supervisor {
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         // 越界校验（同 tool_def）—— 防止上游传错位掩盖。
-        let pos = lsp_position_from_byte(&path, line, col, OffsetEncoding::Utf16).await?;
+        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
 
         // CompletionContext：trigger=Some → TriggerCharacter + triggerCharacter；
         //                None → Invoked（agent 显式请求）。
@@ -3147,6 +3282,7 @@ impl Supervisor {
         })
     }
     /// `find_referencing_symbols`：所有引用 + 每个 ref 落在哪个外层符号里（Task 24）。
+    /// 第二返回值 = aap4 原始 LSP 响应 200B 快照（仅静默空形态漂移疑点时 Some）。
     pub async fn tool_referencing_symbols(
         &self,
         root: &Path,
@@ -3154,7 +3290,7 @@ impl Supervisor {
         line: u32,
         col: u32,
         lang_override: Option<&str>,
-    ) -> ToolResult<Vec<ref_tools::RefSymbolHit>> {
+    ) -> ToolResult<(Vec<ref_tools::RefSymbolHit>, Option<String>)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         ref_tools::find_referencing_symbols(&session, root, file, line, col)
@@ -3168,6 +3304,7 @@ impl Supervisor {
     }
 
     /// `find_referencing_code_snippets`：所有引用 + 每个 ref 前后 N 行（Task 24）。
+    /// 第三返回值 = aap4 原始 LSP 响应 200B 快照（仅静默空形态漂移疑点时 Some）。
     #[allow(clippy::too_many_arguments)]
     pub async fn tool_referencing_code_snippets(
         &self,
@@ -3178,7 +3315,7 @@ impl Supervisor {
         context_lines: u32,
         max_results: usize,
         lang_override: Option<&str>,
-    ) -> ToolResult<Vec<ref_tools::RefSnippetHit>> {
+    ) -> ToolResult<(Vec<ref_tools::RefSnippetHit>, bool, Option<String>)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         ref_tools::find_referencing_code_snippets(
@@ -3262,6 +3399,7 @@ impl Supervisor {
                                 .strip_prefix(root)
                                 .unwrap_or(&path)
                                 .to_string_lossy()
+                                .replace('\\', "/")
                                 .to_string();
                             if h.name == name {
                                 exact.push((rel, h.range));
@@ -3346,37 +3484,41 @@ impl Supervisor {
 
     /// `insert_text_before_symbol`：在 symbol 开头插入 text（Task 25）。
     /// 返回插入内容末尾的 (end_line, end_col)（1-based）。
+    /// bd bt3h：`auto_indent=true`（默认）时插入文本按 host 符号缩进补齐。
     pub async fn tool_edit_insert_before_symbol(
         &self,
         root: &Path,
         file: &str,
         symbol: &str,
         text: &str,
+        auto_indent: bool,
         lang_override: Option<&str>,
     ) -> ToolResult<(u32, u32)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs =
             path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
-        edit_tools::insert_text_before_symbol(&session, root, &abs, symbol, text)
+        edit_tools::insert_text_before_symbol(&session, root, &abs, symbol, text, auto_indent)
             .await
             .map_err(line_edit_err("insert_text_before_symbol"))
     }
 
     /// `insert_text_after_symbol`：在 symbol 末尾插入 text（Task 25）。
+    /// bd bt3h：`auto_indent=true`（默认）时插入文本按 host 符号缩进补齐。
     pub async fn tool_edit_insert_after_symbol(
         &self,
         root: &Path,
         file: &str,
         symbol: &str,
         text: &str,
+        auto_indent: bool,
         lang_override: Option<&str>,
     ) -> ToolResult<(u32, u32)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs =
             path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
-        edit_tools::insert_text_after_symbol(&session, root, &abs, symbol, text)
+        edit_tools::insert_text_after_symbol(&session, root, &abs, symbol, text, auto_indent)
             .await
             .map_err(line_edit_err("insert_text_after_symbol"))
     }
@@ -3450,6 +3592,111 @@ impl Supervisor {
         let out = read_and_slice(&path, file, range).await?;
         self.symbol_cache_put(cache_key, flatten_symbols(resp, &uri, &lang)); // cache_miss → 写入
         Ok(out)
+    }
+
+    /// bd qre0：batch-read —— 一次调用读多文件（纯读，不经写门）。逐文件走
+    /// `fs_tools::read_file`（默认 clamp）；累计估算 token（字节/4，与 `apply_budget`
+    /// 同一 soft-limit 口径）超过 `budget_tokens`（默认 2000）即停止读取，剩余计入
+    /// `skipped`。单文件失败记 `errors` 条目不拖垮整批。响应：
+    /// `{files:[ReadReport...], errors?:[{file,error}], truncated?:true, skipped?:n}`。
+    pub async fn tool_batch_read(
+        &self,
+        root: &Path,
+        files: &[String],
+        budget_tokens: usize,
+    ) -> ToolResult<serde_json::Value> {
+        let budget_bytes = budget_tokens.saturating_mul(4);
+        let mut used = 0usize;
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut errors: Vec<serde_json::Value> = Vec::new();
+        let mut truncated = false;
+        let mut skipped = 0usize;
+        for f in files {
+            if truncated {
+                skipped += 1;
+                continue;
+            }
+            match fs_tools::read_file(root, f, None, None, true).await {
+                Ok(report) => {
+                    let cost = report.content.len();
+                    // 首文件超预算仍读（soft limit，与 apply_budget 语义一致）——
+                    // 但后续文件一律停。
+                    if used + cost > budget_bytes && !items.is_empty() {
+                        truncated = true;
+                        skipped += 1;
+                        continue;
+                    }
+                    used += cost;
+                    items.push(serde_json::to_value(report).unwrap_or(serde_json::Value::Null));
+                }
+                Err(e) => {
+                    errors.push(json!({ "file": f, "error": e.to_string() }));
+                }
+            }
+        }
+        let mut o = serde_json::Map::new();
+        o.insert("files".into(), json!(items));
+        if !errors.is_empty() {
+            o.insert("errors".into(), json!(errors));
+        }
+        if truncated {
+            o.insert("truncated".into(), json!(true));
+            o.insert("skipped".into(), json!(skipped));
+        }
+        Ok(serde_json::Value::Object(o))
+    }
+
+    /// bd b72k：`symbol-body` 的 meta 聚合形态 —— body + doc（上方连续注释行）+
+    /// signature（body 首行）+ location（1-based）+ 上一行/下一行。依赖
+    /// `tool_symbol_body` 先暖 docsym 缓存再取 range；盘上文件现读。任一附带字段
+    /// 取不到就在响应里省略（skip 语义），body 缺失仍报错（与裸形态一致）。
+    pub async fn tool_symbol_body_meta(
+        &self,
+        root: &Path,
+        file: &str,
+        symbol: &str,
+        lang_override: Option<&str>,
+    ) -> ToolResult<serde_json::Value> {
+        let body = self.tool_symbol_body(root, file, symbol, lang_override).await?;
+        let (s0, e0) = crate::edit_context::range_from_symbol_cache(self, root, file, symbol)
+            .unwrap_or((0, 0));
+        let text = tokio::fs::read_to_string(root.join(file))
+            .await
+            .map_err(|e| ToolError::Core(CoreError::Io(e)))?;
+        let lines: Vec<&str> = text.lines().collect();
+        let s = s0 as usize;
+        let e = e0 as usize;
+        // doc：body 起行上方连续注释行（复用 fs_tools 的注释前缀表）。
+        let mut doc_start = s;
+        while doc_start > 0 && crate::fs_tools::looks_like_comment(file, lines[doc_start - 1]) {
+            doc_start -= 1;
+        }
+        let doc =
+            (doc_start < s).then(|| lines[doc_start..s].join("\n").to_string());
+        let signature = lines.get(s).map(|l| l.trim_end().to_string());
+        let prev_line = (s > 0).then(|| lines[s - 1].to_string());
+        let next_line = lines.get(e + 1).map(|l| l.to_string());
+        let mut o = serde_json::Map::new();
+        o.insert("file".into(), json!(file));
+        o.insert("symbol".into(), json!(symbol));
+        o.insert(
+            "location".into(),
+            json!({ "start_line": s0 + 1, "end_line": e0 + 1 }),
+        );
+        if let Some(d) = doc {
+            o.insert("doc".into(), json!(d));
+        }
+        if let Some(sig) = signature {
+            o.insert("signature".into(), json!(sig));
+        }
+        if let Some(p) = prev_line {
+            o.insert("prev_line".into(), json!(p));
+        }
+        if let Some(n) = next_line {
+            o.insert("next_line".into(), json!(n));
+        }
+        o.insert("body".into(), json!(body));
+        Ok(serde_json::Value::Object(o))
     }
 
     /// `replace-body`：按符号名替换函数/类体（C3 一致性链路，PLAN Task 15）。
@@ -3543,14 +3790,14 @@ impl Supervisor {
             .await?;
         let range =
             find_symbol_range(resp.as_ref(), symbol, lang).ok_or_else(|| ToolError::BadArgs {
-                detail: format!("symbol `{symbol}` not found in {}", path.display()),
+                detail: format!("symbol `{symbol}` not found in {}", user_path(root, path)),
             })?;
 
         // 2) 读盘 + content-hash 对账（C3 防线 ①）。
         let old_text = tokio::fs::read_to_string(path)
             .await
             .map_err(|e| ToolError::BadArgs {
-                detail: format!("read {}: {e}", path.display()),
+                detail: format!("read {}: {e}", user_path(root, path)),
             })?;
         let old_hash = content_hash(&old_text);
 
@@ -3584,18 +3831,19 @@ impl Supervisor {
         undo::recorded_write(path, &new_text)
             .await
             .map_err(|e| ToolError::WriteConflict {
-                path: path.display().to_string(),
+                path: user_path(root, path),
                 reason: format!("atomic write failed: {e}"),
             })?;
 
         // 4) 读回 diff 校验（C3 防线 ②③）—— 不符回滚 + 报冲突。
+        // dry-run 干跑未落盘，readback 读到旧内容属预期，跳过比对。
         let readback = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| ToolError::BadArgs {
-                detail: format!("readback {}: {e}", path.display()),
+                detail: format!("readback {}: {e}", user_path(root, path)),
             })?;
-        if readback != new_text {
-            return Err(rollback_after_readback_mismatch(path, &old_text).await);
+        if readback != new_text && !undo::is_dry_run() {
+            return Err(rollback_after_readback_mismatch(path, root, &old_text).await);
         }
 
         // 5) didChange 全量同步 → LS 与盘一致。
@@ -3848,7 +4096,7 @@ impl Supervisor {
 
         let _gate = write_gate::acquire("rename-symbol").await?;
 
-        let pos = lsp_position_from_byte(&path, line, col, OffsetEncoding::Utf16).await?;
+        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
         let pos_params = json!({
             "textDocument": { "uri": uri_str },
             "position": { "line": pos.line, "character": pos.character },
@@ -4045,23 +4293,24 @@ impl Supervisor {
         let old_text = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| ToolError::BadArgs {
-                detail: format!("read {}: {e}", path.display()),
+                detail: format!("read {}: {e}", user_path(root, &path)),
             })?;
         let new_text = delete_symbol_text(&old_text, range)?;
         // undo 收口：快照旧内容 → 原子写 → 入当前事务。
         undo::recorded_write(&path, &new_text)
             .await
             .map_err(|e| ToolError::WriteConflict {
-                path: path.display().to_string(),
+                path: user_path(root, &path),
                 reason: format!("atomic write failed: {e}"),
             })?;
         let readback = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| ToolError::BadArgs {
-                detail: format!("readback {}: {e}", path.display()),
+                detail: format!("readback {}: {e}", user_path(root, &path)),
             })?;
-        if readback != new_text {
-            return Err(rollback_after_readback_mismatch(&path, &old_text).await);
+        // dry-run 干跑未落盘，readback 读到旧内容属预期，跳过比对。
+        if readback != new_text && !undo::is_dry_run() {
+            return Err(rollback_after_readback_mismatch(&path, root, &old_text).await);
         }
         // 走 `ensure_open` 的 mtime-检测路径，与 tool_replace_body / edit_tools 共享
         // 同一 content_version 单调递增（rust-analyzer 拒收非单调 version → channel 关）。
@@ -4605,6 +4854,101 @@ fn flatten_symbols(
     out
 }
 
+/// bd vro3：`symbol-tree --top-level` 的顶层过滤 —— 保留 range **不被**同文件其它
+/// 符号的 range 严格包含的命中（扁平缓存无深度信息，用范围包含重建层级：子符号
+/// range ⊆ 父符号 range）。相同 range 互不包含（并列保留）。
+fn top_level_symbols(hits: Vec<SymbolHit>) -> Vec<SymbolHit> {
+    let n = hits.len();
+    let mut keep = vec![true; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let (h, o) = (&hits[i], &hits[j]);
+            if o.range.start <= h.range.start
+                && h.range.end <= o.range.end
+                && (o.range.start < h.range.start || h.range.end < o.range.end)
+            {
+                keep[i] = false;
+                break;
+            }
+        }
+    }
+    hits.into_iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(h, _)| h)
+        .collect()
+}
+
+/// bd 6ooi：symbol-tree 条目级过滤（`--grep` / `--max-depth`）。两开关均未给时
+/// 原样返回（默认 wire 逐字节不变）；过滤后 symbols 空的条目整个省略。
+fn filter_tree_entry(
+    entry: serde_json::Value,
+    grep: Option<&str>,
+    max_depth: Option<usize>,
+) -> Option<serde_json::Value> {
+    if grep.is_none() && max_depth.is_none() {
+        return Some(entry);
+    }
+    let symbols = entry.get("symbols")?.as_array()?;
+    let grep_lc = grep.map(str::to_lowercase);
+    let kept: Vec<serde_json::Value> = symbols
+        .iter()
+        .filter(|s| {
+            if let Some(g) = &grep_lc {
+                let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if !name.to_lowercase().contains(g.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(d) = max_depth
+                && symbol_containment_depth(s, symbols) >= d
+            {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let mut obj = entry.as_object()?.clone();
+    obj.insert("symbols".into(), serde_json::Value::Array(kept));
+    Some(serde_json::Value::Object(obj))
+}
+
+/// 深度 = 同文件其它符号中 range 严格包含它的个数（顶层=0）。与
+/// `top_level_symbols` 同一包含判据（start ≤ 且 end ≥，至少一端严格）；
+/// 相同 range 互不严格包含（并列不算深）。
+fn symbol_containment_depth(sym: &serde_json::Value, all: &[serde_json::Value]) -> usize {
+    let (Some((sl, sc)), Some((el, ec))) = (json_pos(sym, "start"), json_pos(sym, "end")) else {
+        return 0;
+    };
+    all.iter()
+        .filter(|o| {
+            let (Some((osl, osc)), Some((oel, oec))) = (json_pos(o, "start"), json_pos(o, "end"))
+            else {
+                return false;
+            };
+            let start_le = (osl, osc) <= (sl, sc);
+            let end_ge = (el, ec) <= (oel, oec);
+            let strict = (osl, osc) < (sl, sc) || (el, ec) < (oel, oec);
+            start_le && end_ge && strict
+        })
+        .count()
+}
+
+fn json_pos(sym: &serde_json::Value, key: &str) -> Option<(u64, u64)> {
+    let p = sym.get("range")?.get(key)?;
+    Some((
+        p.get("line")?.as_u64()?,
+        p.get("character")?.as_u64()?,
+    ))
+}
+
 fn push_nested(
     sym: &DocumentSymbol,
     container: Option<String>,
@@ -4642,6 +4986,7 @@ async fn drain_one(
     set: &mut tokio::task::JoinSet<(usize, String, ToolResult<Vec<SymbolHit>>)>,
     entries: &mut Vec<(usize, serde_json::Value)>,
     errors: &mut Vec<serde_json::Value>,
+    top_level: bool,
 ) {
     let Some(joined) = set.join_next().await else {
         return;
@@ -4657,6 +5002,11 @@ async fn drain_one(
     };
     match res {
         Ok(symbols) if !symbols.is_empty() => {
+            let symbols = if top_level {
+                top_level_symbols(symbols)
+            } else {
+                symbols
+            };
             entries.push((idx, serde_json::json!({ "file": file, "symbols": symbols })));
         }
         Ok(_) => {} // 空命中 → 不入 entries
@@ -5085,6 +5435,136 @@ fn failure_warnings(failures: &[(String, ToolError)]) -> Vec<String> {
         .collect()
 }
 
+/// bd 8ft：结果集被 `max_results` 截断时响应顶层标 `truncated:true`。对象形态
+/// 直接加键；裸数组（非 compact）按 [`attach_warning`] 同款升级为对象。仅截断
+/// 发生时调用（skip_if false）。
+fn attach_truncated(value: &mut serde_json::Value) {
+    if value.is_array() {
+        let items = std::mem::take(value);
+        *value = serde_json::json!({ "compact": false, "items": items, "truncated": true });
+    } else if let Some(obj) = value.as_object_mut() {
+        obj.insert("truncated".into(), serde_json::Value::Bool(true));
+    }
+}
+
+/// 读数值环境变量；设了但非法 → warn + 视同未设（不炸请求，配置错误可观测）。
+fn env_u64_var(name: &str) -> Option<u64> {
+    match std::env::var(name) {
+        Ok(s) => match parse_num_env(&s) {
+            Some(n) => Some(n),
+            None => {
+                tracing::warn!("{name}={s:?} is not a number; ignored");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// br41/z0kg：数值 env 解析（trim + u64）；None = 非法。
+fn parse_num_env(s: &str) -> Option<u64> {
+    s.trim().parse::<u64>().ok()
+}
+
+/// z0kg：list 类工具条数默认值——显式旗 > `SERENA_DEFAULT_MAX_ITEMS` > 既有默认。
+/// 未显式传旗时 env 才生效（默认行为不变，br41/z0kg 裁决同构）。
+fn arg_limit(args: &serde_json::Value, key: &str, default: u64) -> u64 {
+    if let Some(n) = args.get(key).and_then(|v| v.as_u64()) {
+        return n;
+    }
+    env_u64_var("SERENA_DEFAULT_MAX_ITEMS").unwrap_or(default)
+}
+
+/// aap4：raw_lsp_response 诊断开关——请求旗 `_debug_raw` 或环境
+/// `SERENA_DEBUG_RAW=1`（daemon 进程环境）。默认关，响应零新字段。
+fn debug_raw_enabled(args: &serde_json::Value) -> bool {
+    args.get("_debug_raw")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || std::env::var("SERENA_DEBUG_RAW").as_deref() == Ok("1")
+}
+
+/// tfa3：写回执瘦身（B.2/B.4 形态）。`post_write_diagnostics` 有 items 原样保留；
+/// items 空 + `pending:true`（LS 未确认，空≠无错）→ 压成单字符串 `"pending"`
+/// （语义不丢：AI 仍需回头复核）；items 空 + 确认干净 → 键省略（skip_if）。
+/// 语义依据见 `post_diag_for_write` doc 的 pending 双态定义。
+fn slim_write_receipt(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let Some(diag) = obj.get("post_write_diagnostics") else {
+        return;
+    };
+    let empty = diag
+        .get("items")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| a.is_empty());
+    if !empty {
+        return;
+    }
+    if diag.get("pending").and_then(|v| v.as_bool()).unwrap_or(false) {
+        obj.insert(
+            "post_write_diagnostics".into(),
+            serde_json::json!("pending"),
+        );
+    } else {
+        obj.remove("post_write_diagnostics");
+    }
+}
+
+/// 51ib：`format` = brief|full|json（默认 full = 既有 wire 逐字节不变）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutFormat {
+    Brief,
+    Full,
+    Json,
+}
+
+fn out_format(args: &serde_json::Value) -> Result<OutFormat, ToolError> {
+    match args.get("format").and_then(|v| v.as_str()) {
+        None | Some("full") => Ok(OutFormat::Full),
+        Some("brief") => Ok(OutFormat::Brief),
+        Some("json") => Ok(OutFormat::Json),
+        Some(other) => Err(ToolError::BadArgs {
+            detail: format!("unknown format `{other}` (accepted: brief, full, json)"),
+        }),
+    }
+}
+
+/// rsqq：search 头部一行概要（kq6e overview summary 同形——字符串头字段）。
+fn search_summary(resp: &SearchResponse) -> String {
+    let files: std::collections::BTreeSet<&str> = resp
+        .hits
+        .iter()
+        .map(|h| h.file.as_str())
+        .collect();
+    let mut s = format!("{} hits in {} files", resp.hits.len(), files.len());
+    if resp.truncated {
+        s.push_str("; truncated");
+    }
+    s
+}
+
+/// bd xxl：Windows 8.3 短名 → 长名归一单点。CI runner 的 `TEMP` 常为
+/// `C:\Users\RUNNER~1\...` 形态——`dunce::canonicalize` 走 fast path 不解析短名，
+/// didOpen URI 与 LS 内部长路径键失配（pyright 系 -32602 / vscode-langservers 系
+/// documentSymbol 恒空）。`std::fs::canonicalize`（GetFinalPathNameByHandle）能解
+/// 短名 → 剥 `\\?\` 前缀（`\\?\UNC\server\share` → `\\server\share`）。解析失败
+/// （不存在/权限）回落 dunce，再失败原样返回 —— 不新增失败模式。
+pub(crate) fn normalize_long_path(p: &Path) -> Option<std::path::PathBuf> {
+    match std::fs::canonicalize(p) {
+        Ok(long) => {
+            let s = long.as_os_str().to_string_lossy();
+            let stripped = s.strip_prefix(r"\\?\UNC\").map(|r| format!(r"\\{r}"));
+            let stripped = stripped
+                .or_else(|| s.strip_prefix(r"\\?\").map(str::to_string))
+                .unwrap_or_else(|| s.to_string());
+            Some(std::path::PathBuf::from(stripped))
+        }
+        Err(_) => dunce::canonicalize(p).ok(),
+    }
+}
+
 /// 结果 JSON 顶层 `warning` 键（wire 无既有 warning 通道，PM 拍板放结果顶层）。
 /// compact envelope 本是对象 → 直接加键；非 compact 裸数组无法带键 → 仅当有
 /// warning 时升级为 `{compact:false, items, warning}` 对象（无 warning 维持裸数组
@@ -5338,11 +5818,60 @@ fn kind_from_lsp(k: &lsp_types::SymbolKind) -> SymbolKindTag {
     let n: i32 = serde_json::from_value(serde_json::json!(k)).unwrap_or(0);
     SymbolKindTag::from_lsp(n as u8)
 }
+
+/// bd kq6e：overview 头部一行概要 —— 总数 + kind 直方图。
+fn overview_summary(hits: &[SymbolHit]) -> String {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for h in hits {
+        let k = match &h.kind {
+            SymbolKindTag::File => "file".into(),
+            SymbolKindTag::Module => "module".into(),
+            SymbolKindTag::Class => "class".into(),
+            SymbolKindTag::Method => "method".into(),
+            SymbolKindTag::Function => "function".into(),
+            SymbolKindTag::Field => "field".into(),
+            SymbolKindTag::Variable => "variable".into(),
+            SymbolKindTag::Other(n) => format!("other({n})"),
+        };
+        *counts.entry(k).or_default() += 1;
+    }
+    let hist = counts
+        .iter()
+        .map(|(k, n)| format!("{k}×{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{} symbol(s): {}", hits.len(), hist)
+}
+
+/// bd w2b5：`--kind` 名 → SymbolKindTag。注意 `from_lsp` 只窄化 Function/Method/Class，
+/// struct/enum/module 等在 hits 里都是 `Other(LSP 码)` —— 别名表按 LSP 3.17 §SymbolKind
+/// 码表直接给 `Other(n)`，保证 `--kind struct` 能命中 RA 输出。未知名返 None（调用方
+/// 报 BAD_ARGS，避免拼写错误静默零结果）。
+fn kind_tag_from_name(name: &str) -> Option<SymbolKindTag> {
+    match name.to_ascii_lowercase().as_str() {
+        "function" | "fn" => Some(SymbolKindTag::Function),
+        "method" => Some(SymbolKindTag::Method),
+        "class" => Some(SymbolKindTag::Class),
+        "file" => Some(SymbolKindTag::Other(1)),
+        "module" | "mod" => Some(SymbolKindTag::Other(2)),
+        "namespace" => Some(SymbolKindTag::Other(3)),
+        "package" => Some(SymbolKindTag::Other(4)),
+        "enum" => Some(SymbolKindTag::Other(10)),
+        "interface" => Some(SymbolKindTag::Other(11)),
+        "struct" => Some(SymbolKindTag::Other(23)),
+        "field" => Some(SymbolKindTag::Other(8)),
+        "property" => Some(SymbolKindTag::Other(7)),
+        "variable" | "var" => Some(SymbolKindTag::Other(13)),
+        "constant" | "const" => Some(SymbolKindTag::Other(14)),
+        _ => None,
+    }
+}
 /// 把 (line, col) 经 offsets.rs 换算为 LSP Position。M0 固定 utf-16。
 /// 读盘 → `position_to_byte` → 校验落在 char 边界。这里简化：假定输入 line/col 即
 /// LSP position（0-based），仅校验越界，避免上层传 0-based 错位时掩盖。
 async fn lsp_position_from_byte(
     path: &Path,
+    file: &str,
     line: u32,
     col: u32,
     enc: OffsetEncoding,
@@ -5350,7 +5879,8 @@ async fn lsp_position_from_byte(
     let text = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| ToolError::BadArgs {
-            detail: format!("read {}: {e}", path.display()),
+            // sec-S5：报用户传入的相对 file，不回显绝对路径（bd serena-rust-hah）。
+            detail: format!("read {file}: {e}"),
         })?;
     let pos = LspPos {
         line,
@@ -5670,7 +6200,12 @@ impl SupervisorTrait for Supervisor {
         args: serde_json::Value,
         lang: Option<&str>,
     ) -> Result<serde_json::Value, ToolError> {
-        let root = Path::new(project_root);
+        // bd xxl：root 带短名（CI runner 的 TEMP=RUNNER~1 等 8.3 形态）→ 一切下游
+        // didOpen URI 与 LS 内部长路径键失配。此处单点归一为长名（解析失败回落
+        // dunce/原样），后续 tool_* 拿到的 root 已是磁盘真实形态。
+        let long_root = normalize_long_path(Path::new(project_root))
+            .unwrap_or_else(|| PathBuf::from(project_root));
+        let root = long_root.as_path();
         // Phase 4 基建 Task 22b：把 args._timeout_ms / args._index_timeout_ms 提取成
         // per-call override，并清掉这两个私有字段（避免传染给具体 tool 的 args 解析）。
         // 实际 timeout 在 tool_* 内部通过 `effective_tool_timeout(lang, &args)` 拿到。
@@ -5719,10 +6254,37 @@ impl SupervisorTrait for Supervisor {
         // drop handler future）时 commit/abort 均不执行 → PENDING/TOUCHED 的 uid
         // 条目永久泄漏。守卫 drop 未收口即兜底 abort，取消路径账本必清。
         let txn = undo::TxnGuard::new(txn_uid);
-        let result = undo::TXN_UID
-            .scope(txn_uid, self.dispatch_tool(tool, root, &args, lang))
-            .await;
-        if undo::WRITE_TOOLS.contains(&tool) {
+        // A3b #3（bd i4a1/wlrr）：写类工具 --dry-run 干跑 —— dispatch 照常执行
+        // （定位/计算/校验全跑），recorded_write 拦截为预览收集；不进事务、不 commit
+        // （commit 含 prune/清 redo 链，干跑绝不触发），预览附进成功返回。
+        let dry_run = undo::WRITE_TOOLS.contains(&tool)
+            && args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let result = if dry_run {
+            let (mut r, preview) =
+                undo::scope_dry_run(self.dispatch_tool(tool, root, &args, lang)).await;
+            if let Ok(v) = &mut r
+                && let Some(obj) = v.as_object_mut()
+            {
+                obj.insert("dry_run".into(), serde_json::Value::Bool(true));
+                obj.insert(
+                    "would_write".into(),
+                    serde_json::Value::Array(
+                        preview
+                            .into_iter()
+                            .map(|(p, c)| {
+                                serde_json::json!({"file": p, "content": c})
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            r
+        } else {
+            undo::TXN_UID
+                .scope(txn_uid, self.dispatch_tool(tool, root, &args, lang))
+                .await
+        };
+        if !dry_run && undo::WRITE_TOOLS.contains(&tool) {
             match &result {
                 Ok(_) => {
                     // P3：commit 落盘移入写门。undo/redo 恢复路径（undo_at/redo_at）
@@ -5833,8 +6395,17 @@ impl Supervisor {
             "overview" => {
                 let file = required_file(args)?;
                 let raw = self.tool_overview(root, &file, lang).await?;
-                let value =
-                    serde_json::to_value(raw).map_err(|e| ToolError::Serialize(e.into()))?;
+                // bd kq6e：`summary:true` 升级为 {summary, symbols} 对象（头部一行概要
+                // + 符号数）；默认维持裸数组 wire 不变。
+                let value = if args
+                    .get("summary")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    serde_json::json!({ "summary": overview_summary(&raw), "symbols": raw })
+                } else {
+                    serde_json::to_value(raw).map_err(|e| ToolError::Serialize(e.into()))?
+                };
                 let root_key = format!("{}|{}", root.display(), file);
                 Ok(self.maybe_delta("overview", &root_key, value, delta).await)
             }
@@ -5845,12 +6416,37 @@ impl Supervisor {
                         .ok_or_else(|| ToolError::BadArgs {
                             detail: "missing 'dir'".into(),
                         })?;
-                let max_files = args
-                    .get("max_files")
+                let max_files = arg_limit(args, "max_files", 200) as usize;
+                // bd vro3：`top_level=true` 每文件只返顶层符号（默认 false 行为不变）。
+                let top_level = args
+                    .get("top_level")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // bd 6ooi：三开关——grep（名子串，大小写不敏感）/ max_depth（包含链
+                // 深度上限，顶层=0）/ files_only（只列文件，零 LS 调用）。
+                let grep = args.get("grep").and_then(|v| v.as_str());
+                let max_depth = args
+                    .get("max_depth")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(200) as usize;
-                serde_json::to_value(self.tool_symbol_tree(root, dir, lang, max_files).await?)
-                    .map_err(|e| ToolError::Serialize(e.into()))
+                    .map(|n| n as usize);
+                let files_only = args
+                    .get("files_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                serde_json::to_value(
+                    self.tool_symbol_tree(
+                        root,
+                        dir,
+                        lang,
+                        max_files,
+                        top_level,
+                        grep,
+                        max_depth,
+                        files_only,
+                    )
+                    .await?,
+                )
+                .map_err(|e| ToolError::Serialize(e.into()))
             }
             "find-symbol" => {
                 let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -5858,8 +6454,29 @@ impl Supervisor {
                         detail: "missing 'query'".into(),
                     }
                 })?;
-                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-                let (raw, mut warnings) = self.tool_find_symbol(root, query, limit, lang).await?;
+                let limit = arg_limit(args, "limit", 50) as usize;
+                // bd w2b5：`kind` 逗号分隔（如 "fn,struct"）——未知名 BAD_ARGS。
+                let kind_filter: Option<Vec<SymbolKindTag>> =
+                    match args.get("kind").and_then(|v| v.as_str()) {
+                        Some(s) if !s.trim().is_empty() => {
+                            let mut tags = Vec::new();
+                            for name in s.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                                tags.push(kind_tag_from_name(name).ok_or_else(|| {
+                                    ToolError::BadArgs {
+                                        detail: format!(
+                                            "unknown kind `{name}` (accepted: fn, method, class, struct, enum, interface, module, namespace, package, field, property, variable, constant, file)"
+                                        ),
+                                    }
+                                })?);
+                            }
+                            Some(tags)
+                        }
+                        _ => None,
+                    };
+                let (mut raw, mut warnings) = self.tool_find_symbol(root, query, limit, lang).await?;
+                if let Some(kinds) = &kind_filter {
+                    raw.retain(|h| kinds.contains(&h.kind));
+                }
                 // bd serena-rust-xzb：workspace 加载失败时 wssym 全空且无任何线索 ——
                 // 有记录即透出（不依赖空结果，xzb 场景下结果恒空）。
                 if let Some(err) = self.workspace_error_for(root) {
@@ -5871,7 +6488,19 @@ impl Supervisor {
                 // 波动 9→4→6+），成功响应同样附 partial 提示，AI 不会把中间态当
                 // 全量；窗口关闭（10s 或首语义成功）后自动消失，wire 零新字段。
                 warnings.extend(self.index_warming_warnings(root));
-                let mut value = symbol_hits_envelope(&raw, compact);
+                let mut value = match out_format(args)? {
+                    // 51ib：brief = 单串 `"name file:line:col"`（grep 友好，最省）。
+                    OutFormat::Brief => {
+                        let items: Vec<String> = raw
+                            .iter()
+                            .map(|h| format!("{} {}", h.name, compact_symbol_hit(h)))
+                            .collect();
+                        serde_json::json!({ "items": items, "raw_count": raw.len() })
+                    }
+                    // full（默认，与既有 wire 逐字节一致）/ json（--json 全形态）。
+                    OutFormat::Full => symbol_hits_envelope(&raw, compact),
+                    OutFormat::Json => symbol_hits_envelope(&raw, false),
+                };
                 attach_warning(&mut value, &warnings);
                 let root_key = format!("{}|{}|{}", root.display(), query, limit);
                 Ok(self
@@ -6244,10 +6873,7 @@ impl Supervisor {
                         detail: "missing 'pattern'".into(),
                     })?;
                 let path_glob = args.get("path_glob").and_then(|v| v.as_str());
-                let max_results = args
-                    .get("max_results")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(100) as usize;
+                let max_results = arg_limit(args, "max_results", 100) as usize;
                 let case_sensitive = args
                     .get("case_sensitive")
                     .and_then(|v| v.as_bool())
@@ -6266,12 +6892,64 @@ impl Supervisor {
                 }
                 // A（§10-A）：命中带所属符号；装饰失败静默（该字段留 None）。
                 enrich_search_with_symbols(self, root, &mut resp.hits, lang).await;
-                serde_json::to_value(resp).map_err(|e| ToolError::Serialize(e.into()))
+                // zpzw：--distinct-symbols —— 同符号（enrich 命中名）多行命中只留首条
+                //（symbol=None 的行不在任何符号内，全部保留）。
+                if args
+                    .get("distinct_symbols")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let mut seen: std::collections::HashSet<String> = Default::default();
+                    resp.hits.retain(|h| match &h.symbol {
+                        Some(s) => seen.insert(s.clone()),
+                        None => true,
+                    });
+                }
+                match out_format(args)? {
+                    // 51ib：brief = grep 风格单串 `file:line:col: text`（最省）。
+                    OutFormat::Brief => {
+                        let items: Vec<String> = resp
+                            .hits
+                            .iter()
+                            .map(|h| format!("{}:{}:{}: {}", h.file, h.line, h.col, h.text))
+                            .collect();
+                        let mut v = serde_json::json!({
+                            "items": items,
+                            "raw_count": resp.hits.len(),
+                        });
+                        if resp.truncated {
+                            v["truncated"] = serde_json::json!(true);
+                        }
+                        Ok(v)
+                    }
+                    // search 默认即全形态，full 与 json 同形（search 无紧凑裁剪层）。
+                    // rsqq：头部一行概要（kq6e overview summary 同形键名）。
+                    OutFormat::Full | OutFormat::Json => {
+                        let mut v =
+                            serde_json::to_value(&resp).map_err(|e| ToolError::Serialize(e.into()))?;
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert(
+                                "summary".into(),
+                                serde_json::json!(search_summary(&resp)),
+                            );
+                        }
+                        Ok(v)
+                    }
+                }
             }
             "symbol-body" => {
                 let (file, symbol) = required_symbol_body_args(args)?;
-                serde_json::to_value(self.tool_symbol_body(root, &file, &symbol, lang).await?)
-                    .map_err(|e| ToolError::Serialize(e.into()))
+                // bd b72k：`meta:true` 升级聚合形态（doc/signature/location/上一行下一行），
+                // 默认裸 body 字符串 wire 不变。
+                if args.get("meta").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let report = self
+                        .tool_symbol_body_meta(root, &file, &symbol, lang)
+                        .await?;
+                    serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
+                } else {
+                    serde_json::to_value(self.tool_symbol_body(root, &file, &symbol, lang).await?)
+                        .map_err(|e| ToolError::Serialize(e.into()))
+                }
             }
             "edit-context" => {
                 // B: 单次调用拿 body + callers + doc + tests（ai-token-features §10-B）。
@@ -6287,7 +6965,7 @@ impl Supervisor {
             "repo-map" => {
                 // E: workspace 级符号地图（ai-token-features §10-E）。
                 // 走 symbol-tree + per-symbol refs 计数，top_n 降序输出。
-                let top_n = args.get("top_n").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let top_n = arg_limit(args, "top_n", 20) as usize;
                 let report = crate::repo_map::build(self, root, lang, top_n).await;
                 serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
             }
@@ -6334,12 +7012,49 @@ impl Supervisor {
                     .get("end_line")
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u32);
-                let report = fs_tools::read_file(root, &file, start_line, end_line)
+                // bd 66al：`no_clamp=true` 关闭 mfxg 的 EOF clamp（严格越界 BAD_ARGS，
+                // 供探测文件真实长度）；默认 clamp。
+                let clamp = !args
+                    .get("no_clamp")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let report = fs_tools::read_file(root, &file, start_line, end_line, clamp)
                     .await
                     .map_err(|e| ToolError::BadArgs {
                         detail: format!("read_file: {e}"),
                     })?;
                 serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
+            }
+            "batch-read" => {
+                // bd qre0：一次调用读多文件，聚合输出预算内停止（默认 2000 tok），
+                // 砍「逐文件 read-file」往返。
+                let files: Vec<String> = args
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'files' (array of repo-relative paths)".into(),
+                    })?;
+                if files.is_empty() {
+                    return Err(ToolError::BadArgs {
+                        detail: "'files' must not be empty".into(),
+                    });
+                }
+                if files.len() > 50 {
+                    return Err(ToolError::BadArgs {
+                        detail: format!("'files' capped at 50 per call (got {})", files.len()),
+                    });
+                }
+                let budget_tokens = args
+                    .get("budget_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(2000) as usize;
+                serde_json::to_value(self.tool_batch_read(root, &files, budget_tokens).await?)
+                    .map_err(|e| ToolError::Serialize(e.into()))
             }
             "list-dir" => {
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -6351,10 +7066,7 @@ impl Supervisor {
                     .get("max_depth")
                     .and_then(|v| v.as_u64())
                     .map(|n| n as usize);
-                let max_entries = args
-                    .get("max_entries")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(500) as usize;
+                let max_entries = arg_limit(args, "max_entries", 500) as usize;
                 let entries =
                     fs_tools::list_dir(root, path, max_depth, max_entries).map_err(|e| {
                         ToolError::BadArgs {
@@ -6371,10 +7083,7 @@ impl Supervisor {
                         detail: "missing 'name_pattern'".into(),
                     })?;
                 let path_glob = args.get("path_glob").and_then(|v| v.as_str());
-                let max_results = args
-                    .get("max_results")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(200) as usize;
+                let max_results = arg_limit(args, "max_results", 200) as usize;
                 let hits = fs_tools::find_file(root, name_pattern, path_glob, max_results)
                     .map_err(|e| ToolError::BadArgs {
                         detail: format!("find_file: {e}"),
@@ -6383,7 +7092,7 @@ impl Supervisor {
             }
             "find-referencing-symbols" => {
                 let (file, line, col) = required_position(args)?;
-                let hits = self
+                let (hits, raw_snip) = self
                     .tool_referencing_symbols(root, &file, line, col, lang)
                     .await?;
                 let empty = hits.is_empty();
@@ -6400,6 +7109,15 @@ impl Supervisor {
                 } else {
                     ref_symbol_hits_envelope(&hits, compact)
                 };
+                // aap4：`_debug_raw`/SERENA_DEBUG_RAW 开且命中静默空 + LS 响应非 null
+                // → 附原始响应 200B 快照（形态漂移诊断）；默认零新字段。
+                if debug_raw_enabled(args)
+                    && empty
+                    && let Some(snip) = raw_snip
+                    && let Some(obj) = value.as_object_mut()
+                {
+                    obj.insert("raw_lsp_response".into(), serde_json::json!(snip));
+                }
                 // bd serena-rust-e0hi/8vo9：空 = 真无 caller 或语义未就绪，警示让 AI 可分。
                 let ws = if empty {
                     self.referencing_empty_warnings(root)
@@ -6425,11 +7143,8 @@ impl Supervisor {
                     .get("context_lines")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(3) as u32;
-                let max_results = args
-                    .get("max_results")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(50) as usize;
-                let hits = self
+                let max_results = arg_limit(args, "max_results", 50) as usize;
+                let (hits, truncated, raw_snip) = self
                     .tool_referencing_code_snippets(
                         root,
                         &file,
@@ -6442,6 +7157,20 @@ impl Supervisor {
                     .await?;
                 let empty = hits.is_empty();
                 let mut value = ref_snippet_hits_envelope(&hits, compact);
+                // bd 8ft：命中顶到 max_results 上限 → `truncated:true`（wire 新字段，
+                // 仅截断发生时出现）。
+                if truncated {
+                    attach_truncated(&mut value);
+                }
+                // aap4：`_debug_raw`/SERENA_DEBUG_RAW 开且命中静默空 + LS 响应非 null
+                // → 附原始响应 200B 快照（形态漂移诊断）；默认零新字段。
+                if debug_raw_enabled(args)
+                    && empty
+                    && let Some(snip) = raw_snip
+                    && let Some(obj) = value.as_object_mut()
+                {
+                    obj.insert("raw_lsp_response".into(), serde_json::json!(snip));
+                }
                 // bd serena-rust-e0hi/8vo9：空 = 真无 caller 或语义未就绪，警示让 AI 可分；
                 // resolution_note（--symbol 多命中提示）保序拼接在后。
                 let mut ws = if empty {
@@ -6491,8 +7220,13 @@ impl Supervisor {
             }
             "insert-text-after-symbol" => {
                 let (file, symbol, text) = required_edit_args(args)?;
+                // bd bt3h：默认 auto-indent（匹配插入点缩进）；`auto_indent:false` 关闭。
+                let auto_indent = args
+                    .get("auto_indent")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let (end_line, end_col) = self
-                    .tool_edit_insert_after_symbol(root, &file, &symbol, &text, lang)
+                    .tool_edit_insert_after_symbol(root, &file, &symbol, &text, auto_indent, lang)
                     .await?;
                 let diag = self.post_diag_for_write(root, &file, lang).await;
                 Ok(serde_json::json!({
@@ -6503,8 +7237,13 @@ impl Supervisor {
             }
             "insert-text-before-symbol" => {
                 let (file, symbol, text) = required_edit_args(args)?;
+                // bd bt3h：默认 auto-indent（匹配插入点缩进）；`auto_indent:false` 关闭。
+                let auto_indent = args
+                    .get("auto_indent")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let (end_line, end_col) = self
-                    .tool_edit_insert_before_symbol(root, &file, &symbol, &text, lang)
+                    .tool_edit_insert_before_symbol(root, &file, &symbol, &text, auto_indent, lang)
                     .await?;
                 let diag = self.post_diag_for_write(root, &file, lang).await;
                 Ok(serde_json::json!({
@@ -6656,6 +7395,36 @@ impl Supervisor {
                 self.sync_ls_after_undo(root, &touched).await;
                 out
             }
+            // ==== recipe 批1 地基三原子命令（local/recipe-plan.md §2 批1）====
+            // test 只读源码、产物不进 undo/txn 栈（不在 undo::WRITE_TOOLS 名单）。
+            "test" => {
+                // 参数名用 target 而非 file：入口存在性预检按 file 字段一律要求
+                // 「已存在文件」，而 test 目标可以是目录（crate/test 目录）。
+                let file = args.get("target").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::BadArgs {
+                        detail: "missing 'target'".into(),
+                    }
+                })?;
+                let name = args.get("name").and_then(|v| v.as_str());
+                recipe::run_test(root, file, name).await
+            }
+            "diff" => {
+                let txn_id = args.get("txn_id").and_then(|v| v.as_u64());
+                let patch = args.get("patch").and_then(|v| v.as_bool()).unwrap_or(false);
+                recipe::diff_txn(root, txn_id, patch).await
+            }
+            "find-test" => {
+                let symbol = args.get("symbol").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::BadArgs {
+                        detail: "missing 'symbol'".into(),
+                    }
+                })?;
+                recipe::find_test(self, root, symbol).await
+            }
+            // recipe 批4 编排层（local/recipe-plan.md §2 批4）：写步各自独立
+            // undo 事务（嵌套 TXN_UID scope），故不进 WRITE_TOOLS——外层 uid
+            // 无 recorded_write，TxnGuard drop 兜底 abort 无害。
+            "recipe" => recipe_ops::run(self, root, args).await,
             // 新建文件（created=true 快照场景的可执行路径；文件已存在 = 参数错）。
             "create-text-file" => {
                 let file = args.get("file").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -6678,13 +7447,38 @@ impl Supervisor {
                 detail: format!("unknown tool: {other}"),
             }),
         }?;
+        // bd ou83：format-on-write（默认关）。写类工具成功后按旗对目标文件跑一次
+        // formatting 并落盘（失败不回滚写结果，仅 warn）；`formatted` 仅在真实应用
+        // ≥1 条编辑时出现（skip_if 0）。
+        if args
+            .get("format_on_write")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            && undo::WRITE_TOOLS.contains(&tool)
+            && let Some(f) = args.get("file").and_then(|v| v.as_str())
+        {
+            let n = self.format_on_write_for(root, f, lang).await;
+            if n > 0
+                && let Some(obj) = value.as_object_mut()
+            {
+                obj.insert("formatted".into(), serde_json::json!(n));
+            }
+        }
         // AI-token 特性 G（§10-G）：execute_tool 末尾统一后处理。_max_tokens 按预算
         // 截断信封 list（items/hits/top/entries + 顶层裸数组折 items 信封，1ve9）；
         // _compress 删 container/kind 冗余字段。两者与 _compact/_delta 同套私有约定
         // （sanitize 不清）。
         // 偏离 plan：原建议逐分支改造为统一变量；实际 match 整体即 Result，
         // `?` 一行收口零分支改动（11 特性已改动各分支，最小侵入）。
-        if let Some(max_tokens) = args.get("_max_tokens").and_then(|v| v.as_u64()) {
+        // tfa3：写回执瘦身——诊断空时只留语义（先于预算截断，省下的字节不再进预算）。
+        slim_write_receipt(&mut value);
+        // br41：SERENA_DEFAULT_MAX_TOKENS 未设 = 无预算（现行为）；设了 = 未显式
+        // `_max_tokens` 时的默认预算，显式旗永远优先。
+        if let Some(max_tokens) = args
+            .get("_max_tokens")
+            .and_then(|v| v.as_u64())
+            .or_else(|| env_u64_var("SERENA_DEFAULT_MAX_TOKENS"))
+        {
             apply_budget(&mut value, max_tokens as usize);
         }
         if args
@@ -6695,6 +7489,29 @@ impl Supervisor {
             apply_compress(&mut value);
         }
         Ok(value)
+    }
+}
+
+/// bd 4lw：LSP 响应 items 解析收口。`null` = 合法空（各工具「空/null = 无结果」
+/// 契约）；**非 null 解析失败** = LS 升级/quirk 漂移的形态变化，不得伪装成
+/// 「无结果」—— `warn!` 留痕（daemon 日志可查）后返空。第二返回值 true = degraded。
+fn parse_lsp_items<T: serde::de::DeserializeOwned>(
+    raw: serde_json::Value,
+    site: &str,
+) -> (Vec<T>, bool) {
+    match raw {
+        serde_json::Value::Null => (Vec::new(), false),
+        v => match serde_json::from_value::<Vec<T>>(v) {
+            Ok(items) => (items, false),
+            Err(e) => {
+                tracing::warn!(
+                    site,
+                    error = %e,
+                    "LSP response parse failed (bd 4lw): shape drift, degrading to empty"
+                );
+                (Vec::new(), true)
+            }
+        },
     }
 }
 
@@ -6796,7 +7613,8 @@ async fn read_and_slice(path: &Path, file: &str, range: lsp_types::Range) -> Too
     let text = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| ToolError::BadArgs {
-            detail: format!("read {}: {e}", path.display()),
+            // sec-S5：报用户传入的相对 file，不回显绝对路径（bd serena-rust-hah）。
+            detail: format!("read {file}: {e}"),
         })?;
     let start = LspPos {
         line: range.start.line,
@@ -7080,15 +7898,25 @@ pub(crate) fn content_hash(text: &str) -> String {
 /// readback 不符后的回滚收口（replace-body / safe-delete-symbol 两处 C3 防线共用）。
 /// 回滚本身失败必须如实上报（错误链带 rollback-failed 事实），不得谎报 rolled
 /// back——盘上新内容仍在，调用方必须知道（BD serena-rust-75k）。
-async fn rollback_after_readback_mismatch(path: &Path, old_text: &str) -> ToolError {
+async fn rollback_after_readback_mismatch(path: &Path, root: &Path, old_text: &str) -> ToolError {
     let reason = match atomic_write(path, old_text).await {
         Ok(()) => "readback mismatch; rolled back".to_string(),
         Err(e) => format!("readback mismatch; rollback FAILED ({e}); file left with new content"),
     };
     ToolError::WriteConflict {
-        path: path.display().to_string(),
+        path: user_path(root, path),
         reason,
     }
+}
+
+/// sec-S5（bd serena-rust-hah）：用户可见错误 message 里的路径相对化（strip root
+/// 前缀）——绝对路径会把用户工程目录结构还原给任意消费方；root 外路径（防御性，
+/// 不伪造）原样输出。
+fn user_path(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .unwrap_or(p)
+        .display()
+        .to_string()
 }
 
 /// 本项目 edit 链路本就走 tmp+rename（语义已对齐），唯一缺口即 symlink：
@@ -8589,7 +9417,7 @@ mod symbol_cache_tests {
         sup.symbol_cache_put(doc_symbol_cache_key(root, "b.rs"), vec![hit("sym_b")]);
 
         let tree = sup
-            .tool_symbol_tree(root, ".", Some("rust"), 200)
+            .tool_symbol_tree(root, ".", Some("rust"), 200, false, None, None, false)
             .await
             .unwrap();
         assert_eq!(
@@ -8602,7 +9430,7 @@ mod symbol_cache_tests {
 
         // dir 逃逸 root。
         let err = sup
-            .tool_symbol_tree(root, "../elsewhere", Some("rust"), 200)
+            .tool_symbol_tree(root, "../elsewhere", Some("rust"), 200, false, None, None, false)
             .await
             .unwrap_err();
         assert!(
@@ -8628,7 +9456,7 @@ mod symbol_cache_tests {
         }
 
         let tree = sup
-            .tool_symbol_tree(root, ".", Some("rust"), 3)
+            .tool_symbol_tree(root, ".", Some("rust"), 3, false, None, None, false)
             .await
             .unwrap();
         assert_eq!(tree["files_scanned"], 3, "max_files=3 截断: {tree}");
@@ -8658,7 +9486,7 @@ mod symbol_cache_tests {
         }
 
         let tree = sup
-            .tool_symbol_tree(root, ".", Some("rust"), 200)
+            .tool_symbol_tree(root, ".", Some("rust"), 200, false, None, None, false)
             .await
             .unwrap();
         assert_eq!(tree["files_scanned"], 6, "6 文件扫描: {tree}");
@@ -8689,7 +9517,7 @@ mod symbol_cache_tests {
         }
 
         let tree = sup
-            .tool_symbol_tree(root, ".", Some("rust"), 200)
+            .tool_symbol_tree(root, ".", Some("rust"), 200, false, None, None, false)
             .await
             .unwrap();
         assert_eq!(tree["files_scanned"], 35, "35 文件扫描: {tree}");
@@ -8716,7 +9544,7 @@ mod symbol_cache_tests {
         }
 
         let tree = sup
-            .tool_symbol_tree(root, ".", Some("rust"), 200)
+            .tool_symbol_tree(root, ".", Some("rust"), 200, false, None, None, false)
             .await
             .unwrap();
         assert_eq!(tree["files_scanned"], 25, "25 文件扫描: {tree}");
@@ -8751,7 +9579,7 @@ mod symbol_cache_tests {
 
         // lang = None 走逐文件 resolve（lang 是预置短路，下面的 resolve_lang_for_file
         // 不被 lang 短路，直接靠扩展名探测 —— 即 P0 修复的核心路径）。
-        let tree = sup.tool_symbol_tree(root, ".", None, 200).await.unwrap();
+        let tree = sup.tool_symbol_tree(root, ".", None, 200, false, None, None, false).await.unwrap();
         let entries = tree["entries"].as_array().unwrap();
         let errors = tree["errors"].as_array().unwrap();
 
@@ -10380,9 +11208,12 @@ mod find_symbol_ls_error_tests {
     }
 
     /// 分支 2 集成（部分成功）：rust+py 混合目录（RA 在 PATH、pyright 缺失）→
-    /// Ok 且 hits 来自 rust、warning 归属 python；随后同 root 仅查 rust（warm session）
-    /// → 分支 3 全成功无 warning。真拉 rust-analyzer —— RA 符号索引双阶段就绪
-    /// （session ready ≠ workspace/symbol 可见，首查可能静默空），轮询非空。
+    /// Ok 且 hits 来自 rust。bd qvv9 起 warning 语义分级：**查询已被 rust 回答**
+    /// （hits 非空）→ NotInstalled 安装广告是纯噪声，不透出；**查询只存在于缺失
+    /// lang**（py_foo，hits 空）→ python warning 解释「为什么空」（x67 语义保留）。
+    /// 随后同 root 仅查 rust（warm session）→ 分支 3 全成功无 warning。
+    /// 真拉 rust-analyzer —— RA 符号索引双阶段就绪（session ready ≠ workspace/symbol
+    /// 可见，首查可能静默空），轮询非空。
     #[tokio::test]
     async fn find_symbol_partial_ls_failure_keeps_hits_and_warns() {
         if std::env::var_os("SERENA_SKIP_LS_E2E")
@@ -10425,19 +11256,22 @@ mod find_symbol_ls_error_tests {
             hits.iter().any(|h| h.name == "alpha_main"),
             "rust hits must survive python LS failure; hits={hits:?} warnings={warnings:?}"
         );
-        // W1a 起 .toml 归 taplo 门（EXT_TABLE 路由）：fixture 的 Cargo.toml（RA workspace
-        // 模式必需）使 toml 成为第三语言——本机无 taplo → 与 python 同进 failures/warnings
-        // （InvalidSpec=表缺该平台组 / NotInstalled=已解析未安装，视平台而定）。
-        // 断言收窄为「python 警告在场 + 警告全集已知」，不再锁死总数。
+        // bd qvv9：查询已被 rust 回答 → python/toml 安装广告不透出（纯噪声）。
+        assert!(
+            warnings.is_empty(),
+            "answered query must carry no NotInstalled noise; warnings={warnings:?}"
+        );
+
+        // 空结果路径：查询只存在于 py 文件且 pyright 缺失 → hits 空且 warning
+        // 归属 python（x67「为什么空」语义保留）。
+        let (hits, warnings) = sup
+            .tool_find_symbol(dir.path(), "py_foo", 50, None)
+            .await
+            .expect("python-only query with pyright missing must not fail the call");
+        assert!(hits.is_empty(), "py_foo must not appear without pyright");
         assert!(
             warnings.iter().any(|w| w.starts_with("python: ")),
-            "python failure must be warned; warnings={warnings:?}"
-        );
-        assert!(
-            warnings
-                .iter()
-                .all(|w| w.starts_with("python: ") || w.starts_with("toml: ")),
-            "unexpected warning surfaced; warnings={warnings:?}"
+            "empty result must be explained; warnings={warnings:?}"
         );
 
         // 分支 3：同 root 仅查 rust（session 已 warm、索引已就绪）→ 全成功无 warning。
@@ -10700,6 +11534,28 @@ mod semantic_readiness_and_args_tests {
             sup.launch_exe_valid(&key),
             "evict 必须同步清 launch_exe 登记"
         );
+        // bd serena-rust-bua（审计 A3）：exe 在盘但会话已 Failed → 判失效。
+        // Session 构造不出 Failed 态，直接测纯函数两因子真值表。
+        std::fs::write(&exe, "fake").expect("recreate fake exe");
+        assert!(Supervisor::reuse_allowed(Some(&exe), None), "无会话态=有效");
+        assert!(
+            Supervisor::reuse_allowed(
+                Some(&exe),
+                Some(&lsp_core::session::SessionState::Ready)
+            ),
+            "exe 在盘 + 非 Failed = 有效"
+        );
+        assert!(
+            !Supervisor::reuse_allowed(
+                Some(&exe),
+                Some(&lsp_core::session::SessionState::Failed("boom".into()))
+            ),
+            "Failed 会话必须判失效（respawn 不得复用旧登记）"
+        );
+        assert!(
+            Supervisor::reuse_allowed(None, None),
+            "无登记条目防御性放行（exe None=有效，单测锚定语义）"
+        );
     }
 }
 
@@ -10919,7 +11775,7 @@ mod silent_failure_tests {
         let path = tmp.path().join("a.rs");
         std::fs::write(&path, "new content").unwrap();
 
-        let err = rollback_after_readback_mismatch(&path, "old content").await;
+        let err = rollback_after_readback_mismatch(&path, tmp.path(), "old content").await;
         match err {
             ToolError::WriteConflict { reason, .. } => {
                 assert!(reason.contains("rolled back"), "{reason}");
@@ -10938,7 +11794,7 @@ mod silent_failure_tests {
         let blocker = tmp.path().join("blocked");
         std::fs::create_dir(&blocker).unwrap(); // 目录占位 → atomic_write rename 必败
 
-        let err = rollback_after_readback_mismatch(&blocker, "old content").await;
+        let err = rollback_after_readback_mismatch(&blocker, tmp.path(), "old content").await;
         match err {
             ToolError::WriteConflict { path, reason } => {
                 assert!(reason.contains("rollback FAILED"), "{reason}");
@@ -11034,5 +11890,416 @@ mod silent_failure_tests {
         let s = serde_json::to_string(&partial).unwrap();
         assert!(s.contains("skipped"), "{s}");
         assert!(s.contains("read failed"), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod sweep_a1_unit_tests {
+    //! 清仓波 A1 新增逻辑的纯单测（bd qvv9/w2b5/kq6e/vro3/4lw/xxl/6k8x/eesd）。
+
+    use super::*;
+
+    fn hit(name: &str, sl: u32, sc: u32, el: u32, ec: u32) -> SymbolHit {
+        SymbolHit {
+            name: name.into(),
+            kind: SymbolKindTag::Function,
+            uri: "file:///t/f.rs".into(),
+            range: lsp_types::Range {
+                start: lsp_types::Position::new(sl, sc),
+                end: lsp_types::Position::new(el, ec),
+            },
+            container: None,
+        }
+    }
+
+    // ==== vro3 ====
+
+    #[test]
+    fn top_level_symbols_drops_contained_children() {
+        let hits = vec![
+            hit("mod", 0, 0, 20, 0),
+            hit("fn_a", 2, 4, 5, 5),
+            hit("fn_b", 6, 4, 9, 5),
+            hit("sibling", 21, 0, 30, 0),
+        ];
+        let top = top_level_symbols(hits);
+        let names: Vec<&str> = top.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["mod", "sibling"], "children must be dropped");
+    }
+
+    #[test]
+    fn top_level_symbols_keeps_identical_ranges() {
+        // 相同 range 互不严格包含 → 并列保留（可预测性优先）。
+        let hits = vec![hit("a", 1, 0, 2, 0), hit("b", 1, 0, 2, 0)];
+        assert_eq!(top_level_symbols(hits).len(), 2);
+    }
+
+    // ==== kq6e ====
+
+    #[test]
+    fn overview_summary_counts_kinds() {
+        let mut f = hit("a", 0, 0, 1, 0);
+        f.kind = SymbolKindTag::Function;
+        let mut m = hit("b", 0, 0, 1, 0);
+        m.kind = SymbolKindTag::Method;
+        let mut o = hit("c", 0, 0, 1, 0);
+        o.kind = SymbolKindTag::Other(23);
+        let s = overview_summary(&[f.clone(), f, m, o]);
+        assert!(s.starts_with("4 symbol(s): "), "{s}");
+        assert!(s.contains("function×2"), "{s}");
+        assert!(s.contains("method×1"), "{s}");
+        assert!(s.contains("other(23)×1"), "{s}");
+    }
+
+    // ==== w2b5 ====
+
+    #[test]
+    fn kind_tag_from_name_maps_lsp_codes_for_narrowed_out_kinds() {
+        assert_eq!(kind_tag_from_name("fn"), Some(SymbolKindTag::Function));
+        assert_eq!(kind_tag_from_name("Function"), Some(SymbolKindTag::Function));
+        assert_eq!(kind_tag_from_name("method"), Some(SymbolKindTag::Method));
+        assert_eq!(kind_tag_from_name("class"), Some(SymbolKindTag::Class));
+        // from_lsp 窄化表外的 kind 都是 Other(n) —— 别名按 LSP 3.17 码表命中。
+        assert_eq!(kind_tag_from_name("struct"), Some(SymbolKindTag::Other(23)));
+        assert_eq!(kind_tag_from_name("enum"), Some(SymbolKindTag::Other(10)));
+        assert_eq!(kind_tag_from_name("mod"), Some(SymbolKindTag::Other(2)));
+        assert_eq!(kind_tag_from_name("var"), Some(SymbolKindTag::Other(13)));
+        assert_eq!(kind_tag_from_name("nope"), None);
+    }
+
+    // ==== 4lw ====
+
+    #[test]
+    fn parse_lsp_items_null_is_legal_empty_and_shape_drift_degrades() {
+        let (v, degraded) = parse_lsp_items::<lsp_types::FoldingRange>(serde_json::Value::Null, "t");
+        assert!(v.is_empty() && !degraded, "null = 合法空，不得标 degraded");
+        // 非 null 但形态漂移（对象而非数组）→ 空结果 + degraded（warn 已在日志）。
+        let (v, degraded) =
+            parse_lsp_items::<lsp_types::FoldingRange>(serde_json::json!({ "x": 1 }), "t");
+        assert!(v.is_empty() && degraded, "degraded={degraded}");
+        // 合法数组 → 原样。
+        let (v, degraded) = parse_lsp_items::<lsp_types::FoldingRange>(json!([]), "t");
+        assert!(v.is_empty() && !degraded);
+    }
+
+    // ==== xxl：8.3 短名长名归一 ====
+
+    #[tokio::test]
+    async fn lsp_position_from_byte_passes_through_zero_based() {
+        // A3b #2 契约锁：tool_refs/tool_hover 的 (line, col) 是 LSP 0-based 原样
+        // 透传，接收侧不做 1-based 补偿——调用方（CLI to_lsp_pos、SymbolHit.range）
+        // 自行保证 0-based。此前 ct_impact/recipe 多 +1 → 请求错位一行一列。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let f = tmp.path().join("a.rs");
+        std::fs::write(&f, "fn a() {}\nfn b() {}\n").expect("write");
+        let pos = lsp_position_from_byte(&f, "a.rs", 1, 4, OffsetEncoding::Utf16)
+            .await
+            .expect("in range");
+        assert_eq!(
+            (pos.line, pos.character),
+            (1, 4),
+            "0-based 输入必须原样透传"
+        );
+        let err = lsp_position_from_byte(&f, "a.rs", 9, 0, OffsetEncoding::Utf16)
+            .await
+            .expect_err("越界必须拒绝");
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[tokio::test]
+    async fn recorded_write_dry_run_intercepts_and_collects_preview() {
+        // A3b #3（bd i4a1/wlrr）undo 层契约：干跑下 recorded_write 返回 Ok、
+        // 不落盘、不记 undo 快照，将写内容进 PREVIEW。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("a.txt");
+        let (_, preview) = undo::scope_dry_run(async {
+            undo::recorded_write(&p, "new\n").await.expect("dry write ok");
+        })
+        .await;
+        assert_eq!(
+            preview,
+            vec![(p.display().to_string(), "new\n".to_string())],
+            "预览须收到 (path, new_content)"
+        );
+        assert!(!p.exists(), "干跑绝不落盘");
+    }
+
+    #[tokio::test]
+    async fn dry_run_create_text_file_previews_without_disk_write() {
+        // A3b #3（bd i4a1/wlrr）execute_tool 层接线：写门入口 dry_run 检查，
+        // 成功返回附 dry_run + would_write，盘上无文件（.txt 无 adapter 免拉 LS）。
+        let sup = Supervisor::direct().await.expect("supervisor");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_str().expect("utf8 root");
+        let v = sup
+            .execute_tool(
+                "create-text-file",
+                root,
+                serde_json::json!({
+                    "file": "preview.txt",
+                    "content": "fn dry() {}\n",
+                    "dry_run": true
+                }),
+                None,
+            )
+            .await
+            .expect("dry-run must succeed");
+        assert_eq!(v["dry_run"], serde_json::json!(true), "返回须带 dry_run 标记");
+        let ww = v["would_write"].as_array().expect("would_write array");
+        assert_eq!(ww.len(), 1, "单文件写恰好一条预览");
+        assert!(
+            ww[0]["file"].as_str().unwrap_or("").ends_with("preview.txt"),
+            "预览 file 为目标路径: {}",
+            ww[0]["file"]
+        );
+        assert_eq!(ww[0]["content"], serde_json::json!("fn dry() {}\n"));
+        assert!(!dir.path().join("preview.txt").exists(), "干跑绝不落盘");
+    }
+
+    #[test]
+    fn normalize_long_path_roundtrips_existing_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = dunce::canonicalize(tmp.path()).expect("canonicalize");
+        let out = normalize_long_path(&p).expect("some");
+        assert_eq!(
+            out.to_string_lossy().to_lowercase(),
+            p.to_string_lossy().to_lowercase(),
+        );
+        // 不存在的路径 → std canonicalize 与 dunce 回落都失败 → None（不新增失败模式）。
+        assert!(normalize_long_path(Path::new("Z:/definitely_not_there_xyz_42")).is_none());
+    }
+
+    // ==== 6k8x：盘符大小写三形态归一（realign 块同一链路）====
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_case_forms_converge_to_canonical_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = dunce::canonicalize(tmp.path()).expect("canonicalize");
+        let p = real.to_string_lossy().replace('\\', "/");
+        let (drive, rest) = p.split_once(':').expect("drive path");
+        let rest_body = rest.trim_start_matches('/');
+        let forms = [
+            format!("file:///{drive}:{rest}"), // 原生形态
+            format!(
+                "file:///{0}:/{1}",
+                drive.to_ascii_uppercase(),
+                rest_body.to_ascii_lowercase()
+            ), // 盘符大写 + 内段全小写
+            format!("file:///{0}:{rest}", drive.to_ascii_lowercase()), // 盘符小写
+        ];
+        for uri in forms {
+            let got = uri_to_path(&uri).and_then(|pp| normalize_long_path(&pp));
+            assert_eq!(
+                got.as_ref().map(|g| g.to_string_lossy().to_lowercase()),
+                Some(real.to_string_lossy().to_lowercase()),
+                "uri {uri} must converge to the real path"
+            );
+        }
+    }
+
+    // ==== eesd：UNC `\\server\share`（path_to_uri_str + uri_to_path fixture）====
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_path_roundtrips_through_uri_str_form() {
+        let unc = Path::new(r"\\server\share\dir\f.rs");
+        // path_to_uri_str（纯字符串，不碰盘）：UNC 发射为 4 斜杠 file://// 形态。
+        let uri = path_to_uri_str(unc);
+        assert!(
+            uri.starts_with("file:////server/share/"),
+            "unexpected UNC uri shape: {uri}"
+        );
+        assert!(uri.ends_with("dir/f.rs"), "{uri}");
+        // uri_to_path：canonicalize 不可达 UNC 失败 → 词法回退（bd eesd 实测该回退
+        // 会丢 UNC 前缀形态——lsp-core 侧已知限制，修法归 lsp-core 域）。此处只钉
+        // 「不 panic、返回 Some」的契约边界。
+        assert!(uri_to_path(&uri).is_some(), "unreachable UNC must still yield Some");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_canonical_three_slash_uri_yields_relative_path_known_limitation() {
+        // RFC 常见 `file://server/share/f.rs` 三斜杠形态：uri_to_path 当前语义丢
+        // authority → 相对路径（lsp-core 侧边界，bd eesd 登记为已知限制）。
+        let back = uri_to_path("file://server/share/f.rs").expect("some");
+        assert!(!back.is_absolute(), "document current behavior: {back:?}");
+    }
+}
+
+#[cfg(test)]
+mod sweep_a3a_unit_tests {
+    //! 清仓波 A3a 新增逻辑的纯单测（bd tfa3/51ib/rsqq/z0kg/6ooi）。
+
+    use super::*;
+
+    fn sym_json(name: &str, sl: u32, sc: u32, el: u32, ec: u32) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "kind": "Function",
+            "uri": "file:///t/f.rs",
+            "range": {
+                "start": {"line": sl, "character": sc},
+                "end": {"line": el, "character": ec},
+            },
+            "container": null,
+        })
+    }
+
+    // ==== tfa3：写回执瘦身 ====
+
+    #[test]
+    fn slim_write_receipt_pending_shrinks_to_word() {
+        let mut v = serde_json::json!({
+            "applied": true, "file": "a.rs",
+            "post_write_diagnostics": {"items": [], "pending": true},
+        });
+        slim_write_receipt(&mut v);
+        assert_eq!(v["post_write_diagnostics"], serde_json::json!("pending"));
+        assert_eq!(v["applied"], serde_json::json!(true), "其余键不动");
+    }
+
+    #[test]
+    fn slim_write_receipt_confirmed_clean_drops_key() {
+        let mut v = serde_json::json!({
+            "applied": true, "file": "a.rs",
+            "post_write_diagnostics": {"items": [], "pending": false},
+        });
+        slim_write_receipt(&mut v);
+        assert!(v.get("post_write_diagnostics").is_none(), "确认干净 → 键省略");
+    }
+
+    #[test]
+    fn slim_write_receipt_nonempty_items_untouched() {
+        let diag = serde_json::json!({
+            "items": [{"message": "x", "line": 1}], "pending": false,
+        });
+        let mut v = serde_json::json!({
+            "applied": true, "file": "a.rs", "post_write_diagnostics": diag,
+        });
+        slim_write_receipt(&mut v);
+        assert_eq!(
+            v["post_write_diagnostics"]["items"].as_array().map(Vec::len),
+            Some(1),
+            "有 items 原样保留"
+        );
+    }
+
+    #[test]
+    fn slim_write_receipt_without_key_is_noop() {
+        let mut v = serde_json::json!({"created": true, "file": "a.rs"});
+        slim_write_receipt(&mut v);
+        assert_eq!(v, serde_json::json!({"created": true, "file": "a.rs"}));
+    }
+
+    // ==== 51ib：format 档位 ====
+
+    #[test]
+    fn out_format_defaults_to_full_and_rejects_unknown() {
+        assert_eq!(out_format(&json!({})).unwrap(), OutFormat::Full);
+        assert_eq!(out_format(&json!({"format": "full"})).unwrap(), OutFormat::Full);
+        assert_eq!(out_format(&json!({"format": "brief"})).unwrap(), OutFormat::Brief);
+        assert_eq!(out_format(&json!({"format": "json"})).unwrap(), OutFormat::Json);
+        assert!(out_format(&json!({"format": "xml"})).is_err());
+    }
+
+    // ==== rsqq：search summary 头 ====
+
+    #[test]
+    fn search_summary_counts_files_and_marks_truncation() {
+        let mk = |file: &str| SearchHit {
+            file: file.into(),
+            line: 1,
+            col: 1,
+            text: "x".into(),
+            match_start: 0,
+            match_end: 1,
+            symbol: None,
+            container: None,
+        };
+        let mut resp = SearchResponse {
+            hits: vec![mk("a.rs"), mk("a.rs"), mk("b.rs")],
+            truncated: false,
+            files_scanned: 9,
+        };
+        assert_eq!(search_summary(&resp), "3 hits in 2 files");
+        resp.truncated = true;
+        assert_eq!(search_summary(&resp), "3 hits in 2 files; truncated");
+    }
+
+    // ==== z0kg：env 默认条数 ====
+
+    #[test]
+    fn parse_num_env_trims_and_rejects_garbage() {
+        assert_eq!(parse_num_env(" 50 "), Some(50));
+        assert_eq!(parse_num_env("0"), Some(0));
+        assert_eq!(parse_num_env("abc"), None);
+        assert_eq!(parse_num_env(""), None);
+    }
+
+    #[test]
+    fn arg_limit_explicit_flag_wins() {
+        // 显式旗永远优先（env 未设路径）；env 生效路径 = or_else 一行，无分支可错。
+        let args = json!({"limit": 7});
+        assert_eq!(arg_limit(&args, "limit", 50), 7);
+        assert_eq!(arg_limit(&json!({}), "limit", 50), 50);
+    }
+
+    // ==== 6ooi：symbol-tree 过滤 ====
+
+    #[test]
+    fn filter_tree_entry_passthrough_when_no_filters() {
+        let e = serde_json::json!({"file": "a.rs", "symbols": [sym_json("f", 0, 0, 1, 0)]});
+        let out = filter_tree_entry(e.clone(), None, None).unwrap();
+        assert_eq!(out, e, "无开关原样返回（默认 wire 不变）");
+    }
+
+    #[test]
+    fn filter_tree_entry_grep_is_case_insensitive_substring() {
+        let e = serde_json::json!({
+            "file": "a.rs",
+            "symbols": [sym_json("run_fast", 0, 0, 1, 0), sym_json("slow", 2, 0, 3, 0)],
+        });
+        let out = filter_tree_entry(e, Some("RUN"), None).unwrap();
+        let names: Vec<&str> = out["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["run_fast"]);
+    }
+
+    #[test]
+    fn filter_tree_entry_max_depth_uses_containment_chain() {
+        let e = serde_json::json!({
+            "file": "a.rs",
+            "symbols": [
+                sym_json("mod", 0, 0, 20, 0),
+                sym_json("fn_in", 2, 4, 5, 5),
+                sym_json("peer", 21, 0, 22, 0),
+            ],
+        });
+        // max_depth=1 = 只留顶层（fn_in 被 mod 严格包含 → 深度 1 ≥ 1 滤掉）。
+        let out = filter_tree_entry(e, None, Some(1)).unwrap();
+        let names: Vec<&str> = out["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["mod", "peer"]);
+    }
+
+    #[test]
+    fn filter_tree_entry_drops_entry_when_all_filtered() {
+        let e = serde_json::json!({"file": "a.rs", "symbols": [sym_json("f", 0, 0, 1, 0)]});
+        assert!(filter_tree_entry(e, Some("zzz"), None).is_none(), "滤空条目省略");
+    }
+
+    #[test]
+    fn symbol_containment_depth_excludes_identical_ranges() {
+        let all = vec![sym_json("a", 1, 0, 2, 0), sym_json("b", 1, 0, 2, 0)];
+        assert_eq!(symbol_containment_depth(&all[0], &all), 0, "并列不加深");
     }
 }

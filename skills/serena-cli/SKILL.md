@@ -23,6 +23,7 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 
 - **行号一律 1-based 含端**——传 0 是用法错误。
 - **多命令任务先预热**：`serena-cli warm`（免冷启动 ~5s）；语义类（def/hover/refs）就绪需 30-60s，用 `wait-ready --stage semantic` 阻塞等，就绪前语义查询会返空+warning（不是坏了）。
+- **`--direct` = 纯冷进程，无 daemon**（bd serena-rust-9hy1）：跳过 lazy-spawn/缓存，只适合轻量读类（overview/read-file/status 等）；语义类工具（def/hover/refs/edit-context）`--direct` 首调必返空 + degraded warning（无预热索引）——语义查询一律走默认 daemon 模式，不要用 `--direct` 后误判"语义层坏了"。
 - **编辑带 `--expected-hash <hash>`**（来自最近 read-file/编辑返回），防并发覆盖。
 - **`--lang <lang>`** 显式指定语言当扩展名有歧义（如 .ts 项目里的 .js）。
 - JSON 解析：stdout 首行可能是 `[warn] ...` 人读行——解析前先切出第一个 `{`。
@@ -30,7 +31,7 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 - 大改/不确定结果 → 改完跑 `undo` 验证能回滚再继续；`undo --list` 看栈。rename 改多文件 = 一个事务，undo 一次全回滚。
 - 深度语义 call-hierarchy 依赖全量索引热身（分钟级），冷会话可能返空——改用 `refs` 拼接。`repo-map` 主源 documentSymbol + 文本兜底，冷会话可用（bd serena-rust-fj17）。
 
-## 命令速查（59 个，按类）
+## 命令速查（63 个，按类）
 
 | 类 | 命令 |
 |---|---|
@@ -40,12 +41,30 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 | 诊断(2) | diagnostics(--wait-gen N) · workspace-diagnostic |
 | 编辑(11) | replace-body · replace-text-in-symbol · insert-text-{before,after}-symbol · delete-text-in-symbol · insert-at-line · replace-lines · delete-lines · rename-symbol(跨文件自动同步) · safe-delete-symbol(有引用拒删) · create-text-file |
 | undo/redo(2) | undo(--steps N / --list) · redo —— 事务级：rename 多文件一次回滚；新建文件 undo 即删；文件被外部改过则拒绝(WRITE_CONFLICT)；栈 20 步/200MB/30 天，重启升级不丢 |
+| recipe 工作流(4) | `test <target> [name]`(cargo/npm 双后端跑测试+解析失败清单) · `diff [txn-id] [--patch]`(写事务写前写后对照) · `find-test <sym>`(启发式定位符号测试) · `recipe <name> [args]`(8 工作流编排，见下) |
 | 补全/长尾 | completion · code-action · format · format-range · inlay-hint · folding-range · document-highlight · semantic-tokens · code-lens · call-hierarchy · type-hierarchy · moniker · document-link |
 | 管理 | status · warm · wait-ready(--stage symbol\|semantic) · stop-all · install <lang> · uninstall <lang> · ls-use <lang\|id> <path> · ls-list · ls-remove <id> · doctor · shell(JSONL 长连接) · lint-shell |
+
+## recipe 工作流（8 个，单命令多步编排）
+
+写步各自独立 undo 事务；单步失败即停并**逆序回滚已完成的写步**（错误 reason 内 JSON 报告 completed_steps/txn_ids/undo_results）；单步截断继续。AI 一次调用 = 多步，token 省过逐工具拼：
+
+| recipe | 输入 | 步骤 |
+|---|---|---|
+| fix-bug | `<file> <sym> [--new-body T]` | ct_tldr → ct_goto_callers → ct_verify(前) → [replace-body] → ct_verify(后)；无 --new-body 只跑分析链 |
+| add-feature | `<name> [--target F]` | ct_define_feature(报告/stub 文本) → [stub 落盘] → 可选测试(--tests-file+--tests) |
+| rename | `<file> <sym> --to N` | ct_impact → [单文件 LSP rename，跨文件 edits 计入 skipped] → ct_verify |
+| add-test | `<sym> [--run]` | find-test → 命中即报告；未命中 → 定义文件 append `mod tests` 模板（已有则显式跳过） |
+| refactor-extract | `<file> <sym> --as N` | ct_smart_edit(extract 整符号抽取) → ct_verify |
+| refactor-rename | `<sym> --to N` | ct_impact → [LSP rename workspace] → ct_verify(定义文件) |
+| review-diff | `[txn-id]` | ct_review_diff（diff + 关联测试 + 报告聚合） |
+| explore | `<path>` | ct_tldr → repo-map → ct_recent_activity |
 
 ## 错误契约
 
 stdout = 紧凑 JSON（默认）+ 可能的 `[warn]` 前缀行；失败 `{"ok":false,"error":{code,message,retryable}}`。高频码：`BAD_ARGS`(参数/文件类型错，不重试) · `WRITE_CONFLICT`(盘上内容与预期不符，先重读) · `LS_TIMEOUT`(retryable，重试) · `LS_NOT_INSTALLED`/`LS_SPAWN_FAILED`(环境问题，走下方处置流程)。退出码 0=成功 1=工具错 2=参数错 4=就绪超时。
+
+`diagnostics` / 写工具附带的 `post_write_diagnostics` 里 **`pending` 是新鲜度判定**（bd serena-rust-i52y）：`false` = LS 已确认本代，items 空=真无错；`true` = 等待窗口内 LS 未推新一代诊断，items 空**不代表无错**（快照可能陈旧）——用 `diagnostics <file> --wait-gen N` 显式复核后再当干净结论。
 
 ## 环境自检与 LS 故障处置
 

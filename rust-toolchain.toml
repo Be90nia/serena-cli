@@ -1,2 +1,7 @@
+# 工具链钉版（bd serena-rust-fc4i）：CI 的 dtolnay/rust-toolchain@stable 曾长期
+# 领先本地 stable 约半年，新 rustc/clippy lint 本地零告警、CI 红线（v0.1.0 实锚）。
+# workflow 侧 dtolnay 步骤显式传 toolchain: "1.89" 与本文件对齐——rustup 对
+# rust-toolchain.toml 的解析优先于 rustup default，本地 cargo 亦被钉到同版。
+# edition 2024 要求 ≥1.85；升钉 = 改本文件 channel + 各 workflow toolchain 同步。
 [toolchain]
-channel = "stable"
+channel = "1.89"

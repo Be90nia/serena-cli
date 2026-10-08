@@ -7,11 +7,18 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    # bd ljzc: 门禁从 windows 单平台扩到三平台——linux/macos 的 cfg 分支
+    # （unix spawn、进程组治理）此前只有 release tag 时才首验。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.89" # = rust-toolchain.toml（bd serena-rust-fc4i），防 stable 漂移
           # locate_finds_functional_rust_analyzer 探测真 rust-analyzer（rustup which
           # → --version 校验）；minimal profile 不含该组件，rustup proxy 会因组件
           # 缺失 --version 失败 → locate 链全落空。
@@ -39,5 +46,6 @@ jobs:
       - name: artifact
         uses: actions/upload-artifact@v4
         with:
-          name: serena-cli-m0-${{ github.sha }}
-          path: target/release/serena-cli.exe
+          # name 带 runner.os——v4 同名二次上传即炸；path 通配 unix 无 .exe 后缀
+          name: serena-cli-m0-${{ runner.os }}-${{ github.sha }}
+          path: target/release/serena-cli*

@@ -12,8 +12,11 @@
 #   4. 分片按装门预算加权（LPT），由 scripts/smoke_shard.py 统一装箱，
 #      workflow 与 smoke_one.sh 共享同一算法，不存在第二份分片逻辑。
 #
-# 触发：每周一定时 + 手动。全量 45+ 门真装真跑太重，不做 push/PR 门禁
-#（push/PR 门禁 = m0-ci.yml 的 cargo test，SERENA_SKIP_LS_E2E=1）。
+# 触发：每周一定时 + 手动。bd serena-rust-0o05: 矩阵三平台化（ubuntu-24.04/
+# windows-2025/macos-15，pin 与 stress-ls.yml 对齐——门分类锚 = actions/
+# runner-images 同三张 Readme；不复制 stress-ls 的 arm 条目）。全量 45+ 门
+# 真装真跑太重，不做 push/PR 门禁（push/PR 门禁 = m0-ci.yml 的 cargo test，
+# SERENA_SKIP_LS_E2E=1）。
 
 name: LS Smoke
 
@@ -27,25 +30,32 @@ permissions:
 
 jobs:
   build-cli:
-    # serena-cli 只构建一次（debug profile），artifact 分发各分片——
+    # 三平台各构建一次（debug profile），artifact 按平台分发各分片——
     # 不让每个 smoke job 冷 cargo build（PM 楔约 #5）。
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89" # = rust-toolchain.toml（bd serena-rust-fc4i），防 stable 漂移
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ubuntu-cargo-smoke-${{ hashFiles('Cargo.lock') }}
+          key: ${{ matrix.os }}-cargo-smoke-${{ hashFiles('Cargo.lock') }}
       - name: build serena-cli (debug)
         run: cargo build --bin serena-cli
       - uses: actions/upload-artifact@v4
         with:
-          name: serena-cli-linux
-          path: target/debug/serena-cli
+          name: serena-cli-${{ matrix.os }}
+          # windows 产物 = serena-cli.exe，通配两者
+          path: target/debug/serena-cli*
           retention-days: 3
 
   plan:
@@ -63,24 +73,29 @@ jobs:
 
   smoke:
     needs: [build-cli, plan]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30 # 目标 ≤25min/片 + 余量
+    runs-on: ${{ matrix.os }}
+    # timeout 提到 60：linux 片预算 ≤25min 是原校准；windows/macos 安装链
+    # （npm/下载解包）显著更慢——门级预算裁剪仍由 smoke_one.sh watchdog 管
+    # （超预算 → SKIP BUDGET 不红），60min 只是防 job 硬杀红。
+    timeout-minutes: 60
     strategy:
-      fail-fast: false # 单门失败只红所在片，不连坐
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+      fail-fast: false # 单门失败只红所在 (os, shard)，不连坐
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+        shard: ${{ fromJSON(needs.plan.outputs.matrix).shard }}
     env:
       # 本 job 是真机冒烟本体：显式开 LS e2e（与 m0-ci 的 =1 门禁语义互补）。
       SERENA_SKIP_LS_E2E: "0"
       # ci_only 门（r8.5 adopt：本机默认排除，CI 纳入全集）—— smoke_shard.py 据
       # 此 env 切换过滤；本地不设即排除 devsense_php 等实验门。
       SERENA_CI_ONLY_INCL: "1"
-      SERENA_CLI: ${{ github.workspace }}/serena-cli
+      SERENA_CLI: ${{ github.workspace }}/bin/${{ matrix.os == 'windows-2025' && 'serena-cli.exe' || 'serena-cli' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: serena-cli-linux
-          path: ${{ github.workspace }}
+          name: serena-cli-${{ matrix.os }}
+          path: bin/
       - name: prepare cli
         run: |
           chmod +x "$SERENA_CLI"

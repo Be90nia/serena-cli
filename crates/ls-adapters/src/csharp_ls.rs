@@ -54,6 +54,11 @@ impl LanguageServerAdapter for CsharpLsAdapter {
         "csharp-ls"
     }
 
+    // bd serena-rust-62z：外层包裹预算跟上自身探针 60s，防 supervisor 30s 默认截断。
+    fn ready_probe_budget(&self) -> Duration {
+        READY_PROBE_TIMEOUT
+    }
+
     fn languages(&self) -> &'static [LanguageId] {
         const LANGS: &[LanguageId] = &[LanguageId::CSharp];
         LANGS

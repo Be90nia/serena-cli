@@ -88,6 +88,22 @@ fn gen_token() -> String {
     token
 }
 
+/// 以 0600 权限打开文件的 OpenOptions（bd w2l）。daemon.lock 内含鉴权 token、
+/// invocations.jsonl 含工具调用明文——umask 022 默认 0644 会让同机其他用户可读。
+/// 仅 Unix 生效（mode 只在创建时应用，已存在文件权限不变）；Windows 文件落在
+/// `%LOCALAPPDATA%\serena\`（用户 profile 内），NTFS 默认 ACL 已限定本用户 +
+/// SYSTEM + 管理员组，无需额外处理。
+pub(crate) fn secure_open() -> std::fs::OpenOptions {
+    #[allow(unused_mut)]
+    let mut opts = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts
+}
+
 fn boot_ms_now() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -118,7 +134,8 @@ fn try_become_daemon_impl(lock_path: &Path, candidate_port: u16) -> Result<Outco
     let serialized = serde_json::to_vec_pretty(&entry)?;
 
     // 原子创建：create_new(true) → 已存在则返回 AlreadyExists，胜者独占。
-    let create_result = std::fs::OpenOptions::new()
+    // 0600：lock 含 token，其他本地用户不可读（bd w2l）。
+    let create_result = secure_open()
         .write(true)
         .create_new(true)
         .open(lock_path);
@@ -166,9 +183,16 @@ pub fn try_become_daemon(lock_path: &Path, candidate_port: u16) -> Result<Outcom
 /// 把 lock 文件回填为最终内容（bind 成功后的端口/token 已确定）。
 pub fn write_final(lock_path: &Path, entry: &LockEntry) -> Result<(), LockError> {
     let serialized = serde_json::to_vec_pretty(entry)?;
-    // 写临时文件 + rename 原子替换（避免读到半写状态）。
+    // 写临时文件 + rename 原子替换（避免读到半写状态）。0600：替换后 lock
+    // 权限继承临时文件——不能让 rename 把 0644 带回来（bd w2l）。
     let tmp = lock_path.with_extension("lock.tmp");
-    std::fs::write(&tmp, &serialized)?;
+    use std::io::Write;
+    let mut f = secure_open()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    f.write_all(&serialized)?;
     std::fs::rename(&tmp, lock_path)?;
     Ok(())
 }
@@ -394,5 +418,33 @@ mod tests {
         );
         assert!(path.is_file(), "宽限判活路径不得删主人的 lock");
         drop(binder.join().expect("binder thread"));
+    }
+
+    /// bd w2l：lock 与 invocation 日志落盘 0600（Unix；Windows 靠 profile 目录
+    /// NTFS 默认 ACL，无权限位可断言）。
+    #[cfg(unix)]
+    #[test]
+    fn lock_and_log_created_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = fresh_lock();
+        let _ = try_become_daemon(&path, 7860).expect("win");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "daemon.lock 必须 0600（实测 {mode:o}）");
+
+        // write_final 重建路径（tmp → rename）也不得把 0644 带回来。
+        let entry = read(&path).unwrap().unwrap();
+        write_final(&path, &entry).expect("write_final");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "write_final 后仍须 0600（实测 {mode:o}）");
+
+        let log = _dir.path().join("invocations.jsonl");
+        secure_open()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"{}\n"))
+            .expect("append");
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "invocations.jsonl 必须 0600（实测 {mode:o}）");
     }
 }

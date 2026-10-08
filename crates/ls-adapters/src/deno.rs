@@ -160,6 +160,9 @@ mod tests {
 
     #[tokio::test]
     async fn launch_uses_lsp_subcommand() {
+        // bd 83f：环境变量改动全程持 crate 级共享锁——并发 set_var("PATH")
+        // 与 powershell/vts 测试互踩（9ai 假红同根因）。
+        let _env = crate::ENV_TEST_LOCK.lock().await;
         // 本机零安装铁律：PATH 注入 fake deno（cache 优先、PATH 兜底的兜底分支）。
         let deno_name = if cfg!(windows) { "deno.exe" } else { "deno" };
         let deno_dir = tempfile::tempdir().expect("tempdir");
@@ -173,7 +176,7 @@ mod tests {
                 .expect("chmod");
         }
         let path_original = std::env::var_os("PATH").unwrap_or_default();
-        // SAFETY: 单线程测试进程内临时改 PATH，函数尾恢复原值（powershell.rs 同款守卫）。
+        // SAFETY: ENV_TEST_LOCK 保证进程内独占；函数尾恢复原值。
         unsafe {
             let new_path = std::env::join_paths(
                 std::iter::once(deno_dir.path().to_path_buf())
@@ -187,7 +190,7 @@ mod tests {
                 project_root: std::env::temp_dir(),
             })
             .await;
-        // SAFETY: 恢复先于任何断言（panic 路径除外；powershell.rs 同款取舍）。
+        // SAFETY: 恢复先于任何断言（panic 路径除外；ENV_TEST_LOCK 持有中）。
         unsafe {
             std::env::set_var("PATH", path_original);
         }

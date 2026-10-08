@@ -8,7 +8,7 @@
 //! 3. 本机 LS 装态：rust-analyzer / clangd / pyright / gopls /
 //!    typescript-language-server / jdtls / csharp-ls —— `which_path` 探测。
 //! 4. daemon 状态：lock 文件存在性 + 端口 7860 是否被占 + token 是否有效（从 lock 读）。
-//! 5. 网络：TCP 探活 github.com:443（10s 超时）—— 本地是否能下载 LS 二进制。
+//! 5. 网络：TCP 探活 github.com:443（10s 超时；SERENA_NETWORK_PROBE_HOST 可覆盖）。
 //!
 //! 输出形态：
 //!   - 人类可读（默认）
@@ -719,18 +719,20 @@ fn read_lock(path: &Path) -> std::io::Result<Option<LockEntry>> {
     }
 }
 
-/// 5. 网络：TCP 探活 github.com:443（10s 超时）。
+/// 5. 网络：TCP 探活（10s 超时；`SERENA_NETWORK_PROBE_HOST`=host:port 覆盖探活目标，bd serena-rust-5uf）。
 fn check_network() -> Check {
-    let addr = match "github.com:443".to_socket_addrs() {
+    let target =
+        std::env::var("SERENA_NETWORK_PROBE_HOST").unwrap_or_else(|_| "github.com:443".into());
+    let addr = match target.to_socket_addrs() {
         Ok(mut iter) => match iter.next() {
             Some(a) => a,
             None => {
                 return Check {
                     category: "net",
                     id: "github",
-                    label: "GitHub reachability",
+                    label: "Network reachability",
                     status: Status::Miss,
-                    detail: "no DNS resolution for github.com".into(),
+                    detail: format!("no DNS resolution for {target}"),
                     hint: Some("check DNS / network connectivity".into()),
                 };
             }
@@ -739,9 +741,9 @@ fn check_network() -> Check {
             return Check {
                 category: "net",
                 id: "github",
-                label: "GitHub reachability",
+                label: "Network reachability",
                 status: Status::Miss,
-                detail: format!("DNS resolve failed: {e}"),
+                detail: format!("DNS resolve failed for {target}: {e}"),
                 hint: Some("check DNS / network connectivity".into()),
             };
         }
@@ -750,18 +752,22 @@ fn check_network() -> Check {
         Ok(_) => Check {
             category: "net",
             id: "github",
-            label: "GitHub reachability",
+            label: "Network reachability",
             status: Status::Ok,
-            detail: format!("github.com:443 reachable ({})", addr.ip()),
+            detail: format!("{target} reachable ({})", addr.ip()),
             hint: None,
         },
         Err(e) => Check {
             category: "net",
             id: "github",
-            label: "GitHub reachability",
+            label: "Network reachability",
             status: Status::Miss,
-            detail: format!("github.com:443 unreachable: {e}"),
-            hint: Some("check firewall / proxy / network connectivity".into()),
+            detail: format!("{target} unreachable: {e}"),
+            hint: Some(
+                "check firewall / proxy / network connectivity; mirror environments can point \
+                 SERENA_NETWORK_PROBE_HOST at a reachable host:port"
+                    .into(),
+            ),
         },
     }
 }
