@@ -464,8 +464,8 @@ async fn undo_and_write_gate_serialize() {
         let store = store.clone();
         async move { undo_at(&store, 1).await }
     });
-    let _ = crate::write_gate::acquire().await; // 与 undo_at 抢门
-    drop(crate::write_gate::acquire().await);
+    let _ = crate::write_gate::acquire("test").await; // 与 undo_at 抢门
+    drop(crate::write_gate::acquire("test").await);
     t.await.unwrap().unwrap();
 }
 

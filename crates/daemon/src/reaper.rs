@@ -289,6 +289,7 @@ mod tests {
             drain_window: Duration::from_millis(100),
             // 7rh：reaper 测试不关心 token 估算。
             no_token_estimate: false,
+            obs: crate::http::ObsState::default(),
         }
     }
 

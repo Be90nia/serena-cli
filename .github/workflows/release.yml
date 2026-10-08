@@ -14,6 +14,14 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # bd 0zy8: musl 静态二进制（Alpine/scratch 容器用户）；musl-tools 提供
+          # link 环境即可，ring 等 C build script 官方支持 musl。
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          # bd gvuo: AWS Graviton/Oracle Arm 主流 ARM64——GitHub 免费 arm runner
+          # 原生构建+原生全量测试（非交叉）。
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
     # v0.2.0: 三平台。ls-runtime/lsp-core 的进程树治理已跨平台（Windows=Job Object
@@ -36,10 +44,15 @@ jobs:
       # M0 CI 仅 windows 测试；linux host 全量测试在本 release 补跑——unix 侧
       # 进程组树治理（spawn_unix.rs）、跨平台 helper 由这里首验。
       - name: Test (linux host)
-        if: runner.os == 'Linux'
+        # musl entry 的 host 测试与 glibc entry 完全重复（host 仍是 glibc），
+        # 跳过避免 CI 空转；ARM runner 原生全量跑（gvuo 诉求本体）。
+        if: runner.os == 'Linux' && !contains(matrix.target, 'musl')
         run: cargo test --workspace
         env:
           SERENA_SKIP_LS_E2E: "1"
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package (Windows)

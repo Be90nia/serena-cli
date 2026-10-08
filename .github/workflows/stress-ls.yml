@@ -54,7 +54,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025, macos-15]
+        # bd gvuo: arm runner 原生覆盖（构建+churn）；6-shard 5h stress 暂不加
+        # arm——无 ARM 长稳诉求反馈前控制 CI 资源（+1 os = +6 job × 5h）。
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -141,7 +143,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025, macos-15]
     env:
       SERENA_CLI: ${{ github.workspace }}/bin/${{ matrix.os == 'windows-2025' && 'serena-cli.exe' || 'serena-cli' }}
       CHURN_LOG_DIR: ${{ github.workspace }}/churn-logs

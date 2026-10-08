@@ -273,25 +273,28 @@ impl Child {
         //   （linux）/ kqueue watchdog（macos，持原始 pid 直杀，兼容脱组）补齐。
         #[cfg(windows)]
         let tree = {
-            let job_err = |cmd: String| {
-                move |e: win32job::JobError| RuntimeError::Spawn {
-                    cmd,
-                    cause: e.into(), // From<JobError> for io::Error（win32job 提供）
-                }
+            let setup = || -> Result<win32job::Job> {
+                let job_err = |cmd: String| {
+                    move |e: win32job::JobError| RuntimeError::Spawn {
+                        cmd,
+                        cause: e.into(), // From<JobError> for io::Error（win32job 提供）
+                    }
+                };
+                let job = win32job::Job::create().map_err(job_err(cmd_display.clone()))?;
+                let mut limit = job
+                    .query_extended_limit_info()
+                    .map_err(job_err(cmd_display.clone()))?;
+                limit.limit_kill_on_job_close();
+                job.set_extended_limit_info(&limit)
+                    .map_err(job_err(cmd_display.clone()))?;
+                let handle = child
+                    .raw_handle()
+                    .expect("child just spawned; process handle alive");
+                job.assign_process(handle as isize)
+                    .map_err(job_err(cmd_display.clone()))?;
+                Ok(job)
             };
-            let job = win32job::Job::create().map_err(job_err(cmd_display.clone()))?;
-            let mut limit = job
-                .query_extended_limit_info()
-                .map_err(job_err(cmd_display.clone()))?;
-            limit.limit_kill_on_job_close();
-            job.set_extended_limit_info(&limit)
-                .map_err(job_err(cmd_display.clone()))?;
-            let handle = child
-                .raw_handle()
-                .expect("child just spawned; process handle alive");
-            job.assign_process(handle as isize)
-                .map_err(job_err(cmd_display.clone()))?;
-            Some(ProcessTreeGuard::Job(job))
+            job_or_degrade(setup(), &cmd_display)
         };
         #[cfg(unix)]
         let tree = child.id().map(ProcessTreeGuard::Group);
@@ -311,6 +314,22 @@ impl Child {
             pid: child.id(),
             child: Some(child),
         })
+    }
+}
+
+/// Job 治理熔断（BD serena-rust-687g）：Job 创建/挂载失败（受限 token、嵌套
+/// job 等）不阻断 LS spawn —— 降级为无 Job 模式（None），LS 照常运行，仅失去
+/// 进程树灭杀兜底；stderr warn 留痕（对齐 macos fork-watchdog 降级风格）。
+#[cfg(windows)]
+fn job_or_degrade(job: Result<win32job::Job>, cmd: &str) -> Option<ProcessTreeGuard> {
+    match job {
+        Ok(job) => Some(ProcessTreeGuard::Job(job)),
+        Err(e) => {
+            eprintln!(
+                "warn: Job Object setup failed ({e}); running without process-tree kill fallback: {cmd}"
+            );
+            None
+        }
     }
 }
 
@@ -368,6 +387,29 @@ mod tests {
                 pid as usize,
                 "event ident must be child pid"
             );
+        }
+    }
+
+    // Windows：Job 熔断降级语义（BD serena-rust-687g）。
+    #[cfg(windows)]
+    mod windows_job_degrade {
+        use super::super::{RuntimeError, job_or_degrade};
+
+        /// 失败熔断：Job setup 失败 → None（无 Job 模式），不 panic、不阻断 spawn。
+        #[test]
+        fn setup_failure_degrades_to_none() {
+            let err = RuntimeError::Spawn {
+                cmd: "mock-ls".into(),
+                cause: std::io::Error::other("mock assign failure"),
+            };
+            assert!(job_or_degrade(Err(err), "mock-ls").is_none());
+        }
+
+        /// 正常路径回归：真实 Job Object 创建成功 → Some(guard)（Windows 语义）。
+        #[test]
+        fn setup_success_yields_guard() {
+            let job = win32job::Job::create().expect("Job::create on windows");
+            assert!(job_or_degrade(Ok(job), "mock-ls").is_some());
         }
     }
 }

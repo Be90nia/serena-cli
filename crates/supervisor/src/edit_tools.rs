@@ -171,7 +171,7 @@ pub async fn replace_text_in_symbol(
     old_text: &str,
     new_text: &str,
 ) -> EditResult<()> {
-    let _gate = write_gate::acquire().await;
+    let _gate = write_gate::acquire("replace-text-in-symbol").await?;
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
@@ -192,7 +192,7 @@ pub async fn insert_text_after_symbol(
     symbol: &str,
     text: &str,
 ) -> EditResult<(u32, u32)> {
-    let _gate = write_gate::acquire().await;
+    let _gate = write_gate::acquire("insert-text-after-symbol").await?;
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
@@ -216,7 +216,7 @@ pub async fn insert_text_before_symbol(
     symbol: &str,
     text: &str,
 ) -> EditResult<(u32, u32)> {
-    let _gate = write_gate::acquire().await;
+    let _gate = write_gate::acquire("insert-text-before-symbol").await?;
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
@@ -246,7 +246,7 @@ pub async fn delete_text_in_symbol(
     start_line: u32,
     end_line: u32,
 ) -> EditResult<()> {
-    let _gate = write_gate::acquire().await;
+    let _gate = write_gate::acquire("delete-text-in-symbol").await?;
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
@@ -424,7 +424,7 @@ async fn line_edit<T, F>(
 where
     F: FnOnce(&str) -> EditResult<(String, T)>,
 {
-    let _gate = write_gate::acquire().await;
+    let _gate = write_gate::acquire("line-edit").await?;
     let _guard = session.ensure_open(file).await?;
     let content = tokio::fs::read_to_string(file).await?;
     verify_hash(expected_hash, &content, file)?;

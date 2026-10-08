@@ -8,6 +8,7 @@
 //! 工具级失败走 200 + `{ok:false}`（A5），transport 错误才用 4xx/5xx。
 //! 503 用于 ShutdownDraining 拒绝新请求（I8）。
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use axum::{
@@ -22,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::dto::{
-    StatusResponse, ToolResponse, WireError, WireErrorCode, wire_error_code_to_exit,
-    wire_error_from_tool_error,
+    StatusRecentError, StatusResponse, ToolResponse, WireError, WireErrorCode,
+    wire_error_code_to_exit, wire_error_from_tool_error,
 };
 
 /// Daemon 状态。`token` 来自 lock 文件（Task 11）；draining 标志由 Reaper（Task 14）置。
@@ -51,6 +52,8 @@ pub struct AppState {
     /// 7rh：SERENA_NO_TOKEN_ESTIMATE=1 时工具成功响应不附 `~tokens` 估算。
     /// daemon 启动读一次（serve），测试直接注入 bool 保持隔离。
     pub no_token_estimate: bool,
+    /// bd 7tk/e1p：观测面（/status 四字段 + invocation 日志增强）共享态。
+    pub obs: ObsState,
 }
 
 impl AppState {
@@ -76,6 +79,98 @@ impl AppState {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+// ==== bd 7tk/e1p：观测面（/status 四字段 + invocations.jsonl 增强字段）====
+
+/// 冷启动窗：daemon 启动后此窗内的调用在重放日志标 `cold_start: true`
+/// （audit-prod-replay「spawn 后首调用 5s 内」切片判据）。R10-F03 的冷
+/// LS_TIMEOUT 调用耗 30s+，故在请求到达时判定而非落日志时——否则漏标。
+const COLD_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// recent_errors / recent_agents 环容量（status 载荷保持小）。
+const OBS_RING_CAP: usize = 8;
+/// invocation_id → 历史次数表容量（长寿命 daemon 防泄漏；越过即 FIFO 驱逐，
+/// 被驱逐 id 的再次重试重新从 0 计，重放分析以窗口为准）。
+const SEEN_MAP_CAP: usize = 4096;
+
+/// 观测共享态。集中成束：AppState 各构造点只需一行 `obs: Default::default()`。
+#[derive(Clone, Default)]
+pub struct ObsState {
+    invocation_count: Arc<std::sync::atomic::AtomicU64>,
+    recent_errors: Arc<std::sync::Mutex<VecDeque<StatusRecentError>>>,
+    /// 最近 N 个 invocation_id 前 8 字符前缀（多 agent 场景区分编排方；重见即刷新最新）。
+    recent_agents: Arc<std::sync::Mutex<VecDeque<String>>>,
+    /// 同一 invocation_id 的历史出现次数（retry_count 差分）+ 首见序（FIFO 驱逐）。
+    seen: Arc<std::sync::Mutex<SeenInvocations>>,
+}
+
+#[derive(Default)]
+struct SeenInvocations {
+    counts: std::collections::HashMap<String, u64>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl ObsState {
+    /// log_invocation 唯一记账点：计数 +1、错误/agent 前缀入环；返回该 id 的
+    /// 历史出现次数（0 = 首次；重放分析里 retry_count 即此值）。
+    fn record(&self, invocation_id: &str, tool: &str, error_code: Option<WireErrorCode>) -> u64 {
+        self.invocation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(code) = error_code {
+            let mut ring = self.recent_errors.lock().unwrap();
+            ring.push_back(StatusRecentError {
+                ts_ms: now_ms(),
+                tool: tool.to_owned(),
+                code,
+            });
+            while ring.len() > OBS_RING_CAP {
+                ring.pop_front();
+            }
+        }
+        let prefix: String = invocation_id.chars().take(8).collect();
+        let mut agents = self.recent_agents.lock().unwrap();
+        if let Some(pos) = agents.iter().position(|p| *p == prefix) {
+            agents.remove(pos);
+        }
+        agents.push_back(prefix);
+        while agents.len() > OBS_RING_CAP {
+            agents.pop_front();
+        }
+        let mut seen = self.seen.lock().unwrap();
+        let entry = seen.counts.entry(invocation_id.to_owned()).or_insert(0);
+        let prior = *entry;
+        *entry += 1;
+        if prior == 0 {
+            // 只记首见序：重试不重复入队，驱逐时键与序同删不悬空。
+            seen.order.push_back(invocation_id.to_owned());
+            while seen.order.len() > SEEN_MAP_CAP
+                && let Some(oldest) = seen.order.pop_front()
+            {
+                seen.counts.remove(&oldest);
+            }
+        }
+        prior
+    }
+
+    fn invocation_count(&self) -> u64 {
+        self.invocation_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn recent_errors_snapshot(&self) -> Vec<StatusRecentError> {
+        self.recent_errors.lock().unwrap().iter().cloned().collect()
+    }
+
+    fn recent_agents_snapshot(&self) -> Vec<String> {
+        self.recent_agents.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Token 校验中间件：缺失或不等 → 403。
@@ -182,6 +277,12 @@ async fn tools_post(
         .replace(req.project_root.clone());
 
     let started = std::time::Instant::now();
+    // bd e1p：冷启动标记在到达时判定（冷 LS_TIMEOUT 调用耗 30s+，落日志时判
+    // uptime 会漏标）；wait_gen 提前取（execute 消费 args 所有权）；缓存命中
+    // 基线供差分（supervisor 默认实现恒 0 → false）。
+    let cold_start = state.start_ts.elapsed() < COLD_START_WINDOW;
+    let wait_gen = req.args.get("wait_gen").and_then(|v| v.as_u64());
+    let cache_before = state.supervisor.cache_hits_total();
     match state
         .supervisor
         .execute_tool(&name, &req.project_root, req.args, req.lang.as_deref())
@@ -197,14 +298,23 @@ async fn tools_post(
                 };
                 supervisor::attach_warning(&mut data, &[combined]);
             }
+            let facts = CallFacts {
+                cache_hit: state.supervisor.cache_hits_total() > cache_before,
+                wait_gen,
+                pending: data.get("pending").and_then(|v| v.as_bool()),
+            };
             log_invocation(
-                &state.invocation_log_path,
-                &invocation_id,
-                &name,
-                &req.project_root,
-                true,
-                None,
-                started.elapsed(),
+                &state,
+                InvocationRecord {
+                    invocation_id: &invocation_id,
+                    tool: &name,
+                    project_root: &req.project_root,
+                    ok: true,
+                    error_code: None,
+                    elapsed: started.elapsed(),
+                    facts,
+                    cold_start,
+                },
             );
             // 7rh：token 估算 = 响应序列化字节 / 4（无 tokenizer 依赖）。tokens
             // 依赖最终字节数，只能先计量再发送（两遍 serialize，Value 零 clone：
@@ -240,14 +350,23 @@ async fn tools_post(
         }
         Err(err) => {
             let wire = wire_error_from_tool_error(&err);
+            let facts = CallFacts {
+                cache_hit: state.supervisor.cache_hits_total() > cache_before,
+                wait_gen,
+                pending: None,
+            };
             log_invocation(
-                &state.invocation_log_path,
-                &invocation_id,
-                &name,
-                &req.project_root,
-                false,
-                Some(wire.code),
-                started.elapsed(),
+                &state,
+                InvocationRecord {
+                    invocation_id: &invocation_id,
+                    tool: &name,
+                    project_root: &req.project_root,
+                    ok: false,
+                    error_code: Some(wire.code),
+                    elapsed: started.elapsed(),
+                    facts,
+                    cold_start,
+                },
             );
             let status = StatusCode::OK; // 工具级失败走 200（A5）
             let resp = ToolResponse::Err {
@@ -286,42 +405,67 @@ pub fn new_invocation_id() -> String {
     )
 }
 
-/// 追加一条工具调用记录到重放日志（d3a）。JSONL，行首键即 invocation_id
-/// （`grep <id> invocations.jsonl` 即索引）。写失败只 warn 不影响工具执行。
-fn log_invocation(
-    path: &std::path::Path,
-    invocation_id: &str,
-    tool: &str,
-    project_root: &str,
+/// 单次工具调用的观测事实（bd e1p）——invocations.jsonl 增强字段的数据源。
+#[derive(Debug, Clone, Copy, Default)]
+struct CallFacts {
+    /// supervisor 符号缓存命中（调用前后 cache_hits_total 差分）。
+    cache_hit: bool,
+    /// 请求 args 携带的 diagnostics `wait_gen`（未携带 = None → null）。
+    wait_gen: Option<u64>,
+    /// 响应 data 的 `pending` 旗（diagnostics 形态超时未确认时 true）。
+    pending: Option<bool>,
+}
+
+/// log_invocation 入参束（bd e1p：消 9 参超限，字段自释名）。
+struct InvocationRecord<'a> {
+    invocation_id: &'a str,
+    tool: &'a str,
+    project_root: &'a str,
     ok: bool,
     error_code: Option<WireErrorCode>,
     elapsed: std::time::Duration,
-) {
-    if path.as_os_str().is_empty() {
+    facts: CallFacts,
+    /// 请求到达时 daemon 是否仍在冷启动窗（bd e1p）。
+    cold_start: bool,
+}
+
+/// 追加一条工具调用记录到重放日志（d3a）。JSONL，行首键即 invocation_id
+/// （`grep <id> invocations.jsonl` 即索引）。写失败只 warn 不影响工具执行。
+/// bd e1p/dt1：尾部追加 cache_hit/wait_gen/pending/cold_start/retry_count——
+/// 旧消费者按键读取不受影响；retry_count = 同 id 在本 daemon 内的历史请求数。
+fn log_invocation(state: &AppState, rec: InvocationRecord<'_>) {
+    // 记账先于路径判断：日志关断（空路径）时 /status 观测面仍计数。
+    let retry_count = state
+        .obs
+        .record(rec.invocation_id, rec.tool, rec.error_code);
+    if state.invocation_log_path.as_os_str().is_empty() {
         return;
     }
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     let line = json!({
-        "invocation_id": invocation_id,
-        "ts_ms": ts_ms,
-        "tool": tool,
-        "project_root": project_root,
-        "ok": ok,
+        "invocation_id": rec.invocation_id,
+        "ts_ms": now_ms(),
+        "tool": rec.tool,
+        "project_root": rec.project_root,
+        "ok": rec.ok,
         // Option<WireErrorCode> 直接走 serde：Some → SCREAMING_SNAKE_CASE，None → null。
-        "error_code": error_code,
-        "duration_ms": elapsed.as_millis() as u64,
+        "error_code": rec.error_code,
+        "duration_ms": rec.elapsed.as_millis() as u64,
+        // bd e1p/dt1 追加字段。
+        "cache_hit": rec.facts.cache_hit,
+        "wait_gen": rec.facts.wait_gen,
+        "pending": rec.facts.pending,
+        "cold_start": rec.cold_start,
+        "retry_count": retry_count,
     });
     if let Err(e) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&state.invocation_log_path)
         .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()))
     {
         eprintln!(
-            "[serena] invocation log append failed (path={path:?}): {e}; tool execution unaffected"
+            "[serena] invocation log append failed (path={:?}): {e}; tool execution unaffected",
+            state.invocation_log_path
         );
     }
 }
@@ -341,6 +485,11 @@ async fn status_get(State(state): State<AppState>) -> Response {
         loaded_ls: loaded,
         draining: state.draining.load(std::sync::atomic::Ordering::Acquire),
         active_project: state.active_project.lock().unwrap().clone(),
+        // bd 7tk：观测四字段（wire v1 追加式）。
+        in_flight: state.in_flight.load(std::sync::atomic::Ordering::Acquire) as u64,
+        invocation_count: state.obs.invocation_count(),
+        recent_errors: state.obs.recent_errors_snapshot(),
+        recent_agents: state.obs.recent_agents_snapshot(),
     };
     (StatusCode::OK, Json(resp)).into_response()
 }
@@ -667,6 +816,7 @@ mod tests {
             invocation_log_path,
             // 7rh：默认开估算；关闭开关的测试显式置 true。
             no_token_estimate: false,
+            obs: ObsState::default(),
         }
     }
 
@@ -1288,5 +1438,96 @@ mod tests {
         let body = body.expect("json body");
         assert_eq!(body["ok"], false);
         assert_eq!(body["error"]["code"], "BAD_ARGS");
+    }
+
+    // ── bd e1p/dt1：invocations.jsonl 观测字段 ──
+
+    /// 追加字段形状：cache_hit/wait_gen/pending/cold_start/retry_count 恒在；
+    /// wait_gen/pending 从请求 args 与响应 data 透传；同 id 二次请求 retry_count=1。
+    #[tokio::test]
+    async fn invocation_log_line_has_obs_fields_and_retry_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations.jsonl");
+        // MockSupervisor 一次性消费 → 两次请求各用一个 state，但共享同一
+        // ObsState（Arc 语义 = 同一 daemon 的观测记账，retry_count 差分成立）。
+        let mut st1 = state_with_log(
+            "secret",
+            MockSupervisor::ok(json!({"items": [], "pending": true})),
+            log.clone(),
+        );
+        let st2 = state_with_log(
+            "secret",
+            MockSupervisor::ok(json!({"items": [], "pending": true})),
+            log.clone(),
+        );
+        st1.obs = st2.obs.clone();
+        let mk = |body| {
+            req_post_invocation("/tools/tool_diagnostics", Some("secret"), "agent-x-1234", body)
+        };
+        oneshot_json(
+            router(st1),
+            mk(json!({
+                "project_root": "D:/x",
+                "args": {"file": "a.py", "wait_gen": 3}
+            })),
+        )
+        .await;
+        oneshot_json(
+            router(st2),
+            mk(json!({
+                "project_root": "D:/x",
+                "args": {"file": "a.py", "wait_gen": 4}
+            })),
+        )
+        .await;
+        let rows = read_log(&log);
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row["invocation_id"], "agent-x-1234");
+            assert_eq!(row["cache_hit"], false, "mock 无缓存语义 → false");
+            assert_eq!(row["pending"], true, "响应 data.pending 透传");
+            assert!(row["cold_start"].is_boolean());
+        }
+        assert_eq!(rows[0]["wait_gen"], 3);
+        assert_eq!(rows[1]["wait_gen"], 4);
+        assert_eq!(rows[0]["retry_count"], 0, "首见 = 0");
+        assert_eq!(rows[1]["retry_count"], 1, "同 id 第二次请求 = 1（bd dt1）");
+    }
+
+    /// 失败调用：错误码入 recent_errors 环，status 四字段形状（bd 7tk）。
+    #[tokio::test]
+    async fn status_exposes_obs_fields_after_error() {
+        let st = state_with_log(
+            "secret",
+            MockSupervisor::err(supervisor::ToolError::BadArgs {
+                detail: "missing file".into(),
+            }),
+            std::path::PathBuf::new(),
+        );
+        let router = router(st);
+        let (status, _) = oneshot_json(
+            router.clone(),
+            req_post_invocation(
+                "/tools/hover",
+                Some("secret"),
+                "err-agent-99",
+                json!({"project_root": "D:/x", "args": {}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::OK, "工具级失败走 200（A5）");
+        let (status, body) = oneshot_json(router, req_get("/status", Some("secret"))).await;
+        assert_eq!(status, AxStatus::OK);
+        let body = body.expect("json body");
+        assert_eq!(body["in_flight"], 0, "请求已落定，无在飞");
+        assert_eq!(body["invocation_count"], 1);
+        let errs = body["recent_errors"].as_array().expect("errors ring");
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0]["tool"], "hover");
+        assert_eq!(errs[0]["code"], "BAD_ARGS");
+        assert!(errs[0]["ts_ms"].is_u64());
+        let agents = body["recent_agents"].as_array().expect("agents ring");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0], "err-agen", "invocation_id 前 8 字符前缀");
     }
 }

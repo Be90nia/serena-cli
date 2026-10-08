@@ -104,6 +104,14 @@ pub struct WireError {
     pub hint: Option<String>,
 }
 
+/// bd 7tk：`recent_errors` 环条目（daemon 侧最近 N 条工具级失败）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusRecentError {
+    pub ts_ms: u64,
+    pub tool: String,
+    pub code: WireErrorCode,
+}
+
 /// `GET /status` 响应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
@@ -114,6 +122,22 @@ pub struct StatusResponse {
     /// 最近一次工具请求的 project_root（daemon 启动时不带 project，为 None）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_project: Option<String>,
+    /// bd 7tk 观测四字段（wire v1 追加式扩展）。旧 daemon 响应缺字段 → 客户端
+    /// `#[serde(default)]` 兜底；新 daemon 多出的键对旧客户端无害（serde 忽略
+    /// 未知字段）。空环省略键 = B0 hint 字段同款 skip 语义。
+    /// 正在执行的工具请求数（drain 排空判据，负载信号）。
+    #[serde(default)]
+    pub in_flight: u64,
+    /// daemon 生命周期内累计工具调用数（= invocations.jsonl 本代行数）。
+    #[serde(default)]
+    pub invocation_count: u64,
+    /// 最近 N 条工具级失败（旧者先出；无失败时省略）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_errors: Vec<StatusRecentError>,
+    /// 最近 N 个 invocation_id 前缀（多 agent 场景：不同编排方各有 id 命名空间；
+    /// 无调用时省略）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_agents: Vec<String>,
 }
 
 /// 把 supervisor 的 `ToolError` 翻译成 wire error。
@@ -452,5 +476,67 @@ mod tests {
         let w = wire_error_from_tool_error(&e);
         assert_eq!(w.code, WireErrorCode::LsSpawnFailed);
         assert!(w.retryable);
+    }
+
+    /// bd 7tk：空环省略键（hint 字段同款 skip 语义）；计数键恒在。
+    #[test]
+    fn status_obs_fields_skip_when_rings_empty() {
+        let resp = StatusResponse {
+            uptime_secs: 1,
+            pid: 2,
+            loaded_ls: vec![],
+            draining: false,
+            active_project: None,
+            in_flight: 0,
+            invocation_count: 0,
+            recent_errors: vec![],
+            recent_agents: vec![],
+        };
+        let j = serde_json::to_value(&resp).unwrap();
+        assert!(j.get("recent_errors").is_none(), "empty ring must omit key");
+        assert!(j.get("recent_agents").is_none(), "empty ring must omit key");
+        assert_eq!(j["in_flight"], 0);
+        assert_eq!(j["invocation_count"], 0);
+    }
+
+    /// bd 7tk：旧 daemon 响应（只有 5 个旧字段）→ 新客户端 default 兜底反序列化。
+    #[test]
+    fn status_legacy_response_without_obs_fields_deserializes() {
+        let resp: StatusResponse = serde_json::from_str(
+            r#"{"uptime_secs":9,"pid":42,"loaded_ls":["rust"],"draining":false}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.in_flight, 0);
+        assert_eq!(resp.invocation_count, 0);
+        assert!(resp.recent_errors.is_empty());
+        assert!(resp.recent_agents.is_empty());
+    }
+
+    /// bd 7tk：带值时四字段全量序列化 + roundtrip（错误码走 SCREAMING 形态）。
+    #[test]
+    fn status_obs_fields_roundtrip() {
+        let resp = StatusResponse {
+            uptime_secs: 3,
+            pid: 4,
+            loaded_ls: vec!["rust".into()],
+            draining: false,
+            active_project: Some("D:/proj".into()),
+            in_flight: 2,
+            invocation_count: 7,
+            recent_errors: vec![StatusRecentError {
+                ts_ms: 123,
+                tool: "hover".into(),
+                code: WireErrorCode::LsTimeout,
+            }],
+            recent_agents: vec!["orca-ab12".into()],
+        };
+        let j = serde_json::to_string(&resp).unwrap();
+        assert!(j.contains("\"code\":\"LS_TIMEOUT\""), "got: {j}");
+        let back: StatusResponse = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.in_flight, 2);
+        assert_eq!(back.invocation_count, 7);
+        assert_eq!(back.recent_errors.len(), 1);
+        assert_eq!(back.recent_errors[0].code, WireErrorCode::LsTimeout);
+        assert_eq!(back.recent_agents, vec!["orca-ab12".to_string()]);
     }
 }

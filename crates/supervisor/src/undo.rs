@@ -602,7 +602,7 @@ pub(crate) async fn undo(root: &Path, steps: usize) -> Result<serde_json::Value,
 /// [`undo`] 的存储路径注入版（单测用）。
 pub(crate) async fn undo_at(store: &Path, steps: usize) -> Result<serde_json::Value, ToolError> {
     // 与写工具串行化：恢复写期间不得有并发写改盘。
-    let _gate = crate::write_gate::acquire().await;
+    let _gate = crate::write_gate::acquire("undo").await?;
     let mut undone = Vec::new();
     for _ in 0..steps {
         match top_active(store).await {
@@ -624,7 +624,7 @@ pub(crate) async fn redo(root: &Path) -> Result<serde_json::Value, ToolError> {
 
 /// [`redo`] 的存储路径注入版（单测用）。
 pub(crate) async fn redo_at(store: &Path) -> Result<serde_json::Value, ToolError> {
-    let _gate = crate::write_gate::acquire().await;
+    let _gate = crate::write_gate::acquire("redo").await?;
     let mut redone = Vec::new();
     // redo 一次重放一个（IDE redo 单步语义；--steps 未列入契约）。
     if let Some(n) = top_undone(store).await {
@@ -653,7 +653,7 @@ pub(crate) async fn list(root: &Path) -> Result<serde_json::Value, ToolError> {
 
 /// [`list`] 的存储路径注入版（单测用）。
 pub(crate) async fn list_at(store: &Path) -> Result<serde_json::Value, ToolError> {
-    let _gate = crate::write_gate::acquire().await;
+    let _gate = crate::write_gate::acquire("undo-list").await?;
     prune_at(store, &Limits::default()).await;
     let mut txns = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&store).await {

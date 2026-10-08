@@ -2694,6 +2694,10 @@ fn dedup_loaded_ls(body: &mut serde_json::Value) {
 }
 
 /// `status` 子命令。
+///
+/// bd 30m：纯探测语义——只读 lock + TCP 探活 + GET /status，**永不 lazy-spawn**
+/// （哨兵/无残留基线依赖 status 无副作用：daemon 不在时报 not-running 而非拉起；
+/// 回归测试 `status_tests::status_absent_daemon_never_spawns`）。
 async fn cmd_status(lock_path: &Path) -> ExitCode {
     let entry = match daemon::lockfile::read(lock_path) {
         Ok(Some(e)) if probe(e.port) => e,
@@ -3033,6 +3037,34 @@ async fn dispatch_shell_cmd(
     cmd: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    dispatch_shell_cmd_with(
+        client,
+        base_token,
+        lock_path,
+        project_root,
+        cmd,
+        args,
+        || ensure_daemon(lock_path),
+    )
+    .await
+}
+
+/// 同 dispatch_shell_cmd；`reensure` 为断流自愈探活的注入点（单测 mock connect
+/// 失败自愈，BD serena-rust-3bu），生产传 `|| ensure_daemon(lock_path)`。
+/// 无参形态避开 `FnOnce(&Path) -> Fut` 的 HRTB 推断陷阱。
+async fn dispatch_shell_cmd_with<F, Fut>(
+    client: &reqwest::Client,
+    base_token: &mut (String, String),
+    lock_path: &Path,
+    project_root: &Path,
+    cmd: &str,
+    args: serde_json::Value,
+    reensure: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(String, String), String>>,
+{
     // 管理命令。
     if cmd == "status" {
         let resp = client
@@ -3105,28 +3137,42 @@ async fn dispatch_shell_cmd(
         "project_root": project_root.to_string_lossy(),
         "args": args,
     });
-    let url = format!("{}/tools/{tool}", base_token.0);
-    let send_tool = |token: &String| {
+    let send_tool = |base: &str, token: &str| {
         client
-            .post(&url)
+            .post(format!("{base}/tools/{tool}"))
             .header("X-Serena-Token", token)
             .json(&body)
             .timeout(FORWARD_TIMEOUT)
             .send()
     };
-    let mut resp = send_with_connect_retry(
-        || send_tool(&base_token.1.clone()),
+    let mut resp = match send_with_connect_retry(
+        || send_tool(&base_token.0, &base_token.1.clone()),
         // 与压测观察一致：error sending request 覆盖 connect 与 request 两类瞬断形态。
         |e: &reqwest::Error| e.is_connect() || e.is_request(),
     )
     .await
-    .map_err(|e| format!("forward {tool}: {e}"))?;
+    {
+        Ok(resp) => resp,
+        // BD serena-rust-3bu：shell 长会话里 daemon 可能已 15min 空闲自退——
+        // connect 类错误（退避耗尽仍连不上）重跑 ensure_daemon lazy-spawn 新
+        // daemon，换新 (base, token) 重发一次；与转发模式 draining 自愈（g0m）同源。
+        Err(e) if e.is_connect() || e.is_request() => {
+            let (base, token) = reensure().await.map_err(|he| {
+                format!("forward {tool}: {e}; reconnect self-heal failed: {he}")
+            })?;
+            *base_token = (base, token);
+            send_tool(&base_token.0, &base_token.1)
+                .await
+                .map_err(|e2| format!("forward {tool}: {e2}"))?
+        }
+        Err(e) => return Err(format!("forward {tool}: {e}")),
+    };
     if resp.status() == reqwest::StatusCode::FORBIDDEN
         && let Some(fresh) = refresh_token_if_stale(lock_path, &base_token.1).await
     {
         // daemon 换代后旧 token 过期：已刷新，用新 token 重发一次。
         base_token.1 = fresh;
-        resp = send_tool(&base_token.1)
+        resp = send_tool(&base_token.0, &base_token.1)
             .await
             .map_err(|e| format!("forward {tool}: {e}"))?;
     }
@@ -4026,5 +4072,135 @@ mod ls_remove_tests {
             other => panic!("want NotFound, got {other:?}"),
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// BD serena-rust-3bu：shell 长会话断流自愈（connect 失败 → 重跑 ensure_daemon）。
+#[cfg(test)]
+mod shell_selfheal_tests {
+    use super::*;
+
+    /// 死端口 connect 失败（退避耗尽）→ 注入的 reensure 被调用 → 换新 base 重发
+    /// 命中 mock daemon → 响应透传，base_token 更新为新 daemon。
+    #[tokio::test]
+    async fn shell_dispatch_selfheals_after_connect_failure() {
+        // 死端口：bind 后立即 drop → connect refused。
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        // mock daemon：一次性 HTTP 200 JSON 响应（原生 TcpListener，免引入 server 依赖）。
+        let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mock_port = srv.local_addr().unwrap().port();
+        let payload = r#"{"ok":true,"data":42}"#;
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = srv.accept().expect("mock daemon accepts one conn");
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            sock.write_all(resp.as_bytes()).expect("mock daemon writes resp");
+        });
+
+        let client = http_client();
+        let mut base_token = (format!("http://127.0.0.1:{dead_port}"), "tok".to_string());
+        let healed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = healed.clone();
+        let resp = dispatch_shell_cmd_with(
+            &client,
+            &mut base_token,
+            std::path::Path::new("unused-lock"),
+            std::path::Path::new("."),
+            "read-file",
+            json!({"file": "a.rs"}),
+            move || {
+                let flag = flag.clone();
+                async move {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok((format!("http://127.0.0.1:{mock_port}"), "tok2".to_string()))
+                }
+            },
+        )
+        .await
+        .expect("自愈后重发应成功");
+        server.join().unwrap();
+
+        assert!(
+            healed.load(std::sync::atomic::Ordering::SeqCst),
+            "connect 失败必须触发重探活"
+        );
+        assert_eq!(resp, json!(42), "mock daemon 响应应透传");
+        assert_eq!(
+            base_token.0,
+            format!("http://127.0.0.1:{mock_port}"),
+            "base 应更新为新 daemon 地址"
+        );
+        assert_eq!(base_token.1, "tok2");
+    }
+
+    /// 自愈探活本身失败：错误链必须同时携带原连接错误与 reensure 失败事实。
+    #[tokio::test]
+    async fn selfheal_failure_surfaces_both_errors() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let client = http_client();
+        let mut base_token = (format!("http://127.0.0.1:{dead_port}"), "tok".to_string());
+        let err = dispatch_shell_cmd_with(
+            &client,
+            &mut base_token,
+            std::path::Path::new("unused-lock"),
+            std::path::Path::new("."),
+            "read-file",
+            json!({"file": "a.rs"}),
+            || async { Err("spawn refused".to_string()) },
+        )
+        .await
+        .expect_err("探活失败必须报错");
+
+        assert!(err.contains("reconnect self-heal failed"), "{err}");
+        assert!(err.contains("spawn refused"), "{err}");
+    }
+}
+
+/// bd 30m：status 纯探测语义回归锁——daemon 不在时报 not-running 且零副作用
+/// （lazy-spawn 出的 daemon 必然写 lock，lock 缺席即证未 spawn）。
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn status_absent_daemon_never_spawns() {
+        let lock = std::env::temp_dir().join(format!(
+            "serena-status-nospawn-{}.lock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&lock);
+
+        let code = cmd_status(&lock).await;
+
+        assert_eq!(code, ExitCode::from(1), "daemon 不在 = not-running (exit 1)");
+        assert!(!lock.exists(), "status 不得 lazy-spawn（lock 出现 = 有 daemon 被拉起）");
+    }
+
+    /// 死 lock（文件在、端口无 listener）同契约：不 spawn、报 not-running。
+    #[tokio::test]
+    async fn status_with_dead_lock_never_spawns() {
+        let lock = std::env::temp_dir().join(format!(
+            "serena-status-deadlock-{}.lock",
+            std::process::id()
+        ));
+        std::fs::write(&lock, "{}").unwrap();
+
+        let code = cmd_status(&lock).await;
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(lock.exists(), "status 不得动死 lock");
+        let _ = std::fs::remove_file(&lock);
     }
 }

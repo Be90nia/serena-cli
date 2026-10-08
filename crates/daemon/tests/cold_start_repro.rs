@@ -66,6 +66,7 @@ async fn cold_start_overview_via_daemon_http() {
         invocation_log_path: std::path::PathBuf::new(),
         drain_window: std::time::Duration::from_secs(2),
         no_token_estimate: false,
+        obs: daemon::http::ObsState::default(),
     };
     let app = daemon::http::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

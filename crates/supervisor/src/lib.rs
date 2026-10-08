@@ -346,6 +346,13 @@ pub trait SupervisorTrait: Send + Sync {
     async fn evict_failed(&self) -> usize {
         0
     }
+
+    /// 符号缓存命中总次数（生命周期单调递增；bd e1p）。daemon 在单次工具调用
+    /// 前后差分此值 = 该调用的命中与否，落 invocations.jsonl `cache_hit` 字段。
+    /// 默认 0：mock/桩实现无缓存语义，差分恒 false。
+    fn cache_hits_total(&self) -> u64 {
+        0
+    }
 }
 
 /// M0 单实例 supervisor。
@@ -403,6 +410,8 @@ pub struct Supervisor {
     /// 4 - 8 并发比，32 次调用 ≈ 100 文件操作，对应在 daemon 主动期约 5~10 秒级
     /// 节流，避免高频 reconcile 开销。
     idle_buffers_reclaim_counter: AtomicU64,
+    /// 符号缓存命中计数（bd e1p）：daemon 每次调用前后差分 = 该调用的命中数。
+    cache_hit_counter: AtomicU64,
     /// 修 P1 #2 测试专用：覆盖默认 TTL 让单测可控；生产 build 不持此字段。
     #[cfg(test)]
     _idle_ttl_override: std::sync::Arc<Mutex<Option<Duration>>>,
@@ -586,6 +595,7 @@ impl Supervisor {
             symbol_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             delta_cache: Arc::new(Mutex::new(HashMap::new())),
             idle_buffers_reclaim_counter: AtomicU64::new(0),
+            cache_hit_counter: AtomicU64::new(0),
             ls_warmup: Mutex::new(HashMap::new()),
             #[cfg(test)]
             _idle_ttl_override: std::sync::Arc::new(Mutex::new(None)),
@@ -1987,7 +1997,12 @@ impl Supervisor {
 
     /// cache 命中查询；返回克隆（平铺 list 小，克隆远便宜于 LS 往返）。
     fn symbol_cache_get(&self, key: &SymbolCacheKey) -> Option<Vec<SymbolHit>> {
-        self.symbol_cache.lock().unwrap().get(key).cloned()
+        let hit = self.symbol_cache.lock().unwrap().get(key).cloned();
+        if hit.is_some() {
+            // bd e1p：命中计数（差分供 invocations.jsonl cache_hit 字段）。
+            self.cache_hit_counter.fetch_add(1, Ordering::Relaxed);
+        }
+        hit
     }
 
     /// 符号缓存写入内核（容量闸门 + 空集跳过）。P2-a5k 抽出供 `Supervisor::symbol_cache_put`
@@ -3517,7 +3532,7 @@ impl Supervisor {
         }
 
         // ===== 全局写门：以下所有步骤持锁（A4 FIFO）=====
-        let _gate = write_gate::acquire().await;
+        let _gate = write_gate::acquire("replace-body").await?;
 
         // 1) 锁内解析符号 range（杜绝客户端 range 过期）。
         let _guard = session.ensure_open(path).await.map_err(ToolError::Core)?;
@@ -3580,12 +3595,7 @@ impl Supervisor {
                 detail: format!("readback {}: {e}", path.display()),
             })?;
         if readback != new_text {
-            // 回滚：老内容写回。
-            let _ = atomic_write(path, &old_text).await;
-            return Err(ToolError::WriteConflict {
-                path: path.display().to_string(),
-                reason: "readback mismatch; rolled back".into(),
-            });
+            return Err(rollback_after_readback_mismatch(path, &old_text).await);
         }
 
         // 5) didChange 全量同步 → LS 与盘一致。
@@ -3836,7 +3846,7 @@ impl Supervisor {
             );
         }
 
-        let _gate = write_gate::acquire().await;
+        let _gate = write_gate::acquire("rename-symbol").await?;
 
         let pos = lsp_position_from_byte(&path, line, col, OffsetEncoding::Utf16).await?;
         let pos_params = json!({
@@ -3878,55 +3888,20 @@ impl Supervisor {
             reason: "rename response has neither `changes` map nor `documentChanges`".into(),
         })?;
 
-        // 4) 对每个文件应用 edits。
+        // 4) 对每个文件应用 edits。单文件失败 = 记入 skipped 后继续其余文件
+        // （不得静默，BD serena-rust-93q）。
         let mut report = RenameReport::default();
         let root_canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         for (uri, mut edits) in by_uri {
             edits.sort_by_key(|e| std::cmp::Reverse(e.0)); // 倒序
-            let abs = match uri_to_path(&uri) {
-                Some(p) => p,
-                None => continue,
-            };
-            // 必须在 root 内（防 path traversal 风险）。
-            if !abs.starts_with(&root_canon) {
-                continue;
-            }
-
-            let content = match tokio::fs::read_to_string(&abs).await {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let mut new_content = content.clone();
-            for (_key, range, new_text) in &edits {
-                let start_byte = match lsp_core::offsets::position_to_byte(
-                    &new_content,
-                    lsp_core::offsets::Position {
-                        line: range.start.line,
-                        character: range.start.character,
-                    },
-                    OffsetEncoding::Utf16,
-                ) {
-                    Ok(b) => b,
-                    Err(_) => break,
+            let (abs, content, new_content) =
+                match prepare_rename_file(&root_canon, &uri, &edits).await {
+                    Ok(v) => v,
+                    Err(skip) => {
+                        report.skipped.push(skip);
+                        continue;
+                    }
                 };
-                let end_byte = match lsp_core::offsets::position_to_byte(
-                    &new_content,
-                    lsp_core::offsets::Position {
-                        line: range.end.line,
-                        character: range.end.character,
-                    },
-                    OffsetEncoding::Utf16,
-                ) {
-                    Ok(b) => b,
-                    Err(_) => break,
-                };
-                new_content = format!(
-                    "{}{}{}",
-                    &new_content[..start_byte],
-                    new_text,
-                    &new_content[end_byte..]
-                );
-            }
 
             if new_content == content {
                 continue;
@@ -3982,7 +3957,7 @@ impl Supervisor {
             path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
         let uri_str = path_to_uri_str(&path);
 
-        let _gate = write_gate::acquire().await;
+        let _gate = write_gate::acquire("safe-delete-symbol").await?;
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         // 1) 锁内解析符号（杜绝过期 range）。
@@ -4086,11 +4061,7 @@ impl Supervisor {
                 detail: format!("readback {}: {e}", path.display()),
             })?;
         if readback != new_text {
-            let _ = atomic_write(&path, &old_text).await;
-            return Err(ToolError::WriteConflict {
-                path: path.display().to_string(),
-                reason: "readback mismatch; rolled back".into(),
-            });
+            return Err(rollback_after_readback_mismatch(&path, &old_text).await);
         }
         // 走 `ensure_open` 的 mtime-检测路径，与 tool_replace_body / edit_tools 共享
         // 同一 content_version 单调递增（rust-analyzer 拒收非单调 version → channel 关）。
@@ -4139,7 +4110,7 @@ impl Supervisor {
         // 统一走 root 界校验（词法 + canonical，含 symlink 语义）。
         let abs =
             path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
-        let _gate = write_gate::acquire().await;
+        let _gate = write_gate::acquire("create-text-file").await?;
         // 门内双检：并发两个 create 只成功一个（TOCTOU 防线）。
         if abs.exists() {
             return Err(ToolError::BadArgs {
@@ -4244,6 +4215,19 @@ pub struct RenameReport {
     pub edits_applied: usize,
     /// 相对 root 路径列表（agent 审计用）。
     pub files: Vec<String>,
+    /// 未能应用的文件与原因（BD serena-rust-93q：多文件部分失败必须可见，不得
+    /// 静默 continue）。空则省略，对旧客户端向后兼容（B0 hint 字段先例）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<RenameSkipped>,
+}
+
+/// rename 单文件跳过记录。
+#[derive(Debug, Serialize)]
+pub struct RenameSkipped {
+    /// 相对 root 路径；URI 无法解析时为原始 URI。
+    pub file: String,
+    /// 跳过原因（uri 不可解析 / root 外 / 读盘失败 / 编辑位置越界）。
+    pub reason: String,
 }
 
 /// 把 `file://...` URL 转回 PathBuf（percent-decode + Windows 盘符大写归一）。
@@ -4467,6 +4451,75 @@ fn parse_workspace_edit(resp: &serde_json::Value) -> Option<Vec<(String, Vec<Edi
                 .collect(),
         )
     }
+}
+
+/// rename 单文件准备：URI→path → root 守卫 → 读盘 → edits 逐条换字节区间。
+/// `Err` = 该文件整体跳过，原因进 `RenameReport.skipped`（BD serena-rust-93q：
+/// 多文件部分失败必须可见，不得静默 continue/break）。字节换算失败按整文件
+/// 跳过处理——部分应用的 rename 会留下不一致的引用状态，跳过并报告更安全。
+async fn prepare_rename_file(
+    root_canon: &Path,
+    uri: &str,
+    edits: &[EditSpec],
+) -> Result<(std::path::PathBuf, String, String), RenameSkipped> {
+    let abs = uri_to_path(uri).ok_or_else(|| RenameSkipped {
+        file: uri.to_string(),
+        reason: "uri not convertible to a file path".into(),
+    })?;
+    let rel = |p: &Path| {
+        p.strip_prefix(root_canon)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    // 必须在 root 内（防 path traversal 风险）。
+    if !abs.starts_with(root_canon) {
+        return Err(RenameSkipped {
+            file: rel(&abs),
+            reason: "outside workspace root".into(),
+        });
+    }
+    let content = tokio::fs::read_to_string(&abs)
+        .await
+        .map_err(|e| RenameSkipped {
+            file: rel(&abs),
+            reason: format!("read failed: {e}"),
+        })?;
+    let mut new_content = content.clone();
+    for (i, (_key, range, new_text)) in edits.iter().enumerate() {
+        let start_byte =
+            lsp_core::offsets::position_to_byte(
+                &new_content,
+                lsp_core::offsets::Position {
+                    line: range.start.line,
+                    character: range.start.character,
+                },
+                OffsetEncoding::Utf16,
+            )
+            .map_err(|_| RenameSkipped {
+                file: rel(&abs),
+                reason: format!("edit {i} start position out of range"),
+            })?;
+        let end_byte = lsp_core::offsets::position_to_byte(
+            &new_content,
+            lsp_core::offsets::Position {
+                line: range.end.line,
+                character: range.end.character,
+            },
+            OffsetEncoding::Utf16,
+        )
+        .map_err(|_| RenameSkipped {
+            file: rel(&abs),
+            reason: format!("edit {i} end position out of range"),
+        })?;
+        new_content = format!(
+            "{}{}{}",
+            &new_content[..start_byte],
+            new_text,
+            &new_content[end_byte..]
+        );
+    }
+    Ok((abs, content, new_content))
 }
 
 /// safe-delete 结果报告。
@@ -5605,6 +5658,11 @@ fn decode_semantic_tokens(data: &[lsp_types::SemanticToken]) -> Vec<SemanticToke
 }
 #[async_trait::async_trait]
 impl SupervisorTrait for Supervisor {
+    /// bd e1p：符号缓存命中总次数（`symbol_cache_get` 命中即 ++）。
+    fn cache_hits_total(&self) -> u64 {
+        self.cache_hit_counter.load(Ordering::Relaxed)
+    }
+
     async fn execute_tool(
         &self,
         tool: &str,
@@ -5672,7 +5730,7 @@ impl SupervisorTrait for Supervisor {
                     // 函数内的 gate 已释放 —— commit 若在门外落盘，可与并发 undo/redo
                     // 的 prune 交错。guard 活到 commit 完成：落盘毫秒级串行化，正确性
                     // 优先。commit_at 自身不加门（非重入门），顺序保证全靠此处。
-                    let _gate = write_gate::acquire().await;
+                    let _gate = write_gate::acquire("undo-commit").await?;
                     // commit_at 先取走 PENDING 再落盘（audit 内存 F8）：IO 失败时
                     // 条目已被 drain，settle 后向上报错不会二次泄漏。
                     let committed = undo::commit(root, txn_uid).await;
@@ -7019,6 +7077,20 @@ pub(crate) fn content_hash(text: &str) -> String {
 /// ↖ mirror: PR oraios/serena#2041（save edited source files atomically）对账 —
 /// 上游把编辑保存从截断写 `open(path,"w")` 改为 temp-file+`os.replace`，并要求
 /// symlink 目标**透传写**（rename 会把链接本体替换成普通文件，破坏链接关系）。
+/// readback 不符后的回滚收口（replace-body / safe-delete-symbol 两处 C3 防线共用）。
+/// 回滚本身失败必须如实上报（错误链带 rollback-failed 事实），不得谎报 rolled
+/// back——盘上新内容仍在，调用方必须知道（BD serena-rust-75k）。
+async fn rollback_after_readback_mismatch(path: &Path, old_text: &str) -> ToolError {
+    let reason = match atomic_write(path, old_text).await {
+        Ok(()) => "readback mismatch; rolled back".to_string(),
+        Err(e) => format!("readback mismatch; rollback FAILED ({e}); file left with new content"),
+    };
+    ToolError::WriteConflict {
+        path: path.display().to_string(),
+        reason,
+    }
+}
+
 /// 本项目 edit 链路本就走 tmp+rename（语义已对齐），唯一缺口即 symlink：
 /// rename 前先解析链接到真实目标，对目标做原子写。
 async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
@@ -8369,6 +8441,21 @@ mod symbol_cache_tests {
         let got = sup.symbol_cache_get(&key).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "f");
+    }
+
+    /// bd e1p：符号缓存命中即累计 `cache_hit_counter`（miss 不计）——daemon 在
+    /// 单次调用前后差分此值 = 该调用的命中与否，落 invocations.jsonl `cache_hit`。
+    #[tokio::test]
+    async fn cache_hit_bumps_counter_for_daemon_diffing() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        let key = doc_symbol_cache_key(root, "a.rs");
+        let before = sup.cache_hits_total();
+        assert!(sup.symbol_cache_get(&key).is_none(), "miss");
+        assert_eq!(sup.cache_hits_total(), before, "miss must not bump");
+        sup.symbol_cache_put(key.clone(), vec![hit("f")]);
+        assert!(sup.symbol_cache_get(&key).is_some(), "hit");
+        assert_eq!(sup.cache_hits_total(), before + 1, "hit must bump by 1");
     }
 
     /// invalidate：mtime 变 → key 变 → miss（下次重调 LS）。std set_modified，无新依赖。
@@ -10815,5 +10902,137 @@ mod path_traversal_tests {
             .await;
         assert!(result.is_ok(), "root 内新建应放行: {result:?}");
         assert!(proj.join("b.rs").is_file());
+    }
+}
+
+/// BD serena-rust-75k / 93q：静默失败清扫回归（回滚失败如实上报、rename 跳过可见）。
+#[cfg(test)]
+mod silent_failure_tests {
+    use super::*;
+
+    // ---- 75k：readback 回滚失败必须上报 ----
+
+    /// 回滚成功路径：文件恢复老内容，reason 如实报 rolled back（无 FAILED 字样）。
+    #[tokio::test]
+    async fn rollback_reports_restored_on_success() {
+        let tmp = tempfile::TempDir::new().expect("TempDir::new");
+        let path = tmp.path().join("a.rs");
+        std::fs::write(&path, "new content").unwrap();
+
+        let err = rollback_after_readback_mismatch(&path, "old content").await;
+        match err {
+            ToolError::WriteConflict { reason, .. } => {
+                assert!(reason.contains("rolled back"), "{reason}");
+                assert!(!reason.contains("FAILED"), "{reason}");
+            }
+            other => panic!("应为 WriteConflict，实得 {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old content");
+    }
+
+    /// 回滚失败路径（目录占位使写回必败）：reason 必须带 rollback FAILED 事实，
+    /// 不得谎报 rolled back。
+    #[tokio::test]
+    async fn rollback_failure_is_reported_not_lied() {
+        let tmp = tempfile::TempDir::new().expect("TempDir::new");
+        let blocker = tmp.path().join("blocked");
+        std::fs::create_dir(&blocker).unwrap(); // 目录占位 → atomic_write rename 必败
+
+        let err = rollback_after_readback_mismatch(&blocker, "old content").await;
+        match err {
+            ToolError::WriteConflict { path, reason } => {
+                assert!(reason.contains("rollback FAILED"), "{reason}");
+                assert!(!reason.contains("rolled back"), "{reason}");
+                assert!(path.contains("blocked"), "{path}");
+            }
+            other => panic!("应为 WriteConflict，实得 {other:?}"),
+        }
+    }
+
+    // ---- 93q：rename 单文件跳过分类 ----
+
+    fn file_uri(p: &Path) -> String {
+        format!("file:///{}", p.to_string_lossy().replace('\\', "/"))
+    }
+
+    #[tokio::test]
+    async fn prepare_rename_reports_unparsable_uri() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = prepare_rename_file(tmp.path(), "not-a-uri", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(err.file, "not-a-uri");
+        assert!(err.reason.contains("uri"), "{}", err.reason);
+    }
+
+    #[tokio::test]
+    async fn prepare_rename_reports_outside_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let f = outside.path().join("x.rs");
+        std::fs::write(&f, "fn a() {}\n").unwrap();
+        let f = dunce::canonicalize(&f).unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+
+        let err = prepare_rename_file(&root, &file_uri(&f), &[])
+            .await
+            .unwrap_err();
+        assert!(err.reason.contains("outside workspace root"), "{}", err.reason);
+        assert!(err.file.ends_with("x.rs"), "{}", err.file);
+    }
+
+    #[tokio::test]
+    async fn prepare_rename_applies_edits_and_reports_out_of_range() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let f = dunce::canonicalize(tmp.path().join("a.rs")).unwrap();
+        let pos = |l: u32, c: u32| lsp_types::Position { line: l, character: c };
+        let rng = |sl: u32, sc: u32, el: u32, ec: u32| lsp_types::Range {
+            start: pos(sl, sc),
+            end: pos(el, ec),
+        };
+
+        // 正常路径：edit 应用，内容与原内容都返回。
+        let edits = vec![(0u64, rng(0, 3, 0, 4), "b".to_string())];
+        let (abs, content, new_content) =
+            prepare_rename_file(&root, &file_uri(&f), &edits).await.unwrap();
+        assert_eq!(abs, f);
+        assert_eq!(content, "fn a() {}\nfn b() {}\n");
+        assert_eq!(new_content, "fn b() {}\nfn b() {}\n");
+
+        // 越界行 → 整文件跳过 + 原因可见（原 break 静默点）。
+        let bad = vec![(9u64, rng(999, 0, 999, 1), "x".to_string())];
+        let err = prepare_rename_file(&root, &file_uri(&f), &bad)
+            .await
+            .unwrap_err();
+        assert!(err.reason.contains("position out of range"), "{}", err.reason);
+        assert!(err.file.ends_with("a.rs"), "{}", err.file);
+    }
+
+    /// wire 双面：skipped 为空时字段省略（向后兼容），非空时随报告输出。
+    #[test]
+    fn rename_report_skipped_field_backward_compatible() {
+        let empty = RenameReport {
+            files_modified: 1,
+            edits_applied: 2,
+            files: vec!["a.rs".into()],
+            skipped: vec![],
+        };
+        let s = serde_json::to_string(&empty).unwrap();
+        assert!(!s.contains("skipped"), "{s}");
+
+        let partial = RenameReport {
+            files_modified: 1,
+            edits_applied: 1,
+            files: vec!["a.rs".into()],
+            skipped: vec![RenameSkipped {
+                file: "b.rs".into(),
+                reason: "read failed: os error 2".into(),
+            }],
+        };
+        let s = serde_json::to_string(&partial).unwrap();
+        assert!(s.contains("skipped"), "{s}");
+        assert!(s.contains("read failed"), "{s}");
     }
 }

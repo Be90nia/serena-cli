@@ -99,6 +99,8 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         drain_window: std::time::Duration::from_secs(15),
         // 7rh：SERENA_NO_TOKEN_ESTIMATE=1 → 工具成功响应不附 ~tokens 估算。
         no_token_estimate: std::env::var("SERENA_NO_TOKEN_ESTIMATE").ok().as_deref() == Some("1"),
+        // bd 7tk/e1p：观测面（/status 四字段 + invocation 日志增强）。
+        obs: crate::http::ObsState::default(),
     };
 
     // reaper 常驻：draining → 删 lock → 卸 LS。lock 归属戳 (path, boot_ms)
