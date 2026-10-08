@@ -124,9 +124,9 @@ fn resolve_launch() -> anyhow::Result<Vec<OsString>> {
 }
 
 /// uvx 分支 argv 构造（纯函数，版本钉单一事实源）。
-fn uvx_launch_argv_pinned(uvx: &OsString) -> Vec<OsString> {
+fn uvx_launch_argv_pinned(uvx: &std::path::Path) -> Vec<OsString> {
     vec![
-        uvx.into(),
+        uvx.as_os_str().into(),
         "--from".into(),
         format!("pyrefly=={PYREFLY_VERSION}").into(),
         "pyrefly".into(),
@@ -136,7 +136,7 @@ fn uvx_launch_argv_pinned(uvx: &OsString) -> Vec<OsString> {
 
 #[cfg(test)]
 fn uvx_launch_argv() -> Vec<OsString> {
-    uvx_launch_argv_pinned(&std::ffi::OsString::from("uvx"))
+    uvx_launch_argv_pinned(std::path::Path::new("uvx"))
 }
 
 #[async_trait]
