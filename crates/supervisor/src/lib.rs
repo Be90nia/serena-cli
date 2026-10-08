@@ -43,11 +43,24 @@ pub mod undo;
 pub mod warm;
 pub mod write_gate;
 
+use ls_adapters::symbol_quirks;
 use lsp_core::types::{SymbolHit, SymbolKindTag};
 use lsp_types::{DocumentSymbol, DocumentSymbolResponse, Position};
 use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
+
+/// per-request documentSymbol 会话重路由（angular `.html` → vscode-html 伴生，
+/// ↖ mirror 上游路由表；其余语言/文件恒等返回）。session 已在手的内联路径用。
+fn reroute_doc_symbols(session: Arc<Session>, root: &Path, file: &str) -> Arc<Session> {
+    if let Some(adapter) = ls_registry::adapter_for(&session.language_id())
+        && let Some(s) =
+            adapter.session_for_file(root, Path::new(file), "textDocument/documentSymbol")
+    {
+        return s;
+    }
+    session
+}
 
 /// Read-only tool timeout. overview/def/refs on small files complete in ms; clangd
 /// cold-start of a project may take seconds. 30s mirrors `READY_PROBE_TIMEOUT`.
@@ -1343,6 +1356,14 @@ impl Supervisor {
         file: &str,
         lang: &str,
     ) -> ToolResult<Arc<Session>> {
+        // per-file 重路由优先（angular `.html` references → ngserver 伴生，↖ mirror
+        // 上游路由表；调用于 references 类工具，method 恒 references）。
+        if let Some(adapter) = ls_registry::adapter_for(lang)
+            && let Some(s) =
+                adapter.session_for_file(root, Path::new(file), "textDocument/references")
+        {
+            return Ok(s);
+        }
         let is_ts_like = std::path::Path::new(file)
             .extension()
             .and_then(|e| e.to_str())
@@ -1356,6 +1377,24 @@ impl Supervisor {
         if is_ts_like
             && let Some(adapter) = ls_registry::adapter_for(lang)
             && let Some(s) = adapter.semantic_session(root)
+        {
+            return Ok(s);
+        }
+        self.semantic_session_or_main(root, lang).await
+    }
+
+    /// per-request 会话重路由：adapter 的 session_for_file（angular `.html` →
+    /// ngserver/html 伴生，↖ mirror 上游 (扩展名 × 方法) 路由表）优先；未路由回落
+    /// [`Self::semantic_session_or_main`]。
+    async fn session_for_request(
+        &self,
+        root: &Path,
+        lang: &str,
+        file: &str,
+        method: &str,
+    ) -> ToolResult<Arc<Session>> {
+        if let Some(adapter) = ls_registry::adapter_for(lang)
+            && let Some(s) = adapter.session_for_file(root, Path::new(file), method)
         {
             return Ok(s);
         }
@@ -1384,7 +1423,9 @@ impl Supervisor {
         lang_override: Option<&str>,
     ) -> ToolResult<Option<lsp_types::Hover>> {
         let lang = resolve_lang_for_file(file, lang_override)?;
-        let session = self.semantic_session_or_main(root, lang.as_str()).await?;
+        let session = self
+            .session_for_request(root, lang.as_str(), file, "textDocument/hover")
+            .await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
@@ -1413,7 +1454,9 @@ impl Supervisor {
         lang_override: Option<&str>,
     ) -> ToolResult<Option<lsp_types::SignatureHelp>> {
         let lang = resolve_lang_for_file(file, lang_override)?;
-        let session = self.semantic_session_or_main(root, lang.as_str()).await?;
+        let session = self
+            .session_for_request(root, lang.as_str(), file, "textDocument/signatureHelp")
+            .await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
@@ -2244,6 +2287,9 @@ impl Supervisor {
     ) -> ToolResult<Vec<SymbolHit>> {
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
+        // angular `.html` → vscode-html 伴生（ngserver documentSymbol 恒 -32601）；
+        // didOpen/ensure_open 跟随重路由会话（tsls 不吃 .html）。
+        let session = reroute_doc_symbols(session, root, file);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         let params = json!({ "textDocument": { "uri": uri.clone() } });
@@ -2260,9 +2306,8 @@ impl Supervisor {
             .request("textDocument/documentSymbol", params, timeout)
             .await?;
 
-        Ok(flatten_symbols(resp, &uri))
+        Ok(flatten_symbols(resp, &uri, lang_str))
     }
-
     /// 跨文件符号树（PLAN Phase 2.5 / 7.2）：聚合 `dir` 下源码文件的 documentSymbol。
     ///
     /// 逐文件走 `tool_overview` —— 天然复用 3.1 缓存（同文件二次 symbol-tree/overview
@@ -2488,6 +2533,8 @@ impl Supervisor {
         let session = self.session_for(root, &lang_str).await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
+        // angular `.html` → vscode-html 伴生（结构 outline 上的 containing walk）。
+        let session = reroute_doc_symbols(session, root, file);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         let params = json!({ "textDocument": { "uri": uri.clone() } });
@@ -2496,7 +2543,13 @@ impl Supervisor {
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
 
-        Ok(collect_containing_hits(resp.as_ref(), &uri, line, col))
+        Ok(collect_containing_hits(
+            resp.as_ref(),
+            &uri,
+            line,
+            col,
+            &lang_str,
+        ))
     }
 
     /// `defining-symbol`：位置 → `tool_def` 拿 Location → 在该 Location 上 documentSymbol
@@ -2546,6 +2599,8 @@ impl Supervisor {
         let session = self.session_for(root, &target_lang).await?;
         let target_path = root.join(&def_file);
         let target_uri = path_to_uri_str(&target_path);
+        // angular `.html` 定义落点 → vscode-html 伴生 outline（ngserver 恒 -32601）。
+        let session = reroute_doc_symbols(session, root, &def_file);
         let _guard = session
             .ensure_open(&target_path)
             .await
@@ -2562,6 +2617,7 @@ impl Supervisor {
             &target_uri,
             def_loc.range.start.line,
             def_loc.range.start.character,
+            &target_lang,
         );
         if hits.is_empty() {
             return Ok(Some(Vec::new()));
@@ -2811,7 +2867,7 @@ impl Supervisor {
                     tracing::debug!(uri, round = n_rounds, "realign docsym request failed");
                     continue;
                 };
-                let flat = flatten_symbols(resp, curi.as_str());
+                let flat = flatten_symbols(resp, curi.as_str(), lang.as_str());
                 // docsym 自身也过磁盘校验 —— 旧 parse tree（RA 分析未跟上 didChange）
                 // 同样视为未对齐，等下一轮。（判定用全表，过滤只影响替换内容。）
                 let disk_ok = hits_match_disk_for_file(&path, &flat);
@@ -3312,6 +3368,10 @@ impl Supervisor {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let uri = path_to_uri_str(&path);
+        // angular `.html` → vscode-html 伴生（didOpen/请求跟随；缓存 hit 分支不经
+        // 此——.html 符号体走伴生后写入同一张 docsym 缓存，键 = (root, file) 与
+        // html 门天然共享）。
+        let session = reroute_doc_symbols(session, root, file);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         let params = json!({ "textDocument": { "uri": uri.clone() } });
@@ -3321,11 +3381,12 @@ impl Supervisor {
             .await?;
 
         // 递归找第一个 name == symbol 的 DocumentSymbol（Nested 形态）。
-        let range = find_symbol_range(resp.as_ref(), symbol).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("symbol `{symbol}` not found in {file}"),
-        })?;
+        let range =
+            find_symbol_range(resp.as_ref(), symbol, &lang).ok_or_else(|| ToolError::BadArgs {
+                detail: format!("symbol `{symbol}` not found in {file}"),
+            })?;
         let out = read_and_slice(&path, file, range).await?;
-        self.symbol_cache_put(cache_key, flatten_symbols(resp, &uri)); // cache_miss → 写入
+        self.symbol_cache_put(cache_key, flatten_symbols(resp, &uri, &lang)); // cache_miss → 写入
         Ok(out)
     }
 
@@ -3417,9 +3478,10 @@ impl Supervisor {
         let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
-        let range = find_symbol_range(resp.as_ref(), symbol).ok_or_else(|| ToolError::BadArgs {
-            detail: format!("symbol `{symbol}` not found in {}", path.display()),
-        })?;
+        let range =
+            find_symbol_range(resp.as_ref(), symbol, lang).ok_or_else(|| ToolError::BadArgs {
+                detail: format!("symbol `{symbol}` not found in {}", path.display()),
+            })?;
 
         // 2) 读盘 + content-hash 对账（C3 防线 ①）。
         let old_text = tokio::fs::read_to_string(path)
@@ -3879,8 +3941,19 @@ impl Supervisor {
         let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
+        // per-LS quirk：fortls 的 selectionRange 恒指行首（↖ mirror
+        // fortran_language_server.py@7a296833 `_build_document_symbols_from_raw_symbols`
+        // 覆写）——references 锚点修到标识符真实位置，否则 safe-delete 的 references
+        // 恒空/错锚。读盘失败按原样放行（修正 best-effort）。
+        let mut resp = resp;
+        if lang == "fortran"
+            && let Some(DocumentSymbolResponse::Nested(items)) = resp.as_mut()
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            symbol_quirks::fix_fortls_selection_ranges(items, &content);
+        }
         let (range, selection) =
-            find_symbol_node(resp.as_ref(), symbol).ok_or_else(|| ToolError::BadArgs {
+            find_symbol_node(resp.as_ref(), symbol, &lang).ok_or_else(|| ToolError::BadArgs {
                 detail: format!("symbol `{symbol}` not found in {file}"),
             })?;
 
@@ -4396,13 +4469,21 @@ pub struct SearchResponse {
 /// M0 客户端声明 `hierarchicalDocumentSymbolSupport=true`，clangd 一定回 Nested 形态；
 /// Flat 仅 mock_ls 用得到，但本模块不耦合 mock_ls，故对两种形态都处理。
 /// `None`（LS 对未就绪/未加载文档返 `null`，如 rust-analyzer）按无符号（合法空）处理。
-fn flatten_symbols(resp: Option<DocumentSymbolResponse>, file_uri: &str) -> Vec<SymbolHit> {
+///
+/// `lang`：per-LS 符号名归一（↖ mirror 上游 `_normalize_symbol_name` 构建层挂点；
+/// erlang `/`→`#`、lua/swift 前缀剥离、nextflow 关键字剥离——ls-adapters
+/// `symbol_quirks`，未覆盖语言恒等）。
+fn flatten_symbols(
+    resp: Option<DocumentSymbolResponse>,
+    file_uri: &str,
+    lang: &str,
+) -> Vec<SymbolHit> {
     let mut out = Vec::new();
     match resp {
         Some(DocumentSymbolResponse::Flat(items)) => {
             for it in items {
                 out.push(SymbolHit {
-                    name: it.name,
+                    name: symbol_quirks::normalize_symbol_name(lang, &it.name, it.kind),
                     kind: kind_from_lsp(&it.kind),
                     uri: it.location.uri.to_string(),
                     range: it.location.range,
@@ -4412,7 +4493,7 @@ fn flatten_symbols(resp: Option<DocumentSymbolResponse>, file_uri: &str) -> Vec<
         }
         Some(DocumentSymbolResponse::Nested(items)) => {
             for it in items {
-                push_nested(&it, None, file_uri, &mut out);
+                push_nested(&it, None, file_uri, lang, &mut out);
             }
         }
         None => {}
@@ -4424,11 +4505,12 @@ fn push_nested(
     sym: &DocumentSymbol,
     container: Option<String>,
     file_uri: &str,
+    lang: &str,
     out: &mut Vec<SymbolHit>,
 ) {
     let container = container.or_else(|| Some(sym.name.clone()));
     out.push(SymbolHit {
-        name: sym.name.clone(),
+        name: symbol_quirks::normalize_symbol_name(lang, &sym.name, sym.kind),
         kind: kind_from_lsp(&sym.kind),
         uri: file_uri.to_string(),
         range: sym.range,
@@ -4436,7 +4518,7 @@ fn push_nested(
     });
     if let Some(children) = sym.children.as_ref() {
         for child in children {
-            push_nested(child, Some(sym.name.clone()), file_uri, out);
+            push_nested(child, Some(sym.name.clone()), file_uri, lang, out);
         }
     }
 }
@@ -4495,15 +4577,22 @@ async fn overview_via_session(
     let lang_str = resolve_lang_for_file(&file, lang_override)?;
     let path = root.join(&file);
     let uri = path_to_uri_str(&path);
-    let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+    // angular `.html` → vscode-html 伴生（'static 并发路径与 tool_overview_inner
+    // 同语义；didOpen/ensure_open 跟随重路由会话——tsls 不吃 .html；flatten 的
+    // lang 用原会话语言——伴生是 html 门，符号名无归一 quirk）。
+    let resp_session = reroute_doc_symbols(Arc::clone(&session), &root, &file);
+    let _guard = resp_session
+        .ensure_open(&path)
+        .await
+        .map_err(ToolError::Core)?;
     let timeout = ls_registry::config::effective_timeout_ms(&lang_str, None)
         .map(|ms| Duration::from_millis(ms as u64))
         .unwrap_or(TOOL_TIMEOUT);
     let params = serde_json::json!({ "textDocument": { "uri": uri.clone() } });
-    let resp: Option<DocumentSymbolResponse> = session
+    let resp: Option<DocumentSymbolResponse> = resp_session
         .request("textDocument/documentSymbol", params, timeout)
         .await?;
-    let out = flatten_symbols(resp, &uri);
+    let out = flatten_symbols(resp, &uri, &session.language_id());
     // 写入走 `symbol_cache_put_impl`（与 `Supervisor::symbol_cache_put` 同语义：
     // 空不写 + 超 SYMBOL_CACHE_MAX_ENTRIES 全清）。直 .insert 会绕过容量闸门。
     let mut cache = cache_arc.lock().unwrap();
@@ -4526,6 +4615,7 @@ fn collect_containing_hits(
     file_uri: &str,
     line: u32,
     col: u32,
+    lang: &str,
 ) -> Vec<SymbolHit> {
     let Some(resp) = resp else {
         return Vec::new();
@@ -4536,23 +4626,24 @@ fn collect_containing_hits(
         line: u32,
         col: u32,
         container: Option<&str>,
+        lang: &str,
         out: &mut Vec<SymbolHit>,
     ) {
         for it in items {
             if position_in_range(it.range, line, col) {
                 out.push(SymbolHit {
-                    name: it.name.clone(),
+                    name: symbol_quirks::normalize_symbol_name(lang, &it.name, it.kind),
                     kind: kind_from_lsp(&it.kind),
                     uri: file_uri.to_owned(),
                     range: it.range,
                     container: container.map(str::to_owned),
                 });
                 if let Some(children) = it.children.as_ref() {
-                    walk(children, file_uri, line, col, Some(&it.name), out);
+                    walk(children, file_uri, line, col, Some(&it.name), lang, out);
                 }
             } else if let Some(children) = it.children.as_ref() {
                 // 父节点不命中但子节点仍可能命中（罕见：嵌套树里父 range 比子 range 大）。
-                walk(children, file_uri, line, col, container, out);
+                walk(children, file_uri, line, col, container, lang, out);
             }
         }
     }
@@ -4560,7 +4651,7 @@ fn collect_containing_hits(
     match resp {
         DocumentSymbolResponse::Nested(items) => {
             let mut out = Vec::new();
-            walk(items, file_uri, line, col, None, &mut out);
+            walk(items, file_uri, line, col, None, lang, &mut out);
             out
         }
         DocumentSymbolResponse::Flat(items) => {
@@ -4569,7 +4660,7 @@ fn collect_containing_hits(
                 .iter()
                 .filter(|it| position_in_range(it.location.range, line, col))
                 .map(|it| SymbolHit {
-                    name: it.name.clone(),
+                    name: symbol_quirks::normalize_symbol_name(lang, &it.name, it.kind),
                     kind: kind_from_lsp(&it.kind),
                     uri: it.location.uri.to_string(),
                     range: it.location.range,
@@ -6484,17 +6575,21 @@ pub(crate) fn normalize_implementations(raw: Option<&serde_json::Value>) -> Vec<
 /// 递归在 Nested documentSymbol 里找第一个 name == `symbol` 的 range。
 /// Flat 形态（SymbolInformation）不含子符号，这里只处理 Nested —— clangd/mock_ls 都是 Nested。
 /// `None`（LS 对未就绪/未加载文档返 `null`）视为未找到。
+///
+/// 匹配键 = per-LS 归一后的 LS 名（↖ mirror 上游归一命名空间寻址——erlang
+/// "create_user#2"、lua "M.foo"→"foo"；`lang` 见 `flatten_symbols` 注）。
 fn find_symbol_range(
     resp: Option<&DocumentSymbolResponse>,
     symbol: &str,
+    lang: &str,
 ) -> Option<lsp_types::Range> {
-    fn walk(items: &[DocumentSymbol], symbol: &str) -> Option<lsp_types::Range> {
+    fn walk(items: &[DocumentSymbol], symbol: &str, lang: &str) -> Option<lsp_types::Range> {
         for it in items {
-            if it.name == symbol {
+            if symbol_quirks::normalize_symbol_name(lang, &it.name, it.kind) == symbol {
                 return Some(it.range);
             }
             if let Some(children) = it.children.as_ref()
-                && let Some(r) = walk(children, symbol)
+                && let Some(r) = walk(children, symbol, lang)
             {
                 return Some(r);
             }
@@ -6502,7 +6597,7 @@ fn find_symbol_range(
         None
     }
     match resp? {
-        DocumentSymbolResponse::Nested(items) => walk(items, symbol),
+        DocumentSymbolResponse::Nested(items) => walk(items, symbol, lang),
         DocumentSymbolResponse::Flat(_) => None,
     }
 }
@@ -6532,21 +6627,24 @@ async fn read_and_slice(path: &Path, file: &str, range: lsp_types::Range) -> Too
 /// 找符号的 `(range, selectionRange)`：range = 删除范围，selectionRange = 标识符
 /// 位置（references 锚点）。Flat 形态无 selectionRange，用 location.range 起点近似
 /// （SymbolInformation 的 location 即标识符所在位置）。
+/// 匹配键同 `find_symbol_range`（归一命名空间）。
 /// `None`（LS 对未就绪/未加载文档返 `null`）视为未找到。
 fn find_symbol_node(
     resp: Option<&DocumentSymbolResponse>,
     symbol: &str,
+    lang: &str,
 ) -> Option<(lsp_types::Range, lsp_types::Range)> {
     fn walk(
         items: &[DocumentSymbol],
         symbol: &str,
+        lang: &str,
     ) -> Option<(lsp_types::Range, lsp_types::Range)> {
         for it in items {
-            if it.name == symbol {
+            if symbol_quirks::normalize_symbol_name(lang, &it.name, it.kind) == symbol {
                 return Some((it.range, it.selection_range));
             }
             if let Some(children) = it.children.as_ref()
-                && let Some(r) = walk(children, symbol)
+                && let Some(r) = walk(children, symbol, lang)
             {
                 return Some(r);
             }
@@ -6554,10 +6652,10 @@ fn find_symbol_node(
         None
     }
     match resp? {
-        DocumentSymbolResponse::Nested(items) => walk(items, symbol),
+        DocumentSymbolResponse::Nested(items) => walk(items, symbol, lang),
         DocumentSymbolResponse::Flat(items) => items
             .iter()
-            .find(|it| it.name == symbol)
+            .find(|it| symbol_quirks::normalize_symbol_name(lang, &it.name, it.kind) == symbol)
             .map(|it| (it.location.range, it.location.range)),
     }
 }
@@ -7116,7 +7214,7 @@ mod containing_symbol_tests {
     fn deepest_match_wins_inside_nested_function_body() {
         let resp = nested_two_level();
         // inner @ 4-5；位置 line=4 col=10 落在 inner 内（且在 outer 内）。
-        let hits = collect_containing_hits(Some(&resp), "file://x", 4, 10);
+        let hits = collect_containing_hits(Some(&resp), "file://x", 4, 10, "rust");
         assert_eq!(hits.len(), 2, "expected outer+inner chain, got {hits:?}");
         assert_eq!(hits[0].name, "outer");
         assert_eq!(hits[0].container, None);
@@ -7128,7 +7226,7 @@ mod containing_symbol_tests {
     fn position_outside_any_symbol_returns_empty() {
         let resp = single_module();
         // outer @ line 0-10；line=20 越过 end.line。
-        let hits = collect_containing_hits(Some(&resp), "file://x", 20, 0);
+        let hits = collect_containing_hits(Some(&resp), "file://x", 20, 0, "rust");
         assert!(hits.is_empty(), "expected empty, got {hits:?}");
     }
 
@@ -7136,7 +7234,7 @@ mod containing_symbol_tests {
     fn position_at_first_char_of_first_line_hits_only_outer() {
         let resp = nested_two_level();
         // outer @ 0-10；inner @ 4-5；line=0 落在 outer（不在 inner）。
-        let hits = collect_containing_hits(Some(&resp), "file://x", 0, 0);
+        let hits = collect_containing_hits(Some(&resp), "file://x", 0, 0, "rust");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "outer");
     }
@@ -7167,7 +7265,7 @@ mod containing_symbol_tests {
             container_name: None,
         };
         let resp = DocumentSymbolResponse::Flat(vec![foo, bar]);
-        let hits = collect_containing_hits(Some(&resp), "file://x", 6, 0);
+        let hits = collect_containing_hits(Some(&resp), "file://x", 6, 0, "rust");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "bar");
     }

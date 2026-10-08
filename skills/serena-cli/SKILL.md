@@ -70,6 +70,8 @@ stdout = 紧凑 JSON（默认）+ 可能的 `[warn]` 前缀行；失败 `{"ok":f
 
 未装 LS → `install <lang>`（73 种可装，自动下载+sha256 校验；T2 语言如 rust 走生态原生命令，见环境处置节）。已知边界：bash hover 恒空（依赖 Unix man 页）；vue 诊断受限（走 tsserver 桥待接）；jdtls 需 JRE 25+。
 
+**专有 LS 用户配置**：个别 server 需要你机器的专有路径才可用——matlab 门要求告知 MATLAB 安装路径（上游对 `workspace/configuration` 应答 `installPath`，launch env 注入 `MATLAB_INSTALL_PATH`；无它 LS 拉不起 MATLAB 进程）。`servers.toml` 的 `[servers.matlab]` 下附注释模板，取消注释并替换为实际安装目录即可（README「Vendor-specific LS configuration」同款说明）。
+
 ## 环境事实
 
 - 首次命令 lazy-spawn 后台 daemon（~5s），之后毫秒级；闲置 10 分钟 LS 被收割、15 分钟 daemon 自退（`SERENA_IDLE_TIMEOUT_SECS=0` 可禁）。

@@ -139,6 +139,21 @@ serena-cli ls-remove marksman                    # uninstall serena-managed cach
 
 Registration takes effect after a daemon restart (`serena-cli stop-all` or the idle timeout). Entries are plain TOML — hand-editing is fine; `ls-use` only rewrites its own `[servers.<id>]` block.
 
+### Vendor-specific LS configuration (MATLAB)
+
+Some servers need your machine's own paths to work at all. MATLAB's language server, for example, must be told where MATLAB is installed (↖ upstream `matlab_language_server.py` replies `installPath` / `matlabConnectionTiming` to `workspace/configuration` and injects `MATLAB_INSTALL_PATH` into the launch env). `servers.toml` ships the template **commented out** under `[servers.matlab]` — point both paths at your install and uncomment:
+
+```toml
+[[servers.matlab.config_reply]]
+section = "MATLAB"
+value = { installPath = "C:/Program Files/MATLAB/R2024b", matlabConnectionTiming = "onStart" }
+
+[servers.matlab.env]
+MATLAB_INSTALL_PATH = "C:/Program Files/MATLAB/R2024b"
+```
+
+This uses the same override channels as `external-servers.toml` / `ls-use` (`config_reply` answers the server's `workspace/configuration`; `env` adds launch environment variables). Restart the daemon afterwards (`serena-cli stop-all`).
+
 ## Golden path (8 commands, ~90% of agent traffic)
 
 ```bash

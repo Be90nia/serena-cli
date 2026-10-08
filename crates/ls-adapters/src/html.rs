@@ -33,11 +33,13 @@ use crate::{
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// npm 缓存目录 id + 版本 pin（对齐 servers.toml [servers.html]，禁随意改）。
-const CACHE_ID: &str = "html";
-const CACHE_VERSION: &str = "4.10.0";
+/// pub：angular.rs 的 vscode-html 伴生复用同一缓存（angular_language_server.py
+/// 的 VsCodeHtmlLanguageServer 伴生同包）。
+pub const CACHE_ID: &str = "html";
+pub const CACHE_VERSION: &str = "4.10.0";
 
 /// `serena-cli install html` 产物里的 bin 名（= servers.toml bin_rel）。
-const BIN_REL: &str = "vscode-html-language-server";
+pub const BIN_REL: &str = "vscode-html-language-server";
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HtmlAdapter;

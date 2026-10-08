@@ -24,6 +24,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lsp_types::InitializeParams;
 
+pub mod angular;
 pub mod astro;
 pub mod basedpyright_server;
 pub mod bash;
@@ -39,11 +40,13 @@ pub mod json;
 pub mod nextflow;
 pub mod powershell;
 pub mod pyre_server;
+pub mod pyrefly_server;
 pub mod pyright;
 pub mod rust_analyzer;
 pub mod sass;
 pub mod scala;
 pub mod svelte;
+pub mod symbol_quirks;
 pub mod ty_server;
 pub mod typescript;
 pub mod vts;
@@ -258,6 +261,21 @@ pub enum LanguageId {
     /// 扩展族 .hlsl/.hlsli/.fx/.fxh/.cginc/.compute/.shader/.glsl/.vert/.frag/
     /// .geom/.tesc/.tese/.comp/.wgsl（上游支持全清单 15 个）。
     Hlsl,
+    /// T2 手写适配器（上游对拍采纳 W3b 批，pyrefly_server.rs，上游 7a296833）：
+    /// Meta pyrefly Python 类型检查器，`uvx --from pyrefly==1.2.0 pyrefly lsp`。
+    /// Python 变体门（python_ty 同族）——.py 归主 Python 门，仅 `--lang
+    /// python_pyrefly` 显式路由可达（deno/pgsql 先例）；didOpen 官方 languageId
+    /// "python"（`lsp_language_id` 已映射）。
+    /// ↖ mirror: pyrefly_server.py@7a296833。
+    PythonPyrefly,
+    /// T2 手写三服务器编排适配器（上游对拍采纳 W3b 批，angular.rs，上游 7a296833）：
+    /// 主会话 = typescript-language-server 挂 @angular/language-service 插件；ngserver
+    /// 伴生（.html definition/hover/references）+ vscode-html 伴生（.html
+    /// documentSymbol）经 `session_for_file` 按扩展名×方法重路由。.ts/.html 归既有
+    /// TypeScript/Html 门，仅 `--lang angular` 显式路由可达（pgsql/mysql 先例）。
+    /// 硬前提 tsconfig + npm install（不满足 = 探针空 + warning 放行）。
+    /// ↖ mirror: angular_language_server.py@7a296833。
+    Angular,
 }
 
 impl LanguageId {
@@ -332,6 +350,8 @@ impl LanguageId {
             Self::Ada => "ada",
             Self::Al => "al",
             Self::Hlsl => "hlsl",
+            Self::PythonPyrefly => "python_pyrefly",
+            Self::Angular => "angular",
         }
     }
     /// 反向：lang 字符串 → LanguageId。未知返 None。
@@ -408,6 +428,10 @@ impl LanguageId {
             "ada" => Some(Self::Ada),
             "al" => Some(Self::Al),
             "hlsl" => Some(Self::Hlsl),
+            // W3b 批：Python 变体门（python_ty 同族，仅显式路由可达）。
+            "python_pyrefly" => Some(Self::PythonPyrefly),
+            // W3b 批：三服务器编排门（.ts/.html 归既有门，仅显式路由可达）。
+            "angular" => Some(Self::Angular),
             _ => None,
         }
     }
@@ -633,6 +657,11 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::Ada => &["ada", "adb", "ads"],
         LanguageId::Al => &["al"],
         LanguageId::Hlsl => &["hlsl", "fx", "glsl", "wgsl"],
+        // W3b 批：Python 变体门——探针 .py（LS 就是吃 Python 源文件的）。
+        LanguageId::PythonPyrefly => &["py"],
+        // W3b 批：angular 门——探针 .ts（主会话是 tsls；.html 探针会经重路由打
+        // ngserver，无探针价值）。
+        LanguageId::Angular => &["ts"],
     }
 }
 
@@ -841,6 +870,20 @@ pub trait LanguageServerAdapter: Send + Sync {
     /// 调用位次：ensure_open（didOpen）之后、references 请求之前（ref_tools
     /// fetch_references）。默认空实现。
     async fn pre_references(&self, _session: &lsp_core::session::Session, _file: &Path) {}
+
+    /// per-file 会话重路由（angular 三服务器编排用：`.html` 的语义请求按方法分流到
+    /// ngserver / vscode-html 伴生 —— 上游按 (扩展名 × 方法) 路由表的适配形态）。
+    /// 返回 `Some` 时 supervisor 把该 (file, method) 的请求发到返回的会话（含
+    /// ensure_open/didOpen）；`None` = 维持调用方原会话。`method` = LSP 方法名
+    /// （如 "textDocument/documentSymbol"）。默认恒 `None`。
+    fn session_for_file(
+        &self,
+        _root: &Path,
+        _file: &Path,
+        _method: &str,
+    ) -> Option<std::sync::Arc<lsp_core::session::Session>> {
+        None
+    }
 }
 
 /// 在 PATH 中查找可执行文件（去 UNC 前缀 dunce），返回 None 表示未找到。

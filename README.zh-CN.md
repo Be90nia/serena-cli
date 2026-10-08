@@ -141,6 +141,21 @@ serena-cli ls-remove marksman                    # 只卸载 serena 托管缓存
 
 注册在 daemon 重启后生效（`serena-cli stop-all` 或等空闲超时）。条目是普通 TOML，可手改；`ls-use` 只重写自己的 `[servers.<id>]` 块。
 
+### 专有 LS 配置（MATLAB）
+
+部分 server 必须知道你机器上的专有路径才能工作。以 MATLAB 为例：其 language server 需要被告知 MATLAB 的安装位置（↖ 上游 `matlab_language_server.py` 对 `workspace/configuration` 应答 `installPath` / `matlabConnectionTiming`，并在启动 env 注入 `MATLAB_INSTALL_PATH`）。`servers.toml` 在 `[servers.matlab]` 下附有**注释掉的**模板——把两处路径换成你的安装目录后取消注释：
+
+```toml
+[[servers.matlab.config_reply]]
+section = "MATLAB"
+value = { installPath = "C:/Program Files/MATLAB/R2024b", matlabConnectionTiming = "onStart" }
+
+[servers.matlab.env]
+MATLAB_INSTALL_PATH = "C:/Program Files/MATLAB/R2024b"
+```
+
+通道与 `external-servers.toml` / `ls-use` 同源（`config_reply` 应答 server 的 `workspace/configuration`；`env` 追加启动环境变量）。改完重启 daemon（`serena-cli stop-all`）。
+
 ## 黄金路径（8 条命令，约占 agent 流量的 90%）
 
 ```bash

@@ -21,12 +21,13 @@ pub mod spec;
 
 pub use ls_adapters::LanguageId;
 use ls_adapters::{
-    LanguageServerAdapter, astro::AstroAdapter, bash::BashAdapter, clangd::ClangdAdapter,
-    csharp_ls::CsharpLsAdapter, css::CssAdapter, deno::DenoAdapter, gopls::GoplsAdapter,
-    html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter, nextflow::NextflowAdapter,
-    powershell::PowerShellAdapter, pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter,
-    sass::SassAdapter, scala::ScalaAdapter, svelte::SvelteAdapter,
-    typescript::TypescriptLanguageServerAdapter, vts::VtsAdapter, vue::VueAdapter,
+    LanguageServerAdapter, angular::AngularAdapter, astro::AstroAdapter, bash::BashAdapter,
+    clangd::ClangdAdapter, csharp_ls::CsharpLsAdapter, css::CssAdapter, deno::DenoAdapter,
+    gopls::GoplsAdapter, html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter,
+    nextflow::NextflowAdapter, powershell::PowerShellAdapter, pyrefly_server::PyreflyServerAdapter,
+    pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter, sass::SassAdapter,
+    scala::ScalaAdapter, svelte::SvelteAdapter, typescript::TypescriptLanguageServerAdapter,
+    vts::VtsAdapter, vue::VueAdapter,
 };
 
 /// 扩展名 → LanguageId 静态表（小写键）。
@@ -228,6 +229,8 @@ singleton!(SASS, SassAdapter);
 singleton!(VTS, VtsAdapter);
 singleton!(NEXTFLOW, NextflowAdapter);
 singleton!(SCALA, ScalaAdapter);
+singleton!(PYREFLY, PyreflyServerAdapter);
+singleton!(ANGULAR, AngularAdapter);
 
 /// 路径 → 语言。扩展名小写后查表，命中即返回；其余 None。
 ///
@@ -305,6 +308,16 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         // 符号名前缀剥离/progress 等待需适配器挂点，bd 69e findings batchC）；
         // servers.toml 条目留 install/doctor（did_change_config 通道仍按 spec 应用）。
         LanguageId::Nextflow => NEXTFLOW.clone(),
+        // pyrefly：T2 接管会话（W3b 采纳——workspace/configuration 必答 + pyrefly.toml
+        // 边界 + $/progress 索引等待需适配器挂点，bd 69e findings batchA 缺失[高]）；
+        // servers.toml [servers.python_pyrefly].uvx 留 install/doctor 面。.py 归主
+        // Python 门，--lang python_pyrefly 显式路由可达。
+        LanguageId::PythonPyrefly => PYREFLY.clone(),
+        // angular：T2 三服务器编排（W3b 采纳——主 tsls 挂 @angular/language-service
+        // 插件 + ngserver/html 伴生经 session_for_file 重路由，bd 69e findings
+        // batchC）；servers.toml [servers.angular].npm 留 install/doctor 面（四包
+        // 同装）。.ts/.html 归既有门，--lang angular 显式路由可达。
+        LanguageId::Angular => ANGULAR.clone(),
         // T0 配置驱动（W1a 批）：toml(taplo)/terraform(terraform-ls)/cue(cue lsp
         // 内置)/nixd(source 构建形态) 条目，ensure_launch 接管。
         LanguageId::Toml | LanguageId::Terraform | LanguageId::Cue | LanguageId::Nix => {
@@ -398,6 +411,10 @@ pub fn lsp_language_id(lang: &str) -> String {
         // `_get_language_id_for_file` 强制发 "python"——两 LS 不赌自名宽容
         // （pyright→python 同款显式映射）。
         "python_ty" | "python_pyrefly" => "python".to_string(),
+        // W3b 批：angular 门主会话是 typescript-language-server（挂 angular plugin），
+        // didOpen 官方口径 "typescript"；.html 不经主会话打开（session_for_file
+        // 重路由到伴生，伴生自设 languageId）。
+        "angular" => "typescript".to_string(),
         other => other.to_string(),
     }
 }

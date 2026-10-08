@@ -201,6 +201,14 @@ fn semantic_session_for_file(
     root: &Path,
     file: &str,
 ) -> std::sync::Arc<Session> {
+    // per-file 重路由优先：angular `.html` references → ngserver 伴生（↖ mirror
+    // 上游路由表——ngserver 聚合模板+TS 引用）；未路由走下方 ts/js 伴生判断。
+    if let Some(adapter) = ls_registry::adapter_for(&session.language_id())
+        && let Some(rerouted) =
+            adapter.session_for_file(root, std::path::Path::new(file), "textDocument/references")
+    {
+        return rerouted;
+    }
     let is_ts_like = std::path::Path::new(file)
         .extension()
         .and_then(|e| e.to_str())

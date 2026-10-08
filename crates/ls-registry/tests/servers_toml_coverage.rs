@@ -184,8 +184,8 @@ fn legacy_entries_survive_batch_addition() {
     }
     assert_eq!(
         servers.len(),
-        73,
-        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）+ bd 56a 第一批 +2 docker/sql + 第二批 +2 pgls/sqls-mysql + 后续批 +1 css + W3 +1 scala + W5 +2 julia/wolfram（html/yaml/marksman/kotlin/dart/ansible 等为存量条目，多批零新增）——集成收口 PM 实测 73"
+        74,
+        "存量 38（14 legacy + 24 A 类）+ Phase 3 新收 24 + astro（7a296833）+ bd 56a 第一批 +2 docker/sql + 第二批 +2 pgls/sqls-mysql + 后续批 +1 css + W3 +1 scala + W5 +2 julia/wolfram + W3b +1 angular（html/yaml/marksman/kotlin/dart/ansible 等为存量条目，多批零新增）——集成收口 PM 实测 74"
     );
     let marksman = &servers["marksman"];
     assert_eq!(marksman.install, "download");
@@ -414,15 +414,17 @@ fn phase3_pkg_entries_parse_with_upstream_pins() {
     assert_eq!(seen.len(), 5, "B/C/D/E/F 五类都应有条目");
 }
 
-/// angular 的 tri-server 编排形态不入表（上游 angular_language_server.py：ngserver +
-/// 伴随 typescript-language-server + vscode-html companion 三进程）。
+/// angular 已随上游对拍采纳 W3b 入表（npm 四包 install 面；三服务器编排由手写
+/// T2 angular.rs 接管会话，本条只服务 install/doctor —— eclipJDTLS 先例反转：
+/// 上游对拍 batchC P0 落地，`w3b_pyrefly_angular_doors_wired` 正向锁形态）。
 #[test]
-fn angular_tri_server_form_is_not_in_table() {
+fn angular_entry_present_with_t2_takeover() {
     let servers = parsed_servers();
-    assert!(
-        !servers.contains_key("angular"),
-        "angular 双/三进程编排不适配单进程 Launch（eclipse_jdtls 先例），不入本表"
-    );
+    let spec = servers
+        .get("angular")
+        .unwrap_or_else(|| panic!("[servers.angular] missing (W3b 采纳)"));
+    assert_eq!(spec.languages, vec!["angular"]);
+    assert_eq!(spec.install, "npm");
 }
 
 /// astro 条目（上游 7a296833 新增）：四包 pin 锚 astro_language_server.py DependencyProvider
@@ -1768,4 +1770,66 @@ fn w5_seven_doors_wired() {
             .binary_name,
         "WolframKernel"
     );
+}
+
+/// W3b 批（上游对拍采纳收尾）验收单测：pyrefly 升 T2（adapter_for Some，uvx 条目留
+/// install/doctor 面；.py 仍归主 Python 门）；angular 三服务器编排 T2（npm 四包
+/// pin 对账；.ts/.html 归既有门，--lang 显式路由；didOpen 官方口径 angular→typescript
+/// ——主会话是 tsls）。
+#[test]
+fn w3b_pyrefly_angular_doors_wired() {
+    use ls_registry::LanguageId;
+    use ls_registry::adapter_for;
+    use ls_registry::config::spec_for;
+
+    let servers = parsed_servers();
+
+    // pyrefly：T2 接管（W3b），uvx pin 1.2.0 + args lsp 与上游 Uvx provider 对齐。
+    let (pyrefly_id, _) =
+        spec_for("python_pyrefly").unwrap_or_else(|| panic!("--lang python_pyrefly must route"));
+    assert_eq!(pyrefly_id, "python_pyrefly");
+    assert!(
+        adapter_for("python_pyrefly").is_some(),
+        "pyrefly 已 T2 接管（bd 69e W3b 采纳）"
+    );
+    let pyrefly = servers["python_pyrefly"].uvx.as_ref().unwrap();
+    assert_eq!(pyrefly.version.as_deref(), Some("1.2.0"));
+    assert_eq!(pyrefly.args, Some(vec!["lsp".to_string()]));
+    // .py 扩展名仍归主 Python 门（变体门仅 --lang 显式可达）。
+    assert_eq!(LanguageId::from_extension("py"), Some(LanguageId::Python));
+    assert_eq!(ls_registry::lsp_language_id("python_pyrefly"), "python");
+
+    // angular：T2 三服务器编排（W3b），npm 四包 pin 与上游 DEFAULT_* 对齐。
+    let (angular_id, _) =
+        spec_for("angular").unwrap_or_else(|| panic!("--lang angular must route"));
+    assert_eq!(angular_id, "angular");
+    assert!(
+        adapter_for("angular").is_some(),
+        "angular 已 T2 接管（bd 69e W3b 采纳）"
+    );
+    let angular = servers["angular"].npm.as_ref().expect("angular npm table");
+    assert_eq!(angular.package, "@angular/language-server");
+    assert_eq!(angular.version.as_deref(), Some("21.2.10"));
+    let secondary: Vec<(&str, Option<&str>)> = angular
+        .secondary_packages
+        .iter()
+        .map(|s| (s.package.as_str(), s.version.as_deref()))
+        .collect();
+    assert_eq!(
+        secondary,
+        vec![
+            ("@angular/language-service", Some("21.2.10")),
+            ("typescript", Some("5.9.3")),
+            ("typescript-language-server", Some("5.1.3")),
+        ],
+        "四包 pin 对账（↖ mirror DEFAULT_* 常量）"
+    );
+    // .ts/.html 归既有门（angular 仅 --lang 显式可达）。
+    assert_eq!(
+        LanguageId::from_extension("ts"),
+        Some(LanguageId::TypeScript)
+    );
+    assert_eq!(LanguageId::from_extension("html"), Some(LanguageId::Html));
+    // didOpen 官方口径：主会话是 tsls。
+    assert_eq!(ls_registry::lsp_language_id("angular"), "typescript");
 }
