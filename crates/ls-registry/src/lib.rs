@@ -23,10 +23,10 @@ pub use ls_adapters::LanguageId;
 use ls_adapters::{
     LanguageServerAdapter, astro::AstroAdapter, bash::BashAdapter, clangd::ClangdAdapter,
     csharp_ls::CsharpLsAdapter, css::CssAdapter, deno::DenoAdapter, gopls::GoplsAdapter,
-    html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter, powershell::PowerShellAdapter,
-    pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter, sass::SassAdapter,
-    svelte::SvelteAdapter, typescript::TypescriptLanguageServerAdapter, vts::VtsAdapter,
-    vue::VueAdapter,
+    html::HtmlAdapter, jdtls::JdtlsAdapter, json::JsonAdapter, nextflow::NextflowAdapter,
+    powershell::PowerShellAdapter, pyright::PyrightAdapter, rust_analyzer::RustAnalyzerAdapter,
+    sass::SassAdapter, scala::ScalaAdapter, svelte::SvelteAdapter,
+    typescript::TypescriptLanguageServerAdapter, vts::VtsAdapter, vue::VueAdapter,
 };
 
 /// 扩展名 → LanguageId 静态表（小写键）。
@@ -226,6 +226,8 @@ singleton!(SVELTE, SvelteAdapter);
 singleton!(DENO, DenoAdapter);
 singleton!(SASS, SassAdapter);
 singleton!(VTS, VtsAdapter);
+singleton!(NEXTFLOW, NextflowAdapter);
+singleton!(SCALA, ScalaAdapter);
 
 /// 路径 → 语言。扩展名小写后查表，命中即返回；其余 None。
 ///
@@ -296,18 +298,26 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         // T0 配置驱动（bd 56a 后续批）：kotlin/dart 走 servers.toml kotlin/dart 条目
         // （download 形态，ensure_launch 接管）。
         LanguageId::Kotlin | LanguageId::Dart => return None,
-        // T0 配置驱动（W1b 批）：ansible/regal/nextflow 条目（npm/download 形态，
+        // T0 配置驱动（W1b 批）：ansible/regal 条目（npm/download 形态，
         // ensure_launch 接管）；ansible 仅 --lang 显式路由可达。
-        LanguageId::Ansible | LanguageId::Rego | LanguageId::Nextflow => return None,
+        LanguageId::Ansible | LanguageId::Rego => return None,
+        // nextflow：T2 接管会话（W3 采纳——config 推送外的 references flush/
+        // 符号名前缀剥离/progress 等待需适配器挂点，bd 69e findings batchC）；
+        // servers.toml 条目留 install/doctor（did_change_config 通道仍按 spec 应用）。
+        LanguageId::Nextflow => NEXTFLOW.clone(),
         // T0 配置驱动（W1a 批）：toml(taplo)/terraform(terraform-ls)/cue(cue lsp
         // 内置)/nixd(source 构建形态) 条目，ensure_launch 接管。
         LanguageId::Toml | LanguageId::Terraform | LanguageId::Cue | LanguageId::Nix => {
             return None;
         }
         // T0 配置驱动（W3 批）：php(phpactor/intelephense 双条目，--lang intelephense
-        // 按 entry id 显式路由)/lua(LuaLS)/scala(metals path_only)/swift(sourcekit-lsp
-        // path_only) 走 servers.toml 条目，ensure_launch 接管。
-        LanguageId::Php | LanguageId::Lua | LanguageId::Scala | LanguageId::Swift => return None,
+        // 按 entry id 显式路由)/lua(LuaLS)/swift(sourcekit-lsp path_only) 走
+        // servers.toml 条目，ensure_launch 接管。
+        LanguageId::Php | LanguageId::Lua | LanguageId::Swift => return None,
+        // scala：T2 接管会话（W3 采纳——build-root 探测作 workspaceFolders、
+        // MetalsProgressTracker 首查等待、showMessageRequest 自动应答 "Import
+        // build"，bd 69e findings batchA 缺失[高]）；servers.toml 条目留 install/doctor。
+        LanguageId::Scala => SCALA.clone(),
         // T0 配置驱动（W4 批）：fortran(fortls uvx)/pascal(pasls download)/haskell
         // (haskell_ls path_only)/ocaml(ocamllsp path_only)/erlang(erlang_ls
         // path_only)/perl(perl_ls path_only)/r(r_ls path_only)/crystal(crystalline
@@ -655,16 +665,21 @@ mod tests {
         );
     }
 
-    /// W3 批：php/lua/scala/swift 全走 T0（无手写 adapter，session_for 落
+    /// W3 批：php/lua/swift 全走 T0（无手写 adapter，session_for 落
     /// ensure_launch）；php 门按 entry id `intelephense` 显式路由（语言 `php` 归
     /// phpactor 条目，phpantom 避撞先例），didOpen 官方口径换算 intelephense→php；
-    /// lua/scala/swift 恒等（不加死映射）。
+    /// lua/swift 恒等（不加死映射）。scala 原本同批 T0，W3 采纳（bd 69e batchA
+    /// 缺失[高]）已升 T2（build-root 探测/metals 编排）。
     #[test]
     fn w3_php_lua_scala_swift_t0_routing() {
-        // T0：四门语言名 + intelephense 别名都无手写 adapter。
-        for lang in ["php", "intelephense", "lua", "scala", "swift"] {
-            assert!(adapter_for(lang).is_none(), "{lang}: W3 四门全 T0");
+        // T0：语言名 + intelephense 别名无手写 adapter（scala 除外，已 T2）。
+        for lang in ["php", "intelephense", "lua", "swift"] {
+            assert!(adapter_for(lang).is_none(), "{lang}: W3 三门全 T0");
         }
+        assert!(
+            adapter_for("scala").is_some(),
+            "scala 已 T2 接管（bd 69e W3 采纳）"
+        );
         // servers.toml 语言路由 / entry id 路由命中。
         assert!(config::spec_for("lua").is_some());
         assert!(config::spec_for("scala").is_some());

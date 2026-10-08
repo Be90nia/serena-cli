@@ -812,11 +812,7 @@ fn w1b_ansible_rego_nextflow_routes_and_ext_roundtrip() {
     use ls_registry::adapter_for;
     use ls_registry::config::spec_for;
 
-    for (lang, want_id) in [
-        ("ansible", "ansible"),
-        ("rego", "regal"),
-        ("nextflow", "nextflow"),
-    ] {
+    for (lang, want_id) in [("ansible", "ansible"), ("rego", "regal")] {
         // --lang 透传值 → spec_for 命中条目（install 链 / doctor hint 同源）。
         let (id, _) =
             spec_for(lang).unwrap_or_else(|| panic!("--lang {lang} must route to a spec"));
@@ -829,6 +825,17 @@ fn w1b_ansible_rego_nextflow_routes_and_ext_roundtrip() {
         // LSP didOpen languageId 恒等（上游 adapter 的 language_id 参数 = 内部名）。
         assert_eq!(ls_registry::lsp_language_id(lang), lang);
     }
+
+    // nextflow：条目仍在（install/doctor + did_change_config 通道），但会话已升
+    // T2（bd 69e W3 采纳——references flush/符号名前缀剥离需适配器挂点）。
+    let (nf_id, _) =
+        spec_for("nextflow").unwrap_or_else(|| panic!("--lang nextflow must route to a spec"));
+    assert_eq!(nf_id, "nextflow");
+    assert!(
+        adapter_for("nextflow").is_some(),
+        "nextflow 已 T2 接管（bd 69e W3 采纳）"
+    );
+    assert_eq!(ls_registry::lsp_language_id("nextflow"), "nextflow");
 
     // LanguageId 反查 + 扩展名闭环（doctor / warm / file_detect 入口面）。
     assert_eq!(
@@ -1301,11 +1308,11 @@ fn w3_php_lua_scala_swift_doors_wired() {
 
     let servers = parsed_servers();
 
-    // T0 分流：--lang 透传值 → spec_for 命中条目；四门 adapter_for 全 None。
+    // T0 分流：--lang 透传值 → spec_for 命中条目；三门 adapter_for 全 None。
+    // scala 除外：W3 采纳（bd 69e batchA 缺失[高]）已升 T2。
     for (lang, want_id) in [
         ("intelephense", "intelephense"),
         ("lua", "lua"),
-        ("scala", "scala"),
         ("swift", "sourcekit_lsp"),
     ] {
         let (id, _) =
@@ -1313,9 +1320,16 @@ fn w3_php_lua_scala_swift_doors_wired() {
         assert_eq!(id, want_id, "spec_for(\"{lang}\") routes to [servers.{id}]");
         assert!(
             adapter_for(lang).is_none(),
-            "{lang}: W3 四门全 T0，adapter_for 必须为 None"
+            "{lang}: W3 三门全 T0，adapter_for 必须为 None"
         );
     }
+    let (scala_id, _) =
+        spec_for("scala").unwrap_or_else(|| panic!("--lang scala must route to a spec"));
+    assert_eq!(scala_id, "scala");
+    assert!(
+        adapter_for("scala").is_some(),
+        "scala 已 T2 接管（bd 69e W3 采纳）"
+    );
     // phpactor 仍占语言路由 `php`（存量条目本体不动）。
     let (php_route_id, _) =
         spec_for("php").unwrap_or_else(|| panic!("--lang php must route to a spec"));

@@ -1005,6 +1005,7 @@ dependencies = [
  "ls-runtime",
  "lsp-core",
  "lsp-types",
+ "percent-encoding",
  "serde_json",
  "tempfile",
  "tokio",

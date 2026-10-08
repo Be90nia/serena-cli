@@ -36,11 +36,13 @@ pub mod html;
 pub mod jdtls;
 pub mod jedi_server;
 pub mod json;
+pub mod nextflow;
 pub mod powershell;
 pub mod pyre_server;
 pub mod pyright;
 pub mod rust_analyzer;
 pub mod sass;
+pub mod scala;
 pub mod svelte;
 pub mod ty_server;
 pub mod typescript;
@@ -833,6 +835,12 @@ pub trait LanguageServerAdapter: Send + Sync {
     /// 默认空实现：不跟踪 `$/progress` 的 LS 直接放行。等待/超时不报错 —— 超时由
     /// 实现方 warn 后放行（上游 permissive 行为），请求自身超时兜底。
     async fn wait_for_cross_file_index(&self, _session: &lsp_core::session::Session) {}
+
+    /// references 请求发请求前的 LS 特异前置（↖ mirror 上游 `_send_references_request`
+    /// 的子类 override 前半，如 nextflow 的强制扫描 + documentSymbol 同步）。
+    /// 调用位次：ensure_open（didOpen）之后、references 请求之前（ref_tools
+    /// fetch_references）。默认空实现。
+    async fn pre_references(&self, _session: &lsp_core::session::Session, _file: &Path) {}
 }
 
 /// 在 PATH 中查找可执行文件（去 UNC 前缀 dunce），返回 None 表示未找到。
@@ -893,6 +901,17 @@ pub fn which_path(name: &str) -> Option<PathBuf> {
 /// `launch_info` 找不到目标时的标准错误：`LS_NOT_INSTALLED` 语义（ARCH §6.3）。
 pub(crate) fn not_installed_error(name: &str, install_hint: &str) -> anyhow::Error {
     anyhow::anyhow!("language server `{name}` not found in PATH; install_hint: {install_hint}")
+}
+
+/// 声明 `window.workDoneProgress`（$/progress 上报门）。lsp-core base capabilities
+/// 无 window 段，而进度只在客户端声明后才上报：nextflow 工作区扫描（↖ mirror
+/// `_create_base_initialize_params`）、metals import/index 进度（↖ mirror
+/// scala_language_server.py "without this Metals never reports what it is doing"）。
+pub(crate) fn declare_work_done_progress(base: &mut InitializeParams) {
+    base.capabilities.window = Some(lsp_types::WindowClientCapabilities {
+        work_done_progress: Some(true),
+        ..Default::default()
+    });
 }
 
 /// 把 `OsString` 列表转 `Vec<OsString>`（方便 stub 写出）。
