@@ -5995,6 +5995,45 @@ mod net_retry_tests {
     }
 
     #[test]
+    fn probe_positions_cjk_fixture_without_selectionrange_lands_on_names() {
+        // bd fq7f 实景：fb4k_fx/zh.py 全 CJK fixture——v0.2.0 旧探针 hover
+        // range.start（def/class 关键字位），pyright 对关键字位 hover 恒 null
+        // → 假超时 rc=4。候选必须落名字 token（本测试钉死坐标防回档）。
+        let wire = json!([
+            {"name": "calc", "kind": "Function", "range": {"start": {"character": 0, "line": 1}, "end": {"character": 16, "line": 4}}},
+            {"name": "x", "kind": {"Other": 13}, "range": {"start": {"character": 9, "line": 1}, "end": {"character": 10, "line": 1}}},
+            {"name": "s", "kind": {"Other": 13}, "range": {"start": {"character": 4, "line": 3}, "end": {"character": 5, "line": 3}}},
+            {"name": "缓存", "kind": "Class", "range": {"start": {"character": 0, "line": 6}, "end": {"character": 16, "line": 8}}},
+            {"name": "存", "kind": "Method", "range": {"start": {"character": 4, "line": 7}, "end": {"character": 16, "line": 8}}}
+        ]);
+        let text = "# 中文注释测试\ndef calc(x):\n    \"\"\"计算平方, 中文 docstring\"\"\"\n    s = \"中文字符串长度十二个字节以上测试\"\n    return x * x\n\nclass 缓存:\n    def 存(self, k, v):\n        return v\n";
+        assert_eq!(
+            hover_probe_positions(&wire, Some(text)),
+            vec![(1, 4), (6, 6), (7, 8)],
+            "calc (1,4) / 缓存 (6,6) / 存 (7,8)——语义 kind 优先且全在名字 token"
+        );
+    }
+
+    #[test]
+    fn probe_positions_cjk_prefix_name_uses_utf16_column() {
+        // bd fq7f：名字前有 CJK 字符时列必须按 LSP UTF-16 单位计（CJK=2），
+        // 不是 UTF-8 字节数（CJK=3）——按字节算列会越出名字 token（单字名
+        // 直接落 ')'），pyright hover 恒 null，探针假 pending。
+        let wire = json!([
+            {"name": "问候", "kind": "Function", "range": {"start": {"character": 0, "line": 0}, "end": {"character": 26, "line": 0}}},
+            {"name": "存", "kind": "Method", "range": {"start": {"character": 4, "line": 1}, "end": {"character": 21, "line": 1}}},
+            {"name": "名", "kind": {"Other": 13}, "range": {"start": {"character": 16, "line": 1}, "end": {"character": 17, "line": 1}}}
+        ]);
+        let text = "def 问候(名字: str) -> str:\n    def 存(self, 名):\n        return 名\n";
+        assert_eq!(
+            hover_probe_positions(&wire, Some(text)),
+            vec![(0, 4), (1, 8), (1, 16)],
+            "问候 def 后 col 4；存 col 8；名 = 15 ASCII + 存(1 个 UTF-16 单位) = col 16；\
+             按字节算会得 18，越出单字名 token"
+        );
+    }
+
+    #[test]
     fn wait_ready_backoff_caps_at_2s() {
         assert_eq!(wait_ready_backoff(0), Duration::from_millis(500));
         assert_eq!(wait_ready_backoff(1), Duration::from_millis(1000));
