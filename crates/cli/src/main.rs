@@ -29,6 +29,10 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(300);
 const MGMT_TIMEOUT: Duration = Duration::from_secs(3);
 /// lazy-spawn 后等 daemon 就绪的总窗口。
 const SPAWN_WAIT: Duration = Duration::from_secs(10);
+/// bd fakewait：draining 老 daemon 退净的接管等待上限。daemon 侧 drain_window
+/// 15s（daemon/src/serve.rs，常量不跨 crate 暴露，此处客户端镜像）+ 收尾余量；
+/// finish_shutdown = 删 lock → 立即 process::exit(0)，两事件毫秒级先后。
+const DRAIN_TAKEOVER_WAIT: Duration = Duration::from_secs(20);
 /// 残留 daemon 端口探活超时（bd 3ab）。
 const RESIDUAL_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// 终止残留进程后等 listen socket 释放再复测的间隔。
@@ -1528,7 +1532,7 @@ async fn cmd_wait_ready(
     });
 
     // daemon 未起时先 lazy-spawn（与转发模式同一条就绪链路）。
-    let (base, token) = match ensure_daemon(lock_path).await {
+    let (mut base, mut token) = match ensure_daemon(lock_path).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("wait-ready: {e}");
@@ -1539,7 +1543,20 @@ async fn cmd_wait_ready(
     let started = Instant::now();
     let deadline = started + Duration::from_secs(timeout_secs);
     let mut round = 0usize;
+    // bd fakewait：探针失败后下一轮重跑 ensure_daemon——stop-all 发生在循环
+    // 中途（或 ensure 之后就撞上）时，不重探活会拿死 base 空转满超时窗。
+    let mut reensure = false;
     loop {
+        if reensure {
+            reensure = false;
+            match ensure_daemon(lock_path).await {
+                Ok((b, t)) => {
+                    base = b;
+                    token = t;
+                }
+                Err(e) => eprintln!("wait-ready: re-ensure failed (keep waiting): {e}"),
+            }
+        }
         // 段 1：符号索引——overview 首符号位置（LSP 0-based，wire 契约直接透传）。
         let overview = probe_tool_call(
             &client,
@@ -1559,6 +1576,7 @@ async fn cmd_wait_ready(
             // 7m8 观测补口：.ok() 静默吞错会让「恒 symbol-pending」无法与「真未就绪」
             // 区分（实例：token 失配 403 / LS spawn 失败被误读为索引未就绪）。
             eprintln!("probe overview error (keep waiting): {e}");
+            reensure = true;
         }
         let overview = overview.ok();
         let symbol_up = overview.as_ref().and_then(|data| {
@@ -1632,6 +1650,7 @@ async fn cmd_wait_ready(
                                 return code;
                             }
                             eprintln!("probe def error (keep waiting): {e}");
+                            reensure = true;
                         }
                     }
                     continue;
@@ -1658,6 +1677,7 @@ async fn cmd_wait_ready(
                             return code;
                         }
                         eprintln!("probe error (keep waiting): {e}");
+                        reensure = true;
                     }
                 }
             }
@@ -1703,6 +1723,7 @@ async fn cmd_wait_ready(
                             return code;
                         }
                         eprintln!("probe find-symbol error (keep waiting): {e}");
+                        reensure = true;
                     }
                 }
             }
@@ -1753,28 +1774,28 @@ async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<u8, ForwardFail
     let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
     let base = match entry {
         Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
-            format!("http://127.0.0.1:{}", e.port)
-        }
-        _ => {
-            // 死 lock（或无 lock）：lazy-spawn。不在这里删 lock——daemon 子进程
-            // 的 lock 仲裁会带宽限接管，CLI 无归属凭据先删会误伤启动中/易主 lock。
-            let (port, child_pid) = spawn_daemon_child()?;
-            wait_ready(port, SPAWN_WAIT).await?;
-            // bd dbx1：3 并发 lazy-spawn 时 OS bind 排他只能 1 赢；败家子进程
-            // bind 失败立即退但都连到胜家 :7860 listener 拿到 200。日志归属必须
-            // 等到 lock.pid 反查——胜家 = 自己的子进程 PID 才算"spawn 成功"，
-            // 败家走 attach 路径、stderr 不打 "lazy-spawned" 字样。
-            if own_child_won(lock_path, child_pid) {
-                tracing::info!(port, child_pid, "lazy-spawned daemon child; daemon ready");
+            // bd fakewait：与 ensure_daemon 同一判定——drain 窗口内老 daemon
+            // listener 仍 accept 但工具请求必 503，等退净再接管；否则 g0m 的
+            // 5s 重试窗 < 15s drain 窗，0 间隔工具命令仍会 rc=3。
+            if alive_but_draining(&e).await {
+                match wait_drain_outcome(lock_path, e.port, DRAIN_TAKEOVER_WAIT)
+                    .await
+                    .map_err(ForwardFailure::from)?
+                {
+                    DrainOutcome::Attach(e2) => format!("http://127.0.0.1:{}", e2.port),
+                    DrainOutcome::ReadyToSpawn => {
+                        spawn_and_adopt(lock_path)
+                            .await
+                            .map_err(ForwardFailure::from)?
+                    }
+                }
             } else {
-                tracing::info!(
-                    port,
-                    child_pid,
-                    "attached to peer-spawned daemon (lost bind race)"
-                );
+                format!("http://127.0.0.1:{}", e.port)
             }
-            format!("http://127.0.0.1:{port}")
         }
+        _ => spawn_and_adopt(lock_path)
+            .await
+            .map_err(ForwardFailure::from)?,
     };
 
     let mut token = read_token_with_retry(lock_path).await?;
@@ -1993,7 +2014,18 @@ async fn wait_ready(port: u16, timeout: Duration) -> Result<(), String> {
         if let Ok(resp) = req.send().await
             && resp.status().is_success()
         {
-            return Ok(());
+            // bd fakewait：drain 窗口内老 daemon 的 /status 也是 200——spawn 链
+            // 等子进程 bind 时会拿老 daemon 误判就绪。draining:true 继续轮询。
+            // 非 JSON 200 按旧语义判就绪（保守不倒退）。
+            let draining = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|b| b.get("draining").and_then(|d| d.as_bool()))
+                .unwrap_or(false);
+            if !draining {
+                return Ok(());
+            }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -3698,7 +3730,34 @@ mod doctor_workspace_tests {
 /// bd b09i：daemon 侧已结构化 loaded_ls（{lang, sessions}），CLI 直透不再折叠。
 async fn cmd_status(lock_path: &Path) -> ExitCode {
     let entry = match daemon::lockfile::read(lock_path) {
-        Ok(Some(e)) if probe(e.port) => e,
+        Ok(Some(e)) if probe(e.port) => {
+            // bd fakewait：drain 窗口撞上 status——照实报告是正在自杀的旧
+            // daemon（旧 uptime）。等退净后接管或拉新，与 wait-ready 同链。
+            if alive_but_draining(&e).await {
+                match wait_drain_outcome(lock_path, e.port, DRAIN_TAKEOVER_WAIT).await {
+                    Ok(DrainOutcome::Attach(e2)) => e2,
+                    Ok(DrainOutcome::ReadyToSpawn) => match ensure_daemon(lock_path).await {
+                        Ok(_) => match daemon::lockfile::read(lock_path) {
+                            Ok(Some(e2)) => e2,
+                            other => {
+                                eprintln!("status: daemon did not come up after drain takeover: {other:?}");
+                                return ExitCode::from(3);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("status: {e}");
+                            return ExitCode::from(3);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("status: {e}");
+                        return ExitCode::from(3);
+                    }
+                }
+            } else {
+                e
+            }
+        }
         _ => {
             println!("daemon: not running");
             return ExitCode::from(1);
@@ -4197,27 +4256,112 @@ async fn cmd_shell(cli: &Cli) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// lazy-spawn daemon 子进程并等就绪，返回 base url。ensure_daemon 与
+/// forward_or_spawn 共用的 spawn 分支（不删 lock——daemon 子进程的 lock 仲裁
+/// 会带宽限接管，CLI 无归属凭据先删会误伤启动中/易主 lock）。
+async fn spawn_and_adopt(lock_path: &Path) -> Result<String, String> {
+    let (port, child_pid) = spawn_daemon_child()?;
+    wait_ready(port, SPAWN_WAIT).await?;
+    // bd dbx1：3 并发 lazy-spawn 时 OS bind 排他只能 1 赢；败家子进程
+    // bind 失败立即退但都连到胜家 :7860 listener 拿到 200。日志归属必须
+    // 等到 lock.pid 反查——胜家 = 自己的子进程 PID 才算"spawn 成功"，
+    // 败家走 attach 路径、stderr 不打 "lazy-spawned" 字样。
+    if own_child_won(lock_path, child_pid) {
+        tracing::info!(port, child_pid, "lazy-spawned daemon child; daemon ready");
+    } else {
+        tracing::info!(
+            port,
+            child_pid,
+            "attached to peer-spawned daemon (lost bind race)"
+        );
+    }
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+/// 探活命中后的语义复查：GET /status，body `draining:true` = daemon 正在
+/// ShutdownDraining（bd fakewait：drain 窗口内 listener 仍 accept，新工具请求
+/// 必 503）。拿不到明确 draining:true 的形态（非 200 / 非 JSON / 请求失败）一律
+/// false 保守判活——保持既有探活语义，宁可走 503 老路不误杀健康 daemon。
+async fn alive_but_draining(entry: &daemon::lockfile::LockEntry) -> bool {
+    let client = http_client();
+    let Ok(resp) = client
+        .get(format!("http://127.0.0.1:{}/status", entry.port))
+        .header("X-Serena-Token", &entry.token)
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|b| b.get("draining").and_then(|d| d.as_bool()))
+        .unwrap_or(false)
+}
+
+/// drain 接管等待的出口。
+#[derive(Debug)]
+enum DrainOutcome {
+    /// lock 存在、daemon 活着且不在 draining（等待期被并发 CLI 接管，直接用）。
+    Attach(daemon::lockfile::LockEntry),
+    /// lock 消失且端口无 listener——可以 spawn 接管。
+    ReadyToSpawn,
+}
+
+/// 等 draining 老 daemon 退净（finish_shutdown = 删 lock → process::exit，
+/// 两事件毫秒级先后；端口的黑洞窗口只在 drain_window 内）。`wait` 上限必须
+/// ≥ daemon 侧 drain_window（serve.rs 15s，常量不跨 crate 暴露）。
+async fn wait_drain_outcome(
+    lock_path: &Path,
+    port: u16,
+    wait: Duration,
+) -> Result<DrainOutcome, String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match daemon::lockfile::read(lock_path) {
+            Ok(Some(e)) => {
+                if daemon::lockfile::is_alive_graceful(e.port) && !alive_but_draining(&e).await {
+                    return Ok(DrainOutcome::Attach(e));
+                }
+            }
+            Ok(None) => {
+                if !port_has_listener(port) {
+                    return Ok(DrainOutcome::ReadyToSpawn);
+                }
+            }
+            Err(e) => return Err(format!("read lock: {e}")),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "old daemon on :{port} still draining after {wait:?}; \
+                 retry, or check for a residual listener"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// 探活 + lazy-spawn，返回 (base_url, token)。
 async fn ensure_daemon(lock_path: &Path) -> Result<(String, String), String> {
     let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
     let base = match entry {
         Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
-            format!("http://127.0.0.1:{}", e.port)
-        }
-        _ => {
-            // 同 forward_or_spawn：不删 lock，交 daemon 子进程仲裁接管。
-            // bd dbx1：归属反查避免并发 lazy-spawn 时全部误报"已 spawn"。
-            let (port, child_pid) = spawn_daemon_child()?;
-            wait_ready(port, SPAWN_WAIT).await?;
-            if !own_child_won(lock_path, child_pid) {
-                tracing::info!(
-                    port,
-                    child_pid,
-                    "attached to peer-spawned daemon (lost bind race)"
-                );
+            // bd fakewait：drain 窗口内老 daemon TCP 探活必中但请求必 503——
+            // 半死 daemon 视同将死，等退净后接管，不把请求打进必 503 的 listener。
+            if alive_but_draining(&e).await {
+                match wait_drain_outcome(lock_path, e.port, DRAIN_TAKEOVER_WAIT).await? {
+                    DrainOutcome::Attach(e2) => format!("http://127.0.0.1:{}", e2.port),
+                    DrainOutcome::ReadyToSpawn => spawn_and_adopt(lock_path).await?,
+                }
+            } else {
+                format!("http://127.0.0.1:{}", e.port)
             }
-            format!("http://127.0.0.1:{port}")
         }
+        _ => spawn_and_adopt(lock_path).await?,
     };
     let token = read_token_with_retry(lock_path).await?;
     Ok((base, token))
@@ -6552,5 +6696,136 @@ mod wait_ready_progress_tests {
             wait_ready_progress(WaitStage::Symbol, true, 1, "lib.rs"),
             "symbol-ok"
         );
+    }
+}
+
+/// bd fakewait：drain 窗口自愈链的单元契约。mock daemon 用手写 HTTP 响应
+/// （与 shell_selfheal_tests 同手法）；temp lock 用 temp_dir + 唯一名
+/// （cli 不引 tempfile dev-dep，见 dbx1 测试注释）。
+#[cfg(test)]
+mod drain_takeover_tests {
+    use super::*;
+    use daemon::lockfile::{LockEntry, write_final};
+    use std::path::PathBuf;
+
+    fn fresh_lock(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "serena-fakewait-{}-{}-{}.lock",
+            std::process::id(),
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn test_entry(port: u16) -> LockEntry {
+        LockEntry {
+            pid: 4242,
+            port,
+            boot_ms: 1,
+            token: "deadbeef".repeat(4),
+        }
+    }
+
+    /// mock daemon：bind 随机端口，对 GET /status 回指定 status line + JSON body。
+    /// std::thread + 先读后写（与 shell_selfheal_tests 同手法；tokio accept task
+    /// 在 current_thread runtime 下会被 reqwest 连接先 RST）。accept 循环应对
+    /// wait_ready 轮询的多请求；线程随测试进程退出回收。
+    fn spawn_status_mock(status_line: &str, body: serde_json::Value) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().unwrap().port();
+        let status_line = status_line.to_string();
+        let payload = body.to_string();
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { break };
+                let status_line = status_line.clone();
+                let payload = payload.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf);
+                    let resp = format!(
+                        "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                });
+            }
+        });
+        port
+    }
+
+    const OK_200: &str = "HTTP/1.1 200 OK";
+
+    #[tokio::test]
+    async fn alive_but_draining_true_only_on_explicit_flag() {
+        let port = spawn_status_mock(OK_200, json!({"draining": true}));
+        assert!(alive_but_draining(&test_entry(port)).await, "draining:true 必须识别");
+    }
+
+    #[tokio::test]
+    async fn alive_but_draining_false_on_live_and_on_unreachable() {
+        let port = spawn_status_mock(OK_200, json!({"draining": false}));
+        assert!(!alive_but_draining(&test_entry(port)).await, "活 daemon 不误杀");
+        // 连不上 = 拿不到明确标志 → 保守判活（保持既有探活语义）。
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        assert!(!alive_but_draining(&test_entry(dead_port)).await, "无响应保守判活");
+    }
+
+    #[tokio::test]
+    async fn wait_ready_poll_ignores_draining_and_accepts_live() {
+        // draining:true 的 200 不算就绪 → 短窗耗尽必 Err。
+        let drain_port = spawn_status_mock(OK_200, json!({"draining": true}));
+        assert!(
+            wait_ready(drain_port, Duration::from_millis(1200)).await.is_err(),
+            "draining /status 200 不得判就绪"
+        );
+        // draining:false → 首轮即 Ok。
+        let live_port = spawn_status_mock(OK_200, json!({"draining": false}));
+        assert!(
+            wait_ready(live_port, Duration::from_secs(3)).await.is_ok(),
+            "正常 /status 判就绪不倒退"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_drain_outcome_attaches_live_lock_and_spawns_when_gone() {
+        // Attach：lock 活 + 不 draining → 直接给出 entry。
+        let port = spawn_status_mock(OK_200, json!({"draining": false}));
+        let lock = fresh_lock("attach");
+        write_final(&lock, &test_entry(port)).expect("write lock");
+        match wait_drain_outcome(&lock, port, Duration::from_secs(3)).await {
+            Ok(DrainOutcome::Attach(e)) => assert_eq!(e.port, port),
+            other => panic!("expected Attach, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&lock);
+        // ReadyToSpawn：lock 消失 + 端口空 → 立即可 spawn。
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let gone = fresh_lock("gone");
+        match wait_drain_outcome(&gone, dead_port, Duration::from_secs(3)).await {
+            Ok(DrainOutcome::ReadyToSpawn) => {}
+            other => panic!("expected ReadyToSpawn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_drain_outcome_times_out_while_peer_keeps_draining() {
+        let port = spawn_status_mock(OK_200, json!({"draining": true}));
+        let lock = fresh_lock("timeout");
+        write_final(&lock, &test_entry(port)).expect("write lock");
+        let r = wait_drain_outcome(&lock, port, Duration::from_millis(800)).await;
+        assert!(r.is_err(), "peer 恒 draining 必须超时 Err 而非空转");
+        assert!(r.unwrap_err().contains("still draining"));
+        let _ = std::fs::remove_file(&lock);
     }
 }
