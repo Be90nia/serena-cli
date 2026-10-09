@@ -297,7 +297,7 @@ async fn wal_open(store: &Path, uid: u64) -> std::io::Result<PathBuf> {
             return Ok(dir.clone());
         }
     }
-    prune_at(store, &Limits::default()).await;
+    bump_evicted_count(store, prune_at(store, &Limits::default()).await).await;
     let n = alloc_txn_num(store);
     let dir = store.join(format!("txn-{n}"));
     tokio::fs::create_dir_all(dir.join("before")).await?;
@@ -1161,7 +1161,8 @@ fn file_diff_text(f: &FileRec) -> String {
 /// [`list`] 的存储路径注入版（单测用）。
 pub(crate) async fn list_at(store: &Path) -> Result<serde_json::Value, ToolError> {
     let _gate = crate::write_gate::acquire("undo-list").await?;
-    prune_at(store, &Limits::default()).await;
+    let limits = Limits::default();
+    bump_evicted_count(store, prune_at(store, &limits).await).await;
     let mut txns = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&store).await {
         while let Ok(Some(ent)) = rd.next_entry().await {
@@ -1225,18 +1226,32 @@ pub(crate) async fn list_at(store: &Path) -> Result<serde_json::Value, ToolError
         }
     }
     txns.sort_by_key(|t| Reverse(t["txn_id"].as_i64().unwrap_or(0)));
-    Ok(
-        serde_json::json!({"project_hash": store.file_name().map(|s| s.to_string_lossy().to_string()), "txns": txns}),
-    )
+    // 杠精 F13：栈上限显式化——淘汰（条数/字节/时长）是静默发生的，用户看栈
+    // "少了"要能就地找到原因；累计逐出数持久化在 store，跨 daemon 重启可查。
+    let mut out = serde_json::json!({
+        "project_hash": store.file_name().map(|s| s.to_string_lossy().to_string()),
+        "txns": txns,
+        "stack_limits": {
+            "max_entries": limits.max_txns,
+            "max_total_bytes": limits.max_total_bytes,
+            "max_age_secs": limits.max_age_secs,
+        },
+    });
+    let evicted = evicted_count(store).await;
+    if evicted > 0 {
+        out["evicted_count"] = serde_json::json!(evicted);
+    }
+    Ok(out)
 }
 
 /// 保留策略 prune：超龄 → 超数 → 超量，均从最旧（N 最小）整事务淘汰。
-async fn prune_at(store: &Path, limits: &Limits) {
+/// 返回本轮逐出的事务数（供累计计数持久化，`undo --list` 的 evicted_count 用）。
+async fn prune_at(store: &Path, limits: &Limits) -> usize {
     let now = epoch_secs();
     // 收集 (n, state, timestamp, size)。
     let mut items: Vec<(u64, bool, u64, u64)> = Vec::new();
     let Ok(mut rd) = tokio::fs::read_dir(store).await else {
-        return;
+        return 0;
     };
     while let Ok(Some(ent)) = rd.next_entry().await {
         let name = ent.file_name().to_string_lossy().to_string();
@@ -1278,12 +1293,14 @@ async fn prune_at(store: &Path, limits: &Limits) {
         total = total.saturating_sub(size);
         expired.push(n);
     }
+    let evicted = expired.len();
     for n in expired {
         // active/undone/discarded 同号不并存（状态机互斥），按三种名式尝试删除。
         let _ = tokio::fs::remove_dir_all(store.join(format!("txn-{n}"))).await;
         let _ = tokio::fs::remove_dir_all(store.join(format!("undone-{n}"))).await;
         let _ = tokio::fs::remove_dir_all(store.join(format!("discarded-{n}"))).await;
     }
+    evicted
 }
 
 fn dir_size(dir: &Path) -> u64 {
@@ -1299,6 +1316,27 @@ fn dir_size(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+/// 累计逐出计数持久化（杠精 F13：静默淘汰必须留账，否则 `undo --list` 看栈"少了"
+/// 不知原因）。文件名不落 txn-/undone-/discarded- 前缀，列表/编号/扫描按前缀解析
+/// 天然跳过。写点仅 prune 路径（wal_open 持 WAL_INIT 锁、list 持写门），读改写
+/// 竞窗最坏少计一次——提示字段，不参与决策，可接受。
+async fn bump_evicted_count(store: &Path, evicted: usize) {
+    if evicted == 0 {
+        return;
+    }
+    let prev = evicted_count(store).await;
+    let _ = tokio::fs::write(store.join("evicted-count"), (prev + evicted as u64).to_string())
+        .await;
+}
+
+async fn evicted_count(store: &Path) -> u64 {
+    tokio::fs::read_to_string(store.join("evicted-count"))
+        .await
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 fn epoch_secs() -> u64 {

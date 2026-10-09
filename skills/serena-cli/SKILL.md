@@ -29,7 +29,7 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 - **`--symbol <NAME>`** 三命令通用符号名直查：find-referencing-code-snippets / symbol-body / edit-context（后两者的位置第二参保留兼容，二选一）。
 - **ls-use 已知语言**（如 `ls-use python <bin>`）按二进制名智能匹配内置 server：唯一命中自动选（回显生效 id + 启动命令形态）；零/多命中拒改并列候选——想继承某内置条目请显式点名 server id（如 `ls-use jedi <bin>`）。注册条目重启 daemon 后**接管该语言会话启动**（T2 适配器让位，bd 9z0x）；doctor/ls-list 同步反映注册态。
 - JSON 解析：stdout 首行可能是 `[warn] ...` 人读行——解析前先切出第一个 `{`。
-- **写类命令对无 LS 的文件类型拒写**（如 .txt → BAD_ARGS "file not supported"）——纯文本用普通文件工具。
+- **写类命令对无 LS 的文件类型拒写**（如 .txt → BAD_ARGS，带扩展名时报 `unsupported extension .<ext>: <file> (pass --lang <lang> to override)`，无扩展名保持 `file not supported` + `--lang` 提示）——纯文本用普通文件工具。
 - 大改/不确定结果 → 改完跑 `undo` 验证能回滚再继续；`undo --list` 看栈。rename 改多文件 = 一个事务，undo 一次全回滚。
 - 深度语义 call-hierarchy 依赖全量索引热身（分钟级），冷会话可能返空——改用 `refs` 拼接。`repo-map` 主源 documentSymbol + 文本兜底，冷会话可用（bd serena-rust-fj17）。
 - **写前干跑**：写类命令加全局 `--dry-run` → 完整定位/校验但不落盘，返 `dry_run:true + applied:false + would_apply:true + would_write[{file,patch}]`（unified diff，无全文 token 炸弹）；`applied:true` 只在真写时出现。
@@ -48,7 +48,7 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 | 上下文聚合(4) | edit-context(改前必备) · repo-map(全 project 按文件顶层符号清单，LS 免热身) · defining-symbol · signature-help |
 | 诊断(2) | diagnostics(--wait-gen N；N=0 立即返回当前快照——暖会话毫秒级，冷启动首次拉取仍需 LS 往返) · workspace-diagnostic(LS 不支持时指路逐文件 diagnostics) |
 | 编辑(11) | replace-body · replace-text-in-symbol · insert-text-{before,after}-symbol · delete-text-in-symbol · insert-at-line · replace-lines · delete-lines(start>end 报「顺序错」非「越界」) · rename-symbol(跨文件自动同步；语义未就绪窗口 -32602 改判 LS_NOT_READY retryable rc=5 带 wait-ready 指引，位置真无符号保留原错误) · safe-delete-symbol(有引用拒删) · create-text-file |
-| undo/redo(2) | undo(--steps N / --list；空栈返 nothing_to_undo:true，rc=0 非报错) · redo —— 事务级：rename 多文件一次回滚；新建文件 undo 即删；文件被外部改过则拒绝(WRITE_CONFLICT)；栈 20 步/200MB/30 天，重启升级不丢 |
+| undo/redo(2) | undo(--steps N / --list；空栈返 nothing_to_undo:true，rc=0 非报错；--list 回显 stack_limits 与累计 evicted_count，逐出账跨 daemon 重续) · redo —— 事务级：rename 多文件一次回滚；新建文件 undo 即删；文件被外部改过则拒绝(WRITE_CONFLICT)；栈 20 步/200MB/30 天，重启升级不丢 |
 | recipe 工作流(4) | `test <target> [name]`(cargo/npm 双后端跑测试+解析失败清单) · `diff [txn-id] [--patch]`(写事务写前写后对照，--patch 出 unified hunk) · `find-test <sym>`(也收 `--symbol <NAME>`，与 symbol-body 同形) · `recipe <name> [args]`(8 工作流编排，见下) |
 | 补全/长尾(13) | completion · code-action · format · format-range · inlay-hint · folding-range · document-highlight · semantic-tokens · code-lens · call-hierarchy · type-hierarchy · moniker · document-link |
 | 管理(14) | status · project-info · change-history(--symbol 走 git -L 符号级) · warm · wait-ready(--stage symbol\|semantic\|def\|indexing；RA 真就绪=Indexing progress end) · stop-all · install <lang> · uninstall <lang> · ls-use <lang\|id> <path> · ls-list · ls-remove <id> · doctor · shell(JSONL 长连接) · lint-shell |

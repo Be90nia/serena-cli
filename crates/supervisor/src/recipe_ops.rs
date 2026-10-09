@@ -736,7 +736,7 @@ async fn review_diff(
 /// explore `<path>`：ct_tldr → repo-map → ct_recent_activity（三读步）。
 /// path 必须是**文件**（critic3-F6）：tldr 以单文件为锚，目录无 tldr 语义 ——
 /// 目录入口给带指引的参数错（list-dir 找文件），而非透传 LS 层
-/// "file not supported"（误导成 recipe 整体坏）。
+/// "unsupported extension ..."（误导成 recipe 整体坏）。
 async fn explore(
     sup: &crate::Supervisor,
     root: &Path,

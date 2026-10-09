@@ -655,6 +655,36 @@ async fn list_reports_stack_overview() {
     assert_eq!(r["txns"][0]["state"], "discarded", "{r}");
 }
 
+/// 杠精 F13：静默淘汰必须可见——造 22 条（上限 20）→ --list 给出 stack_limits
+/// 与累计 evicted_count；无逐出史不带该字段（"若发生过失逐才加"）。
+#[tokio::test]
+async fn list_reports_stack_limits_and_evicted_count() {
+    let store = tmpdir("limits_store");
+    let work = tmpdir("limits_work");
+    let a = work.join("a.txt");
+    for i in 0..22 {
+        let u = uid();
+        txn_write(&store, &a, &format!("v{i}"), u).await;
+        commit_at(&store, u).await.unwrap();
+    }
+    let r = list_at(&store).await.unwrap();
+    assert_eq!(r["txns"].as_array().unwrap().len(), 20, "{r}");
+    let limits = &r["stack_limits"];
+    assert_eq!(limits["max_entries"], 20);
+    assert_eq!(limits["max_total_bytes"], Limits::default().max_total_bytes);
+    assert_eq!(limits["max_age_secs"], Limits::default().max_age_secs);
+    assert_eq!(r["evicted_count"], 2, "{r}");
+
+    let clean = tmpdir("limits_clean_store");
+    let b = work.join("b.txt");
+    let u = uid();
+    txn_write(&clean, &b, "v", u).await;
+    commit_at(&clean, u).await.unwrap();
+    let r = list_at(&clean).await.unwrap();
+    assert!(r.get("evicted_count").is_none(), "{r}");
+    assert_eq!(r["stack_limits"]["max_entries"], 20);
+}
+
 /// bd serena-rust-mfht F8：list 摘要带行数 diff——单文件 modify 多行 + 新文件场景。
 /// agent 多步编辑后凭 summary 选 undo target 必须有信息量。
 #[tokio::test]

@@ -65,9 +65,46 @@ pub fn external_servers_path() -> Option<PathBuf> {
 static EXTERNAL: LazyLock<Option<spec::ServersToml>> =
     LazyLock::new(|| external_servers_path().and_then(|p| load_external(&p)));
 
+fn invalid_data(msg: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
+}
+
+/// 用户手写配置的容错解码：UTF-8 为主；UTF-16（LE/BE，含/不含 BOM）转码。
+/// Windows PowerShell 重定向与记事本"Unicode"默认产出 UTF-16——BOM 形态被
+/// `read_to_string` 报 InvalidData（误判 unreadable），BOM-less 形态解出 NUL
+/// 交错"合法"UTF-8 文本让 toml 在首个 NUL 报 parse 错（误判 invalid），
+/// 全注释预留配置两种形态都中招。
+fn decode_config_text(bytes: Vec<u8>) -> std::io::Result<String> {
+    let utf16 = |b: &[u8], big_endian: bool| -> std::io::Result<String> {
+        let units: Vec<u16> = b
+            .chunks_exact(2)
+            .map(|c| {
+                if big_endian {
+                    u16::from_be_bytes([c[0], c[1]])
+                } else {
+                    u16::from_le_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        String::from_utf16(&units).map_err(|e| invalid_data(format!("UTF-16 decode: {e}")))
+    };
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, false);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, true);
+    }
+    match std::str::from_utf8(&bytes) {
+        // 真 UTF-8 文本不含 NUL；含即 BOM-less UTF-16 特征，按端序试解兜底。
+        Ok(s) if !s.contains('\0') => Ok(s.to_owned()),
+        Ok(_) => utf16(&bytes, false).or_else(|_| utf16(&bytes, true)),
+        Err(e) => Err(invalid_data(e.to_string())),
+    }
+}
+
 /// `EXTERNAL` 的加载本体（路径参数化以供测试注入）。成功时对覆盖/扩展名冲突逐条 warn。
 pub(crate) fn load_external(path: &Path) -> Option<spec::ServersToml> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match std::fs::read(path).and_then(decode_config_text) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
@@ -1537,6 +1574,53 @@ package = "@vue/language-server"
             load_external(dir.path()).is_none(),
             "目录路径 → 读取失败 → None"
         );
+    }
+
+    /// 杠精 F4：空文件/全注释（预留配置）= 合法空配置，不 warn 不判 invalid。
+    #[test]
+    fn load_external_comments_only_is_valid_empty_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("external-servers.toml");
+        std::fs::write(&p, "# 预留配置\n# [servers.mydsl]\n# languages = [\"x\"]\n")
+            .expect("write comments-only toml");
+        let loaded = load_external(&p).expect("全注释必须是合法空配置");
+        assert!(loaded.servers.is_empty(), "{:?}", loaded.servers.keys());
+    }
+
+    /// 杠精 F4：UTF-8 BOM——toml 0.8 原生容忍，锁契约防回归。
+    #[test]
+    fn load_external_bom_comments_only_is_valid_empty_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("external-servers.toml");
+        std::fs::write(&p, "\u{feff}# reserve\n# nothing enabled yet\n").expect("write bom toml");
+        let loaded = load_external(&p).expect("BOM + 全注释必须是合法空配置");
+        assert!(loaded.servers.is_empty(), "{:?}", loaded.servers.keys());
+    }
+
+    /// 杠精 F4：Windows 侧 UTF-16 全注释预留配置（PowerShell 重定向/记事本"Unicode"
+    /// 产物，含 BOM 与 BOM-less 两种）必须当合法空配置，不得误判 unreadable/invalid。
+    #[test]
+    fn load_external_utf16_comments_only_is_valid_empty_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let text = "# reserve\n# nothing enabled yet\n";
+        for (label, bytes) in [
+            ("utf16le-bom", {
+                let mut b = vec![0xFF, 0xFE];
+                b.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+                b
+            }),
+            ("utf16le-bomless", text.encode_utf16().flat_map(u16::to_le_bytes).collect()),
+            ("utf16be-bom", {
+                let mut b = vec![0xFE, 0xFF];
+                b.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+                b
+            }),
+        ] {
+            let p = dir.path().join(format!("external-{label}.toml"));
+            std::fs::write(&p, bytes).unwrap_or_else(|e| panic!("write {label}: {e}"));
+            let loaded = load_external(&p).unwrap_or_else(|| panic!("{label} 必须是合法空配置"));
+            assert!(loaded.servers.is_empty(), "{label}: {:?}", loaded.servers.keys());
+        }
     }
 
     /// §2/§3 正常路径：合法 external 表加载成功；覆盖内置条目（marksman）时走

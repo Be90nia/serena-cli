@@ -6124,7 +6124,17 @@ fn resolve_lang_for_file(file: &str, lang_override: Option<&str>) -> ToolResult<
         .or_else(|| ls_registry::file_detect::detect_language(Path::new(file)).map(|l| l.as_str()))
         .map(str::to_string)
         .ok_or_else(|| ToolError::BadArgs {
-            detail: format!("file not supported: {file}"),
+            // 杠精 F3：与路径守卫拒绝（"path escapes project root"）文案分流——
+            // 带扩展名时点明扩展名，用户能直接分清文件类型错 vs 路径错。
+            detail: match Path::new(file).extension().and_then(|e| e.to_str()) {
+                Some(ext) => format!(
+                    "unsupported extension .{ext}: {file} (pass --lang <lang> to override)"
+                ),
+                None => format!(
+                    "file not supported: {file} (no extension/filename language match; \
+                     pass --lang <lang> to override)"
+                ),
+            },
         })
 }
 
@@ -12195,6 +12205,26 @@ mod path_traversal_tests {
                 other => panic!("tool={tool} 应为 BAD_ARGS，实得 {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn unsupported_extension_error_distinct_from_path_escape() {
+        // 杠精 F3：扩展名门与路径守卫文案分流——扩展名错点明扩展名 + --lang 出路，
+        // 用户能分清"文件类型错"vs"路径错"。
+        let err = resolve_lang_for_file("doc.zzunsup99", None).unwrap_err();
+        let ToolError::BadArgs { detail } = err else {
+            panic!("应为 BAD_ARGS");
+        };
+        assert!(
+            detail.contains("unsupported extension .zzunsup99") && detail.contains("--lang"),
+            "{detail}"
+        );
+        // 无扩展名文件保持原语义（file not supported），不误报扩展名。
+        let err = resolve_lang_for_file("zznosuchname99", None).unwrap_err();
+        let ToolError::BadArgs { detail } = err else {
+            panic!("应为 BAD_ARGS");
+        };
+        assert!(detail.contains("file not supported"), "{detail}");
     }
 
     #[tokio::test]

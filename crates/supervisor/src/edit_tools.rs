@@ -443,7 +443,14 @@ fn end_line_col(new_text: &str, end_byte: usize) -> (u32, u32) {
     (line, col)
 }
 
-/// 在 `line`（1-based）前插入 content（规范化补尾 `\n`），原有行整体下移；
+/// 宿主文件主导行尾：`\r\n` 占全部换行过半 → CRLF。空文件无信号 → `\n`。
+fn dominant_eol(text: &str) -> &'static str {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count();
+    if crlf * 2 > lf { "\r\n" } else { "\n" }
+}
+
+/// 在 `line`（1-based）前插入 content（补尾行尾跟随宿主主导行尾），原有行整体下移；
 /// `line == total+1` 即追加到文件尾。返回 `(new_text, end_line, end_col)`：
 /// end position = 插入内容末尾（1-based，col 按字符计）。
 pub(crate) fn apply_insert_at_line(
@@ -457,9 +464,13 @@ pub(crate) fn apply_insert_at_line(
         return Err(line_bounds_error(line, line, total + 1));
     }
     let pos = starts[(line - 1) as usize];
-    let mut content = content.to_string();
-    if !content.ends_with('\n') {
-        content.push('\n'); // ↖ mirror: file_tools.py@43ae021 InsertAtLineTool.apply 内容规范化
+    // 杠精 F5：插入行尾跟随宿主主导行尾——CRLF 文件硬插 \n 会漂移成 mixed 行尾
+    // （read-file line_endings 变脏）。内容已有 \r\n 先折平防 \r\r\n，再统一展开。
+    // Δ 上游恒写 \n（mirror: file_tools.py@43ae021 InsertAtLineTool.apply 内容规范化）。
+    let eol = dominant_eol(text);
+    let mut content = content.replace("\r\n", "\n").replace('\n', eol);
+    if !content.ends_with(eol) {
+        content.push_str(eol);
     }
     let new_text = format!("{}{}{}", &text[..pos], content, &text[pos..]);
     let (end_line, end_col) = end_line_col(&new_text, pos + content.len());
@@ -655,6 +666,19 @@ mod tests {
         let err = apply_insert_at_line("a\nb\n", 4, "x\n").unwrap_err();
         assert!(err.to_string().contains("out of bounds"), "{err}");
         assert!(apply_insert_at_line("a\n", 0, "x\n").is_err());
+    }
+
+    #[test]
+    fn insert_at_line_follows_crlf_host_line_endings() {
+        // 杠精 F5：CRLF 宿主 → 插入行（含缺尾补齐）用 \r\n，文件保持纯 CRLF。
+        let (out, _, _) = apply_insert_at_line("a\r\nb\r\n", 2, "c").unwrap();
+        assert_eq!(out, "a\r\nc\r\nb\r\n");
+        // 内容自带 \n / \r\n 一律归一到宿主行尾（防 \r\r\n 与 mixed）。
+        let (out, _, _) = apply_insert_at_line("a\r\nb\r\n", 1, "x\ny\r\n").unwrap();
+        assert_eq!(out, "x\r\ny\r\na\r\nb\r\n");
+        // LF 宿主行为对称：内容自带 \r\n 折平为 \n。
+        let (out, _, _) = apply_insert_at_line("a\nb\n", 1, "x\r\n").unwrap();
+        assert_eq!(out, "x\na\nb\n");
     }
 
     #[test]
