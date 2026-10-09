@@ -81,12 +81,16 @@ fn walk_nested(items: &[lsp_types::DocumentSymbol], name: &str) -> Option<lsp_ty
     None
 }
 
-/// 在 `text` 内 `[range.start, range.end]` 范围内，定位 `needle` 第一次出现处 byte 范围。
+/// 在 `text` 内 `[range.start, range.end]` 范围内，定位 `needle` 唯一出现处 byte 范围。
 /// 返回 (start_byte, end_byte) 在 text 内的绝对 byte offset。
+/// 多处命中 → BadArgs 拒改。拍板（bd serena-rust-pz4q）：默认拒改而非 replace-all
+/// 或 warning——错误强制 AI 收敛 needle 语义，warning 会被忽略重现「静默改首处」
+/// 盲测事故；`--all/--first` 旗需动 crates/cli，本票只收 supervisor 侧。
 fn locate_in_range(
     path: &Path,
     text: &str,
     range: lsp_types::Range,
+    symbol: &str,
     needle: &str,
     enc: OffsetEncoding,
 ) -> EditResult<(usize, usize)> {
@@ -112,7 +116,16 @@ fn locate_in_range(
     .map_err(|e| EditError::BadArgs {
         detail: format!("range end: {e}"),
     })?;
-    let body = &text[start_byte..end_byte];
+    // 匹配/统计域扩到 range 首尾行**整行**：pyright 等对函数 range 在语句末尾截断
+    // （不含行尾注释），同行注释里的同词命中落在 range 外被漏计（bd serena-rust-pz4q
+    // rework：同行双命中静默改首处实测）。行首回退只含缩进空白、行尾推进只含注释，
+    // 不会卷入相邻符号。
+    let lo = text[..start_byte].rfind('\n').map_or(0, |i| i + 1);
+    let hi = text[end_byte..]
+        .find('\n')
+        .map_or(text.len(), |i| end_byte + i);
+    let body = &text[lo..hi];
+    let hit_count = body.matches(needle).count();
     let rel = body.find(needle).ok_or_else(|| {
         // bd serena-rust-i4j：needle 在符号体内找不到 ≠ 参数错 —— 符号 range 是
         // 拿门后现解析的，此处失配说明盘上内容已被并发写改掉。报 BAD_ARGS 会
@@ -123,7 +136,16 @@ fn locate_in_range(
                 .into(),
         }
     })?;
-    Ok((start_byte + rel, start_byte + rel + needle.len()))
+    if hit_count > 1 {
+        return Err(EditError::BadArgs {
+            detail: format!(
+                "old_text matches {hit_count} times inside symbol `{symbol}` ({}); \
+                 refine old_text to match exactly one occurrence",
+                path.display()
+            ),
+        });
+    }
+    Ok((lo + rel, lo + rel + needle.len()))
 }
 
 /// 把 LSP Position 换算为绝对 byte offset。
@@ -205,7 +227,7 @@ pub async fn replace_text_in_symbol(
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
-    let (lo, hi) = locate_in_range(file, &content, range, old_text, OffsetEncoding::Utf16)?;
+    let (lo, hi) = locate_in_range(file, &content, range, symbol, old_text, OffsetEncoding::Utf16)?;
     let mut new_content = String::with_capacity(content.len() + new_text.len());
     new_content.push_str(&content[..lo]);
     new_content.push_str(new_text);
@@ -684,5 +706,68 @@ mod tests {
             matches!(err, EditError::WriteConflict { .. }),
             "hash 失配必须拒写，实际: {err}"
         );
+    }
+
+    /// bd serena-rust-pz4q：old_text 在符号体内多处命中必须拒改（静默改首处盲测实锤）；
+    /// 单命中照旧可替换，零命中保持 WRITE_CONFLICT（bd i4j 语义不变）。
+    #[test]
+    fn multi_hit_needle_rejected_single_hit_ok() {
+        let path = Path::new("calc.py");
+        let text = "def divide(x, y):\n    \"\"\"uses x - y.\"\"\"\n    return x - y\n";
+        let range = lsp_types::Range {
+            start: Position::new(0, 0),
+            end: Position::new(2, 16),
+        };
+        let err =
+            locate_in_range(path, text, range, "divide", "x - y", OffsetEncoding::Utf16)
+                .unwrap_err();
+        let EditError::BadArgs { detail } = &err else {
+            panic!("多命中必须 BadArgs 拒改: {err:?}")
+        };
+        assert!(detail.contains("2 times"), "detail 必须含命中数: {detail}");
+
+        let text1 = "def divide(x, y):\n    return x - y\n";
+        let range1 = lsp_types::Range {
+            start: Position::new(0, 0),
+            end: Position::new(1, 16),
+        };
+        let (lo, hi) =
+            locate_in_range(path, text1, range1, "divide", "x - y", OffsetEncoding::Utf16)
+                .unwrap();
+        assert_eq!(&text1[lo..hi], "x - y");
+
+        let err0 = locate_in_range(path, text1, range1, "divide", "x * y", OffsetEncoding::Utf16)
+            .unwrap_err();
+        assert!(
+            matches!(err0, EditError::WriteConflict { .. }),
+            "零命中语义不变: {err0:?}"
+        );
+    }
+
+    /// bd serena-rust-pz4q rework：pyright 函数 range 在语句末尾截断（不含行尾注释），
+    /// 同行注释里的第二处命中必须计入统计域（匹配/统计域扩到 range 首尾行整行）。
+    #[test]
+    fn same_line_hit_in_trailing_comment_counts() {
+        let path = Path::new("twofx.py");
+        // range 照 pyright 实测形态：end (1,16) = `    return a - 1` 语句末尾，注释在 range 外。
+        let text = "def helper(a):\n    return a - 1  # two hits mention a - 1\n";
+        let range = lsp_types::Range {
+            start: Position::new(0, 1),
+            end: Position::new(1, 16),
+        };
+        let err =
+            locate_in_range(path, text, range, "helper", "a - 1", OffsetEncoding::Utf16)
+                .unwrap_err();
+        let EditError::BadArgs { detail } = &err else {
+            panic!("行尾注释中的第二处命中必须计入: {err:?}")
+        };
+        assert!(detail.contains("2 times"), "detail 必须含命中数: {detail}");
+
+        // 对照：唯一命中在语句内（注释无同词）→ 单命中照旧返回语句内切片。
+        let text1 = "def helper(a):\n    return a - 1  # halve it\n";
+        let (lo, hi) =
+            locate_in_range(path, text1, range, "helper", "a - 1", OffsetEncoding::Utf16)
+                .unwrap();
+        assert_eq!(&text1[lo..hi], "a - 1");
     }
 }

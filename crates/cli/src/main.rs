@@ -262,14 +262,26 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         debug_raw: bool,
     },
-    /// 取符号体切片（position-free；documentSymbol 定位）。
-    SymbolBody { file: String, symbol: String },
+    /// 取符号体切片（position-free；documentSymbol 定位）。符号名：位置第二参或
+    /// `--symbol`（二选一；kdye：与 find-referencing-code-snippets 参数形状对齐）。
+    SymbolBody {
+        /// 目标文件（相对 root）。
+        file: String,
+        /// 符号名（位置第二参，兼容保留）。
+        symbol: Option<String>,
+        /// 符号名旗标（与位置第二参等价二选一）。
+        #[arg(long = "symbol", value_name = "NAME")]
+        symbol_flag: Option<String>,
+    },
     /// AI 编辑主路径聚合：单次返回 body + callers + doc + tests（ai-token §10-B）。
     EditContext {
         /// 目标文件（相对 root）。
         file: String,
-        /// 符号名。
-        symbol: String,
+        /// 符号名（位置第二参，兼容保留）。
+        symbol: Option<String>,
+        /// 符号名旗标（与位置第二参等价二选一）。
+        #[arg(long = "symbol", value_name = "NAME")]
+        symbol_flag: Option<String>,
     },
     /// 全 workspace 符号地图（按调用热度 top N）。ai-token §10-E。
     RepoMap {
@@ -601,10 +613,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    // bd serena-rust-4ux（内部追踪号，不入 --help）
-    /// 注册/覆盖/列出/移除用户自装 LS（写 external-servers.toml）。
-    /// 已知语言/id → 继承内置条目，仅改指你的二进制；未知 id → `--lang <LANG>
-    /// --ext .<ext>` 注册全新语言。注册在 daemon 重启后生效。
+    // bd serena-rust-4ux（内部追踪号，不入 --help）；oxw0：语言名命中改按二进制名
+    /// 智能匹配。注册/覆盖/列出/移除用户自装 LS（写 external-servers.toml）。
+    /// 已知 server id → 整条继承内置条目，仅改指你的二进制；已知语言 → 按二进制
+    /// 名智能匹配内置 server：唯一命中自动选（回显最终生效 id + 启动命令形态），
+    /// 零/多命中拒改并列出候选；未知 id → `--lang <LANG> --ext .<ext>` 注册全新
+    /// 语言。注册在 daemon 重启后生效。
     LsUse {
         /// 语言名或 server id（与 <path> 搭配注册/覆盖）。
         #[arg(default_value = "")]
@@ -1130,30 +1144,60 @@ fn hover_ready(data: &serde_json::Value) -> bool {
 /// （bd serena-rust-7m8：csharp-ls 首符号 range=整声明行首 / astro 模板符号 hover 合法 null）。
 const SEMANTIC_PROBE_SYMBOLS: usize = 3;
 
-/// 行内定位符号名的 UTF-16 列（LSP Position.character 契约）；行内无该名 → None。
+/// 行内定位符号名的 UTF-16 列（LSP Position.character 契约）；只认**整词**命中
+/// （bd serena-rust-gqyp 精化：子串会把 `run` 打进 `running`/参数 `x` 吃进早位），
+/// 行内无该名 → None。
 fn name_column_in_line(line_text: &str, name: &str) -> Option<u32> {
-    let byte_col = line_text.find(name)?;
-    Some(
-        line_text[..byte_col]
-            .chars()
-            .map(char::len_utf16)
-            .sum::<usize>() as u32,
-    )
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0usize;
+    while let Some(rel) = line_text[from..].find(name) {
+        let start = from + rel;
+        let end = start + name.len();
+        let before = line_text[..start].chars().next_back().is_some_and(is_ident);
+        let after = line_text[end..].chars().next().is_some_and(is_ident);
+        if !before && !after {
+            let col = line_text[..start].chars().map(char::len_utf16).sum::<usize>();
+            return Some(col as u32);
+        }
+        from = end;
+    }
+    None
 }
 
 /// semantic 档 hover 探针候选位置（bd serena-rust-7m8）：overview 符号数组 →
-/// 至多 [`SEMANTIC_PROBE_SYMBOLS`] 个「符号名自身」坐标。每符号 selectionRange.start
-/// 优先；无则读探针文件 range.start 行内找符号名文本（标识符偏移 = 用户代码
-/// 标识符）。行内无该名 / 行越界（模板符号等）→ **丢弃该候选**，绝不退
-/// range.start：行首落在 use/derive/声明修饰上时 RA 对行首 stdlib token hover
-/// 恒空（bd serena-rust-b8sp），假探针会把「已就绪」永判 pending；候选全灭
-/// 由调用方在进度行点明根因。
+/// 「符号名自身」坐标。每符号 selectionRange.start 优先；无则读探针文件 range.start
+/// 起 ≤3 行窗口内找**整词**符号名（bd serena-rust-gqyp 同款精化：pyright fixture
+/// 实测 supervisor overview 组装丢弃 selectionRange 恒走 fallback，且 range.start
+/// 落在 def/class 声明关键字位时 LS hover 恒空）。行窗口内无该名 / 行越界
+/// （模板符号等）→ **丢弃该候选**，绝不退 range.start：行首落在 use/derive/声明
+/// 修饰上时 RA 对行首 stdlib token hover 恒空（bd serena-rust-b8sp），假探针会把
+/// 「已就绪」永判 pending。
+/// 候选偏置：Class/Function/Method/Constructor 优先（语义 hover 最稳，冷窗口
+/// 局部变量 hover 常空）；无任何该类符号时不截断全量扫描，避免 import/属性形态
+/// 挤掉唯一可打点符号。候选全灭由调用方在进度行点明根因。
 fn hover_probe_positions(data: &serde_json::Value, file_text: Option<&str>) -> Vec<(u32, u32)> {
     let Some(symbols) = data.as_array() else {
         return Vec::new();
     };
+    let semantic_kind = |s: &serde_json::Value| -> bool {
+        matches!(
+            s.get("kind").and_then(|k| k.as_str()),
+            Some("Class" | "Function" | "Method" | "Constructor")
+        )
+    };
+    let mut ordered: Vec<&serde_json::Value> = symbols.iter().collect();
+    // 稳定排序：语义符号提前，其余保原序；全无语义符号 → 全量（不截断）。
+    ordered.sort_by_key(|s| !semantic_kind(s));
+    let take = if ordered.iter().any(|s| semantic_kind(s)) {
+        SEMANTIC_PROBE_SYMBOLS
+    } else {
+        ordered.len()
+    };
+    let lines: Vec<&str> = file_text
+        .map(|t| t.split('\n').collect())
+        .unwrap_or_default();
     let mut out = Vec::new();
-    for sym in symbols.iter().take(SEMANTIC_PROBE_SYMBOLS) {
+    for sym in ordered.into_iter().take(take) {
         let sel_start = sym.get("selectionRange").and_then(|r| r.get("start"));
         if let Some((line, col)) = sel_start.and_then(|s| {
             Some((
@@ -1169,14 +1213,18 @@ fn hover_probe_positions(data: &serde_json::Value, file_text: Option<&str>) -> V
         let (Some(name), Some(range_start)) = (name, range_start) else {
             continue;
         };
-        let Some(line) = range_start.get("line").and_then(|v| v.as_u64()) else {
+        let Some(start_line) = range_start.get("line").and_then(|v| v.as_u64()) else {
             continue;
         };
-        if let Some(col) = file_text
-            .and_then(|t| t.split('\n').nth(line as usize))
-            .and_then(|l| name_column_in_line(l.strip_suffix('\r').unwrap_or(l), name))
-        {
-            out.push((line as u32, col));
+        for off in 0..3u64 {
+            let Some(l) = lines.get((start_line + off) as usize) else {
+                break;
+            };
+            let l = l.strip_suffix('\r').unwrap_or(l);
+            if let Some(col) = name_column_in_line(l, name) {
+                out.push(((start_line + off) as u32, col));
+                break;
+            }
         }
     }
     out
@@ -1269,6 +1317,31 @@ async fn probe_tool_call(
             .unwrap_or(serde_json::Value::Null)),
         _ => Err(payload.get("error").cloned().unwrap_or(payload).to_string()),
     }
+}
+
+/// probe_tool_call 折叠出的错误串里的 wire code（ok:false → error JSON 的 code）；
+/// 非 JSON（transport 5xx / decode）→ None = 瞬态。
+fn wire_err_code(err: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(err)
+        .ok()?
+        .get("code")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// wait-ready 探针遇确定性错误（LS_NOT_INSTALLED，静态可判）→ 打印 + fail-fast；
+/// None = 瞬态错误，继续等。bd serena-rust-nqjo：未装 LS 时无限 pending 挂满
+/// 超时窗，而同刻普通工具调用一发即报 LS_NOT_INSTALLED。
+fn not_installed_exit(e: &str, lang: Option<&str>) -> Option<ExitCode> {
+    if wire_err_code(e).as_deref() != Some("LS_NOT_INSTALLED") {
+        return None;
+    }
+    eprintln!(
+        "wait-ready: language server not installed (lang {}); {e}",
+        lang.unwrap_or("(auto)")
+    );
+    eprintln!("hint: run `serena-cli install <lang>` (or `serena-cli doctor --fix`), then retry");
+    Some(ExitCode::from(1))
 }
 
 /// l5nv：短输入糖——argv 首个位置参数 `?query` → `find-symbol query`（后续 token
@@ -1380,6 +1453,9 @@ async fn cmd_wait_ready(
         )
         .await;
         if let Err(e) = &overview {
+            if let Some(code) = not_installed_exit(e, lang.as_deref()) {
+                return code;
+            }
             // 7m8 观测补口：.ok() 静默吞错会让「恒 symbol-pending」无法与「真未就绪」
             // 区分（实例：token 失配 403 / LS spawn 失败被误读为索引未就绪）。
             eprintln!("probe overview error (keep waiting): {e}");
@@ -1438,7 +1514,12 @@ async fn cmd_wait_ready(
                         return ExitCode::SUCCESS;
                     }
                     Ok(_) => {}
-                    Err(e) => eprintln!("probe error (keep waiting): {e}"),
+                    Err(e) => {
+                        if let Some(code) = not_installed_exit(&e, lang.as_deref()) {
+                            return code;
+                        }
+                        eprintln!("probe error (keep waiting): {e}");
+                    }
                 }
             }
         } else if stage == WaitStage::Symbol {
@@ -1477,7 +1558,12 @@ async fn cmd_wait_ready(
                         return ExitCode::SUCCESS;
                     }
                     Ok(_) => {}
-                    Err(e) => eprintln!("probe find-symbol error (keep waiting): {e}"),
+                    Err(e) => {
+                        if let Some(code) = not_installed_exit(&e, lang.as_deref()) {
+                            return code;
+                        }
+                        eprintln!("probe find-symbol error (keep waiting): {e}");
+                    }
                 }
             }
         }
@@ -1725,7 +1811,10 @@ async fn wait_ready(port: u16, timeout: Duration) -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(format!("daemon on :{port} not ready within {timeout:?}"))
+    Err(format!(
+        "daemon on :{port} not ready within {timeout:?}; cold start in progress: \
+         retry, or run wait-ready --stage symbol first"
+    ))
 }
 
 /// connect 类瞬断退避重试：首发起发 + `CONNECT_BACKOFF_MS` 各一轮，共 5 发。
@@ -1906,12 +1995,20 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             }
             ("find-referencing-code-snippets", a)
         }
-        Some(Cmd::SymbolBody { file, symbol }) => {
-            ("symbol-body", json!({"file": file, "symbol": symbol}))
-        }
-        Some(Cmd::EditContext { file, symbol }) => {
-            ("edit-context", json!({"file": file, "symbol": symbol}))
-        }
+        Some(Cmd::SymbolBody { file, symbol, .. }) => (
+            "symbol-body",
+            json!({
+                "file": file,
+                "symbol": symbol.as_deref().expect("resolved by resolve_with_alias"),
+            }),
+        ),
+        Some(Cmd::EditContext { file, symbol, .. }) => (
+            "edit-context",
+            json!({
+                "file": file,
+                "symbol": symbol.as_deref().expect("resolved by resolve_with_alias"),
+            }),
+        ),
         Some(Cmd::RepoMap { top_n }) => ("repo-map", json!({"top_n": top_n})),
         Some(Cmd::Warm { lang, timeout_secs }) => {
             ("warm", json!({"lang": lang, "timeout_secs": timeout_secs}))
@@ -2235,6 +2332,17 @@ fn inject_private_args(args: &mut serde_json::Value, cli: &Cli) {
     }
 }
 
+/// unknown tool 错误的 daemon/CLI 版本错位 hint（bd serena-rust-eog5，第 3 次同坑）：
+/// 新 CLI 连旧 exe lazy-spawn 的 daemon 时，新子命令报 BAD_ARGS unknown tool ——
+/// 表象是功能缺失，实是 daemon 版本落后。
+fn unknown_tool_hint(err: &serde_json::Value) -> Option<&'static str> {
+    let code = err.get("code").and_then(|c| c.as_str())?;
+    let msg = err.get("message").and_then(|m| m.as_str())?;
+    (code == "BAD_ARGS" && msg.starts_with("unknown tool")).then_some(
+        "daemon may have been started by an older binary; run `serena-cli stop-all` and retry",
+    )
+}
+
 /// 按子命令转发 HTTP。
 /// Ok(0) = 工具成功；Ok(n) = 工具失败（wire 码 → exit 码，消息已打 stderr）；
 /// Err = 传输层失败（bd serena-rust-cwt：退出码经返回值传递，不用 process::exit）。
@@ -2333,6 +2441,9 @@ async fn forward(
         _ => {
             let err = payload.get("error").cloned().unwrap_or(payload);
             eprintln!("tool error: {err}");
+            if let Some(hint) = unknown_tool_hint(&err) {
+                eprintln!("[hint] {hint}");
+            }
             // Δ 43ae021：exit 码按 wire code 取（ARCH §6.3 / dto::wire_error_code_to_exit），
             // 不再一律 1 —— Internal→3、BadArgs→2，agent 据此免重试确定性失败。
             // bd serena-rust-cwt：不再 std::process::exit —— 那会跳 Drop，
@@ -2496,8 +2607,76 @@ fn local_err_json(code: &str, msg: &str) {
     );
 }
 
+/// 用户二进制的匹配键（小写 stem，去扩展）——`ls-use` 按二进制名智能匹配内置
+/// server（oxw0）。无文件名段时退空串（validate_user_binary 已挡，不会命中任何键）。
+fn binary_stem(p: &Path) -> String {
+    p.file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// 内置条目暴露的启动二进制名键（小写）：id + path_only/npm/uvx/dotnet/gem/
+/// download 各子表的启动名。download 的 bin_path 取末段剥 .exe（marksman.exe →
+/// marksman；平台互异路径全收）。
+fn builtin_binary_keys(id: &str, spec: &ls_registry::spec::ServerSpec) -> Vec<String> {
+    let mut keys = vec![id.to_ascii_lowercase()];
+    if let Some(po) = &spec.path_only {
+        keys.push(po.binary_name.to_ascii_lowercase());
+    }
+    if let Some(n) = &spec.npm {
+        keys.push(n.package.to_ascii_lowercase());
+        keys.push(n.bin_rel.to_ascii_lowercase());
+    }
+    if let Some(u) = &spec.uvx {
+        keys.push(u.package.to_ascii_lowercase());
+        keys.push(u.entrypoint.to_ascii_lowercase());
+    }
+    if let Some(d) = &spec.dotnet {
+        keys.push(d.tool.to_ascii_lowercase());
+    }
+    if let Some(g) = &spec.gem {
+        keys.push(g.gem.to_ascii_lowercase());
+    }
+    if let Some(dl) = &spec.download {
+        let mut push_bin = |bp: &str| {
+            let name = bp
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(bp)
+                .to_ascii_lowercase();
+            keys.push(name.strip_suffix(".exe").unwrap_or(&name).to_string());
+        };
+        push_bin(&dl.bin_path);
+        for bp in dl.bin_path_per_platform.values() {
+            push_bin(bp);
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// 按二进制 stem 在内置表里找 server：恰好一个 → Ok((id, spec))；零/多个 →
+/// Err(命中 id 清单)（零命中 = 空清单）。
+fn builtin_id_for_binary(
+    stem: &str,
+) -> Result<(&'static str, &'static ls_registry::spec::ServerSpec), Vec<&'static str>> {
+    let hits: Vec<_> = ls_registry::config::builtin_entries()
+        .into_iter()
+        .filter(|(id, spec)| builtin_binary_keys(id, spec).iter().any(|k| k == stem))
+        .collect();
+    if hits.len() == 1 {
+        let (id, spec) = hits[0];
+        Ok((id, spec))
+    } else {
+        Err(hits.iter().map(|(id, _)| *id).collect())
+    }
+}
+
 /// ls-use <LANG_OR_ID> <PATH>：注册/覆盖；--list；--remove <ID>；--lang/--ext
-/// 注册全新语言。已知语言/id → 继承内置 languages/extensions/exec。
+/// 注册全新语言。已知 server id → 整条继承内置条目；仅语言名命中 → 按二进制名
+/// 智能匹配内置 server（oxw0：语言默认条目的启动参数对别的二进制必然错配），
+/// 唯一命中自动选，零/多命中拒改并列候选。
 fn cmd_ls_use(
     lang_or_id: &str,
     path: Option<String>,
@@ -2565,16 +2744,89 @@ fn cmd_ls_use(
             return ExitCode::from(2);
         }
     };
-    let (id, languages, extensions, exec, is_override) = match ls_registry::config::builtin_spec_for(
-        lang_or_id,
-    ) {
-        Some((id, spec)) => (
+    // bd serena-rust-oxw0：lang_or_id 显式命中内置 server id = 用户点名条目，整条
+    // 继承（尊重显式选择）；仅语言名命中 → 按二进制 stem 智能匹配内置 server，
+    // 唯一命中自动选（回显最终生效 id），零/多命中拒改并列候选。
+    let explicit_id = ls_registry::config::builtin_entries()
+        .iter()
+        .any(|(bid, _)| bid.eq_ignore_ascii_case(lang_or_id));
+    let mut matched_by: Option<String> = None;
+    let (id, languages, extensions, exec, is_override) = match ls_registry::config::builtin_spec_for(lang_or_id) {
+        Some((id, spec)) if explicit_id => (
             id.to_string(),
             spec.languages.clone(),
             spec.extensions.clone(),
             ls_registry::config::inherited_exec(spec),
             true,
         ),
+        Some((lang_id, _)) => {
+            let stem = binary_stem(&bin);
+            match builtin_id_for_binary(&stem) {
+                // 唯一命中语言默认条目 → 常规整条继承。
+                Ok((hit, hspec)) if hit == lang_id => (
+                    hit.to_string(),
+                    hspec.languages.clone(),
+                    hspec.extensions.clone(),
+                    ls_registry::config::inherited_exec(hspec),
+                    true,
+                ),
+                // 唯一命中别的条目 → 重定向：用命中条目的启动形态；languages 并上
+                // 请求语言（external 同语言并列胜内置，merge_pick §3——python 路由
+                // 随注册切到命中条目）。
+                Ok((hit, hspec)) => {
+                    matched_by = Some(format!(
+                        "binary `{stem}` matched built-in server `{hit}` (requested language `{lang_or_id}`)"
+                    ));
+                    let mut langs = vec![lang_or_id.to_string()];
+                    langs.extend(
+                        hspec.languages.iter().filter(|l| !l.eq_ignore_ascii_case(lang_or_id)).cloned(),
+                    );
+                    (
+                        hit.to_string(),
+                        langs,
+                        hspec.extensions.clone(),
+                        ls_registry::config::inherited_exec(hspec),
+                        true,
+                    )
+                }
+                // 零命中 → 拒改 + 该语言的内置 server 候选（要求显式点名 server id）。
+                Err(hits) if hits.is_empty() => {
+                    let servers: Vec<&str> = ls_registry::config::builtin_entries()
+                        .into_iter()
+                        .filter(|(_, s)| {
+                            s.languages.iter().any(|l| l.eq_ignore_ascii_case(lang_or_id))
+                        })
+                        .map(|(bid, _)| bid)
+                        .collect();
+                    let list = if servers.is_empty() {
+                        "(none — browse `serena-cli ls-list`)".to_string()
+                    } else {
+                        servers.join(", ")
+                    };
+                    local_err_json(
+                        "BAD_ARGS",
+                        &format!(
+                            "binary `{stem}` matches no built-in server; built-in servers for \
+                             language `{lang_or_id}`: {list}; register explicitly with a server \
+                             id: serena-cli ls-use <server-id> <path>"
+                        ),
+                    );
+                    return ExitCode::from(2);
+                }
+                // 多命中 → 拒改 + 命中清单（同名二进制归属歧义）。
+                Err(hits) => {
+                    local_err_json(
+                        "BAD_ARGS",
+                        &format!(
+                            "binary `{stem}` matches multiple built-in servers ({}); register \
+                             explicitly with a server id: serena-cli ls-use <server-id> <path>",
+                            hits.join(", ")
+                        ),
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
         None => match (new_lang, new_ext) {
             (Some(l), Some(e)) => {
                 if !ls_registry::config::valid_block_id(lang_or_id) {
@@ -2622,13 +2874,31 @@ fn cmd_ls_use(
         local_err_json("INTERNAL", &format!("write {cfg_str}: {e}"));
         return ExitCode::from(3);
     }
+    // 启动命令形态回显：{bin} 展开为注册的二进制——参数与二进制错配一眼可见
+    // （oxw0：此前回显只有 server 名，jedi 参数塞给 pyright 不可见）。
+    let launch: Vec<String> = if exec.is_empty() {
+        vec![bin.display().to_string()]
+    } else {
+        exec.iter()
+            .map(|a| {
+                if a == "{bin}" {
+                    bin.display().to_string()
+                } else {
+                    a.clone()
+                }
+            })
+            .collect()
+    };
     println!(
         "{}",
         json!({
             "ok": true,
             "server": id,
+            "languages": languages,
+            "launch": launch,
             "file": cfg_str,
             "mode": if is_override { "override" } else { "new" },
+            "matched_by": matched_by,
             "note": "takes effect after daemon restart (serena-cli stop-all or idle timeout)",
         })
     );
@@ -3332,11 +3602,23 @@ async fn cmd_stop_all(lock_path: &Path) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        other => {
-            // 端口死/请求失败：lock 留给 daemon 仲裁路径接管清理。
-            // CLI 无归属凭据，此处的 daemon 可能正在 draining 收尾或 lock 已易主——
-            // 无条件删会制造孤儿（bd y2y）。
-            eprintln!("shutdown probe failed: {other:?}; lock left for lazy-spawn arbitration");
+        Ok(r) => {
+            // daemon 还在（draining 收尾 / lock 易主）：lock 留给仲裁路径接管清理。
+            // CLI 无归属凭据，无条件删会制造孤儿（bd y2y）。
+            eprintln!(
+                "shutdown probe failed: HTTP {}; lock left for lazy-spawn arbitration",
+                r.status()
+            );
+            ExitCode::from(3)
+        }
+        Err(e) if e.is_connect() => {
+            // 锁在但端口连不上 = daemon 已死：对齐 status 的人话（bd serena-rust-6i2l）；
+            // 「无 daemon 在跑」已达成 → 0，lock 留给 lazy-spawn 仲裁删。
+            println!("daemon: not running (stale lock left for lazy-spawn arbitration)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("shutdown probe failed: {e}; lock left for lazy-spawn arbitration");
             ExitCode::from(3)
         }
     }
@@ -4020,6 +4302,116 @@ mod with_alias_tests {
     }
 }
 
+/// bd serena-rust-kdye（symbol-body / edit-context `--symbol` 旗标）+ oxw0（ls-use
+/// 二进制名智能匹配纯函数）锁。
+#[cfg(test)]
+mod blindfix_c_tests {
+    use super::*;
+
+    #[test]
+    fn clap_parses_symbol_flag_and_positional_on_both_commands() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "serena-cli",
+            "--project",
+            ".",
+            "symbol-body",
+            "calc.py",
+            "--symbol",
+            "divide",
+        ])
+        .unwrap();
+        let Some(Cmd::SymbolBody {
+            file,
+            symbol,
+            symbol_flag,
+        }) = cli.cmd
+        else {
+            panic!("expected symbol-body");
+        };
+        assert_eq!(file, "calc.py");
+        assert!(symbol.is_none() && symbol_flag.as_deref() == Some("divide"));
+
+        // 位置第二参兼容形状不变。
+        let cli = Cli::try_parse_from([
+            "serena-cli",
+            "--project",
+            ".",
+            "edit-context",
+            "calc.py",
+            "divide",
+        ])
+        .unwrap();
+        let Some(Cmd::EditContext {
+            symbol,
+            symbol_flag,
+            ..
+        }) = cli.cmd
+        else {
+            panic!("expected edit-context");
+        };
+        assert!(symbol.as_deref() == Some("divide") && symbol_flag.is_none());
+    }
+
+    #[test]
+    fn resolve_with_alias_merges_and_rejects_symbol_forms() {
+        let mut flag_only = Cmd::SymbolBody {
+            file: "calc.py".into(),
+            symbol: None,
+            symbol_flag: Some("divide".into()),
+        };
+        resolve_with_alias(&mut flag_only).unwrap();
+        let Cmd::SymbolBody { symbol, .. } = &flag_only else {
+            panic!("variant changed");
+        };
+        assert_eq!(symbol.as_deref(), Some("divide"));
+
+        let mut both = Cmd::EditContext {
+            file: "calc.py".into(),
+            symbol: Some("a".into()),
+            symbol_flag: Some("b".into()),
+        };
+        assert!(resolve_with_alias(&mut both).is_err(), "双给必拒");
+
+        let mut neither = Cmd::EditContext {
+            file: "calc.py".into(),
+            symbol: None,
+            symbol_flag: None,
+        };
+        assert!(resolve_with_alias(&mut neither).is_err(), "全缺必拒");
+    }
+
+    #[test]
+    fn builtin_id_for_binary_matches_langserver_entrypoints() {
+        // oxw0 主形态：pyright-langserver → pyright（不再落 jedi 条目）。
+        assert_eq!(
+            builtin_id_for_binary("pyright-langserver").map(|(id, _)| id),
+            Ok("pyright")
+        );
+        assert_eq!(
+            builtin_id_for_binary("jedi-language-server").map(|(id, _)| id),
+            Ok("jedi")
+        );
+        assert!(
+            builtin_id_for_binary("no-such-binary-xyz")
+                .unwrap_err()
+                .is_empty(),
+            "零命中 = 空候选清单"
+        );
+    }
+
+    #[test]
+    fn builtin_binary_keys_cover_download_bin_paths() {
+        let entries = ls_registry::config::builtin_entries();
+        let (_, spec) = entries
+            .iter()
+            .find(|(id, _)| *id == "marksman")
+            .expect("marksman in builtin table");
+        let keys = builtin_binary_keys("marksman", spec);
+        assert!(keys.contains(&"marksman".to_string()), "keys: {keys:?}");
+    }
+}
+
 #[cfg(test)]
 mod shorthand_tests {
     use super::rewrite_shorthand_argv;
@@ -4123,22 +4515,39 @@ fn json_escape(s: &str) -> String {
 /// 不破；replace-body 本用 `--with`，其余写工具自此同形。位置参数在 clap 里
 /// 已成 Option，未解析就到 tool_request = 编程错误（cli_main 必先跑本函数）。
 fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
-    fn merge(pos: &mut Option<String>, alias: &mut Option<String>) -> Result<(), String> {
+    fn merge(
+        pos: &mut Option<String>,
+        alias: &mut Option<String>,
+        label: &str,
+        flag: &str,
+    ) -> Result<(), String> {
         match (pos.take(), alias.take()) {
             (Some(t), None) | (None, Some(t)) => {
                 *pos = Some(t);
                 Ok(())
             }
             (Some(_), Some(_)) => {
-                Err("provide the text positionally or via --with, not both".into())
+                Err(format!("provide the {label} positionally or via --{flag}, not both"))
             }
-            (None, None) => Err("missing text: pass it positionally or via --with".into()),
+            (None, None) => Err(format!("missing {label}: pass it positionally or via --{flag}")),
         }
     }
     match cmd {
         Cmd::InsertTextBeforeSymbol { text, with, .. }
         | Cmd::InsertAtLine { text, with, .. }
-        | Cmd::ReplaceLines { text, with, .. } => merge(text, with),
+        | Cmd::ReplaceLines { text, with, .. } => merge(text, with, "text", "with"),
+        // bd serena-rust-kdye：symbol-body / edit-context 符号名旗标归一——与位置
+        // 第二参等价二选一，wire args 键名不变。
+        Cmd::SymbolBody {
+            symbol,
+            symbol_flag,
+            ..
+        }
+        | Cmd::EditContext {
+            symbol,
+            symbol_flag,
+            ..
+        } => merge(symbol, symbol_flag, "symbol", "symbol"),
         // bd 4nqk：内容四来源（位置 / --with / --stdin / --content-file）恰好一个。
         Cmd::CreateTextFile {
             content,
@@ -4180,7 +4589,7 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
                 ),
             }
         }
-        Cmd::InsertTextAfterSymbol { text, with, .. } => merge(text, with),
+        Cmd::InsertTextAfterSymbol { text, with, .. } => merge(text, with, "text", "with"),
         _ => Ok(()),
     }
 }
@@ -4803,6 +5212,75 @@ mod net_retry_tests {
         assert!(!hover_ready(&json!({"contents": null})));
     }
 
+    // ---- bd serena-rust-nqjo rework：打点整词精化 + ≤3 行窗口 + kind 偏置 ----
+
+    #[test]
+    fn probe_positions_whole_word_skips_substring_hit() {
+        // 子串命中 `running` 不是 `run` —— 整词精化后落在真正的 run 名字上。
+        let wire = json!([
+            {"name": "run", "kind": "Function", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 3, "character": 1}}}
+        ]);
+        let text = "def running(x):\n    return run(x)\n";
+        // run 在 line 0 无整词命中（running 吃掉），窗口 +1 行命中 `run(x)` 列 11。
+        assert_eq!(hover_probe_positions(&wire, Some(text)), vec![(1, 11)]);
+    }
+
+    #[test]
+    fn probe_positions_cross_line_signature_hits_name_token() {
+        // range.start 行是装饰器（pyright 对装饰器函数 range 从 @ 行起），
+        // 名字在窗口 +1 行 —— 单行版 fallback 会丢候选导致 hover 恒 pending。
+        let wire = json!([
+            {"name": "cached_compute", "kind": "Function", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 1}}}
+        ]);
+        let text = "@cache\ndef cached_compute(x):\n    return x\n";
+        assert_eq!(hover_probe_positions(&wire, Some(text)), vec![(1, 4)]);
+    }
+
+    #[test]
+    fn probe_positions_prefers_semantic_kinds_over_variables() {
+        // 冷窗口局部变量 hover 常空：Class/Function/Method 优先于 Other(变量)。
+        let wire = json!([
+            {"name": "alpha", "kind": {"Other": 13}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 9}}},
+            {"name": "beta", "kind": {"Other": 13}, "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 8}}},
+            {"name": "gamma", "kind": {"Other": 13}, "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 9}}},
+            {"name": "Repo", "kind": "Class", "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 12}}}
+        ]);
+        let text = "alpha = 1\nbeta = 2\ngamma = 3\nclass Repo:\n";
+        let got = hover_probe_positions(&wire, Some(text));
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], (3, 6), "Class 排到候选首位");
+    }
+
+    #[test]
+    fn probe_positions_scans_all_symbols_when_no_semantic_kind() {
+        // 全无语义 kind（import 别名/属性形态）→ 不截断，4 个全扫，3 个可定位。
+        let wire = json!([
+            {"name": "a", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}},
+            {"name": "b", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}},
+            {"name": "zz", "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 5}}},
+            {"name": "d", "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 4}}}
+        ]);
+        let text = "a = 1\nb = 2\nzz = 3\nd = 4\n";
+        assert_eq!(hover_probe_positions(&wire, Some(text)).len(), 4);
+    }
+
+    #[test]
+    fn probe_positions_pyright_fixture_shape_lands_on_name() {
+        // PM 实景复刻：supervisor overview 组装丢弃 selectionRange（字段缺失），
+        // range.start 落在 def/class 关键字位 → 必须打在名字 token 上。
+        let wire = json!([
+            {"name": "Calculator", "kind": "Class", "range": {"start": {"character": 0, "line": 3}, "end": {"character": 18, "line": 3}}},
+            {"name": "__init__", "kind": "Method", "range": {"start": {"character": 4, "line": 4}, "end": {"character": 38, "line": 4}}},
+            {"name": "base", "kind": {"Other": 13}, "range": {"start": {"character": 23, "line": 4}, "end": {"character": 36, "line": 4}}}
+        ]);
+        let text = "\"\"\"doc\"\"\"\n\n\nclass Calculator:\n    def __init__(self, base: int = 0):\n        self.base = base\n";
+        assert_eq!(
+            hover_probe_positions(&wire, Some(text)),
+            vec![(3, 6), (4, 8), (4, 23)],
+            "class 名 (3,6) / 方法名 (4,8) / 参数名 (4,23)，全在名字 token 内"
+        );
+    }
+
     #[test]
     fn wait_ready_backoff_caps_at_2s() {
         assert_eq!(wait_ready_backoff(0), Duration::from_millis(500));
@@ -5232,5 +5710,53 @@ mod status_tests {
             resolve_git_head_sha(&dotgit, "e327fa5000000000000000000000000000000000").expect("detached");
         assert!(sha.starts_with("e327fa5"), "got: {sha}");
         let _ = std::fs::remove_dir_all(&dotgit);
+    }
+}
+
+/// 盲测波 Wave1-B：wait-ready LS_NOT_INSTALLED fail-fast（bd serena-rust-nqjo）+
+/// unknown tool 版本错位 hint（bd serena-rust-eog5）的纯函数锁。
+#[cfg(test)]
+mod blindfix_b_tests {
+    use super::*;
+
+    #[test]
+    fn not_installed_exit_failfasts_on_wire_code() {
+        let e = r#"{"code":"LS_NOT_INSTALLED","message":"language server `pyright` not found in PATH; install_hint: npm install -g pyright","retryable":false}"#;
+        let code = not_installed_exit(e, Some("python")).expect("确定性错误必须 fail-fast");
+        assert_eq!(code, ExitCode::from(1));
+    }
+
+    #[test]
+    fn not_installed_exit_keeps_waiting_on_transient_and_other_codes() {
+        // transport 层（非 JSON）= 瞬态。
+        assert!(not_installed_exit("hover: transport 503: {...}", Some("python")).is_none());
+        // 其他 wire code ≠ 未装（如 BAD_ARGS）不该误判成 install 问题。
+        let bad = r#"{"code":"BAD_ARGS","message":"invalid file"}"#;
+        assert!(not_installed_exit(bad, None).is_none());
+    }
+
+    #[test]
+    fn unknown_tool_hint_hits_only_bad_args_unknown_tool() {
+        let hit = json!({"code":"BAD_ARGS","message":"unknown tool: recipe"});
+        assert_eq!(
+            unknown_tool_hint(&hit),
+            Some("daemon may have been started by an older binary; run `serena-cli stop-all` and retry")
+        );
+        // 同文案但非 BAD_ARGS → 不 hint。
+        let internal = json!({"code":"INTERNAL","message":"unknown tool: recipe"});
+        assert!(unknown_tool_hint(&internal).is_none());
+        // BAD_ARGS 但不是 unknown tool → 不 hint。
+        let other = json!({"code":"BAD_ARGS","message":"invalid server id `x`"});
+        assert!(unknown_tool_hint(&other).is_none());
+        // 非 object 错误体 → 不 hint。
+        assert!(unknown_tool_hint(&json!("unknown tool: recipe")).is_none());
+    }
+
+    #[test]
+    fn wire_err_code_reads_code_field_only() {
+        let e = r#"{"code":"LS_TIMEOUT","message":"x"}"#;
+        assert_eq!(wire_err_code(e).as_deref(), Some("LS_TIMEOUT"));
+        assert_eq!(wire_err_code("transport 500: internal"), None);
+        assert_eq!(wire_err_code(r#"{"message":"no code"}"#), None);
     }
 }

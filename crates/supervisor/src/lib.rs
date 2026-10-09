@@ -175,8 +175,11 @@ pub type ToolResult<T> = std::result::Result<T, ToolError>;
 /// 会漏检同粒度改写，命中旧 SymbolHit → replace-body 切片错位）。
 type SymbolCacheKey = (PathBuf, String, Option<(SystemTime, u64)>);
 
-/// O3 解析候选：(file 相对路径, 符号 range)。
-type SymbolCandidates = Vec<(String, lsp_types::Range)>;
+/// O3 解析候选：(file 相对路径, 符号名, 符号全范围)。
+type SymbolCandidates = Vec<(String, String, lsp_types::Range)>;
+
+/// O3 pick 中间形态：(符号名, 符号全范围)——扫描侧再拼 file 维度成 SymbolCandidates。
+type SymbolNameRanges = Vec<(String, lsp_types::Range)>;
 
 /// overview / symbol-body 的缓存 key；文件不可 stat（不存在/失败）→ None（确定性 key）。
 fn doc_symbol_cache_key(root: &Path, file: &str) -> SymbolCacheKey {
@@ -204,6 +207,49 @@ fn find_symbol_cache_key(
         format!("ws?{query}"),
         root_mtime.map(|m| (m, 0)),
     )
+}
+
+/// bd serena-rust-gqyp：documentSymbol/workspace-symbol 的 `range` 是符号**全范围**
+/// （起点落在 `def`/`class` 声明关键字上），refs/hover 类语义请求必须打在**名字
+/// token** 上——打在关键字上 LS 恒返空（对拍实锤：同刻名字处 1 item、关键字处
+/// 0 item）。在 range 起始 ≤3 行内找整词名字，命中 → 返回名字位置（UTF-16 col，
+/// 与 LSP wire 同基线）；找不到（装饰器跨行等稀有形态）→ 原样返回 `range.start`
+/// 保守降级。
+fn refine_symbol_name_position(
+    text: &str,
+    name: &str,
+    range: lsp_types::Range,
+) -> lsp_types::Position {
+    let last_line = range.start.line.saturating_add(2).min(range.end.line);
+    let window = (last_line - range.start.line + 1) as usize;
+    for (i, line) in text
+        .lines()
+        .skip(range.start.line as usize)
+        .take(window)
+        .enumerate()
+    {
+        if let Some(byte_col) = find_whole_word(line, name) {
+            let col16: usize = line[..byte_col].chars().map(char::len_utf16).sum();
+            return lsp_types::Position {
+                line: range.start.line + i as u32,
+                character: col16 as u32,
+            };
+        }
+    }
+    range.start
+}
+
+/// `name` 在 `line` 内首次**整词**出现的 byte offset（两侧非标识符字符，防
+/// `add` 命中 `additional`）。
+fn find_whole_word(line: &str, name: &str) -> Option<usize> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(name)
+        .find(|(start, hit)| {
+            let end = start + hit.len();
+            line[..*start].chars().next_back().is_none_or(|c| !is_word(c))
+                && line[end..].chars().next().is_none_or(|c| !is_word(c))
+        })
+        .map(|(start, _)| start)
 }
 
 /// 符号缓存写入内核（容量闸门 + 空集跳过）。P2-a5k 抽出供 `Supervisor::symbol_cache_put`
@@ -3351,10 +3397,10 @@ impl Supervisor {
         name: &str,
         lang: Option<&str>,
     ) -> ToolResult<(String, u32, u32, Option<String>)> {
-        // (file, range) 候选；精确名优先于前缀，同级确定性排序。
-        let pick = |hits: &[SymbolHit]| -> (SymbolCandidates, SymbolCandidates) {
-            let mut exact: Vec<(String, lsp_types::Range)> = Vec::new();
-            let mut prefix: Vec<(String, lsp_types::Range)> = Vec::new();
+        // (name, range) 候选对；精确名优先于前缀，同级确定性排序（file 维度在扫描侧拼）。
+        let pick = |hits: &[SymbolHit]| -> (SymbolNameRanges, SymbolNameRanges) {
+            let mut exact: SymbolNameRanges = Vec::new();
+            let mut prefix: SymbolNameRanges = Vec::new();
             for h in hits {
                 if h.name == name {
                     exact.push((h.name.clone(), h.range));
@@ -3364,23 +3410,26 @@ impl Supervisor {
             }
             (exact, prefix)
         };
-        let mut exact: Vec<(String, lsp_types::Range)> = Vec::new();
-        let mut prefix: Vec<(String, lsp_types::Range)> = Vec::new();
+        let mut exact: SymbolCandidates = Vec::new();
+        let mut prefix: SymbolCandidates = Vec::new();
 
         // 1) documentSymbol 缓存扫描。key.1 即构造时的 file 相对路径，直接可复用。
+        //    `ws?{query}` 条目是 find-symbol 的 workspace 级缓存，k.1 是伪文件名——
+        //    扫进去会把 query 名当文件选出（file="ws?divide" → refs 打到不存在的
+        //    路径上），必须排除。
         let root_id = key_root_identity(root);
         let cached_files: Vec<(String, Vec<SymbolHit>)> = self
             .symbol_cache
             .lock()
             .unwrap()
             .iter()
-            .filter(|(k, _)| key_root_identity(&k.0) == root_id)
+            .filter(|(k, _)| !k.1.starts_with("ws?") && key_root_identity(&k.0) == root_id)
             .map(|(k, v)| (k.1.clone(), v.clone()))
             .collect();
         for (file, hits) in &cached_files {
             let (e, p) = pick(hits);
-            exact.extend(e.into_iter().map(|(_, r)| (file.clone(), r)));
-            prefix.extend(p.into_iter().map(|(_, r)| (file.clone(), r)));
+            exact.extend(e.into_iter().map(|(n, r)| (file.clone(), n, r)));
+            prefix.extend(p.into_iter().map(|(n, r)| (file.clone(), n, r)));
         }
 
         // 2) 缓存零命中 → workspace/symbol 兜底（冷 daemon 窗口）。暖机窗口内
@@ -3402,9 +3451,9 @@ impl Supervisor {
                                 .replace('\\', "/")
                                 .to_string();
                             if h.name == name {
-                                exact.push((rel, h.range));
+                                exact.push((rel, h.name.clone(), h.range));
                             } else if h.name.starts_with(name) {
-                                prefix.push((rel, h.range));
+                                prefix.push((rel, h.name.clone(), h.range));
                             }
                         }
                     }
@@ -3425,10 +3474,11 @@ impl Supervisor {
         }
         let warming = !self.index_warming_warnings(root).is_empty();
 
-        let by_pos = |a: &(String, lsp_types::Range), b: &(String, lsp_types::Range)| {
+        let by_pos = |a: &(String, String, lsp_types::Range),
+                      b: &(String, String, lsp_types::Range)| {
             a.0.cmp(&b.0)
-                .then(a.1.start.line.cmp(&b.1.start.line))
-                .then(a.1.start.character.cmp(&b.1.start.character))
+                .then(a.2.start.line.cmp(&b.2.start.line))
+                .then(a.2.start.character.cmp(&b.2.start.character))
         };
         exact.sort_by(by_pos);
         prefix.sort_by(by_pos);
@@ -3438,7 +3488,7 @@ impl Supervisor {
         } else {
             (&prefix, prefix.len())
         };
-        let Some((file, range)) = chosen.first().cloned() else {
+        let Some((file, sym_name, range)) = chosen.first().cloned() else {
             // 打回修复（bd serena-rust-bxd）：暖机窗口内零命中 ≠ 符号不存在——
             // wssym 可能仍未爬完，错误必须带 hint 防 AI 误判（对齐 find-symbol
             // 的 partial warning，不能比它更误导）。
@@ -3452,13 +3502,21 @@ impl Supervisor {
             }
             return Err(ToolError::BadArgs { detail });
         };
+        // bd serena-rust-gqyp：全范围起点 = 声明关键字处，refs 打上去恒空——精化到
+        // 名字 token（refine_symbol_name_position）；文件读不到（合成缓存/竞态删除）
+        // → 保守回退 range.start。
+        let pos = tokio::fs::read_to_string(root.join(&file))
+            .await
+            .ok()
+            .map(|text| refine_symbol_name_position(&text, &sym_name, range))
+            .unwrap_or(range.start);
         let note = (total > 1).then(|| {
             format!(
                 "resolved --symbol {name} -> {file}:{} ({total} matches; using first, 1-based line)",
-                range.start.line + 1
+                pos.line + 1
             )
         });
-        Ok((file, range.start.line, range.start.character, note))
+        Ok((file, pos.line, pos.character, note))
     }
 
     /// `replace_text_in_symbol`：在 symbol 体内替换 old→new（Task 25）。
@@ -9184,6 +9242,114 @@ mod symbol_cache_tests {
         assert!(
             !err.to_string().contains("index may still be warming"),
             "非窗口零命中不得带 hint: {err}"
+        );
+    }
+
+    /// bd serena-rust-gqyp：--symbol 解析坐标必须精化到**名字 token**——缓存里的
+    /// range 是全范围（起点 = def 关键字），直接喂 refs 恒空（对拍实锤）。真实
+    /// tempdir 文件锁换算约定：`def divide` 关键字 (1,4) → 名字 (1,8)。
+    #[tokio::test]
+    async fn resolve_symbol_position_refines_to_name_token() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("m.py"),
+            "class C:\n    def divide(self, x):\n        return divide(x)\n",
+        )
+        .unwrap();
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "m.py"),
+            vec![SymbolHit {
+                name: "divide".into(),
+                kind: SymbolKindTag::Function,
+                uri: "file:///x/m.py".into(),
+                range: lsp_types::Range {
+                    start: Position::new(1, 4), // `def` 关键字
+                    end: Position::new(2, 24),
+                },
+                container: Some("C".into()),
+            }],
+        );
+        let (file, line, col, note) = sup
+            .resolve_symbol_position(root, "divide", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (file.as_str(), line, col),
+            ("m.py", 1, 8),
+            "必须精化到名字 (1,8) 而非关键字 (1,4)"
+        );
+        assert!(note.is_none(), "单命中不提示");
+    }
+
+    /// bd serena-rust-gqyp 伴随缺陷：find-symbol 的 `ws?{query}` 缓存条目 k.1 是
+    /// 伪文件名，直查扫描不得把它当 file 候选（否则可能选出 "ws?divide" 当路径）。
+    /// fallback 走 tool_find_symbol 消费 URI 真路径属设计内，保留。
+    #[tokio::test]
+    async fn resolve_symbol_position_ignores_ws_pseudo_file_entries() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/o3-ws");
+        sup.symbol_cache_put(
+            find_symbol_cache_key(root, "divide", None),
+            vec![SymbolHit {
+                name: "divide".into(),
+                kind: SymbolKindTag::Function,
+                uri: "file:///x/a.py".into(),
+                range: lsp_types::Range {
+                    start: Position::new(3, 0),
+                    end: Position::new(9, 0),
+                },
+                container: None,
+            }],
+        );
+        // 无过滤时直查扫描会把 "ws?divide" 当文件候选，且按文件名序 "ws?divide" <
+        // "x/a.py" 排前当选 → Ok("ws?divide")；过滤后只能经 fallback 从 URI 派生
+        // 真相对路径 → Ok("x/a.py")。
+        let (file, line, col, _note) = sup
+            .resolve_symbol_position(root, "divide", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (file.as_str(), line, col),
+            ("x/a.py", 3, 0),
+            "ws? 伪文件名不得当选，必须用 URI 派生路径"
+        );
+    }
+
+    /// bd serena-rust-gqyp：名字精化的换算约定——整词匹配、UTF-16 col、找不到回退。
+    #[test]
+    fn refine_symbol_name_position_finds_whole_word_name_token() {
+        let text = "class C:\n    def divide(self, x):\n        return divide(x)\n";
+        let full = lsp_types::Range {
+            start: Position::new(1, 4),
+            end: Position::new(2, 24),
+        };
+        let p = refine_symbol_name_position(text, "divide", full);
+        assert_eq!(p, Position::new(1, 8), "名字 token 位置，非 def 关键字");
+
+        // 整词边界：add 不得命中 additional → 回退 range.start。
+        let text2 = "def additional(x):\n    pass\n";
+        let full2 = lsp_types::Range {
+            start: Position::new(0, 0),
+            end: Position::new(1, 8),
+        };
+        assert_eq!(
+            refine_symbol_name_position(text2, "add", full2),
+            Position::new(0, 0),
+            "无整词命中回退 range.start"
+        );
+
+        // col 按 UTF-16 计：名字前有多字节字符，byte offset 12 → utf16 col 10。
+        let text3 = "x = \"中\" # divide\n";
+        let full3 = lsp_types::Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 17),
+        };
+        assert_eq!(
+            refine_symbol_name_position(text3, "divide", full3),
+            Position::new(0, 10),
+            "col 必须是 UTF-16 单位数"
         );
     }
 

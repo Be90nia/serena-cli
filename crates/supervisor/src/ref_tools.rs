@@ -489,7 +489,11 @@ pub async fn find_referencing_code_snippets(
     let refs =
         fetch_references_with_hybrid_companion(&session, &canon_root, &abs_file, line, col, refs)
             .await;
-    let refs = drop_self_reference(refs, &abs_file, line);
+    // bd serena-rust-gqyp rework 拍板：本工具语义 = 符号**全部**引用点+片段（含定义
+    // 点——AI 改码前定义位置是有效上下文）。不做 nl2w 的查询行自引用过滤，否则
+    // --symbol（查询点=定义）与位置形式（查询点=调用）各丢对侧端点，两形式条目集
+    // 永不相等（PM 同刻对拍 1≠2 实测）；票面验收 = 条目集一致含定义。「callers 不含
+    // 定义」语义由 find_referencing_symbols 保留 drop_self_reference 承担。
 
     let mut cache: HashMap<String, String> = HashMap::new();
     let mut out = Vec::new();

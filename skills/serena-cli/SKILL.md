@@ -11,8 +11,8 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 
 ```
 1. serena-cli overview <file>                    # 顶层符号列表；禁 read 整文件
-2. serena-cli edit-context <file> <symbol>       # 改前一次拿齐 body+callers+doc+tests
-3. serena-cli symbol-body <file> <symbol>        # 按名取函数体（免行号往返）
+2. serena-cli edit-context <file> <symbol>       # 改前一次拿齐 body+callers+doc+tests（符号名也可 --symbol <NAME>）
+3. serena-cli symbol-body <file> <symbol>        # 按名取函数体（免行号往返；符号名也可 --symbol <NAME>）
 4. serena-cli replace-body <file> <symbol> --with <NEW>   # 换体（写门+hash 对账+原子写）
 5. serena-cli find-referencing-symbols <file> <line> <col>  # 改前影响面
 6. serena-cli diagnostics <file> --wait-gen 1    # 收尾验证（等新一轮诊断）
@@ -26,6 +26,8 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 - **`--direct` = 纯冷进程，无 daemon**（bd serena-rust-9hy1）：跳过 lazy-spawn/缓存，只适合轻量读类（overview/read-file/status 等）；语义类工具（def/hover/refs/edit-context）`--direct` 首调必返空 + degraded warning（无预热索引）——语义查询一律走默认 daemon 模式，不要用 `--direct` 后误判"语义层坏了"。
 - **编辑带 `--expected-hash <hash>`**（来自最近 read-file/编辑返回），防并发覆盖。
 - **`--lang <lang>`** 显式指定语言当扩展名有歧义（如 .ts 项目里的 .js）。
+- **`--symbol <NAME>`** 三命令通用符号名直查：find-referencing-code-snippets / symbol-body / edit-context（后两者的位置第二参保留兼容，二选一）。
+- **ls-use 已知语言**（如 `ls-use python <bin>`）按二进制名智能匹配内置 server：唯一命中自动选（回显生效 id + 启动命令形态）；零/多命中拒改并列候选——想继承某内置条目请显式点名 server id（如 `ls-use jedi <bin>`）。
 - JSON 解析：stdout 首行可能是 `[warn] ...` 人读行——解析前先切出第一个 `{`。
 - **写类命令对无 LS 的文件类型拒写**（如 .txt → BAD_ARGS "file not supported"）——纯文本用普通文件工具。
 - 大改/不确定结果 → 改完跑 `undo` 验证能回滚再继续；`undo --list` 看栈。rename 改多文件 = 一个事务，undo 一次全回滚。
