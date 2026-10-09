@@ -249,6 +249,10 @@ enum Cmd {
         /// `--end-line` 短别名（二选一，双给拒）。
         #[arg(long)]
         end: Option<u32>,
+        /// bd a14g：soft limit（content 字节 = N*4 − 32 元数据留余），超按整行砍
+        /// （留半行丢），响应附 `truncated:true/total_bytes/total_tokens`；0 = BAD_ARGS。
+        #[arg(long, value_name = "N")]
+        max_tokens: Option<u64>,
     },
     /// 列出目录项（不递归）。
     ListDir { path: String },
@@ -334,7 +338,9 @@ enum Cmd {
     },
     // bd serena-rust-55m / bxd（内部追踪号，不入 --help）
     /// 阻塞到就绪：循环探测。`--stage symbol` =
-    /// overview 首符号非空即就绪（符号索引层，秒级）；`--stage semantic`（默认，
+    /// overview 首符号非空即就绪（符号索引层，秒级）；`--stage indexing` =
+    /// RA Indexing progress end 真就绪屏障（bd 0vj1；hover/def 的 prime-caches
+    /// 路径收敛，预算按 Cargo.lock 规模 60-300s）；`--stage semantic`（默认，
     /// 保持现行为）= hover contents 非空（类型分析层；未就绪响应带 warning，
     /// 解析即判据）。就绪 exit 0；超时 exit 4。探测间隔 500ms 起指数退避到 2s
     /// 封顶，进度（含阶段）单行打 stderr。
@@ -1150,7 +1156,8 @@ async fn forward_with_draining_retry(cli: &Cli, lock_path: &Path) -> Result<u8, 
 // ==== bd serena-rust-55m：wait-ready ====
 
 /// wait-ready 就绪档位：symbol = 符号索引可用（秒级）；
-/// semantic = 类型分析可用（大 workspace 可达 120s+，历史默认判据）。
+/// semantic = 类型分析可用（大 workspace 可达 120s+，历史默认判据）；
+/// indexing = RA Indexing progress end 真就绪屏障（bd 0vj1，daemon 侧等待收敛）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum WaitStage {
     Symbol,
@@ -1158,6 +1165,9 @@ enum WaitStage {
     /// def 同层探针：hover 就绪 ≠ def/refs 就绪（hover ready 后 def 仍可能
     /// items:[]）。ready = 语义解析层真可用。
     Def,
+    /// Indexing progress end 屏障（bd 0vj1）：判据 = daemon 侧 session_for 的
+    /// Indexing 等待收敛（end 到达或分档超时兜底）后首个工具调用成功返回。
+    Indexing,
 }
 
 /// 读类工具输出档位（find-symbol / search `--format`）。
@@ -1562,7 +1572,15 @@ async fn cmd_wait_ready(
                 })
         });
         let mut probe_count = 0usize;
-        if symbol_up.is_some() {
+        if stage == WaitStage::Indexing {
+            // bd 0vj1：探针 = WaitIndexing end。daemon 侧 session_for 阻塞至 Indexing
+            // 等待收敛（end 到达 / 分档超时 + documentSymbol 兜底），本调用返回即屏障
+            // 已过 —— 载荷不判形，就绪语义在服务端等待而非响应内容。
+            if overview.is_some() {
+                eprintln!("ready (indexing) in {}s", started.elapsed().as_secs());
+                return ExitCode::SUCCESS;
+            }
+        } else if symbol_up.is_some() {
             if stage == WaitStage::Symbol {
                 eprintln!("ready (symbol) in {}s", started.elapsed().as_secs());
                 return ExitCode::SUCCESS;
@@ -2088,6 +2106,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             file,
             start_line,
             end_line,
+            max_tokens,
             ..
         }) => (
             "read-file",
@@ -2095,6 +2114,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
                 "file": file,
                 "start_line": start_line,
                 "end_line": end_line,
+                "max_tokens": max_tokens,
             }),
         ),
         Some(Cmd::ListDir { path }) => ("list-dir", json!({"path": path})),
@@ -4684,6 +4704,7 @@ mod blindfix_c_tests {
             end_line: None,
             start: Some(3),
             end: Some(7),
+            max_tokens: None,
         };
         resolve_with_alias(&mut cmd).unwrap();
         let Cmd::ReadFile {
@@ -4703,6 +4724,7 @@ mod blindfix_c_tests {
             end_line: None,
             start: None,
             end: Some(9),
+            max_tokens: None,
         };
         resolve_with_alias(&mut mixed).unwrap();
         let Cmd::ReadFile {
@@ -4721,6 +4743,7 @@ mod blindfix_c_tests {
             end_line: None,
             start: Some(2),
             end: None,
+            max_tokens: None,
         };
         assert!(resolve_with_alias(&mut both).is_err(), "双给必拒");
     }
@@ -4811,6 +4834,28 @@ mod blindfix_c_tests {
             cli.cmd,
             Some(Cmd::WaitReady {
                 stage: WaitStage::Def,
+                ..
+            })
+        ));
+    }
+
+    /// bd 0vj1：`--stage indexing` 可解析（ValueEnum 命名 = 小写变体名，rc=2 前科防御）。
+    #[test]
+    fn clap_parses_wait_ready_stage_indexing() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "serena-cli",
+            "--project",
+            ".",
+            "wait-ready",
+            "--stage",
+            "indexing",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::WaitReady {
+                stage: WaitStage::Indexing,
                 ..
             })
         ));
@@ -5336,6 +5381,7 @@ mod tests {
             end_line: Some(2),
             start: None,
             end: None,
+            max_tokens: None,
         };
         normalize_positions(&mut cmd).unwrap();
         let Cmd::ReadFile {

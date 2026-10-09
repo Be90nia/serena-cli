@@ -267,7 +267,8 @@ pub fn catalog() -> serde_json::Value {
                     "file": {"type": "string", "required": true},
                     "start_line": {"type": "number", "required": false, "description": "1-based inclusive"},
                     "end_line": {"type": "number", "required": false, "description": "1-based inclusive"},
-                    "no_clamp": {"type": "bool", "required": false, "default": false, "description": "bd 66al: true → strict bounds (end_line beyond EOF = BAD_ARGS); default clamps to EOF (bd mfxg)"}
+                    "no_clamp": {"type": "bool", "required": false, "default": false, "description": "bd 66al: true → strict bounds (end_line beyond EOF = BAD_ARGS); default clamps to EOF (bd mfxg)"},
+                    "max_tokens": {"type": "number", "required": false, "description": "bd a14g: soft limit, content 截断按 4B/T 估算（预算 = n*4-32 字节，留余 metadata），超按整行砍（留半行丢），写 truncated:true/total_bytes/total_tokens；0 = BAD_ARGS rc=2（与 07u5 同形）"}
                 }
             },
             "list-dir": {

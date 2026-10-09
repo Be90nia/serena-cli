@@ -9,13 +9,14 @@
 //! - `text_document.document_symbol.hierarchical_document_symbol_support = true`
 //! - `general.stale_request_support = { cancel: true, retry_on_content_modified: [...] }`
 //! - `general.position_encodings = [utf-16, utf-8]`（clangd 默认 utf-16；mock_ls capabilities 同）
+//! - `window.work_done_progress = true`（$/progress 上报门，bd 0vj1：不声明则 RA 全量静默）
 //!
 //! workspace 能力保持最小集（仅声明 workspaceFolders=true），避免过度声明误导服务器。
 
 use lsp_types::{
     ClientCapabilities, DocumentSymbolClientCapabilities, GeneralClientCapabilities,
     InitializeParams, PositionEncodingKind, StaleRequestSupportClientCapabilities,
-    TextDocumentClientCapabilities, WorkspaceClientCapabilities,
+    TextDocumentClientCapabilities, WindowClientCapabilities, WorkspaceClientCapabilities,
 };
 
 /// 默认客户端信息。CLI 在 supervisor 层组装时（Task 10）可改 name/version；本模块只给个稳定默认。
@@ -38,6 +39,12 @@ pub const RETRY_ON_CONTENT_MODIFIED: [&str; 7] = [
     "textDocument/implementation",
     "textDocument/typeDefinition",
 ];
+
+/// `window.workDoneProgress` 声明值（$/progress 上报门）—— 同源常量模式（对齐
+/// `RETRY_ON_CONTENT_MODIFIED`）。LSP spec：进度只在客户端声明后才上报；RA 侧
+/// `report_progress` 首行检查该声明，缺失 → `$/progress` 全量静默（bd 0vj1：
+/// Indexing end 真就绪判据的直接前置）。
+pub const WORK_DONE_PROGRESS: bool = true;
 
 /// 构造 base `InitializeParams`：填写 processId、capabilities、client_info，
 /// rootUri/rootPath/workspaceFolders 由调用方（supervisor）按项目补齐。
@@ -72,6 +79,10 @@ pub fn base_initialize_params() -> InitializeParams {
                 PositionEncodingKind::UTF16,
                 PositionEncodingKind::UTF8,
             ]),
+            ..Default::default()
+        }),
+        window: Some(WindowClientCapabilities {
+            work_done_progress: Some(WORK_DONE_PROGRESS),
             ..Default::default()
         }),
         ..Default::default()
@@ -201,6 +212,15 @@ mod tests {
             .expect("base 必须声明 stale_request_support");
         assert!(s.cancel);
         assert!(!s.retry_on_content_modified.is_empty());
+    }
+
+    /// bd 0vj1：不声明 workDoneProgress → RA `report_progress` 首行 return，
+    /// `$/progress` 全量静默 → Indexing end 真就绪判据永不到达（silent fail）。
+    #[test]
+    fn base_declares_work_done_progress() {
+        let p = base_initialize_params();
+        let w = p.capabilities.window.expect("base 必须声明 window");
+        assert_eq!(w.work_done_progress, Some(WORK_DONE_PROGRESS));
     }
 
     #[test]

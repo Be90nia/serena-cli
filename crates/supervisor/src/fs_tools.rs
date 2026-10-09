@@ -71,13 +71,20 @@ pub struct ReadReport {
     pub total_lines: usize,
     /// 客户端请求的 start_line（1-based，未指定 = 1）。
     pub start_line: u32,
-    /// 客户端请求的 end_line（1-based，含）。
+    /// 客户端请求的 end_line（1-based，含）；max_tokens 截断后刷新成截断末行。
     pub end_line: u32,
     /// 全文 content-hash（sha256 前 16 位）—— 行级三件套 `expected_hash` 对账用。
     pub hash: String,
     /// 杠精 ke2a-6：content 经 lines() 归一为 \n（CRLF 被静默剥 \r）而 hash 按
     /// 原字节——据此字段判断拼接写回是否引入行尾转换。crlf | lf | mixed。
     pub line_endings: &'static str,
+    /// 整文件字节数（与 content 串脱钩，永远填）。max_tokens 截断后 caller 凭
+    /// `truncated:true + total_bytes` 判断损失比例。
+    pub total_bytes: usize,
+    /// 是否被 max_tokens 砍到（false = 全文返回）。仅 max_tokens 给定可能为 true。
+    pub truncated: bool,
+    /// 整文件估算 token（4B/T，与 apply_budget 同口径）；max_tokens 未给 = None。
+    pub total_tokens: Option<usize>,
 }
 
 /// `list_dir` 单条结果。
@@ -152,12 +159,16 @@ fn split_lines_mixed(text: &str) -> Vec<&str> {
     lines
 }
 
-/// 读 `root/file` 内容，可选 1-based 行切片。
+/// 读 `root/file` 内容，可选 1-based 行切片 + max_tokens 截断（bd a14g）。
 ///
 /// - `start_line=None, end_line=None`：全文件；
 /// - `start_line=Some(s), end_line=None`：s..末；
 /// - `start_line=None, end_line=Some(e)`：1..e；
-/// - `start_line=Some(s), end_line=Some(e)`：s..e（含 e）。
+/// - `start_line=Some(s), end_line=Some(e)`：s..e（含 e）；
+/// - `max_tokens=Some(n)`：按 4B/T 估算 content 字节上限 = `n*4 − 32`（32 =
+///   response metadata 留余），按整行切（留半行砍掉，split_lines_mixed 同源）；
+///   超限置 `truncated:true` 并刷新 `end_line` 到截断末行；`max_tokens=Some(0)`
+///   = BAD_ARGS（与 07u5 全局 `--max-tokens 0` 同走 rc=2）。
 ///
 /// `clamp=true`（默认，bd mfxg）：`end_line` 超 EOF 自动收到末行（6 行文件传
 /// 20 = 读到 EOF）；`clamp=false`（--no-clamp，bd 66al）保留严格越界 BAD_ARGS，
@@ -168,7 +179,13 @@ pub async fn read_file(
     start_line: Option<u32>,
     end_line: Option<u32>,
     clamp: bool,
+    max_tokens: Option<usize>,
 ) -> FsResult<ReadReport> {
+    if let Some(0) = max_tokens {
+        return Err(FsError::BadArgs {
+            detail: "max_tokens must be >= 1 (got 0)".into(),
+        });
+    }
     let canon_path = safe_join(root, file)?;
     let text = tokio::fs::read_to_string(&canon_path).await.map_err(|e| {
         // bd serena-rust-sgc0：二进制内容 InvalidData（"stream did not contain
@@ -189,9 +206,10 @@ pub async fn read_file(
     //   保持一致。
     let lines: Vec<&str> = split_lines_mixed(&text);
     let total = lines.len();
+    let total_bytes = text.len();
     let s = start_line.unwrap_or(1);
     let raw_e = end_line.unwrap_or(total as u32);
-    let e = if clamp {
+    let mut e = if clamp {
         raw_e.min(total as u32)
     } else {
         raw_e
@@ -206,7 +224,37 @@ pub async fn read_file(
             detail: format!("invalid range {s}..{e} (start > end)"),
         });
     }
-    let content = lines[(s - 1) as usize..e as usize].join("\n");
+    // max_tokens 截断（bd a14g）：按整行累加到预算内，留半行砍掉（与
+    // split_lines_mixed 同源）。预算 = n*4 − 32 字节；32 = response 其它字段
+    // 的留余（coarse，不精确）。ponytail: 不做精确 BPE——soft limit 同 apply_budget。
+    let slice = &lines[(s - 1) as usize..e as usize];
+    let (content, truncated) = {
+        let raw = slice.join("\n");
+        match max_tokens {
+            Some(n) => {
+                let budget = n.saturating_mul(4).saturating_sub(32);
+                if raw.len() > budget {
+                    let mut bytes = 0usize;
+                    let mut kept = 0usize;
+                    for (i, line) in slice.iter().enumerate() {
+                        // +1 给除首行外的 \n 分隔符（join 时插入）。
+                        let cost = if i == 0 { line.len() } else { line.len() + 1 };
+                        if bytes + cost > budget {
+                            break;
+                        }
+                        bytes += cost;
+                        kept = i + 1;
+                    }
+                    e = s + kept as u32 - 1;
+                    (slice[..kept].join("\n"), true)
+                } else {
+                    (raw, false)
+                }
+            }
+            None => (raw, false),
+        }
+    };
+    let total_tokens = max_tokens.map(|_| total_bytes / 4);
     // 杠精 ke2a-6：CRLF 文件静默转 LF 的拼接写回防雷标记（\n 计数含 \r\n 内的）。
     let line_endings = {
         let crlf = text.matches("\r\n").count();
@@ -226,6 +274,9 @@ pub async fn read_file(
         end_line: e,
         hash: crate::content_hash(&text),
         line_endings,
+        total_bytes,
+        truncated,
+        total_tokens,
     })
 }
 
@@ -423,7 +474,7 @@ mod binary_read_tests {
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::write(dir.path().join("bin.py"), vec![0xFFu8; 64]).expect("binary fixture");
 
-        let err = read_file(dir.path(), "bin.py", None, None, true)
+        let err = read_file(dir.path(), "bin.py", None, None, true, None)
             .await
             .expect_err("binary content must fail");
         let FsError::BadArgs { detail } = err else {
@@ -433,7 +484,7 @@ mod binary_read_tests {
 
         // 同目录文本文件不受影响。
         std::fs::write(dir.path().join("good.py"), "x = 1\n").expect("text fixture");
-        let ok = read_file(dir.path(), "good.py", None, None, true)
+        let ok = read_file(dir.path(), "good.py", None, None, true, None)
             .await
             .expect("read ok");
         assert_eq!(ok.content, "x = 1");
@@ -447,12 +498,12 @@ mod binary_read_tests {
         std::fs::write(dir.path().join("crlf.py"), "a = 1\r\nb = 2\r\n").expect("crlf fixture");
         std::fs::write(dir.path().join("lf.py"), "a = 1\nb = 2\n").expect("lf fixture");
         std::fs::write(dir.path().join("mixed.py"), "a = 1\r\nb = 2\n").expect("mixed fixture");
-        let crlf = read_file(dir.path(), "crlf.py", None, None, true).await.expect("crlf");
+        let crlf = read_file(dir.path(), "crlf.py", None, None, true, None).await.expect("crlf");
         assert_eq!(crlf.line_endings, "crlf");
         assert_eq!(crlf.content, "a = 1\nb = 2", "content 保持 LF 归一（既有契约）");
-        let lf = read_file(dir.path(), "lf.py", None, None, true).await.expect("lf");
+        let lf = read_file(dir.path(), "lf.py", None, None, true, None).await.expect("lf");
         assert_eq!(lf.line_endings, "lf");
-        let mixed = read_file(dir.path(), "mixed.py", None, None, true).await.expect("mixed");
+        let mixed = read_file(dir.path(), "mixed.py", None, None, true, None).await.expect("mixed");
         assert_eq!(mixed.line_endings, "mixed");
     }
 
@@ -491,7 +542,7 @@ mod mixed_line_endings_tests {
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("mixed.py");
         std::fs::write(&path, b"line1\r\nline2\nline3\rline4\nline5\r\n").expect("fixture");
-        let r = read_file(dir.path(), "mixed.py", None, None, true)
+        let r = read_file(dir.path(), "mixed.py", None, None, true, None)
             .await
             .expect("read ok");
         // 修复前: total_lines=4（lines() 只切 \n，少计裸 \r 分隔的 line3/line4）
@@ -501,11 +552,11 @@ mod mixed_line_endings_tests {
         // content 切片按行号也对齐（lines() 同样语义升级）
         assert_eq!(r.content, "line1\nline2\nline3\nline4\nline5");
         // 单行切片 line3 单独取出（裸 \r 被剥，等价 .lines() 对 "line3\r" 的处理）
-        let r3 = read_file(dir.path(), "mixed.py", Some(3), Some(3), true)
+        let r3 = read_file(dir.path(), "mixed.py", Some(3), Some(3), true, None)
             .await
             .expect("slice ok");
         assert_eq!(r3.content, "line3");
-        let r5 = read_file(dir.path(), "mixed.py", Some(5), Some(5), true)
+        let r5 = read_file(dir.path(), "mixed.py", Some(5), Some(5), true, None)
             .await
             .expect("slice ok");
         assert_eq!(r5.content, "line5");
@@ -515,7 +566,7 @@ mod mixed_line_endings_tests {
     async fn read_file_pure_crlf_unchanged() {
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::write(dir.path().join("crlf.py"), "a = 1\r\nb = 2\r\n").expect("fixture");
-        let r = read_file(dir.path(), "crlf.py", None, None, true)
+        let r = read_file(dir.path(), "crlf.py", None, None, true, None)
             .await
             .expect("read ok");
         assert_eq!(r.total_lines, 2);
@@ -527,7 +578,7 @@ mod mixed_line_endings_tests {
     async fn read_file_pure_lf_unchanged() {
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::write(dir.path().join("lf.py"), "a = 1\nb = 2\n").expect("fixture");
-        let r = read_file(dir.path(), "lf.py", None, None, true)
+        let r = read_file(dir.path(), "lf.py", None, None, true, None)
             .await
             .expect("read ok");
         assert_eq!(r.total_lines, 2);
@@ -539,7 +590,7 @@ mod mixed_line_endings_tests {
     async fn read_file_no_trailing_newline_keeps_tail() {
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::write(dir.path().join("notail.py"), "a\nb").expect("fixture");
-        let r = read_file(dir.path(), "notail.py", None, None, true)
+        let r = read_file(dir.path(), "notail.py", None, None, true, None)
             .await
             .expect("read ok");
         assert_eq!(r.total_lines, 2, "末尾无终止符 = 仍有 2 行");
@@ -563,5 +614,145 @@ mod mixed_line_endings_tests {
             vec!["line1", "line2", "line3", "line4", "line5"],
             "混合行尾 = 5 行"
         );
+    }
+}
+
+// bd serena-rust-a14g：max_tokens 截断 read_file content。
+//
+// - None = 现行为不变（无 truncated/total_bytes/total_tokens 改字节）；
+//   但 total_bytes 总是填，total_tokens 仍 None。
+// - Some(0) = BAD_ARGS rc=2（与 07u5 路径同形 —— 禁静默吐空）；
+// - Some(n)：content 超 n*4-32 字节按整行砍、刷新 end_line、写 truncated:true
+//   + total_bytes 总文件字节 + total_tokens=总文件字节/4；
+// - hash 始终按文件全文算（写门 `expected_hash` 契约不受截断影响）。
+#[cfg(test)]
+mod max_tokens_tests {
+    use super::*;
+
+    /// max_tokens=None 不截——回归 + 验证 total_bytes 字段始终填、total_tokens=None。
+    #[tokio::test]
+    async fn read_file_max_tokens_none_does_not_truncate() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let body = (1..=10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(dir.path().join("a.txt"), &body).expect("fixture");
+        let r = read_file(dir.path(), "a.txt", None, None, true, None)
+            .await
+            .expect("read ok");
+        assert!(!r.truncated, "None → 不截");
+        // content 串按 split_lines_mixed 归一（无尾 \n，与既有契约一致）。
+        let expected_content = (1..=10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(r.content, expected_content);
+        assert_eq!(r.end_line, 10);
+        assert_eq!(r.total_lines, 10);
+        assert_eq!(r.total_bytes, body.len(), "total_bytes 永远填");
+        assert!(
+            r.total_tokens.is_none(),
+            "max_tokens 未给 = total_tokens None"
+        );
+    }
+
+    /// max_tokens=0 → BadArgs（与 07u5 全局 `--max-tokens 0` rc=2 同形）。
+    #[tokio::test]
+    async fn read_file_max_tokens_zero_is_bad_args() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("a.txt"), "x = 1\n").expect("fixture");
+        let err = read_file(dir.path(), "a.txt", None, None, true, Some(0))
+            .await
+            .expect_err("max_tokens=0 → BadArgs");
+        let FsError::BadArgs { detail } = err else {
+            panic!("expect BadArgs, got {err:?}");
+        };
+        assert!(detail.contains("max_tokens must be >= 1"), "{detail}");
+    }
+
+    /// 200 行小文件 max_tokens=50：按整行砍，truncated:true + total_bytes=整文件。
+    ///   预算 = 50*4-32 = 168 字节；
+    ///   `line{i:03}` 8 字符 + \n = 9 字节/行（首行 8 字节）。
+    ///   8 行 8 + 7*9 = 71 字节 ≤ 168；19 行 8 + 18*9 = 170 > 168。
+    ///   留半行砍 = 18 行 167 字节（最后候选行被放弃）→ 实际尽量精确边界卡死。
+    #[tokio::test]
+    async fn read_file_max_tokens_truncates_large_file_to_budget_lines() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let body: String = (1..=200)
+            .map(|i| format!("line{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(dir.path().join("big.txt"), &body).expect("fixture");
+        let r = read_file(dir.path(), "big.txt", None, None, true, Some(50))
+            .await
+            .expect("read ok");
+        assert!(r.truncated, "200 行小文件 max_tokens=50 必须截");
+        assert_eq!(r.total_bytes, body.len(), "total_bytes 永远 = 整文件");
+        assert_eq!(r.total_lines, 200, "total_lines 永远 = 整文件行数");
+        let got_lines = r.content.split('\n').filter(|s| !s.is_empty()).count();
+        assert!(got_lines < 200, "截后行数 < 全量: {got_lines}");
+        assert_eq!(
+            r.end_line as usize,
+            got_lines,
+            "end_line = 截后末行（契约：content 行数 = end_line - start_line + 1）"
+        );
+        assert!(r.total_tokens.is_some(), "max_tokens 给 = total_tokens Some");
+    }
+
+    /// 单大行 max_tokens=1：整行超预算被整行丢（留半行砍），content 串=""
+    ///   truncated:true + total_bytes=整文件。验证单行文件不被「半行」截走。
+    #[tokio::test]
+    async fn read_file_max_tokens_truncates_single_huge_line_to_empty() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        // 单行很长，无 \n —— 任何 max_tokens < len(line)/4 必被整行砍。
+        let big = "X".repeat(10 * 1024);
+        std::fs::write(dir.path().join("oneline.bin"), &big).expect("fixture");
+        let r = read_file(dir.path(), "oneline.bin", None, None, true, Some(1))
+            .await
+            .expect("read ok");
+        assert!(r.truncated);
+        assert_eq!(r.total_bytes, 10 * 1024);
+        assert_eq!(r.total_lines, 1, "单行无 \n = total_lines=1");
+        assert_eq!(r.end_line, 0, "整行被丢 → end_line = start_line - 1 = 0");
+        assert!(
+            r.content.is_empty(),
+            "首行整行超预算被砍 → content=\"\": got {} bytes",
+            r.content.len()
+        );
+        assert_eq!(r.total_tokens, Some(10 * 1024 / 4), "估算 = 字节/4");
+    }
+
+    /// 截断后契约自洽：content 行数 = end_line − start_line + 1；hash 仍按整
+    /// 文件算（行级三件套 `expected_hash` 不受 max_tokens 影响）。
+    #[tokio::test]
+    async fn read_file_max_tokens_keeps_hash_and_line_invariant() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let full: String = (1..=100)
+            .map(|i| format!("line{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(dir.path().join("f.txt"), &full).expect("fixture");
+        let unrestricted =
+            crate::content_hash(&full);
+        let r = read_file(dir.path(), "f.txt", Some(1), Some(50), true, Some(80))
+            .await
+            .expect("read ok");
+        assert!(r.truncated);
+        let got_lines = r.content.split('\n').filter(|s| !s.is_empty()).count();
+        assert_eq!(
+            r.end_line as usize - r.start_line as usize + 1,
+            got_lines,
+            "行号契约：end_line - start_line + 1 = content 行数"
+        );
+        assert_eq!(
+            r.hash, unrestricted,
+            "hash 仍按整文件算（写门 expected_hash 契约保持）"
+        );
+        // start_line 不动（用户显式传 1）。
+        assert_eq!(r.start_line, 1);
     }
 }

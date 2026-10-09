@@ -203,7 +203,7 @@ async fn line_edit_hash_mismatch_rejects_write() {
         .expect("overview");
 
     // read-file 拿真 hash 作对照；用过期/伪造 hash 写必拒（C3 对账拒写）。
-    let report = supervisor::fs_tools::read_file(&root, "demo.cpp", None, None, true)
+    let report = supervisor::fs_tools::read_file(&root, "demo.cpp", None, None, true, None)
         .await
         .expect("read_file");
     assert!(!report.hash.is_empty(), "read-file 应返回 hash");

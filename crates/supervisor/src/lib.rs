@@ -3692,7 +3692,7 @@ impl Supervisor {
                 skipped += 1;
                 continue;
             }
-            match fs_tools::read_file(root, f, None, None, true).await {
+            match fs_tools::read_file(root, f, None, None, true, None).await {
                 Ok(report) => {
                     let cost = report.content.len();
                     // 首文件超预算仍读（soft limit，与 apply_budget 语义一致）——
@@ -7184,11 +7184,25 @@ impl Supervisor {
                     .get("no_clamp")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let report = fs_tools::read_file(root, &file, start_line, end_line, clamp)
-                    .await
-                    .map_err(|e| ToolError::BadArgs {
-                        detail: format!("read_file: {e}"),
-                    })?;
+                // bd a14g：read-file 本地 max_tokens（公共 args，非 `_max_tokens`
+                // 私有预算）—— content 串超预算按整行砍，写 `truncated:true` +
+                // `total_bytes` + `total_tokens`。=0 走 fs_tools::BadArgs → rc=2。
+                let max_tokens = args
+                    .get("max_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                let report = fs_tools::read_file(
+                    root,
+                    &file,
+                    start_line,
+                    end_line,
+                    clamp,
+                    max_tokens,
+                )
+                .await
+                .map_err(|e| ToolError::BadArgs {
+                    detail: format!("read_file: {e}"),
+                })?;
                 serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
             }
             "batch-read" => {

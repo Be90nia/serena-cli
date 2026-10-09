@@ -37,12 +37,13 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 - **空结果先读 warning/hint 再下结论**：hover 裸 null 且无 warning = 该位置确无符号信息（LS 已就绪）；带 warning = 未就绪/降级，先 wait-ready。
 - **--max-tokens ≥ 1**：0 在参数层拒（rc=2）——旧版会静默吐空集。
 - **read-file 的 line_endings 字段**：`crlf/mixed` 时 content 已被归一为 LF 而 hash 按原字节——把读到的 content 拼接写回会转行尾，CRLF 文件慎用拼接写回（走行级三件套或带 hash 的整写）。
+- **read-file --max-tokens <N> 截 content 字段**（子命令私有，全局 `--max-tokens` 不冲突亦不生效）：content 超 `N*4-32` 字节按整行砍、刷新 `end_line` 到截断末行、响应附 `truncated:true` + `total_bytes`（整文件字节，始终填）+ `total_tokens`（整文件估算，`--max-tokens` 没给 = `null`）；hash 仍按整文件算（行级三件套 `expected_hash` 契约不动）；半行直接丢、不传半行回 client；`end_line < start_line`（含 `end_line:0`）= 首行就放不下、0 行被返回（输入参数仍必须 ≥1，输出端此形态属正常）；适用场景：先看一眼大文件头几十行再决定要不要全文。
 
 ## 命令速查（66 个子命令，含 help；按类）
 
 | 类 | 命令 |
 |---|---|
-| 读/导航(7) | overview · symbol-tree · read-file(1-based 含端，回传 hash+line_endings；`--start/--end` 为 `--start-line/--end-line` 短别名) · list-dir · find-file · search(--exclude <GLOB> 可多次；默认尊重 .gitignore，`--no-ignore` 逃生) · hover |
+| 读/导航(7) | overview · symbol-tree · read-file(1-based 含端，回传 hash+line_endings+total_bytes+truncated+total_tokens；`--start/--end` 为 `--start-line/--end-line` 短别名；`--max-tokens <N>` 截 content) · list-dir · find-file · search(--exclude <GLOB> 可多次；默认尊重 .gitignore，`--no-ignore` 逃生) · hover |
 | 符号(8) | find-symbol · symbol-body · def · refs · find-implementations · find-referencing-symbols · find-referencing-code-snippets · containing-symbol |
 | 上下文聚合 | edit-context(改前必备) · repo-map(全 project 按文件顶层符号清单，LS 免热身) · defining-symbol · signature-help |
 | 诊断(2) | diagnostics(--wait-gen N) · workspace-diagnostic(LS 不支持时指路逐文件 diagnostics) |

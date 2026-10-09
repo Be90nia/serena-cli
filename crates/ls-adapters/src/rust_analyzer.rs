@@ -29,6 +29,11 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// root 未设置 / 无候选文件时的退路：旧版虚拟探针 URI（不触发项目索引，仅保底）。
 const PROBE_FALLBACK: &str = "file:///__rust_analyzer_ready_probe__";
 
+/// RA Indexing progress token（RA `main_loop.rs` 硬编码 `"rustAnalyzer/cachePriming"`，
+/// title="Indexing"，0.3.x→0.5.x 五年未变）。bd 0vj1 B 修：`$/progress` 该 token 的
+/// begin→end 完成 = prime caches 收敛 = hover/def/goto 走的路径真就绪。
+const INDEXING_TOKEN: &str = "rustAnalyzer/cachePriming";
+
 /// 当前会话项目 root 表（per-project 键化，bd serena-rust-4y6）。adapter 是零字段
 /// 单例（`Copy`）存不了实例状态 —— 会话级数据放静态槽，由 supervisor::session_for
 /// 在 `on_server_ready` 前经 `set_project_root` 写入（读侧无键，走 get_last 相邻语义）。
@@ -76,10 +81,19 @@ impl LanguageServerAdapter for RustAnalyzerAdapter {
     }
 
     async fn on_server_ready(&self, session: &lsp_core::session::Session) -> anyhow::Result<()> {
-        // 探针必须用 root 下真实文件：虚拟 URI 不触发 rust-analyzer 的 workspace
-        // lazy-load，首个真实工具请求就得独自承担全量索引（cold-start 87s 根因，
-        // 见 local/cold-start-hang-diagnosis.md）。探针返回时索引已完成。
-        // 失败也返回 Ok 让 supervisor 放行。
+        // bd 0vj1 B 修：等 RA Indexing progress（token cachePriming）end。documentSymbol
+        // 走 Salsa 不依赖 prime caches —— 旧探针返 Ok ≠ hover/def/goto 真就绪，30s 超时
+        // 放行后语义层永不收敛。
+        // 兜底链：(a) Indexing end = 真就绪；(b/c) token 缺失（cachePriming 关 / 老 RA /
+        // capability 未生效）、RA 进程死亡或预算耗尽 → 退回旧 documentSymbol 探针 1 次
+        // （失败也 Ok，保持放行契约，不阻塞 ls_registry 启动链）。
+        let indexed = Self::wait_indexing(session, Self::indexing_wait_for_root()).await;
+        if indexed {
+            return Ok(());
+        }
+        // A 兜底：root 下真实文件 documentSymbol 探针（虚拟 URI 不触发 rust-analyzer
+        // 的 workspace lazy-load，首个真实工具请求就得独自承担全量索引 —— cold-start
+        // 87s 根因，见 local/cold-start-hang-diagnosis.md）。
         use serde_json::json;
         let probe = session
             .request::<serde_json::Value>(
@@ -90,6 +104,12 @@ impl LanguageServerAdapter for RustAnalyzerAdapter {
             .await;
         let _ = probe;
         Ok(())
+    }
+
+    /// bd serena-rust-62z：外层包裹预算必须 ≥ 内部最坏路径（Indexing 等待 T + 兜底
+    /// 探针 30s），5s 余量保证内部先超时 —— 否则长预算被外层默认 30s 截断（jdtls 同款）。
+    fn ready_probe_budget(&self) -> Duration {
+        Self::indexing_wait_for_root() + READY_PROBE_TIMEOUT + Duration::from_secs(5)
     }
 
     fn request_hooks(&self) -> RequestHooks {
@@ -103,6 +123,55 @@ impl LanguageServerAdapter for RustAnalyzerAdapter {
 }
 
 impl RustAnalyzerAdapter {
+    /// Indexing 等待预算：root 的 Cargo.lock 包数分档（0vj1 契约）。包数含全部
+    /// 依赖（含 dev/build），是 RA 全量索引规模的廉价代理 —— 偏大取档更安全。
+    fn indexing_wait_for_root() -> Duration {
+        indexing_wait(PROBE_ROOT.get_last().and_then(|root| cargo_lock_crates(&root)))
+    }
+
+    /// Indexing begin→end 等待主体。切片等待（200ms）间轮询会话态：RA 进程死亡
+    /// （OOM / 被杀 → stdout EOF → Failed）时 `$/progress` end 永不到达，白等满档
+    /// 预算毫无意义 —— 立即退出走兜底，supervisor 对 Failed 会话自愈换新
+    /// （调研 rust-analyzer-progress-protocol.md Q4 #3「探活」边界）。
+    async fn wait_indexing(session: &lsp_core::session::Session, budget: Duration) -> bool {
+        const ALIVE_POLL: Duration = Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + budget;
+        // 段 1：等 Indexing begin（早到通知在 resolved，切片重复调用幂等消费）。
+        loop {
+            let Some(slice) = Self::alive_slice(session, deadline, ALIVE_POLL) else {
+                return false;
+            };
+            if session.wait_for_progress(INDEXING_TOKEN, slice).await.is_ok() {
+                break;
+            }
+        }
+        // 段 2：等在飞 progress 清空（Indexing end = 真就绪）。
+        loop {
+            let Some(slice) = Self::alive_slice(session, deadline, ALIVE_POLL) else {
+                return false;
+            };
+            if session.wait_indexing_drain(slice).await {
+                return true;
+            }
+        }
+    }
+
+    /// 下一个等待切片；预算耗尽或会话已 Failed → None（等待终止）。
+    fn alive_slice(
+        session: &lsp_core::session::Session,
+        deadline: std::time::Instant,
+        poll: Duration,
+    ) -> Option<Duration> {
+        if matches!(session.state(), lsp_core::session::SessionState::Failed(_)) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        Some(poll.min(remaining))
+    }
+
     /// `on_server_ready` 将发出的探针 URI：root 下真实小文件的 file URI；root 未设置
     /// 或无候选文件时退虚拟 URI。
     fn probe_uri(&self) -> String {
@@ -176,6 +245,24 @@ impl RustAnalyzerAdapter {
     }
 }
 
+/// Indexing 等待分档（0vj1 契约）：<500 crates → 60s，<2000 → 120s，≥2000 → 300s；
+/// 拿不到包数（无 Cargo.lock，rust-project.json 形态）→ 120s 默认。
+fn indexing_wait(crates: Option<usize>) -> Duration {
+    match crates {
+        Some(n) if n < 500 => Duration::from_secs(60),
+        Some(n) if n < 2000 => Duration::from_secs(120),
+        Some(_) => Duration::from_secs(300),
+        None => Duration::from_secs(120),
+    }
+}
+
+/// Cargo.lock `[[package]]` 段计数 —— 无子进程、无网络的规模估计。文件缺失/不可读
+/// → None（回默认档）。
+fn cargo_lock_crates(root: &Path) -> Option<usize> {
+    let text = std::fs::read_to_string(root.join("Cargo.lock")).ok()?;
+    Some(text.lines().filter(|l| l.starts_with("[[package]]")).count())
+}
+
 /// Windows 隐藏子进程窗口（CREATE_NO_WINDOW）；非 Windows 无操作。
 trait CreationFlagsSafe {
     fn creation_flags_safe(&mut self) -> &mut Self;
@@ -240,5 +327,46 @@ mod tests {
     async fn binary_functional_rejects_garbage_path() {
         let bogus = std::env::temp_dir().join("__definitely_not_rust_analyzer__.exe");
         assert!(!RustAnalyzerAdapter::binary_functional(&bogus).await);
+    }
+
+    /// Indexing 等待分档边界（0vj1 契约：None→120s，<500→60s，<2000→120s，≥2000→300s）。
+    #[test]
+    fn indexing_wait_tiers_by_crate_count() {
+        assert_eq!(indexing_wait(None), Duration::from_secs(120));
+        assert_eq!(indexing_wait(Some(0)), Duration::from_secs(60));
+        assert_eq!(indexing_wait(Some(499)), Duration::from_secs(60));
+        assert_eq!(indexing_wait(Some(500)), Duration::from_secs(120));
+        assert_eq!(indexing_wait(Some(1999)), Duration::from_secs(120));
+        assert_eq!(indexing_wait(Some(2000)), Duration::from_secs(300));
+    }
+
+    /// Cargo.lock `[[package]]` 计数（含依赖），缺失文件 → None。
+    #[test]
+    fn cargo_lock_crates_counts_packages_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            "# generated by cargo\nversion = 4\n\n[[package]]\nname = \"a\"\n\n[[package]]\nname = \"b\"\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_lock_crates(dir.path()), Some(2));
+        let missing = dir.path().join("nope");
+        assert_eq!(cargo_lock_crates(&missing), None);
+    }
+
+    /// 62z 契约：外层 ready_probe_budget 必须覆盖内部最坏路径（Indexing 等待 T +
+    /// 兜底探针），否则长预算被外层默认 30s 截断 —— 慢索引永远走不完自己的等待。
+    #[test]
+    fn ready_probe_budget_covers_indexing_wait_and_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "[[package]]\nname = \"a\"\n").unwrap();
+        let adapter = RustAnalyzerAdapter;
+        adapter.set_project_root(dir.path());
+        let t = indexing_wait(cargo_lock_crates(dir.path()));
+        assert_eq!(t, Duration::from_secs(60));
+        assert!(
+            adapter.ready_probe_budget() > t + READY_PROBE_TIMEOUT,
+            "外层预算必须严格大于内部最坏路径"
+        );
     }
 }

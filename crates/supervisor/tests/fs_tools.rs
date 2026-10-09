@@ -21,7 +21,7 @@ async fn read_file_full_returns_all_lines() {
     let d = dir("full");
     let p = d.join("a.txt");
     fs::write(&p, "l1\nl2\nl3\nl4\nl5\n").unwrap();
-    let r = fs_tools::read_file(&d, "a.txt", None, None, true).await.unwrap();
+    let r = fs_tools::read_file(&d, "a.txt", None, None, true, None).await.unwrap();
     assert_eq!(r.content, "l1\nl2\nl3\nl4\nl5");
     assert_eq!(r.total_lines, 5);
     assert_eq!(r.start_line, 1);
@@ -33,7 +33,7 @@ async fn read_file_slice_by_line_range() {
     let d = dir("slice");
     let p = d.join("a.txt");
     fs::write(&p, "l1\nl2\nl3\nl4\nl5\n").unwrap();
-    let r = fs_tools::read_file(&d, "a.txt", Some(2), Some(4), true)
+    let r = fs_tools::read_file(&d, "a.txt", Some(2), Some(4), true, None)
         .await
         .unwrap();
     assert_eq!(r.content, "l2\nl3\nl4");
@@ -46,7 +46,7 @@ async fn read_file_end_line_beyond_eof_clamps() {
     // bd mfxg：默认 clamp —— end_line 超 EOF 收到末行，不再 BAD_ARGS。
     let d = dir("clamp");
     fs::write(d.join("a.txt"), "l1\nl2\n").unwrap();
-    let r = fs_tools::read_file(&d, "a.txt", Some(1), Some(99), true)
+    let r = fs_tools::read_file(&d, "a.txt", Some(1), Some(99), true, None)
         .await
         .unwrap();
     assert_eq!(r.content, "l1\nl2");
@@ -58,7 +58,7 @@ async fn read_file_no_clamp_keeps_strict_bounds() {
     // bd 66al：--no-clamp 恢复严格越界 BAD_ARGS。
     let d = dir("noclamp");
     fs::write(d.join("a.txt"), "l1\nl2\n").unwrap();
-    let err = fs_tools::read_file(&d, "a.txt", Some(1), Some(99), false)
+    let err = fs_tools::read_file(&d, "a.txt", Some(1), Some(99), false, None)
         .await
         .unwrap_err();
     assert!(
@@ -72,7 +72,7 @@ async fn read_file_out_of_range_returns_bad_args() {
     let d = dir("oor");
     fs::write(d.join("a.txt"), "l1\nl2\n").unwrap();
     // start 超 EOF 任何模式下都是 BAD_ARGS。
-    let err = fs_tools::read_file(&d, "a.txt", Some(9), None, true)
+    let err = fs_tools::read_file(&d, "a.txt", Some(9), None, true, None)
         .await
         .unwrap_err();
     assert!(
@@ -87,7 +87,7 @@ async fn read_file_escape_root_rejected() {
     // 路径必须解析后落在 root 外（用绝对路径跨 root）。
     let other = std::env::temp_dir().join("serena-t23-other-not-exist");
     let _ = fs::create_dir_all(&other);
-    let err = fs_tools::read_file(&d, other.to_str().unwrap(), None, None, true)
+    let err = fs_tools::read_file(&d, other.to_str().unwrap(), None, None, true, None)
         .await
         .unwrap_err();
     assert!(

@@ -482,6 +482,14 @@ impl Session {
                 }
             });
 
+        // `window/workDoneProgress/cancel` 空 stub（bd 0vj1 契约项：不实现取消）。
+        // 该通知 spec 方向是 client→server 且我们从不主动取消 RA 索引 —— 空 handler
+        // 仅兜住个别服务器的越界误发帧；闭包不持 session 引用，无 Arc 环，
+        // 无需 shutdown 清表（对比上方两个持 Weak 的 handler）。
+        session
+            .client
+            .on_notification("window/workDoneProgress/cancel", |_| {});
+
         // 握手：发 initialize → 等响应（最多握手段预算，见 HANDSHAKE_TIMEOUT_DEFAULT）
         // → 发 initialized 通知。
         // 拿到 initialize 响应的 `capabilities` 子对象存入 Session（PLAN Phase 2.5，

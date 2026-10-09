@@ -763,6 +763,11 @@
           "required": true,
           "type": "string"
         },
+        "max_tokens": {
+          "description": "bd a14g: soft limit, content 截断按 4B/T 估算（预算 = n*4-32 字节，留余 metadata），超按整行砍（留半行丢），写 truncated:true/total_bytes/total_tokens；0 = BAD_ARGS rc=2（与 07u5 同形）",
+          "required": false,
+          "type": "number"
+        },
         "no_clamp": {
           "default": false,
           "description": "bd 66al: true → strict bounds (end_line beyond EOF = BAD_ARGS); default clamps to EOF (bd mfxg)",
