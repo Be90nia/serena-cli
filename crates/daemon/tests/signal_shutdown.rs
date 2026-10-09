@@ -36,6 +36,7 @@ fn test_state(drain_window: Duration) -> AppState {
         loaded_ls: Arc::new(Mutex::new(vec![])),
         draining: Arc::new(AtomicBool::new(false)),
         active_project: Arc::new(Mutex::new(None)),
+        switch_reported: Arc::new(Mutex::new(std::collections::HashSet::new())),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         in_flight: Arc::new(AtomicUsize::new(0)),
         invocation_log_path: std::path::PathBuf::new(),

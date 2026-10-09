@@ -60,6 +60,7 @@ async fn cold_start_overview_via_daemon_http() {
         loaded_ls: Arc::new(std::sync::Mutex::new(vec![])),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         active_project: Arc::new(std::sync::Mutex::new(None)),
+        switch_reported: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         // 空路径 = 不写 envelope 日志（压测探活不需要 d3a 重放索引）。

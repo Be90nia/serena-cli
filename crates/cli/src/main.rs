@@ -710,8 +710,9 @@ enum Cmd {
     ///   {"id":3,"cmd":"exit"}
     /// 响应：{"id":<n>,"ok":true,"data":...} 或 {"id":<n>,"ok":false,"error":...}。
     /// 单 daemon 顺序多 project：跨 project 调用会隐式切换 active_project（LS
-    /// session 按 project 复用池），响应带 `project switched: A -> B` warning。
-    /// EOF 或 exit 请求后退出 0。
+    /// session 按 project 复用池），响应带 `project switched: A -> B` warning
+    /// （同 (from,to) 对 daemon 生命周期内只报一次，bd ts9d）。EOF 或 exit
+    /// 请求后退出 0。
     ///
     /// 各 tool 的 args 字段名与 CLI 透传参数同名（project_root 走 shell 全局
     /// `--project`，不重复传）：find-symbol={query,limit?,format?}、read-file=
