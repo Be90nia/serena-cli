@@ -69,7 +69,9 @@ const AFTER_HELP_GUIDE: &str = "\
     name = "serena-cli",
     version,
     about = "serena-rust LSP CLI",
-    after_help = AFTER_HELP_GUIDE
+    after_help = AFTER_HELP_GUIDE,
+    // 复测4 yim0-邻接: 零参数 cmd=None 曾直通 forward 的 expect panic(rc=101), 改为 usage rc=2
+    arg_required_else_help = true
 )]
 struct Cli {
     /// 直连模式：单进程拉 LS 直调（M0 路径）。
