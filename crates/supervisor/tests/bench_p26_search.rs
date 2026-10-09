@@ -32,16 +32,14 @@ async fn bench_search_200_files_x50_calls() {
 
     // warm up
     for i in 1..=3 {
-        let _ = sup
-            .tool_search_for_pattern(&root, &format!("needle_{i:03}"), None, 50, true)
+        let _ = sup.tool_search_for_pattern(&root, &format!("needle_{i:03}"), None, 50, true, &[], false)
             .await
             .unwrap();
     }
 
     let t0 = Instant::now();
     for i in 1..=calls {
-        let _ = sup
-            .tool_search_for_pattern(&root, &format!("needle_{i:03}"), None, 50, true)
+        let _ = sup.tool_search_for_pattern(&root, &format!("needle_{i:03}"), None, 50, true, &[], false)
             .await
             .unwrap();
     }
@@ -65,8 +63,7 @@ async fn bench_search_worker_release_during_long_scan() {
     let sup = std::sync::Arc::new(Supervisor::direct().await.expect("supervisor init"));
 
     // warm
-    let _ = sup
-        .tool_search_for_pattern(&root, "needle_001", None, 50, true)
+    let _ = sup.tool_search_for_pattern(&root, "needle_001", None, 50, true, &[], false)
         .await
         .unwrap();
 
@@ -74,8 +71,7 @@ async fn bench_search_worker_release_during_long_scan() {
 
     // 先单独跑一次大 search 测基线耗时
     let t_big = Instant::now();
-    let _ = sup
-        .tool_search_for_pattern(&root, &big, None, 50, true)
+    let _ = sup.tool_search_for_pattern(&root, &big, None, 50, true, &[], false)
         .await
         .unwrap();
     let big_alone_ms = t_big.elapsed().as_secs_f64() * 1000.0;
@@ -86,21 +82,14 @@ async fn bench_search_worker_release_during_long_scan() {
     let sup2 = sup.clone();
     let t_concurrent = Instant::now();
     let big_handle = tokio::spawn(async move {
-        sup2.tool_search_for_pattern(&root, &big, None, 50, true)
+        sup2.tool_search_for_pattern(&root, &big, None, 50, true, &[], false)
             .await
     });
     let small_durations: Vec<f64> = {
         let mut durs = Vec::new();
         for i in 1..=10 {
             let t = Instant::now();
-            let _ = sup
-                .tool_search_for_pattern(
-                    &std::env::temp_dir().join("serena-perf-ws"),
-                    &format!("needle_{i:03}"),
-                    None,
-                    50,
-                    true,
-                )
+            let _ = sup.tool_search_for_pattern(&std::env::temp_dir().join("serena-perf-ws"), &format!("needle_{i:03}"), None, 50, true, &[], false)
                 .await
                 .unwrap();
             durs.push(t.elapsed().as_secs_f64() * 1000.0);

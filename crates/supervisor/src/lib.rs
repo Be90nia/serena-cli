@@ -1571,7 +1571,10 @@ impl Supervisor {
             .await?;
         let path = root.join(file);
         let uri = path_to_uri_str(&path);
-        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+        let _guard = session
+            .ensure_open(&path)
+            .await
+            .map_err(crate::fs_tools::ensure_open_err(file))?;
         let params = json!({
             "textDocument": { "uri": uri.clone() },
             "position": { "line": line, "character": col },
@@ -2083,9 +2086,21 @@ impl Supervisor {
             "previousResultIds": [],
             "textDocument": { "uri": path_to_uri_str(&root.join(".")) },
         });
+        // 杠精 07u5-5：LS 不支持 workspace/diagnostic 时裸 -32601 直穿对 AI 不可操作；
+        // 拦下转 BadArgs 并指路逐文件 `diagnostics`。doc 注释曾宣称此转换，实现缺位。
         let resp: Option<serde_json::Value> = session
             .request("workspace/diagnostic", params, INDEX_TIMEOUT)
-            .await?;
+            .await
+            .map_err(|e| match e {
+                CoreError::Rpc {
+                    code: -32601, ..
+                } => ToolError::BadArgs {
+                    detail: format!(
+                        "workspace-diagnostic: LS `{lang}` does not support workspace/diagnostic; use per-file `diagnostics <file>` instead"
+                    ),
+                },
+                other => ToolError::Core(other),
+            })?;
         let Some(raw) = resp else {
             return Ok(Vec::new());
         };
@@ -2455,7 +2470,10 @@ impl Supervisor {
         // angular `.html` → vscode-html 伴生（ngserver documentSymbol 恒 -32601）；
         // didOpen/ensure_open 跟随重路由会话（tsls 不吃 .html）。
         let session = reroute_doc_symbols(session, root, file);
-        let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
+        let _guard = session
+            .ensure_open(&path)
+            .await
+            .map_err(crate::fs_tools::ensure_open_err(file))?;
 
         let params = json!({ "textDocument": { "uri": uri.clone() } });
         // Phase 4 基建 Task 22b：timeout 由三层合并（CLI args._timeout_ms >
@@ -3925,6 +3943,9 @@ impl Supervisor {
     /// - `path_glob`：可选 glob 过滤（如 `"*.cpp"` `"src/**/*.py"`）
     /// - `max_results` 默认 100：超过返回 truncated 标记
     /// - 不动 LS —— 这是 fs 工具，不需要 LSP
+    // 与 tool_format_range/symbol_tree 等同款：tool 层透传形参天然偏宽，逐调用点
+    // 结构化反而加一层；allow 为既定 house pattern。
+    #[allow(clippy::too_many_arguments)]
     pub async fn tool_search_for_pattern(
         &self,
         root: &Path,
@@ -3932,6 +3953,8 @@ impl Supervisor {
         path_glob: Option<&str>,
         max_results: usize,
         case_sensitive: bool,
+        exclude: &[String],
+        no_ignore: bool,
     ) -> ToolResult<SearchResponse> {
         use regex::RegexBuilder;
 
@@ -3942,54 +3965,15 @@ impl Supervisor {
                 detail: format!("bad regex: {e}"),
             })?;
         let glob_re = match path_glob {
-            Some(g) => {
-                let mut r = String::from("^");
-                // glob 不含 `/` 时，前后加 `.*`，让 `*.cpp` 也匹配 `src/a.cpp`。
-                if !g.contains('/') {
-                    r.push_str(".*");
-                }
-                // 把 glob 转 regex —— 支持 `**` 跨任意段 + `*` 单段 + `?` 单字符。
-
-                let mut i = 0;
-                let chars: Vec<char> = g.chars().collect();
-                while i < chars.len() {
-                    let c = chars[i];
-
-                    // `**` 跨任意段（包括 `/`）。
-                    if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
-                        r.push_str(".*");
-                        i += 2;
-                        // 吞掉紧跟的 `/`（`src/**/foo` 等价 `src/foo`）。
-                        if i < chars.len() && chars[i] == '/' {
-                            i += 1;
-                        }
-                        continue;
-                    }
-
-                    match c {
-                        '*' => r.push_str("[^/]*"),
-                        '?' => r.push('.'),
-                        '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '\\' => {
-                            r.push('\\');
-                            r.push(c);
-                        }
-                        '[' | ']' => r.push(c),
-                        _ => r.push(c),
-                    }
-                    i += 1;
-                }
-                r.push('$');
-                Some(
-                    RegexBuilder::new(&r)
-                        .case_insensitive(!case_sensitive)
-                        .build()
-                        .map_err(|e| ToolError::BadArgs {
-                            detail: format!("bad glob: {e}"),
-                        })?,
-                )
-            }
+            Some(g) => Some(glob_to_regex(g, !case_sensitive)?),
             None => None,
         };
+        // 杠精 cv1e：--exclude 逃生——glob 列表（同 path_glob 语法），命中即跳过
+        // （在计数/读取之前，测量脚本等噪音不进 token 账单）。
+        let mut exclude_re = Vec::with_capacity(exclude.len());
+        for g in exclude {
+            exclude_re.push(glob_to_regex(g, !case_sensitive)?);
+        }
 
         let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
@@ -3998,7 +3982,7 @@ impl Supervisor {
         // 850 文件冷扫可占 worker 数百 ms-数秒，导致 /status、reaper select、L/batch
         // 并行的 7 条兄弟请求显著延迟。包 spawn_blocking 后 worker 立刻释放，P2-6。
         let (hits, truncated, files_scanned) = tokio::task::spawn_blocking(move || {
-            Self::search_sync_scan(&root, &regex, glob_re.as_ref(), max_results)
+            Self::search_sync_scan(&root, &regex, glob_re.as_ref(), &exclude_re, max_results, no_ignore)
         })
         .await
         .map_err(|e| {
@@ -4023,13 +4007,18 @@ impl Supervisor {
         root: &Path,
         regex: &regex::Regex,
         glob_re: Option<&regex::Regex>,
+        exclude_re: &[regex::Regex],
         max_results: usize,
+        no_ignore: bool,
     ) -> (Vec<SearchHit>, bool, usize) {
         use ignore::WalkBuilder;
 
         let mut walker = WalkBuilder::new(root);
+        // 杠精 cv1e：默认尊重 .gitignore（standard_filters）；--no-ignore 逃生 =
+        // 关 gitignore 族过滤器（hidden 与 should_ignore 表仍生效——.git/ 内部与
+        // 构建产物不因逃生而进结果，防噪音反灌）。
         walker
-            .standard_filters(true)
+            .standard_filters(!no_ignore)
             .require_git(false)
             // 内置 ignore 目录（target/node_modules/.idea 等）—— .git 由
             // standard_filters 的 hidden filter 默认排除，但 target/node_modules
@@ -4037,6 +4026,9 @@ impl Supervisor {
             .filter_entry(|e| {
                 e.depth() == 0 || !e.file_name().to_str().is_some_and(fs_tools::should_ignore)
             });
+        if no_ignore {
+            walker.hidden(true).parents(false);
+        }
 
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut truncated = false;
@@ -4060,6 +4052,9 @@ impl Supervisor {
             if let Some(g) = glob_re
                 && !g.is_match(&rel_str)
             {
+                continue;
+            }
+            if exclude_re.iter().any(|g| g.is_match(&rel_str)) {
                 continue;
             }
 
@@ -4334,7 +4329,15 @@ impl Supervisor {
         // 文本交叉验证：workspace 内符号名仍有 ≥1 处可疑出现（排除定义行 +
         // 注释/字符串粗滤）→ 拒删，提示语义层可能不可用。RPC_ERROR 不可重试。
         let search = self
-            .tool_search_for_pattern(root, &regex::escape(symbol), None, TEXT_GATE_MAX_HITS, true)
+            .tool_search_for_pattern(
+                root,
+                &regex::escape(symbol),
+                None,
+                TEXT_GATE_MAX_HITS,
+                true,
+                &[],
+                false,
+            )
             .await?;
         let n =
             textual_occurrences_outside_def(&search.hits, file, selection.start.line + 1, symbol);
@@ -5589,6 +5592,47 @@ fn out_format(args: &serde_json::Value) -> Result<OutFormat, ToolError> {
     }
 }
 
+/// glob → regex（search path_glob / --exclude 共用）。支持 `**` 跨段、`*` 单段、
+/// `?` 单字符；glob 不含 `/` 时匹配任意路径（`*.cpp` 也命中 `src/a.cpp`）。
+fn glob_to_regex(g: &str, case_insensitive: bool) -> ToolResult<regex::Regex> {
+    let mut r = String::from("^");
+    if !g.contains('/') {
+        r.push_str(".*");
+    }
+    let mut i = 0;
+    let chars: Vec<char> = g.chars().collect();
+    while i < chars.len() {
+        let c = chars[i];
+        // `**` 跨任意段（包括 `/`）；吞掉紧跟的 `/`（`src/**/foo` 等价 `src/foo`）。
+        if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            r.push_str(".*");
+            i += 2;
+            if i < chars.len() && chars[i] == '/' {
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            '*' => r.push_str("[^/]*"),
+            '?' => r.push('.'),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '\\' => {
+                r.push('\\');
+                r.push(c);
+            }
+            '[' | ']' => r.push(c),
+            _ => r.push(c),
+        }
+        i += 1;
+    }
+    r.push('$');
+    regex::RegexBuilder::new(&r)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|e| ToolError::BadArgs {
+            detail: format!("bad glob: {e}"),
+        })
+}
+
 /// rsqq：search 头部一行概要（kq6e overview summary 同形——字符串头字段）。
 fn search_summary(resp: &SearchResponse) -> String {
     let files: std::collections::BTreeSet<&str> = resp
@@ -5944,8 +5988,14 @@ async fn lsp_position_from_byte(
         line,
         character: col,
     };
-    lsp_core::offsets::position_to_byte(&text, pos, enc).map_err(|e| ToolError::BadArgs {
-        detail: format!("position {line}:{col} out of range: {e}"),
+    lsp_core::offsets::position_to_byte(&text, pos, enc).map_err(|_| ToolError::BadArgs {
+        // 杠精 07u5-4：报用户 1-based 坐标（内部 line/col 已是 0-based），原因只说
+        // 一遍——裸 LSP Display 是泛化的 "position out of range"，原样拼接会重复。
+        detail: format!(
+            "position {}:{} (1-based) out of range: line is past end of file or column is past end of line",
+            line + 1,
+            col + 1
+        ),
     })?;
     Ok(Position::new(pos.line, pos.character))
 }
@@ -6324,19 +6374,49 @@ impl SupervisorTrait for Supervisor {
                 && let Some(obj) = v.as_object_mut()
             {
                 obj.insert("dry_run".into(), serde_json::Value::Bool(true));
+                // 杠精 wuhi：dry_run:true 与 applied:true 同现自相矛盾（AI 扫字段
+                // 误判已写入）——dry-run 语义 = applied:false + would_apply:true。
+                obj.insert("applied".into(), serde_json::Value::Bool(false));
+                obj.insert("would_apply".into(), serde_json::Value::Bool(true));
+                // 杠精 wuhi：content 全文预览在大文件上是 token 炸弹——默认 hunk 化
+                // （unified diff，盘上现内容 vs 将写内容；新建文件走 /dev/null 头）。
                 obj.insert(
                     "would_write".into(),
                     serde_json::Value::Array(
                         preview
                             .into_iter()
                             .map(|(p, c)| {
-                                serde_json::json!({"file": p, "content": c})
+                                let pb = std::path::PathBuf::from(&p);
+                                let rel = pb
+                                    .strip_prefix(root)
+                                    .unwrap_or(&pb)
+                                    .to_string_lossy()
+                                    .replace('\\', "/");
+                                let (before, created) = match std::fs::read_to_string(&pb) {
+                                    Ok(s) => (s, false),
+                                    Err(_) => (String::new(), true),
+                                };
+                                serde_json::json!({
+                                    "file": p,
+                                    "patch": recipe::unified_diff(&rel, &before, &c, created),
+                                })
                             })
                             .collect(),
                     ),
                 );
             }
             r
+        } else if undo::WRITE_TOOLS.contains(&tool) {
+            // bd serena-rust-15jb：WAL 先记账后写盘，store 必须在工具执行期可见
+            // （recorded_write 前置持久化 txn 记录）。root 不可解析时在此早失败，
+            // 任何目标文件都尚未写 —— 优于旧版「写成功后 commit 才报 BAD_ARGS」。
+            let store = undo::store_for(root)?;
+            undo::TXN_STORE
+                .scope(
+                    store,
+                    undo::TXN_UID.scope(txn_uid, self.dispatch_tool(tool, root, &args, lang)),
+                )
+                .await
         } else {
             undo::TXN_UID
                 .scope(txn_uid, self.dispatch_tool(tool, root, &args, lang))
@@ -6811,6 +6891,14 @@ impl Supervisor {
                         self.semantic_not_ready_warnings(root, &file, line, col, lang)
                             .await,
                     );
+                    // 杠精 ke2a-5：裸 null 5 字符无法区分「位置无符号」和「未就绪」；
+                    // 未就绪已由 we0 warning 表达，就绪态的空结果补静态 hint 收口。
+                    if ws.is_empty() {
+                        ws.push(
+                            "hover null: no symbol information at this position (semantic layer is ready; for a symbol name use find-symbol / edit-context)"
+                                .into(),
+                        );
+                    }
                 } else {
                     // bd serena-rust-bxd O2/O4：首个语义成功 → 关暖机窗口。
                     self.mark_semantic_ready(root);
@@ -6937,7 +7025,27 @@ impl Supervisor {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let mut resp = self
-                    .tool_search_for_pattern(root, pattern, path_glob, max_results, case_sensitive)
+                    .tool_search_for_pattern(
+                        root,
+                        pattern,
+                        path_glob,
+                        max_results,
+                        case_sensitive,
+                        // 杠精 cv1e：--exclude glob 列表 + --no-ignore 逃生。
+                        &args
+                            .get("exclude")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                        args
+                            .get("no_ignore")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    )
                     .await?;
                 // I（§11-I）：--comments-only 注释行过滤，先滤后 enrich 省 LSP 缓存查询。
                 let comments_only = args
@@ -7013,7 +7121,7 @@ impl Supervisor {
                 // B: 单次调用拿 body + callers + doc + tests（ai-token-features §10-B）。
                 let (file, symbol) = required_symbol_body_args(args)?;
                 let (report, warnings) =
-                    crate::edit_context::collect(self, root, &file, &symbol, lang).await;
+                    crate::edit_context::collect(self, root, &file, &symbol, lang).await?;
                 let mut value =
                     serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))?;
                 // bd serena-rust-e0hi/8vo9：callers 空 + 语义未证就绪 → 降级警示字段。
@@ -7444,7 +7552,22 @@ impl Supervisor {
                     // undo 结果，见 sync_ls_after_undo）。
                     let touched = undo::take_touched();
                     self.sync_ls_after_undo(root, &touched).await;
-                    out
+                    // 杠精 07u5-8：空栈静默 {"skipped":[],"undone":[]} 易被误读成
+                    // 「可能已回滚」；结构化 nothing_to_undo 收口（保持 rc=0：空栈
+                    // 是合法查询结果，非用法错误）。
+                    out.map(|mut v| {
+                        if v.get("undone")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|a| a.is_empty())
+                            && v.get("skipped")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|a| a.is_empty())
+                            && let Some(o) = v.as_object_mut()
+                        {
+                            o.insert("nothing_to_undo".into(), serde_json::Value::Bool(true));
+                        }
+                        v
+                    })
                 }
             }
             "redo" => {
@@ -10176,8 +10299,7 @@ mod search_filter_tests {
         )
         .unwrap();
 
-        let resp = sup
-            .tool_search_for_pattern(root, "foo_drain_window", None, 50, false)
+        let resp = sup.tool_search_for_pattern(root, "foo_drain_window", None, 50, false, &[], false)
             .await
             .unwrap();
         let files: Vec<&str> = resp.hits.iter().map(|h| h.file.as_str()).collect();
@@ -12211,6 +12333,9 @@ mod sweep_a1_unit_tests {
             .await
             .expect("dry-run must succeed");
         assert_eq!(v["dry_run"], serde_json::json!(true), "返回须带 dry_run 标记");
+        // 杠精 wuhi：dry_run:true 下 applied 必须 false（语义修正），写意原图 would_apply。
+        assert_eq!(v["applied"], serde_json::json!(false), "dry-run 不得报 applied:true");
+        assert_eq!(v["would_apply"], serde_json::json!(true), "须带 would_apply:true");
         let ww = v["would_write"].as_array().expect("would_write array");
         assert_eq!(ww.len(), 1, "单文件写恰好一条预览");
         assert!(
@@ -12218,7 +12343,17 @@ mod sweep_a1_unit_tests {
             "预览 file 为目标路径: {}",
             ww[0]["file"]
         );
-        assert_eq!(ww[0]["content"], serde_json::json!("fn dry() {}\n"));
+        // 杠精 wuhi：would_write 默认 hunk 化（unified patch），不再塞全文 content。
+        assert!(
+            ww[0].get("content").is_none(),
+            "content 全文字段必须移除: {}",
+            ww[0]
+        );
+        let patch = ww[0]["patch"].as_str().expect("patch string");
+        assert!(
+            patch.starts_with("--- /dev/null\n+++ b/") && patch.contains("+fn dry() {}"),
+            "新建文件 unified patch 形态: {patch}"
+        );
         assert!(!dir.path().join("preview.txt").exists(), "干跑绝不落盘");
     }
 

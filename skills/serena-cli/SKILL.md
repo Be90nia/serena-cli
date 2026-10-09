@@ -1,6 +1,6 @@
 ---
 name: serena-cli
-description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按名寻址，实测省 token 71-99%）。当需要查符号/定义/引用/实现、读或改函数体、跨文件重命名、安全删除、找 bug 影响面、写代码前了解结构时使用；大文件（>500 行）读写前优先用它而非 read/grep。不适用：纯文本/配置/文档编辑（无 LS 的文件类型会拒写）、不需要理解代码语义的机械替换。
+description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按名寻址，符号级读写实测省 token 71-99%；--compress 集合响应实测再省 ~8-13%）。当需要查符号/定义/引用/实现、读或改函数体、跨文件重命名、安全删除、找 bug 影响面、写代码前了解结构时使用；大文件（>500 行）读写前优先用它而非 read/grep。不适用：纯文本/配置/文档编辑（无 LS 的文件类型会拒写）、不需要理解代码语义的机械替换。
 ---
 
 # serena-cli 使用纪律
@@ -22,34 +22,39 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 ## 关键纪律（违者返工）
 
 - **行号一律 1-based 含端**——传 0 是用法错误。
-- **多命令任务先预热**：`serena-cli warm`（免冷启动 ~5s）；语义类（def/hover/refs）就绪需 30-60s，用 `wait-ready --stage semantic` 阻塞等，就绪前语义查询会返空+warning（不是坏了）。
+- **多命令任务先预热**：`serena-cli warm`（免冷启动 ~5s）；语义类（def/hover/refs）就绪需 30-60s，用 `wait-ready --stage semantic` 阻塞等，就绪前语义查询会返空+warning（不是坏了）；紧接要跑 def/refs 的用 `--stage def`（hover 就绪后 def 仍可能空窗，bd y3c1），超时/空结果自带降级指引。
 - **`--direct` = 纯冷进程，无 daemon**（bd serena-rust-9hy1）：跳过 lazy-spawn/缓存，只适合轻量读类（overview/read-file/status 等）；语义类工具（def/hover/refs/edit-context）`--direct` 首调必返空 + degraded warning（无预热索引）——语义查询一律走默认 daemon 模式，不要用 `--direct` 后误判"语义层坏了"。
 - **编辑带 `--expected-hash <hash>`**（来自最近 read-file/编辑返回），防并发覆盖。
 - **`--lang <lang>`** 显式指定语言当扩展名有歧义（如 .ts 项目里的 .js）。
 - **`--symbol <NAME>`** 三命令通用符号名直查：find-referencing-code-snippets / symbol-body / edit-context（后两者的位置第二参保留兼容，二选一）。
-- **ls-use 已知语言**（如 `ls-use python <bin>`）按二进制名智能匹配内置 server：唯一命中自动选（回显生效 id + 启动命令形态）；零/多命中拒改并列候选——想继承某内置条目请显式点名 server id（如 `ls-use jedi <bin>`）。
+- **ls-use 已知语言**（如 `ls-use python <bin>`）按二进制名智能匹配内置 server：唯一命中自动选（回显生效 id + 启动命令形态）；零/多命中拒改并列候选——想继承某内置条目请显式点名 server id（如 `ls-use jedi <bin>`）。注册条目重启 daemon 后**接管该语言会话启动**（T2 适配器让位，bd 9z0x）；doctor/ls-list 同步反映注册态。
 - JSON 解析：stdout 首行可能是 `[warn] ...` 人读行——解析前先切出第一个 `{`。
 - **写类命令对无 LS 的文件类型拒写**（如 .txt → BAD_ARGS "file not supported"）——纯文本用普通文件工具。
 - 大改/不确定结果 → 改完跑 `undo` 验证能回滚再继续；`undo --list` 看栈。rename 改多文件 = 一个事务，undo 一次全回滚。
 - 深度语义 call-hierarchy 依赖全量索引热身（分钟级），冷会话可能返空——改用 `refs` 拼接。`repo-map` 主源 documentSymbol + 文本兜底，冷会话可用（bd serena-rust-fj17）。
+- **写前干跑**：写类命令加全局 `--dry-run` → 完整定位/校验但不落盘，返 `dry_run:true + applied:false + would_apply:true + would_write[{file,patch}]`（unified diff，无全文 token 炸弹）；`applied:true` 只在真写时出现。
+- **search 噪音控制**：默认尊重 .gitignore（被忽略的测量/脚本不进结果）；仍嫌吵用 `--exclude <GLOB>`（可多次）；要看全量加 `--no-ignore`（.git/ 与构建产物仍排除）。
+- **空结果先读 warning/hint 再下结论**：hover 裸 null 且无 warning = 该位置确无符号信息（LS 已就绪）；带 warning = 未就绪/降级，先 wait-ready。
+- **--max-tokens ≥ 1**：0 在参数层拒（rc=2）——旧版会静默吐空集。
+- **read-file 的 line_endings 字段**：`crlf/mixed` 时 content 已被归一为 LF 而 hash 按原字节——把读到的 content 拼接写回会转行尾，CRLF 文件慎用拼接写回（走行级三件套或带 hash 的整写）。
 
-## 命令速查（63 个，按类）
+## 命令速查（66 个子命令，含 help；按类）
 
 | 类 | 命令 |
 |---|---|
-| 读/导航(7) | overview · symbol-tree · read-file(1-based 含端，回传 hash) · list-dir · find-file · search · hover |
+| 读/导航(7) | overview · symbol-tree · read-file(1-based 含端，回传 hash+line_endings；`--start/--end` 为 `--start-line/--end-line` 短别名) · list-dir · find-file · search(--exclude <GLOB> 可多次；默认尊重 .gitignore，`--no-ignore` 逃生) · hover |
 | 符号(8) | find-symbol · symbol-body · def · refs · find-implementations · find-referencing-symbols · find-referencing-code-snippets · containing-symbol |
 | 上下文聚合 | edit-context(改前必备) · repo-map(全 project 按文件顶层符号清单，LS 免热身) · defining-symbol · signature-help |
-| 诊断(2) | diagnostics(--wait-gen N) · workspace-diagnostic |
-| 编辑(11) | replace-body · replace-text-in-symbol · insert-text-{before,after}-symbol · delete-text-in-symbol · insert-at-line · replace-lines · delete-lines · rename-symbol(跨文件自动同步) · safe-delete-symbol(有引用拒删) · create-text-file |
-| undo/redo(2) | undo(--steps N / --list) · redo —— 事务级：rename 多文件一次回滚；新建文件 undo 即删；文件被外部改过则拒绝(WRITE_CONFLICT)；栈 20 步/200MB/30 天，重启升级不丢 |
-| recipe 工作流(4) | `test <target> [name]`(cargo/npm 双后端跑测试+解析失败清单) · `diff [txn-id] [--patch]`(写事务写前写后对照) · `find-test <sym>`(启发式定位符号测试) · `recipe <name> [args]`(8 工作流编排，见下) |
+| 诊断(2) | diagnostics(--wait-gen N) · workspace-diagnostic(LS 不支持时指路逐文件 diagnostics) |
+| 编辑(11) | replace-body · replace-text-in-symbol · insert-text-{before,after}-symbol · delete-text-in-symbol · insert-at-line · replace-lines · delete-lines(start>end 报「顺序错」非「越界」) · rename-symbol(跨文件自动同步) · safe-delete-symbol(有引用拒删) · create-text-file |
+| undo/redo(2) | undo(--steps N / --list；空栈返 nothing_to_undo:true，rc=0 非报错) · redo —— 事务级：rename 多文件一次回滚；新建文件 undo 即删；文件被外部改过则拒绝(WRITE_CONFLICT)；栈 20 步/200MB/30 天，重启升级不丢 |
+| recipe 工作流(4) | `test <target> [name]`(cargo/npm 双后端跑测试+解析失败清单) · `diff [txn-id] [--patch]`(写事务写前写后对照，--patch 出 unified hunk) · `find-test <sym>`(也收 `--symbol <NAME>`，与 symbol-body 同形) · `recipe <name> [args]`(8 工作流编排，见下) |
 | 补全/长尾 | completion · code-action · format · format-range · inlay-hint · folding-range · document-highlight · semantic-tokens · code-lens · call-hierarchy · type-hierarchy · moniker · document-link |
-| 管理 | status · warm · wait-ready(--stage symbol\|semantic) · stop-all · install <lang> · uninstall <lang> · ls-use <lang\|id> <path> · ls-list · ls-remove <id> · doctor · shell(JSONL 长连接) · lint-shell |
+| 管理(14) | status · project-info · change-history(--symbol 走 git -L 符号级) · warm · wait-ready(--stage symbol\|semantic\|def) · stop-all · install <lang> · uninstall <lang> · ls-use <lang\|id> <path> · ls-list · ls-remove <id> · doctor · shell(JSONL 长连接) · lint-shell |
 
 ## recipe 工作流（8 个，单命令多步编排）
 
-写步各自独立 undo 事务；单步失败即停并**逆序回滚已完成的写步**（错误 reason 内 JSON 报告 completed_steps/txn_ids/undo_results）；单步截断继续。AI 一次调用 = 多步，token 省过逐工具拼：
+写步各自独立 undo 事务；单步失败即停并**逆序回滚已完成的写步**（错误 message 为单层人话：失败步（内部 `ct_` 前缀已剥）/原因/回滚账目——回滚不完整时显式标 ROLLBACK INCOMPLETE）；单步截断继续。AI 一次调用 = 多步，token 省过逐工具拼：
 
 | recipe | 输入 | 步骤 |
 |---|---|---|
@@ -64,7 +69,7 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 
 ## 错误契约
 
-stdout = 紧凑 JSON（默认）+ 可能的 `[warn]` 前缀行；失败 `{"ok":false,"error":{code,message,retryable}}`。高频码：`BAD_ARGS`(参数/文件类型错，不重试) · `WRITE_CONFLICT`(盘上内容与预期不符，先重读) · `LS_TIMEOUT`(retryable，重试) · `LS_NOT_INSTALLED`/`LS_SPAWN_FAILED`(环境问题，走下方处置流程)。退出码 0=成功 1=工具错 2=参数错 4=就绪超时。
+stdout = 紧凑 JSON（默认）+ 可能的 `[warn]` 前缀行；失败 `{"ok":false,"error":{code,message,retryable}}`（客户端侧校验错误同形打 stderr，rc=2）。高频码：`BAD_ARGS`(参数/文件类型错，不重试) · `WRITE_CONFLICT`(盘上内容与预期不符，先重读) · `LS_TIMEOUT`(retryable，重试) · `LS_NOT_INSTALLED`/`LS_SPAWN_FAILED`(环境问题，走下方处置流程)。退出码 **0**=成功 **1**=工具错(不可重试) **2**=参数错 **3**=INTERNAL(daemon/传输/序列化/IO 故障——重试同参大概率再败，先 `doctor`/`status` 查环境) **4**=就绪超时 **5**=可重试工具错(LS_TIMEOUT/LS_TERMINATED/LS_SPAWN_FAILED/LS_NOT_READY 瞬态，直接重试)。
 
 `diagnostics` / 写工具附带的 `post_write_diagnostics` 里 **`pending` 是新鲜度判定**（bd serena-rust-i52y）：`false` = LS 已确认本代，items 空=真无错；`true` = 等待窗口内 LS 未推新一代诊断，items 空**不代表无错**（快照可能陈旧）——用 `diagnostics <file> --wait-gen N` 显式复核后再当干净结论。
 

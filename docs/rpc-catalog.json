@@ -939,6 +939,18 @@
           "required": false,
           "type": "bool"
         },
+        "exclude": {
+          "default": [],
+          "description": "glob list to skip (same syntax as path_glob), e.g. ['*_measure.py']",
+          "required": false,
+          "type": "array[string]"
+        },
+        "no_ignore": {
+          "default": false,
+          "description": "escape hatch: include .gitignore'd files (.git/ and built-in ignore dirs still excluded)",
+          "required": false,
+          "type": "bool"
+        },
         "format": {
           "default": "full",
           "description": "bd 51ib: brief = 'file:line:col: text' strings; full/json = default response (adds bd rsqq summary header)",

@@ -11,10 +11,41 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// serena-rust-nodd：跨 run 残留清扫——本文件 `serena_sha256_e2e_*` 目录曾被
+/// 注释为「进程退出后残留」，已改为每次套件启动删 >2h 的 serena 前缀残留
+/// （age 阈值避开并行 run 在用目录）。
+#[test]
+fn sweep_stale_serena_tempdirs() {
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        // serena-powershell 是 powershell LS 的运行时日志目录（非测试产物），不碰。
+        if name == "serena-powershell" || !name.starts_with("serena") {
+            continue;
+        }
+        let stale = ent
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t < cutoff)
+            .unwrap_or(false);
+        if stale {
+            let _ = if ent.path().is_dir() {
+                std::fs::remove_dir_all(ent.path())
+            } else {
+                std::fs::remove_file(ent.path())
+            };
+        }
+    }
+}
+
 /// 进程内原子计数器（测试间唯一子目录名）。
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// 建一个临时子目录（进程退出后残留，但测试只在 temp 下、无副作用）。
+/// 建一个临时子目录（单 run 内残留由同套件的 sweep_stale_serena_tempdirs 在
+/// 下次启动时回收；serena-rust-nodd）。
 fn fresh_dir(label: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();

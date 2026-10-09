@@ -31,4 +31,5 @@ scripts/smoke_fixtures/**/bin/
 
 # agent 独立构建目录（CARGO_TARGET_DIR 避锁用，不入库）
 target-a3b/
+target-*/
 

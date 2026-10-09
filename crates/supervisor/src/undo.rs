@@ -10,18 +10,37 @@
 //!   FileRec 契约四字段 `path/created/before/after_sha256` 之外追加
 //!   `after/before_file/after_file`：redo 要把文件写回 after 内容（契约设计第 3
 //!   条「redo 可重放」），只有 after_sha256 物理上无法重放；>100KB 的快照旁路存
-//!   `before/{i}`、`after/{i}`（i = files 数组下标）防 manifest 爆炸。
+//!   `before/{i}`、`after/{i}`（i = 同类旁路文件序号，manifest 持有相对路径引用）
+//!   防 manifest 爆炸。
 //! - 事务边界 = execute_tool 的一次调用（rename-symbol 多文件改动在同一调用内
 //!   逐个 `recorded_write`，天然聚合成一个事务）。写点统一收口 `recorded_write`。
-//! - undo 冲突门：恢复前逐文件校验盘上 sha256 == after_sha256；任一不匹配整事务
-//!   拒绝。错误映射复用 `ToolError::WriteConflict` → wire `WRITE_CONFLICT`（语义
-//!   同族：盘上内容与预期状态不符，C3 防线；exit 1、不可重试），零新错误码。
+//! - 崩溃序（bd serena-rust-15jb）：`recorded_write` 先把该文件的 txn 记录持久化
+//!   （side 文件 + manifest 原子重写，manifest 是记账提交点），**再**写目标文件
+//!   —— kill 打中写提交窗只会留下「有记录无改动」（undo 侧幂等收口为 no-op），
+//!   绝不出现「有改动无记录」的永久脱账写入。
+//! - undo 冲突语义（bd serena-rust-3ux6 拍板：**自动跳过 + warning**，不做
+//!   `--force`）：盘面与事务后状态不符（外部编辑）的事务已不可干净回滚，undo
+//!   把它整事务改名 `discarded-{N}`（留档、不参与栈/prune 照常回收），附
+//!   warning 指明原因与下一可用事务，继续尝试更早事务 —— 楔死状态有出路，且
+//!   跳过不消耗 steps 名额（steps 只数真实回滚）。剩余 `WRITE_CONFLICT`
+//!   （IO 占用/存储损坏）仍整步报错。选自动跳过而非 `--force`：(a) 本战役禁改
+//!   cli crate，加不了 flag；(b) AI 操作者少一轮「先撞错再补 flag」往返，返回
+//!   报文自带完整交代。redo 侧对称（外部冲突链式 discarded 清栈）。
+//! - redo 重放序（bd serena-rust-b5od）：按**事务时间序（N 升序）**重放，即最
+//!   后 undo 的先 redo —— undo 是 LIFO 弹栈，正放必须还原原始写入顺序，否则
+//!   深度 ≥2 时 pre-image 对账必然失配（F1 根因：曾取 N 最大 undone 项）。每次
+//!   redo 调用重放一个有效事务（IDE 单步语义不变）；盘面已处于目标态（崩溃窗）
+//!   → no-op 收口。
+//! - undo 冲突门（保留）：恢复写前逐文件校验盘面，外部编辑冲突整事务跳过（见
+//!   上），IO/存储错误整步报错。错误映射复用 `ToolError::WriteConflict` → wire
+//!   `WRITE_CONFLICT`（零新错误码）。
 //! - created=true 的文件 undo = 删除文件（用户拍板）；redo = 按 after 内容重建。
 //! - LS 态同步（P2-b）：整事务恢复成功后把涉及文件登记进 `TOUCHED`（uid 键侧信道），
 //!   undo/redo 收口取走并逐文件 didChange / didClose（lib.rs `sync_ls_after_undo`）。
 //! - 栈序：N 大 = 新。undo 取 N 最大的 `txn-{N}`；undo 后 rename 为
-//!   `undone-{N}`；redo 取 N 最大的 `undone-{N}` 重放后 rename 回 `txn-{N}`；
-//!   新事务落盘后删除全部 `undone-*`（IDE 语义：新写入清空 redo 链）。
+//!   `undone-{N}`；redo 取 N **最小**的 `undone-{N}` 重放后 rename 回 `txn-{N}`
+//!   （时间序正放，见上）；新事务落盘后删除全部 `undone-*`（IDE 语义：新写入
+//!   清空 redo 链）。
 //! - 保留策略（新事务追加前 + `undo --list` 时 prune，无后台定时器）：
 //!   ① 事务时间戳 > 30 天 ② 总事务数 > 20 ③ 总大小 > 200 MB —— 从最旧
 //!   （N 最小）开始整事务淘汰。
@@ -92,17 +111,11 @@ struct FileRec {
     after_file: Option<String>,
 }
 
-/// 内存态快照条目（commit 时转 FileRec 落盘）。
-struct Entry {
-    path: PathBuf,
-    before: Option<String>,
-    created: bool,
-    after: String,
-    after_sha256: String,
-}
-
-/// 待落盘快照。键 = 事务 uid（execute_tool 每次调用分配，进程内唯一）。
-static PENDING: StdMutex<Vec<(u64, Entry)>> = StdMutex::new(Vec::new());
+/// 打开的 WAL 事务：uid → txn 目录绝对路径（bd serena-rust-15jb：记账先行，
+/// 事务目录在 `recorded_write` 首笔写入时即落盘，commit 只做收口、abort 负责
+/// 删除）。abort 在同步上下文（TxnGuard::drop）调用，故存绝对路径而非 store，
+/// 免去收口点再解析项目根。
+static OPEN_TXNS: StdMutex<Vec<(u64, PathBuf)>> = StdMutex::new(Vec::new());
 static NEXT_UID: AtomicU64 = AtomicU64::new(1);
 
 /// undo/redo 恢复写涉及的文件登记（P2-b LS 态同步桥）。键 = 承载本次 undo/redo
@@ -124,6 +137,12 @@ tokio::task_local! {
     /// 当前事务 uid。execute_tool 用 `scope` 包裹工具执行；scope 外（--direct
     /// 调试路径）读到 0 = 不记账。
     pub(crate) static TXN_UID: u64;
+
+    /// 当前事务的 undo 存储目录根（bd serena-rust-15jb）。WAL 要求
+    /// `recorded_write` 在写目标文件前持久化 txn 记录，而存储目录按项目根哈希
+    /// 键控、工具层只有文件路径 —— 由 execute_tool / ct_txn 在进入 TXN_UID
+    /// scope 时一并注入。uid≠0 而本值缺失 = 接线缺陷，recorded_write 显式报错。
+    pub(crate) static TXN_STORE: PathBuf;
 
     /// A3b #3（bd i4a1/wlrr）：--dry-run 干跑开关。execute_tool 对写类工具以
     /// `scope_dry_run` 包裹 dispatch；recorded_write 命中时不落盘、不记 undo 快照，
@@ -222,9 +241,12 @@ pub fn is_write_tool(tool: &str) -> bool {
     WRITE_TOOLS.contains(&tool)
 }
 
-/// 写点统一收口：快照旧内容 → 原子写 → 成功后入待落盘栈。
+/// 写点统一收口：快照旧内容 → **先持久化 txn 记录（WAL）** → 原子写目标文件。
 ///
-/// 与 [`crate::atomic_write`] 同签名同错误面（io::Error），调用点仅换函数名。
+/// 崩溃序不变量（bd serena-rust-15jb）：manifest（记账提交点）先于目标文件落
+/// 盘 —— kill 打中写提交窗只会留下「有记录无改动」，undo 侧按 no-op 幂等收口；
+/// 「有改动无记录」的脱账写入在结构上不可能出现。与 [`crate::atomic_write`] 同
+/// 签名同错误面（io::Error），调用点仅换函数名。
 /// 无事务上下文（uid=0，--direct 路径）退化为裸 atomic_write。
 pub(crate) async fn recorded_write(path: &Path, new_content: &str) -> std::io::Result<()> {
     // A3b #3：--dry-run 干跑 —— 不落盘、不记 undo 快照，将写内容转预览收集
@@ -240,33 +262,156 @@ pub(crate) async fn recorded_write(path: &Path, new_content: &str) -> std::io::R
     if uid == 0 {
         return crate::atomic_write(path, new_content).await;
     }
+    let store = TXN_STORE
+        .try_with(|s| s.clone())
+        .map_err(|_| std::io::Error::other("undo txn store not in scope (missing TXN_STORE wiring)"))?;
     // 快照必须在写盘前取（契约设计第 2 条：成功写盘前把旧状态快照入栈）。
     let (before, created) = match tokio::fs::read_to_string(path).await {
         Ok(c) => (Some(c), false),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, true),
         Err(e) => return Err(e),
     };
-    crate::atomic_write(path, new_content).await?;
-    let entry = Entry {
-        path: path.to_path_buf(),
-        before,
-        created,
-        after: new_content.to_string(),
-        after_sha256: sha256_hex(new_content.as_bytes()),
-    };
-    PENDING
-        .lock()
-        .expect("undo PENDING lock poisoned")
-        .push((uid, entry));
-    Ok(())
+    // WAL：先记账（txn 目录 + manifest 原子重写），再动目标文件。
+    wal_append(&store, uid, path, before, created, new_content).await?;
+    crate::atomic_write(path, new_content).await
 }
 
-/// 丢弃某事务的待落盘快照（工具失败时调用）。
-pub(crate) fn abort(uid: u64) {
-    PENDING
+/// WAL 初始化：uid 首笔写入时 prune → 分配事务号 → 建 `txn-{N}` 目录 → 写空
+/// manifest（原子写保证目录自创建起始终可读）。uid → 目录登记进 [`OPEN_TXNS`]。
+/// WAL_INIT 串行化分配临界区：不同 uid 并发 wal_open 时防止 alloc 撞号（写门只
+/// 保证单工具内有序，不假设所有 recorded_write 调用点都持门）。
+static WAL_INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn wal_open(store: &Path, uid: u64) -> std::io::Result<PathBuf> {
+    {
+        let open = OPEN_TXNS.lock().expect("undo OPEN_TXNS lock poisoned");
+        if let Some((_, dir)) = open.iter().find(|(u, _)| *u == uid) {
+            return Ok(dir.clone());
+        }
+    }
+    let _init = WAL_INIT.lock().await;
+    // 双检：等锁期间同 uid 可能已开账。
+    {
+        let open = OPEN_TXNS.lock().expect("undo OPEN_TXNS lock poisoned");
+        if let Some((_, dir)) = open.iter().find(|(u, _)| *u == uid) {
+            return Ok(dir.clone());
+        }
+    }
+    prune_at(store, &Limits::default()).await;
+    let n = alloc_txn_num(store);
+    let dir = store.join(format!("txn-{n}"));
+    tokio::fs::create_dir_all(dir.join("before")).await?;
+    tokio::fs::create_dir_all(dir.join("after")).await?;
+    write_manifest(
+        &dir,
+        &Manifest {
+            txn_id: n,
+            timestamp: epoch_secs(),
+            files: Vec::new(),
+        },
+    )
+    .await?;
+    OPEN_TXNS
         .lock()
-        .expect("undo PENDING lock poisoned")
-        .retain(|(u, _)| *u != uid);
+        .expect("undo OPEN_TXNS lock poisoned")
+        .push((uid, dir.clone()));
+    Ok(dir)
+}
+
+/// 追加一条文件记录进 uid 的事务：先写 side 文件，再原子重写 manifest（提交点）。
+async fn wal_append(
+    store: &Path,
+    uid: u64,
+    path: &Path,
+    before: Option<String>,
+    created: bool,
+    after: &str,
+) -> std::io::Result<()> {
+    let dir = wal_open(store, uid).await?;
+    // 绝对路径归一（Windows 反斜杠/盘符大小写由 dunce 处理；失败用原路径）。
+    let path_str = dunce::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let (before, before_file) = match &before {
+        Some(c) if c.len() <= INLINE_LIMIT => (Some(c.clone()), None),
+        Some(c) => write_side_file(&dir, "before", c).await?,
+        None if created => (None, None),
+        None => {
+            return Err(std::io::Error::other(
+                "txn entry: modified file without before snapshot",
+            ));
+        }
+    };
+    let (after_inline, after_file) = if after.len() <= INLINE_LIMIT {
+        (Some(after.to_string()), None)
+    } else {
+        write_side_file(&dir, "after", after).await?
+    };
+    let mut manifest = read_manifest(&dir)
+        .await
+        .map_err(|e| std::io::Error::other(format!("wal manifest unreadable: {e}")))?;
+    manifest.files.push(FileRec {
+        path: path_str,
+        created,
+        before,
+        after: after_inline,
+        after_sha256: sha256_hex(after.as_bytes()),
+        before_file,
+        after_file,
+    });
+    write_manifest(&dir, &manifest).await
+}
+
+/// 写 side 快照文件，返回 (None, 相对路径) 的 FileRec 字段对。side 文件先于
+/// manifest 落盘：manifest 引用的旁路文件必然已完整存在。
+async fn write_side_file(
+    dir: &Path,
+    kind: &str,
+    content: &str,
+) -> std::io::Result<(Option<String>, Option<String>)> {
+    // 同类序号自增（WAL 逐笔追加，内嵌快照不占位）：相对路径由 manifest 引用，
+    // 命名对外不透明。
+    let i = {
+        let side = dir.join(kind);
+        let mut n = 0u32;
+        if let Ok(mut rd) = tokio::fs::read_dir(&side).await {
+            while let Some(ent) = rd.next_entry().await? {
+                if ent.file_name().to_string_lossy().parse::<u32>().is_ok() {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let rel = format!("{kind}/{i}");
+    tokio::fs::write(dir.join(&rel), content).await?;
+    Ok((None, Some(rel)))
+}
+
+/// manifest 原子写（temp+rename）：manifest 是记账提交点，撕裂写 = 假账。
+async fn write_manifest(dir: &Path, manifest: &Manifest) -> std::io::Result<()> {
+    let body = serde_json::to_string_pretty(manifest)
+        .map_err(|e| std::io::Error::other(format!("manifest serialize: {e}")))?;
+    crate::atomic_write(&dir.join("manifest.json"), &body).await
+}
+
+/// 丢弃某事务（工具失败/取消路径调用）：删除已开账的 WAL 事务目录 + 清旁表。
+/// 同步 fs 删除 —— 调用点在错误/Drop 路径，目录只含本事务快照，短暂阻塞可接受。
+pub(crate) fn abort(uid: u64) {
+    let dir = OPEN_TXNS
+        .lock()
+        .expect("undo OPEN_TXNS lock poisoned")
+        .iter()
+        .find(|(u, _)| *u == uid)
+        .map(|(_, d)| d.clone());
+    if let Some(dir) = dir {
+        let _ = std::fs::remove_dir_all(&dir);
+        OPEN_TXNS
+            .lock()
+            .expect("undo OPEN_TXNS lock poisoned")
+            .retain(|(u, _)| *u != uid);
+    }
     // audit 内存 F8：TOUCHED 同款回收——恢复登记只属 undo/redo 路径，但 abort 语义
     // 是"本事务账目全清"，两条旁表一起 retain 才对得上。
     TOUCHED
@@ -345,93 +490,44 @@ pub(crate) fn take_touched() -> Vec<TouchedFile> {
     taken
 }
 
-/// 提交某事务：无快照 = no-op；否则 prune → 落盘 `txn-{N}` → 清空 redo 链。
+/// 提交某事务：WAL 收口（记账已在 `recorded_write` 前置落盘）——清空 redo 链。
+/// uid 未开账（无任何 recorded_write）= no-op。
 ///
-/// 落盘 IO 失败映射 `CoreError::Io` → wire INTERNAL：写本身已成功但 undo 记账
-/// 失败，绝不能静默吞（用户会误以为仍有 undo 保险）。
+/// 收口近似无败：记账先行的全部意义即「写成功 ⇒ 账必已落盘」，收口只剩 redo 链
+/// 清理。旧版（收口时才落账）在此处 IO 失败会产生「写成功但无 undo 保险」的不
+/// 可修复态，已随 WAL 化消除。
 pub(crate) async fn commit(root: &Path, uid: u64) -> Result<(), ToolError> {
     let store = store_for(root)?;
-    commit_at(&store, uid, &Limits::default())
+    commit_at(&store, uid)
         .await
         .map_err(|e| ToolError::Core(lsp_core::error::CoreError::Io(e)))
 }
 
 /// [`commit`] 的存储路径注入版（单测用）。
-pub(crate) async fn commit_at(store: &Path, uid: u64, limits: &Limits) -> std::io::Result<()> {
-    let entries: Vec<Entry> = {
-        let mut pending = PENDING.lock().expect("undo PENDING lock poisoned");
-        let taken: Vec<Entry> = pending
-            .iter()
-            .filter(|(u, _)| *u == uid)
-            .map(|(_, e)| Entry {
-                path: e.path.clone(),
-                before: e.before.clone(),
-                created: e.created,
-                after: e.after.clone(),
-                after_sha256: e.after_sha256.clone(),
-            })
-            .collect();
-        pending.retain(|(u, _)| *u != uid);
-        taken
-    };
-    if entries.is_empty() {
+pub(crate) async fn commit_at(store: &Path, uid: u64) -> std::io::Result<()> {
+    let Some((_, dir)) = OPEN_TXNS
+        .lock()
+        .expect("undo OPEN_TXNS lock poisoned")
+        .iter()
+        .find(|(u, _)| *u == uid)
+        .map(|(u, d)| (*u, d.clone()))
+    else {
         return Ok(());
-    }
-    prune_at(store, limits).await;
-    let n = alloc_txn_num(store);
-    let dir = store.join(format!("txn-{n}"));
-    tokio::fs::create_dir_all(dir.join("before")).await?;
-    tokio::fs::create_dir_all(dir.join("after")).await?;
-
-    let mut files = Vec::with_capacity(entries.len());
-    for (i, e) in entries.iter().enumerate() {
-        // 绝对路径归一（Windows 反斜杠/盘符大小写由 dunce 处理；失败用原路径）。
-        let path_str = dunce::canonicalize(&e.path)
-            .unwrap_or_else(|_| e.path.clone())
-            .to_string_lossy()
-            .to_string();
-        let (before, before_file) = match &e.before {
-            Some(c) if c.len() <= INLINE_LIMIT => (Some(c.clone()), None),
-            Some(c) => {
-                let rel = format!("before/{i}");
-                tokio::fs::write(dir.join(&rel), c).await?;
-                (None, Some(rel))
-            }
-            None if e.created => (None, None),
-            None => {
-                return Err(std::io::Error::other(format!(
-                    "txn entry {i}: modified file without before snapshot"
-                )));
-            }
-        };
-        let (after, after_file) = if e.after.len() <= INLINE_LIMIT {
-            (Some(e.after.clone()), None)
-        } else {
-            let rel = format!("after/{i}");
-            tokio::fs::write(dir.join(&rel), &e.after).await?;
-            (None, Some(rel))
-        };
-        files.push(FileRec {
-            path: path_str,
-            created: e.created,
-            before,
-            after,
-            after_sha256: e.after_sha256.clone(),
-            before_file,
-            after_file,
-        });
-    }
-    let manifest = Manifest {
-        txn_id: n,
-        timestamp: epoch_secs(),
-        files,
     };
-    let body = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| std::io::Error::other(format!("manifest serialize: {e}")))?;
-    tokio::fs::write(dir.join("manifest.json"), body).await?;
-
-    // IDE 语义：新写入清空 redo 链。
-    remove_all_undone(store).await;
+    OPEN_TXNS
+        .lock()
+        .expect("undo OPEN_TXNS lock poisoned")
+        .retain(|(u, _)| *u != uid);
+    // IDE 语义：新写入清空 redo 链。空事务（0 文件，理论不可达）不动 redo 链，
+    // 与旧版 entries.is_empty() 早退对齐。
+    let has_files = read_manifest(&dir)
+        .await
+        .map(|m| !m.files.is_empty())
+        .unwrap_or(false);
+    if has_files {
+        let store = dir.parent().map(Path::to_path_buf).unwrap_or_else(|| store.to_path_buf());
+        remove_all_undone(&store).await;
+    }
     Ok(())
 }
 
@@ -478,13 +574,17 @@ fn parse_dir_n(name: &str, prefix: &str) -> Option<u64> {
     name.strip_prefix(prefix)?.parse().ok()
 }
 
-/// 分配下一个事务号：现有 txn-*/undone-* 的 max N + 1（跨进程重启天然续号）。
+/// 分配下一个事务号：现有 txn-*/undone-*/*discarded-* 的 max N + 1（跨进程重启
+/// 天然续号）。discarded 计入：否则 N 复用会让 `txn-{N}` → `discarded-{N}` 的
+/// 退栈 rename 覆盖同号旧留档（Windows rename 语义 = 静默覆盖）。
 fn alloc_txn_num(store: &Path) -> u64 {
     let mut max = 0u64;
     if let Ok(rd) = std::fs::read_dir(store) {
         for ent in rd.flatten() {
             let name = ent.file_name().to_string_lossy().to_string();
-            let n = parse_dir_n(&name, "txn-").or_else(|| parse_dir_n(&name, "undone-"));
+            let n = parse_dir_n(&name, "txn-")
+                .or_else(|| parse_dir_n(&name, "undone-"))
+                .or_else(|| parse_dir_n(&name, "discarded-"));
             if let Some(n) = n {
                 max = max.max(n);
             }
@@ -505,107 +605,250 @@ async fn remove_all_undone(store: &Path) {
     }
 }
 
-/// undo 单事务：冲突门（盘 sha == after_sha256，整事务拒绝）→ 恢复 before /
-/// 删除 created 文件 → rename 为 undone-{N}。
-pub(crate) async fn undo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
-    let dir = store.join(format!("txn-{n}"));
-    let manifest = read_manifest(&dir).await?;
-    // 冲突门：先全量校验，任一文件不匹配则整事务拒绝（契约设计第 4 条）。
-    // 注意：校验全过后的恢复写入阶段若 IO 失败（磁盘满/权限/占用），仍可能留下
-    // 半恢复状态——此时事务保持 txn-{n}，重试 undo 即幂等补完（created 已删跳过、
-    // before 内容确定性写回）。
-    for f in &manifest.files {
-        check_conflict_undo(f).await?;
-    }
-    for f in &manifest.files {
-        let p = Path::new(&f.path);
-        if f.created {
-            // created 文件已被外部删除 = 结果一致，跳过（幂等）。
-            if p.exists() {
-                tokio::fs::remove_file(p)
-                    .await
-                    .map_err(|e| ToolError::WriteConflict {
-                        path: f.path.clone(),
-                        reason: format!("undo remove created file failed: {e}"),
-                    })?;
-            }
-        } else {
-            let before = side_content(&dir, &f.before, &f.before_file, "before").await?;
-            // 原子写（temp+rename）：undo 是数据恢复路径，截断写半途崩溃 = 文件损坏。
-            // Windows 上目标被编辑器占用时 rename 可能失败——此时返回冲突门错误，
-            // 用户关掉占用后重试 undo（幂等）即可。
-            crate::atomic_write(p, &before)
-                .await
-                .map_err(|e| ToolError::WriteConflict {
-                    path: f.path.clone(),
-                    reason: format!("undo restore failed: {e}"),
-                })?;
-        }
-    }
-    tokio::fs::rename(&dir, store.join(format!("undone-{n}")))
-        .await
-        .map_err(|e| ToolError::WriteConflict {
-            path: dir.display().to_string(),
-            reason: format!("undo: mark txn undone failed: {e}"),
-        })?;
-    // 整事务恢复成功后才登记（P2-b）：LS 同步只对真正落盘恢复的文件。
-    register_touched(&manifest.files);
-    Ok(manifest.files.len())
+/// undo 单步结果。
+enum UndoOne {
+    /// 正常回滚（或幂等补完此前半途的恢复），值为涉及文件数。
+    Reverted(usize),
+    /// 盘面已处于事务前状态（崩溃窗「有记录无改动」/外部已回退）——无恢复写，
+    /// 仅收口记账。
+    NothingToRevert,
 }
 
-/// redo 单事务：冲突门（盘 sha == before_sha256 = undo 后状态）→ 写回 after。
-async fn redo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
-    let dir = store.join(format!("undone-{n}"));
-    let manifest = read_manifest(&dir).await?;
-    for f in &manifest.files {
-        // redo 冲突门：预期盘上处于 undo 后状态。
-        if f.created {
-            // created 文件 undo 后应不存在；已存在且内容 == after = 幂等重放，放行。
-            if let Ok(c) = tokio::fs::read_to_string(&f.path).await
-                && sha256_hex(c.as_bytes()) != f.after_sha256
-            {
-                return Err(conflict(
-                    &f.path,
-                    "redo: created file exists with foreign content",
-                ));
-            }
-        } else {
-            let before = side_content(&dir, &f.before, &f.before_file, "before").await?;
-            let unchanged = tokio::fs::read_to_string(&f.path)
+/// undo/redo 单步失败：外部编辑冲突（可安全丢弃整事务）vs 瞬态错误（原样上抛）。
+enum UndoFail {
+    External { path: String, reason: String },
+    /// WAL 开账撕裂（bd serena-rust-15jb）：manifest.json 缺失 = 崩溃打中
+    /// mkdir 与首次 manifest 原子写之间的窗口 —— 零记录零影响，安全丢弃。
+    Torn,
+    Transient(ToolError),
+}
+
+/// 盘面分类：事务后状态（待恢复）/ 事务前状态（已恢复或未落盘）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileState {
+    AfterState,
+    BeforeState,
+}
+
+/// undo 单事务：冲突门（盘 sha == after_sha256，整事务拒绝）→ 恢复 before /
+/// 删除 created 文件 → rename 为 undone-{N}。
+///
+/// 兼容包装（recipe 回滚路径）：外部编辑冲突仍按 `WRITE_CONFLICT` 报错，由调用
+/// 方逐事务处置；undo 工具路径走 [`undo_one_classified`] 的自动跳过语义。
+pub(crate) async fn undo_one(store: &Path, n: u64) -> Result<usize, ToolError> {
+    match undo_one_classified(store, n).await {
+        Ok(UndoOne::Reverted(files)) => Ok(files),
+        Ok(UndoOne::NothingToRevert) => Ok(0),
+        // 撕裂账（无 manifest）零记录零影响，回滚计 0 文件。
+        Err(UndoFail::Torn) => Ok(0),
+        Err(UndoFail::External { path, reason }) => Err(conflict(&path, &reason)),
+        Err(UndoFail::Transient(e)) => Err(e),
+    }
+}
+
+/// undo 单事务（盘面分类版）：全事务后态 → 恢复；全事务前态 → no-op 收口（崩
+/// 溃窗「有记录无改动」/恢复半途崩溃的幂等补完）；混态无外部冲突 → 幂等补完；
+/// 任一外部冲突 → 整事务拒绝（不产生部分恢复写）。
+async fn undo_one_classified(store: &Path, n: u64) -> Result<UndoOne, UndoFail> {
+    let dir = store.join(format!("txn-{n}"));
+    let manifest = match read_manifest(&dir).await {
+        Ok(m) => m,
+        Err(e) => {
+            // WAL 开账撕裂窗口（见 UndoFail::Torn）：manifest 不在盘 = 安全丢弃；
+            // 在盘但损坏 = 真存储损坏，保持报错（取证优先，不静默吞）。
+            if tokio::fs::metadata(dir.join("manifest.json"))
                 .await
-                .map(|c| sha256_hex(c.as_bytes()) == sha256_hex(before.as_bytes()))
-                .unwrap_or(false);
-            if !unchanged {
-                return Err(conflict(
-                    &f.path,
-                    "redo: file on disk is not in the expected pre-redo (post-undo) state",
-                ));
+                .is_err()
+            {
+                return Err(UndoFail::Torn);
+            }
+            return Err(UndoFail::Transient(e));
+        }
+    };
+    // 先全量分类，后写盘：门不过绝不产生部分恢复（契约设计第 4 条）。
+    let mut states = Vec::with_capacity(manifest.files.len());
+    for f in &manifest.files {
+        states.push(classify_for_undo(&dir, f).await?);
+    }
+    if states.iter().all(|s| *s == FileState::BeforeState) {
+        mark_undone(store, n, &dir)
+            .await
+            .map_err(|e| UndoFail::Transient(io_conflict(&dir, "undo: mark txn undone failed", e)))?;
+        return Ok(UndoOne::NothingToRevert);
+    }
+    // 恢复写（幂等：BeforeState 文件重写同内容；AfterState 正常恢复）。
+    for f in &manifest.files {
+        restore_before(&dir, f).await.map_err(UndoFail::Transient)?;
+    }
+    mark_undone(store, n, &dir)
+        .await
+        .map_err(|e| UndoFail::Transient(io_conflict(&dir, "undo: mark txn undone failed", e)))?;
+    // 整事务恢复成功后才登记（P2-b）：LS 同步只对真正落盘恢复的文件。
+    register_touched(&manifest.files);
+    Ok(UndoOne::Reverted(manifest.files.len()))
+}
+
+/// undo 单文件盘面分类；外部编辑（既非事务前也非事务后状态）→ External。
+async fn classify_for_undo(dir: &Path, f: &FileRec) -> Result<FileState, UndoFail> {
+    let current = tokio::fs::read_to_string(&f.path).await;
+    match (f.created, current) {
+        // created 文件已被外部删除 = undo 目标状态一致，放行（幂等跳过删除）。
+        (true, Err(_)) => Ok(FileState::BeforeState),
+        (true, Ok(c)) if sha256_hex(c.as_bytes()) == f.after_sha256 => Ok(FileState::AfterState),
+        (true, Ok(_)) => Err(UndoFail::External {
+            path: f.path.clone(),
+            reason: "undo conflict: created file was modified after the transaction".into(),
+        }),
+        (false, Ok(c)) if sha256_hex(c.as_bytes()) == f.after_sha256 => Ok(FileState::AfterState),
+        (false, Ok(c)) => {
+            let before = side_content(dir, &f.before, &f.before_file, "before")
+                .await
+                .map_err(UndoFail::Transient)?;
+            if sha256_hex(before.as_bytes()) == sha256_hex(c.as_bytes()) {
+                Ok(FileState::BeforeState)
+            } else {
+                Err(UndoFail::External {
+                    path: f.path.clone(),
+                    reason: "undo conflict: file changed after the transaction (sha mismatch)"
+                        .into(),
+                })
             }
         }
+        (false, Err(_)) => Err(UndoFail::External {
+            path: f.path.clone(),
+            reason:
+                "undo conflict: expected the file to exist (post-transaction state), but it is missing"
+                    .into(),
+        }),
     }
+}
+
+/// 恢复单文件到事务前状态（created → 删除；modified → before 内容原子写回）。
+async fn restore_before(dir: &Path, f: &FileRec) -> Result<(), ToolError> {
+    let p = Path::new(&f.path);
+    if f.created {
+        // created 文件已被外部删除 = 结果一致，跳过（幂等）。
+        if p.exists() {
+            tokio::fs::remove_file(p)
+                .await
+                .map_err(|e| conflict(&f.path, &format!("undo remove created file failed: {e}")))?;
+        }
+        return Ok(());
+    }
+    let before = side_content(dir, &f.before, &f.before_file, "before").await?;
+    // 原子写（temp+rename）：undo 是数据恢复路径，截断写半途崩溃 = 文件损坏。
+    // Windows 上目标被编辑器占用时 rename 可能失败——返回冲突门错误，用户关掉
+    // 占用后重试 undo（幂等补完）即可。
+    crate::atomic_write(p, &before)
+        .await
+        .map_err(|e| conflict(&f.path, &format!("undo restore failed: {e}")))
+}
+
+/// undo 收口：事务目录翻转 `txn-{N}` → `undone-{N}`。
+async fn mark_undone(store: &Path, n: u64, dir: &Path) -> std::io::Result<()> {
+    tokio::fs::rename(dir, store.join(format!("undone-{n}"))).await
+}
+
+/// redo 单步结果。
+enum RedoOne {
+    Replayed(usize),
+    /// 盘面已处于事务后状态（redo 写后、收口前崩溃；或外部已应用同内容）。
+    NothingToReplay,
+}
+
+/// redo 单事务（盘面分类版）：全事务前态 → 正放 after；混态无外部冲突 → 幂等
+/// 补完（redo 半途崩溃）；全事务后态 → no-op 收口；任一外部冲突 → 整事务拒绝。
+async fn redo_one_classified(store: &Path, n: u64) -> Result<RedoOne, UndoFail> {
+    let dir = store.join(format!("undone-{n}"));
+    let manifest = match read_manifest(&dir).await {
+        Ok(m) => m,
+        // 同 undo_one_classified：无 manifest = 撕裂账安全丢弃（防御对称）。
+        Err(_) if tokio::fs::metadata(dir.join("manifest.json")).await.is_err() => {
+            return Err(UndoFail::Torn);
+        }
+        Err(e) => return Err(UndoFail::Transient(e)),
+    };
+    let mut states = Vec::with_capacity(manifest.files.len());
     for f in &manifest.files {
-        let after = side_content(&dir, &f.after, &f.after_file, "after").await?;
+        states.push(classify_for_redo(&dir, f).await?);
+    }
+    if states.iter().all(|s| *s == FileState::AfterState) {
+        mark_active(store, n, &dir)
+            .await
+            .map_err(|e| UndoFail::Transient(io_conflict(&dir, "redo: mark txn active failed", e)))?;
+        return Ok(RedoOne::NothingToReplay);
+    }
+    // 正放/补完：逐文件写回 after（幂等，AfterState 文件重写同内容）。
+    for f in &manifest.files {
+        let after = side_content(&dir, &f.after, &f.after_file, "after")
+            .await
+            .map_err(UndoFail::Transient)?;
         let p = Path::new(&f.path);
         if let Some(parent) = p.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
         // 原子写，同 undo_one：恢复路径禁截断写（防半途损坏）。
-        crate::atomic_write(p, &after)
-            .await
-            .map_err(|e| ToolError::WriteConflict {
-                path: f.path.clone(),
-                reason: format!("redo reapply failed: {e}"),
-            })?;
-    }
-    tokio::fs::rename(&dir, store.join(format!("txn-{n}")))
-        .await
-        .map_err(|e| ToolError::WriteConflict {
-            path: dir.display().to_string(),
-            reason: format!("redo: mark txn active failed: {e}"),
+        crate::atomic_write(p, &after).await.map_err(|e| {
+            UndoFail::Transient(conflict(&f.path, &format!("redo reapply failed: {e}")))
         })?;
+    }
+    mark_active(store, n, &dir)
+        .await
+        .map_err(|e| UndoFail::Transient(io_conflict(&dir, "redo: mark txn active failed", e)))?;
     // 整事务重放成功后才登记（P2-b），同 undo_one。
     register_touched(&manifest.files);
-    Ok(manifest.files.len())
+    Ok(RedoOne::Replayed(manifest.files.len()))
+}
+
+/// redo 单文件盘面分类；外部编辑 → External。
+async fn classify_for_redo(dir: &Path, f: &FileRec) -> Result<FileState, UndoFail> {
+    let current = tokio::fs::read_to_string(&f.path).await;
+    match (f.created, current) {
+        // created 文件 undo 后应不存在；缺失 = 可重建。
+        (true, Err(_)) => Ok(FileState::BeforeState),
+        (true, Ok(c)) if sha256_hex(c.as_bytes()) == f.after_sha256 => Ok(FileState::AfterState),
+        (true, Ok(_)) => Err(UndoFail::External {
+            path: f.path.clone(),
+            reason: "redo: created file exists with foreign content".into(),
+        }),
+        (false, Ok(c)) => {
+            let disk = sha256_hex(c.as_bytes());
+            if disk == f.after_sha256 {
+                return Ok(FileState::AfterState);
+            }
+            let before = side_content(dir, &f.before, &f.before_file, "before")
+                .await
+                .map_err(UndoFail::Transient)?;
+            if disk == sha256_hex(before.as_bytes()) {
+                Ok(FileState::BeforeState)
+            } else {
+                Err(UndoFail::External {
+                    path: f.path.clone(),
+                    reason: "redo: file on disk is not in the expected pre-redo (post-undo) state"
+                        .into(),
+                })
+            }
+        }
+        (false, Err(_)) => Err(UndoFail::External {
+            path: f.path.clone(),
+            reason: "redo: expected the file to exist (post-undo state), but it is missing".into(),
+        }),
+    }
+}
+
+/// redo 收口：事务目录翻转 `undone-{N}` → `txn-{N}`。
+async fn mark_active(store: &Path, n: u64, dir: &Path) -> std::io::Result<()> {
+    tokio::fs::rename(dir, store.join(format!("txn-{n}"))).await
+}
+
+/// 冲突事务退栈留档：`{prefix}-{N}` → `discarded-{N}`（bd serena-rust-3ux6）。
+/// 留档不参与栈（top_active/bottom_undone 不扫），prune 照常按上限回收。
+async fn discard_dir(store: &Path, prefix: &str, n: u64) -> std::io::Result<()> {
+    tokio::fs::rename(
+        store.join(format!("{prefix}-{n}")),
+        store.join(format!("discarded-{n}")),
+    )
+    .await
 }
 
 fn conflict(path: &str, reason: &str) -> ToolError {
@@ -615,29 +858,12 @@ fn conflict(path: &str, reason: &str) -> ToolError {
     }
 }
 
-/// undo 冲突门：单文件校验盘上状态 == 事务后状态。
-async fn check_conflict_undo(f: &FileRec) -> Result<(), ToolError> {
-    let current = tokio::fs::read_to_string(&f.path).await;
-    match (f.created, current) {
-        // created 文件已被外部删除 = undo 目标状态一致，放行（幂等跳过删除）。
-        (true, Err(_)) => Ok(()),
-        (true, Ok(c)) if sha256_hex(c.as_bytes()) == f.after_sha256 => Ok(()),
-        (true, Ok(_)) => Err(conflict(
-            &f.path,
-            "undo conflict: created file was modified after the transaction",
-        )),
-        (false, Ok(c)) if sha256_hex(c.as_bytes()) == f.after_sha256 => Ok(()),
-        (false, Ok(_)) => Err(conflict(
-            &f.path,
-            "undo conflict: file changed after the transaction (sha mismatch)",
-        )),
-        (false, Err(_)) => Err(conflict(
-            &f.path,
-            "undo conflict: expected the file to exist (post-transaction state), but it is missing",
-        )),
-    }
+/// io::Error → 旧版同形 `WriteConflict`（收口 rename 失败等，错误面保持不变）。
+fn io_conflict(dir: &Path, what: &str, e: std::io::Error) -> ToolError {
+    conflict(&dir.display().to_string(), &format!("{what}: {e}"))
 }
 
+/// 读 `manifest.json`；不可读/损坏 = 存储损坏级 `WRITE_CONFLICT`（留档可查）。
 async fn read_manifest(dir: &Path) -> Result<Manifest, ToolError> {
     let body = tokio::fs::read_to_string(dir.join("manifest.json"))
         .await
@@ -740,7 +966,8 @@ pub(crate) async fn read_txn_at(
     })
 }
 
-/// `undo`：回滚最近 `steps` 个事务；中途冲突即停（已完成的事务保留 undone 状态）。
+/// `undo`：回滚最近 `steps` 个事务；外部编辑冲突的事务自动 discarded 跳过并附
+/// warning（bd serena-rust-3ux6），no-op 崩溃窗事务幂等收口（bd serena-rust-15jb）。
 pub(crate) async fn undo(root: &Path, steps: usize) -> Result<serde_json::Value, ToolError> {
     undo_at(&store_for(root)?, steps).await
 }
@@ -750,17 +977,62 @@ pub(crate) async fn undo_at(store: &Path, steps: usize) -> Result<serde_json::Va
     // 与写工具串行化：恢复写期间不得有并发写改盘。
     let _gate = crate::write_gate::acquire("undo").await?;
     let mut undone = Vec::new();
-    for _ in 0..steps {
-        match top_active(store).await {
-            Ok(Some(n)) => {
-                let files = undo_one(store, n).await?;
-                undone.push(serde_json::json!({"txn_id": n, "files": files}));
-            }
-            // 空栈 = no-op（IDE undo 语义）。
+    let mut skipped = Vec::new();
+    let mut done = 0usize;
+    // steps 只数真实回滚；no-op 收口与外部冲突 discarded 跳过不占名额（栈单调
+    // 收缩保证终止）。空栈 = no-op（IDE undo 语义）。
+    while done < steps {
+        let n = match top_active(store).await {
+            Ok(Some(n)) => n,
             _ => break,
+        };
+        match undo_one_classified(store, n).await {
+            Ok(UndoOne::Reverted(files)) => {
+                undone.push(serde_json::json!({"txn_id": n, "files": files}));
+                done += 1;
+            }
+            Ok(UndoOne::NothingToRevert) => {
+                undone.push(serde_json::json!({
+                    "txn_id": n,
+                    "files": 0,
+                    "note": "no-op: change not present on disk (crash window or already reverted)"
+                }));
+            }
+            Err(UndoFail::External { path, reason }) => {
+                discard_dir(store, "txn", n).await.map_err(|e| {
+                    conflict(
+                        &format!("txn-{n}"),
+                        &format!("undo: discard conflicted txn failed: {e}"),
+                    )
+                })?;
+                let next = top_active(store).await.ok().flatten();
+                skipped.push(serde_json::json!({
+                    "txn_id": n,
+                    "state": "discarded",
+                    "reason": reason,
+                    "file": path,
+                    "next_active_txn": next,
+                }));
+            }
+            Err(UndoFail::Torn) => {
+                discard_dir(store, "txn", n).await.map_err(|e| {
+                    conflict(
+                        &format!("txn-{n}"),
+                        &format!("undo: discard torn txn failed: {e}"),
+                    )
+                })?;
+                let next = top_active(store).await.ok().flatten();
+                skipped.push(serde_json::json!({
+                    "txn_id": n,
+                    "state": "discarded",
+                    "reason": "torn transaction (no manifest) — discarded",
+                    "next_active_txn": next,
+                }));
+            }
+            Err(UndoFail::Transient(e)) => return Err(e),
         }
     }
-    Ok(serde_json::json!({"undone": undone}))
+    Ok(serde_json::json!({"undone": undone, "skipped": skipped}))
 }
 
 /// `redo`：重放最近被 undo 的事务。
@@ -772,21 +1044,74 @@ pub(crate) async fn redo(root: &Path) -> Result<serde_json::Value, ToolError> {
 pub(crate) async fn redo_at(store: &Path) -> Result<serde_json::Value, ToolError> {
     let _gate = crate::write_gate::acquire("redo").await?;
     let mut redone = Vec::new();
-    // redo 一次重放一个（IDE redo 单步语义；--steps 未列入契约）。
-    if let Some(n) = top_undone(store).await {
-        let files = redo_one(store, n).await?;
-        redone.push(serde_json::json!({"txn_id": n, "files": files}));
+    let mut skipped = Vec::new();
+    // 每次调用重放一个**有效**事务（IDE 单步语义；--steps 未列入契约）。重放序 =
+    // 事务时间序（N 升序：最后 undo 的先 redo；bd serena-rust-b5od）。外部冲突
+    // 链式 discarded 清栈（因果链已被外部编辑打破，后续多半同弃，但栈收缩保证
+    // 终止，报文一次交代完整）；no-op 收口占当次名额。
+    loop {
+        let Some(n) = bottom_undone(store).await else {
+            break;
+        };
+        match redo_one_classified(store, n).await {
+            Ok(RedoOne::Replayed(files)) => {
+                redone.push(serde_json::json!({"txn_id": n, "files": files}));
+                break;
+            }
+            Ok(RedoOne::NothingToReplay) => {
+                redone.push(serde_json::json!({
+                    "txn_id": n,
+                    "files": 0,
+                    "note": "no-op: change already on disk (crash window)"
+                }));
+                break;
+            }
+            Err(UndoFail::External { path, reason }) => {
+                discard_dir(store, "undone", n).await.map_err(|e| {
+                    conflict(
+                        &format!("undone-{n}"),
+                        &format!("redo: discard conflicted txn failed: {e}"),
+                    )
+                })?;
+                let next = bottom_undone(store).await;
+                skipped.push(serde_json::json!({
+                    "txn_id": n,
+                    "state": "discarded",
+                    "reason": reason,
+                    "file": path,
+                    "next_undone_txn": next,
+                }));
+            }
+            Err(UndoFail::Torn) => {
+                discard_dir(store, "undone", n).await.map_err(|e| {
+                    conflict(
+                        &format!("undone-{n}"),
+                        &format!("redo: discard torn txn failed: {e}"),
+                    )
+                })?;
+                let next = bottom_undone(store).await;
+                skipped.push(serde_json::json!({
+                    "txn_id": n,
+                    "state": "discarded",
+                    "reason": "torn transaction (no manifest) — discarded",
+                    "next_undone_txn": next,
+                }));
+            }
+            Err(UndoFail::Transient(e)) => return Err(e),
+        }
     }
-    Ok(serde_json::json!({"redone": redone}))
+    Ok(serde_json::json!({"redone": redone, "skipped": skipped}))
 }
 
-/// 栈顶 undone 事务（N 最大的 undone-*）。
-async fn top_undone(store: &Path) -> Option<u64> {
+/// 重放队首：N **最小**的 undone 事务（时间序正放，bd serena-rust-b5od）。
+/// 旧版取 N 最大（LIFO）——深度 ≥2 时 pre-image 对账必然失配且失败不弹栈 =
+/// 永久 WRITE_CONFLICT 楔死，即 F1 根因。
+async fn bottom_undone(store: &Path) -> Option<u64> {
     let mut best: Option<u64> = None;
     let mut rd = tokio::fs::read_dir(store).await.ok()?;
     while let Ok(Some(ent)) = rd.next_entry().await {
         if let Some(n) = parse_dir_n(ent.file_name().to_string_lossy().as_ref(), "undone-") {
-            best = Some(best.map_or(n, |b: u64| b.max(n)));
+            best = Some(best.map_or(n, |b: u64| b.min(n)));
         }
     }
     best
@@ -808,6 +1133,7 @@ pub(crate) async fn list_at(store: &Path) -> Result<serde_json::Value, ToolError
             let (prefix, n) = parse_dir_n(&name, "txn-")
                 .map(|n| ("active", n))
                 .or_else(|| parse_dir_n(&name, "undone-").map(|n| ("undone", n)))
+                .or_else(|| parse_dir_n(&name, "discarded-").map(|n| ("discarded", n)))
                 .unwrap_or(("", 0));
             if n == 0 {
                 continue;
@@ -859,6 +1185,7 @@ async fn prune_at(store: &Path, limits: &Limits) {
         let (is_active, n) = parse_dir_n(&name, "txn-")
             .map(|n| (true, n))
             .or_else(|| parse_dir_n(&name, "undone-").map(|n| (false, n)))
+            .or_else(|| parse_dir_n(&name, "discarded-").map(|n| (false, n)))
             .unwrap_or((false, 0));
         if n == 0 {
             continue;
@@ -894,9 +1221,10 @@ async fn prune_at(store: &Path, limits: &Limits) {
         expired.push(n);
     }
     for n in expired {
-        // active 与 undone 同号不并存（状态机互斥），按两种名式尝试删除即可。
+        // active/undone/discarded 同号不并存（状态机互斥），按三种名式尝试删除。
         let _ = tokio::fs::remove_dir_all(store.join(format!("txn-{n}"))).await;
         let _ = tokio::fs::remove_dir_all(store.join(format!("undone-{n}"))).await;
+        let _ = tokio::fs::remove_dir_all(store.join(format!("discarded-{n}"))).await;
     }
 }
 

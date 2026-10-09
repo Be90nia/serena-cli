@@ -41,16 +41,39 @@ fn entry_file_matches(path: &Path, lang: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// root 下找该语言首个真实源文件（filtered_walker：gitignore + target/node_modules
-/// 等内置 ignore；限深 4 对齐 ls-adapters::find_language_source_file）。探针必须打
-/// 真实源文件 —— 虚拟路径不触发项目索引（cold-start-hang 根因）。
-fn find_entry_file(root: &Path, lang: &str) -> Option<PathBuf> {
-    crate::fs_tools::filtered_walker(root)
+/// root 下找该语言首个**可作 UTF-8 文本解码**的真实源文件（filtered_walker：
+/// gitignore + target/node_modules 等内置 ignore；限深 4 对齐
+/// ls-adapters::find_language_source_file）。探针必须打真实源文件 —— 虚拟路径
+/// 不触发项目索引（cold-start-hang 根因）。第二返回值 = 被跳过的解码失败文件
+/// （相对 root、正斜杠）—— bd serena-rust-sgc0：二进制内容 .py 曾把整次 warm
+/// 毒化成 INTERNAL；逐文件跳过继续，跳过清单交调用方出 warning。
+fn find_entry_file(root: &Path, lang: &str) -> (Option<PathBuf>, Vec<String>) {
+    let mut skipped = Vec::new();
+    for entry in crate::fs_tools::filtered_walker(root)
         .max_depth(Some(4))
         .build()
         .filter_map(Result::ok)
-        .find(|e| e.file_type().is_some_and(|t| t.is_file()) && entry_file_matches(e.path(), lang))
-        .map(|e| e.into_path())
+    {
+        if !entry.file_type().is_some_and(|t| t.is_file())
+            || !entry_file_matches(entry.path(), lang)
+        {
+            continue;
+        }
+        match std::fs::read(entry.path()) {
+            Ok(bytes) if std::str::from_utf8(&bytes).is_ok() => {
+                return (Some(entry.into_path()), skipped);
+            }
+            _ => skipped.push(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            ),
+        }
+    }
+    (None, skipped)
 }
 
 /// warm 主入口（execute_tool `"warm"` 分支调用）。
@@ -66,8 +89,9 @@ pub(crate) async fn warm(
 
     // 1) 入口文件先探：无源文件 = warm 无意义，且防对错误 lang 白白 spawn 一个 LS。
     //    BadArgs 先于 session_for —— 确定性用法错不烧启动成本。
-    let entry = find_entry_file(root, &lang).ok_or_else(|| ToolError::BadArgs {
-        detail: format!("no {lang} source files under {}", root.display()),
+    let (entry, skipped) = find_entry_file(root, &lang);
+    let entry = entry.ok_or_else(|| ToolError::BadArgs {
+        detail: format!("no readable {lang} source files under {}", root.display()),
     })?;
 
     // 2) 触发 LS 启动（T2 含 on_server_ready 根探针；未装走 NotInstalled 原样上抛）。
@@ -97,7 +121,7 @@ pub(crate) async fn warm(
         }
     }
 
-    Ok(json!({
+    let mut out = json!({
         "lang": lang,
         "project": root.display().to_string(),
         "ready": ready,
@@ -107,7 +131,15 @@ pub(crate) async fn warm(
             .strip_prefix(root)
             .unwrap_or(&entry)
             .to_string_lossy(),
-    }))
+    });
+    // bd serena-rust-sgc0：解码失败被跳过的文件显式带出——可见的降级，不静默。
+    if !skipped.is_empty() {
+        out["warnings"] = json!(skipped
+            .iter()
+            .map(|f| format!("{f}: not readable as UTF-8 text (binary content?); skipped"))
+            .collect::<Vec<_>>());
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -158,8 +190,43 @@ mod tests {
     /// rust_demo 能找到 .rs 入口（纯 fs，不拉 LS）。
     #[test]
     fn find_entry_file_finds_rust_source() {
-        let entry = find_entry_file(&rust_demo_root(), "rust").expect("entry file");
+        let (entry, skipped) = find_entry_file(&rust_demo_root(), "rust");
+        let entry = entry.expect("entry file");
         assert_eq!(entry.extension().unwrap(), "rs");
+        assert!(skipped.is_empty(), "rust_demo 无二进制文件: {skipped:?}");
+    }
+
+    /// bd serena-rust-sgc0：二进制内容 .py 不毒化 warm —— 跳过 + 记入 skipped，
+    /// 入口落到下一个可解码文件（纯 fs，不拉 LS）。
+    #[test]
+    fn find_entry_file_skips_binary_and_reports() {
+        let dir = std::env::temp_dir().join(format!("warm_bin_skip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        // 4096B 非 UTF-8 字节（0xFF 开头必然解码失败），与票面复现形态一致。
+        std::fs::write(dir.join("bin.py"), vec![0xFFu8; 4096]).expect("binary fixture");
+        std::fs::write(dir.join("good.py"), "def add(a, b):\n    return a + b\n")
+            .expect("text fixture");
+
+        let (entry, skipped) = find_entry_file(&dir, "python");
+        let entry = entry.expect("good.py must be picked");
+        assert_eq!(entry.file_name().unwrap(), "good.py");
+        assert_eq!(skipped, vec!["bin.py".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 全部候选解码失败 → (None, skipped 非空)，warm 侧转 BadArgs（不 INTERNAL）。
+    #[test]
+    fn find_entry_file_all_binary_yields_none_with_skipped() {
+        let dir = std::env::temp_dir().join(format!("warm_bin_all_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(dir.join("bin.py"), vec![0xFFu8; 64]).expect("binary fixture");
+
+        let (entry, skipped) = find_entry_file(&dir, "python");
+        assert!(entry.is_none());
+        assert_eq!(skipped, vec!["bin.py".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 无该语言源文件 → BadArgs，且先于 session_for（不 spawn LS）。

@@ -75,6 +75,9 @@ pub struct ReadReport {
     pub end_line: u32,
     /// 全文 content-hash（sha256 前 16 位）—— 行级三件套 `expected_hash` 对账用。
     pub hash: String,
+    /// 杠精 ke2a-6：content 经 lines() 归一为 \n（CRLF 被静默剥 \r）而 hash 按
+    /// 原字节——据此字段判断拼接写回是否引入行尾转换。crlf | lf | mixed。
+    pub line_endings: &'static str,
 }
 
 /// `list_dir` 单条结果。
@@ -119,7 +122,18 @@ pub async fn read_file(
     clamp: bool,
 ) -> FsResult<ReadReport> {
     let canon_path = safe_join(root, file)?;
-    let text = tokio::fs::read_to_string(&canon_path).await?;
+    let text = tokio::fs::read_to_string(&canon_path).await.map_err(|e| {
+        // bd serena-rust-sgc0：二进制内容 InvalidData（"stream did not contain
+        // valid UTF-8"）归 BAD_ARGS——文件不可读作文本是目标文件问题（exit 2），
+        // 不是 Io → INTERNAL（exit 3 契约外）。
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            FsError::BadArgs {
+                detail: format!("{file}: not readable as UTF-8 text (binary content?): {e}"),
+            }
+        } else {
+            FsError::Io(e)
+        }
+    })?;
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
     let s = start_line.unwrap_or(1);
@@ -140,13 +154,42 @@ pub async fn read_file(
         });
     }
     let content = lines[(s - 1) as usize..e as usize].join("\n");
+    // 杠精 ke2a-6：CRLF 文件静默转 LF 的拼接写回防雷标记（\n 计数含 \r\n 内的）。
+    let line_endings = {
+        let crlf = text.matches("\r\n").count();
+        let lf = text.matches('\n').count();
+        if crlf == 0 {
+            "lf"
+        } else if crlf == lf {
+            "crlf"
+        } else {
+            "mixed"
+        }
+    };
     Ok(ReadReport {
         content,
         total_lines: total,
         start_line: s,
         end_line: e,
         hash: crate::content_hash(&text),
+        line_endings,
     })
+}
+
+/// bd serena-rust-sgc0：ensure_open 对二进制文件的 Core(Io InvalidData)（lsp-core
+/// didOpen read_to_string 解码失败）归一为 BAD_ARGS——文件不可读作文本是目标
+/// 文件问题（exit 2），不是内部故障（exit 3 契约外）。其余 CoreError 原样上抛。
+pub(crate) fn ensure_open_err(
+    file: &str,
+) -> impl Fn(lsp_core::error::CoreError) -> crate::ToolError + '_ {
+    move |e| match e {
+        lsp_core::error::CoreError::Io(io) if io.kind() == std::io::ErrorKind::InvalidData => {
+            crate::ToolError::BadArgs {
+                detail: format!("{file}: not readable as UTF-8 text (binary content?)"),
+            }
+        }
+        other => crate::ToolError::Core(other),
+    }
 }
 
 /// 列 `root/path` 下的目录/文件。
@@ -313,5 +356,71 @@ mod comment_tests {
         // 空行/未知扩展名 fallback。
         assert!(!looks_like_comment("a.rs", "   "));
         assert!(looks_like_comment("a.unknown", "# shebang-ish"));
+    }
+}
+
+#[cfg(test)]
+mod binary_read_tests {
+    use super::*;
+
+    /// bd serena-rust-sgc0：二进制内容 read_file → BAD_ARGS（非 Io → INTERNAL）。
+    #[tokio::test]
+    async fn read_file_binary_content_is_bad_args() {
+        // serena-rust-nodd：tempfile 托管（Drop 即清，不再留 fs_bin_read_* 残留）。
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("bin.py"), vec![0xFFu8; 64]).expect("binary fixture");
+
+        let err = read_file(dir.path(), "bin.py", None, None, true)
+            .await
+            .expect_err("binary content must fail");
+        let FsError::BadArgs { detail } = err else {
+            panic!("expect BadArgs, got {err:?}");
+        };
+        assert!(detail.contains("not readable as UTF-8 text"), "{detail}");
+
+        // 同目录文本文件不受影响。
+        std::fs::write(dir.path().join("good.py"), "x = 1\n").expect("text fixture");
+        let ok = read_file(dir.path(), "good.py", None, None, true)
+            .await
+            .expect("read ok");
+        assert_eq!(ok.content, "x = 1");
+    }
+
+    /// 杠精 ke2a-6：CRLF 文件 read_file 的 line_endings 标记（content 静默归一
+    /// LF，但 hash 按原字节——标记让拼接写回方感知行尾转换）。
+    #[tokio::test]
+    async fn read_file_marks_line_endings() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("crlf.py"), "a = 1\r\nb = 2\r\n").expect("crlf fixture");
+        std::fs::write(dir.path().join("lf.py"), "a = 1\nb = 2\n").expect("lf fixture");
+        std::fs::write(dir.path().join("mixed.py"), "a = 1\r\nb = 2\n").expect("mixed fixture");
+        let crlf = read_file(dir.path(), "crlf.py", None, None, true).await.expect("crlf");
+        assert_eq!(crlf.line_endings, "crlf");
+        assert_eq!(crlf.content, "a = 1\nb = 2", "content 保持 LF 归一（既有契约）");
+        let lf = read_file(dir.path(), "lf.py", None, None, true).await.expect("lf");
+        assert_eq!(lf.line_endings, "lf");
+        let mixed = read_file(dir.path(), "mixed.py", None, None, true).await.expect("mixed");
+        assert_eq!(mixed.line_endings, "mixed");
+    }
+
+    /// ensure_open_err 归一：InvalidData → BadArgs，其余 io → Core 原样。
+    #[test]
+    fn ensure_open_err_maps_only_invalid_data() {
+        let binary = lsp_core::error::CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ));
+        let err = ensure_open_err("bin.py")(binary);
+        let crate::ToolError::BadArgs { detail } = err else {
+            panic!("expect BadArgs, got {err:?}");
+        };
+        assert!(detail.contains("bin.py"), "{detail}");
+
+        let missing = lsp_core::error::CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        ));
+        let err = ensure_open_err("gone.py")(missing);
+        assert!(matches!(err, crate::ToolError::Core(_)), "{err:?}");
     }
 }

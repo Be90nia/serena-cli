@@ -217,6 +217,8 @@ pub fn catalog() -> serde_json::Value {
                     "case_sensitive": {"type": "bool", "required": false, "default": false},
                     "comments_only": {"type": "bool", "required": false, "default": false, "description": "I: filter to comment lines only"},
                     "distinct_symbols": {"type": "bool", "required": false, "default": false, "description": "bd zpzw: keep first hit per enriched symbol name (symbol=null rows kept)"},
+                    "exclude": {"type": "array[string]", "required": false, "default": [], "description": "glob list to skip (same syntax as path_glob), e.g. ['*_measure.py']"},
+                    "no_ignore": {"type": "bool", "required": false, "default": false, "description": "escape hatch: include .gitignore'd files (.git/ and built-in ignore dirs still excluded)"},
                     "format": {"type": "string", "required": false, "default": "full", "description": "bd 51ib: brief = 'file:line:col: text' strings; full/json = default response (adds bd rsqq summary header)"}
                 }
             },

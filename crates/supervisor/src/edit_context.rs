@@ -91,7 +91,10 @@ fn locate_name_in_body(body_text: &str, symbol: &str) -> (u32, u32) {
         .unwrap_or((0, 0))
 }
 
-/// `edit-context` 聚合入口。任一段失败不影响其他字段。
+/// `edit-context` 聚合入口。body 失败 = 四段全不可得（callers/doc/tests 均以
+/// body 为前提）→ 硬错与 symbol-body 对齐（bd serena-rust-37nl：全 null +
+/// rc=0 是静默失败，AI 会误判"无 callers/tests"）；body 成功后 callers/doc
+/// 段失败仍按字段降级（任一段失败不影响其他字段）。
 /// 第二返回值 = 降级警示（bd serena-rust-e0hi/8vo9）：callers 空且语义层未证就绪
 /// 时由 [`Supervisor::referencing_empty_warnings`] 给出，dispatch 层 attach 到 wire。
 pub async fn collect(
@@ -100,7 +103,7 @@ pub async fn collect(
     file: &str,
     symbol: &str,
     lang: Option<&str>,
-) -> (EditContextReport, Vec<String>) {
+) -> Result<(EditContextReport, Vec<String>), ToolError> {
     let mut report = EditContextReport {
         file: file.into(),
         symbol: symbol.into(),
@@ -112,16 +115,29 @@ pub async fn collect(
     let mut warnings = Vec::new();
 
     // 1) body：symbol-body + 缓存里取 range。
-    let mut body_line_0based: u32 = 0;
-    if let Ok(text) = sup.tool_symbol_body(root, file, symbol, lang).await {
-        let (s0, e0) = range_from_symbol_cache(sup, root, file, symbol).unwrap_or((0, 0));
-        body_line_0based = s0;
-        report.body = Some(BodyRange {
-            start_line: s0 + 1, // 1-based 输出给 AI
-            end_line: e0 + 1,
-            text,
-        });
-    }
+    let text = match sup.tool_symbol_body(root, file, symbol, lang).await {
+        Ok(t) => t,
+        // bd serena-rust-37nl：嵌套名（A.b / A::b）在 documentSymbol 里按平铺
+        // 短名检索，not-found 补短名提示；瞬态错（LS_TIMEOUT 等）原样上抛。
+        Err(ToolError::BadArgs { detail }) => {
+            let nested = symbol.contains('.') || symbol.contains("::");
+            return Err(ToolError::BadArgs {
+                detail: if nested {
+                    format!("{detail}; nested names are searched flat — retry with the short name (part after the last `.`)")
+                } else {
+                    detail
+                },
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let (s0, e0) = range_from_symbol_cache(sup, root, file, symbol).unwrap_or((0, 0));
+    let body_line_0based = s0;
+    report.body = Some(BodyRange {
+        start_line: s0 + 1, // 1-based 输出给 AI
+        end_line: e0 + 1,
+        text,
+    });
 
     // 2) callers + tests：refs 反查。RA `references` 要求光标在符号名上才返回真引用，
     //    用 locate_name_in_body 找 body 内符号名 token（签名行）作为查点 —— bd syra：
@@ -167,7 +183,7 @@ pub async fn collect(
         }
     }
 
-    (report, warnings)
+    Ok((report, warnings))
 }
 
 /// 把 `HoverContents` 三 variant 折叠为人类可读 doc 字符串：
@@ -315,7 +331,9 @@ mod tests {
         let sup = crate::Supervisor::direct().await.expect("supervisor");
         // 预热 + busy-retry 直到 callers 非空且 doc Some（RA cold-start 索引就绪；
         // refs 与 hover 就绪时间不同步，只盯 callers 会在 hover 仍冷时漏出循环）。
-        let (mut report, _) = collect(&sup, &root, "lib.rs", "add", Some("rust")).await;
+        let (mut report, _) = collect(&sup, &root, "lib.rs", "add", Some("rust"))
+            .await
+            .expect("collect ok");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
         while std::time::Instant::now() < deadline {
             let callers_ok = report
@@ -327,7 +345,10 @@ mod tests {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            report = collect(&sup, &root, "lib.rs", "add", Some("rust")).await.0;
+            report = collect(&sup, &root, "lib.rs", "add", Some("rust"))
+                .await
+                .expect("collect ok")
+                .0;
         }
 
         assert!(report.body.is_some(), "body 必须有内容");
@@ -360,9 +381,10 @@ mod tests {
         assert!(tests.is_empty(), "rust_demo 无 tests/ 文件 → 空 Vec");
     }
 
-    /// B: 故意传不存在的符号 → body 失败，callers/doc/tests 也都 None（短路）。
+    /// bd serena-rust-37nl：未知符号 → 硬错与 symbol-body 对齐（不再全 null +
+    /// rc=0 静默失败）；嵌套名（含 `.`/`::`）额外带短名提示，短名查询不带。
     #[tokio::test]
-    async fn edit_context_failed_body_yields_others_null() {
+    async fn edit_context_unknown_symbol_errors_like_symbol_body() {
         if !rust_analyzer_available() {
             eprintln!("skipped: rust-analyzer not on PATH");
             return;
@@ -373,24 +395,37 @@ mod tests {
             return;
         }
         let sup = crate::Supervisor::direct().await.expect("supervisor");
-        let (report, warnings) = collect(
+
+        // 短名未知符号：not found，无嵌套提示。
+        let err = collect(
             &sup,
             &root,
             "lib.rs",
             "nonexistent_symbol_xyz_qq",
             Some("rust"),
         )
-        .await;
+        .await
+        .expect_err("unknown symbol must error");
+        let ToolError::BadArgs { detail } = err else {
+            panic!("expect BadArgs, got {err:?}");
+        };
+        assert!(detail.contains("not found"), "{detail}");
+        assert!(!detail.contains("nested names"), "{detail}");
 
-        // 失败隔离契约：body 失败 → callers/doc/tests 也都 None（短路在 if let Some(body)）；
-        // 失败≠降级 → warnings 必须为空（e0hi/8vo9 旗只随空 hits 走）。
-        assert!(report.body.is_none(), "body 失败必须 None");
-        assert!(report.callers.is_none(), "callers 必须 None（短路）");
-        assert!(report.doc.is_none(), "doc 必须 None（短路）");
-        assert!(report.tests.is_none(), "tests 必须 None（短路）");
-        assert!(
-            warnings.is_empty(),
-            "refs 失败（callers=null）不警示，降级旗只认空 hits: {warnings:?}"
-        );
+        // 嵌套形态未知符号：not found + 短名提示（与 symbol-body 行为对齐处）。
+        let err = collect(
+            &sup,
+            &root,
+            "lib.rs",
+            "NoSuchType.nonexistent_symbol_xyz_qq",
+            Some("rust"),
+        )
+        .await
+        .expect_err("nested unknown symbol must error");
+        let ToolError::BadArgs { detail } = err else {
+            panic!("expect BadArgs, got {err:?}");
+        };
+        assert!(detail.contains("not found"), "{detail}");
+        assert!(detail.contains("nested names"), "{detail}");
     }
 }

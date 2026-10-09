@@ -91,7 +91,7 @@ async fn rename_without_to_flag_is_bad_args() {
 // ============ 失败报告形态（protocol_fail 纯函数） ============
 
 #[test]
-fn fail_report_is_parseable_json_with_required_fields() {
+fn fail_report_is_single_layer_message_with_required_facts() {
     let err = protocol_fail(
         "add-feature",
         "write-stub",
@@ -107,15 +107,20 @@ fn fail_report_is_parseable_json_with_required_fields() {
         panic!("expect Protocol");
     };
     assert_eq!(tool, "recipe:add-feature");
-    let report: Value = serde_json::from_str(&reason).expect("reason must be JSON");
-    assert_eq!(report["failed_step"], "write-stub");
-    assert_eq!(report["error"], "bad args: injected");
-    assert_eq!(
-        report["completed_steps"],
-        json!(["ct_define_feature", "write-stub"])
+    // 杠精 07u5-6：reason 必须是单层人话（非 JSON 字符串），失败步/原因/回滚账目齐备。
+    assert!(reason.contains("failed at step write-stub: bad args: injected"), "{reason}");
+    assert!(
+        reason.contains("completed steps: [define_feature, write-stub]"),
+        "{reason}"
     );
-    assert_eq!(report["txn_ids"], json!([7, 9]));
-    assert_eq!(report["undo_results"][0]["txn_id"], 9);
+    assert!(
+        reason.contains("rolled back 2 write txn(s) [7, 9]"),
+        "{reason}"
+    );
+    assert!(
+        !reason.trim_start().starts_with('{'),
+        "不得再是双层 JSON: {reason}"
+    );
 }
 
 // ============ 失败中断 + 逆序 undo（真 LS：rust-analyzer fixture） ============
@@ -148,15 +153,141 @@ async fn add_feature_stub_failure_reports_completed_steps() {
     let crate::ToolError::Protocol { reason, .. } = err else {
         panic!("expect Protocol, got {err:?}");
     };
-    let report: Value = serde_json::from_str(&reason).expect("reason must be JSON");
-    assert_eq!(report["failed_step"], "write-stub", "{report}");
-    assert_eq!(
-        report["completed_steps"],
-        json!(["ct_define_feature"]),
-        "{report}"
+    assert!(reason.contains("failed at step write-stub"), "{reason}");
+    assert!(
+        reason.contains("completed steps: [define_feature]"),
+        "{reason}"
     );
-    assert_eq!(report["txn_ids"], json!([]), "{report}");
-    // 步1 是读步：无 txn 可回滚，undo_results 如实为空。
-    assert_eq!(report["undo_results"], json!([]), "{report}");
+    // 步1 是读步：无 txn 可回滚，报告不得谎称回滚。
+    assert!(!reason.contains("rolled back"), "{reason}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============ bd serena-rust-4nuq：verify_after error 诊断判定门 ============
+
+/// RA workspace/symbol 就绪轮询（裸 fixture 无 cargo workspace 时恒空——
+/// 全功能验收教训：fixture 放 TEMP 且自带 Cargo.toml 成独立 crate）。
+async fn wait_ra_symbol_ready(sup: &crate::Supervisor, root: &Path, symbol: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let found = sup
+            .tool_find_symbol(root, symbol, 10, None)
+            .await
+            .map(|(items, _)| items.iter().any(|i| i.name == symbol))
+            .unwrap_or(false);
+        if found {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "RA workspace/symbol 未就绪: {symbol}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+fn write_mini_crate(dir: &Path, name: &str, lib_src: &str) {
+    std::fs::create_dir_all(dir.join("src")).expect("src dir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .expect("Cargo.toml");
+    std::fs::write(dir.join("src/lib.rs"), lib_src).expect("src/lib.rs");
+}
+
+#[test]
+fn verify_errors_of_flags_only_error_entries() {
+    assert!(verify_errors_of(&json!({"diagnostics": [], "pending": false})).is_none());
+    assert!(
+        verify_errors_of(&json!({"diagnostics": ["[warn] L1:1 x"], "pending": true})).is_none(),
+        "warn/hint 不触发失败门"
+    );
+    let err = verify_errors_of(&json!({
+        "diagnostics": ["[warn] L1:1 keep", "[error] L6:12 Expected expression"],
+        "pending": false
+    }))
+    .expect("error 条目必须触发失败门");
+    let crate::ToolError::BadArgs { detail } = err else {
+        panic!("expect BadArgs, got {err:?}");
+    };
+    assert!(detail.contains("1 error-level"), "{detail}");
+    assert!(detail.contains("Expected expression"), "{detail}");
+}
+
+/// fix-bug 喂语法坏 body：replace-body 落盘后 verify_after 出 error 诊断 →
+/// 判定失败（failed_step=ct_verify_after）+ 逆序回滚，盘上无残留。
+/// RA 真 LS（语法级诊断，无需 cargo workspace；同 add_feature 失败注入惯例）。
+#[tokio::test]
+async fn fix_bug_broken_body_fails_and_rolls_back() {
+    if skip_ls_e2e() {
+        eprintln!("skip: SERENA_SKIP_LS_E2E=1");
+        return;
+    }
+    if !rust_analyzer_available() {
+        eprintln!("skip: rust-analyzer not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("recipe_4nuq_bad_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_mini_crate(&dir, "fx4nuq_bad", "pub fn seeded() -> i32 { 1 }\n");
+    let sup = sup_direct().await;
+    wait_ra_symbol_ready(&sup, &dir, "seeded").await;
+    let err = run(
+        &sup,
+        &dir,
+        &json!({
+            "name": "fix-bug",
+            "pos": ["src/lib.rs", "seeded"],
+            "new_body": "pub fn seeded() -> i32 { return ???broken }"
+        }),
+    )
+    .await
+    .expect_err("broken body must fail at verify gate");
+    let crate::ToolError::Protocol { reason, .. } = err else {
+        panic!("expect Protocol, got {err:?}");
+    };
+    // 杠精 07u5-6：单层人话——失败步（内部 ct_ 前缀剥除）+ 原因 + 回滚账目。
+    assert!(reason.contains("failed at step verify_after"), "{reason}");
+    assert!(reason.contains("error-level diagnostic"), "{reason}");
+    // 逆序回滚：replace-body 的 txn 被撤销。
+    assert!(reason.contains("rolled back 1 write txn(s)"), "{reason}");
+    // 盘上无残留：内容回到 recipe 前。
+    let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read back");
+    assert_eq!(text, "pub fn seeded() -> i32 { 1 }\n", "坏 body 必须被回滚");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 好 body 重放不回归：verify_after 无 error 诊断 → Ok，盘上落新体。
+#[tokio::test]
+async fn fix_bug_good_body_succeeds() {
+    if skip_ls_e2e() {
+        eprintln!("skip: SERENA_SKIP_LS_E2E=1");
+        return;
+    }
+    if !rust_analyzer_available() {
+        eprintln!("skip: rust-analyzer not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("recipe_4nuq_good_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_mini_crate(&dir, "fx4nuq_good", "pub fn seeded() -> i32 { 1 }\n");
+    let sup = sup_direct().await;
+    wait_ra_symbol_ready(&sup, &dir, "seeded").await;
+    let ok = run(
+        &sup,
+        &dir,
+        &json!({
+            "name": "fix-bug",
+            "pos": ["src/lib.rs", "seeded"],
+            "new_body": "pub fn seeded() -> i32 { 42 }"
+        }),
+    )
+    .await
+    .expect("good body must succeed");
+    assert_eq!(ok["recipe"], "fix-bug", "{ok}");
+    assert!(ok["txn_id"].as_u64().is_some(), "{ok}");
+    let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read back");
+    assert!(text.contains("42"), "新体必须落盘: {text}");
     let _ = std::fs::remove_dir_all(&dir);
 }

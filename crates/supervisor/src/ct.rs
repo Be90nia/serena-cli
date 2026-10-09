@@ -741,7 +741,12 @@ where
 {
     let uid = crate::undo::next_uid();
     let guard = crate::undo::TxnGuard::new(uid);
-    let result = crate::undo::TXN_UID.scope(uid, f).await;
+    // bd serena-rust-15jb：写步内 recorded_write 走 WAL 先记账后写盘，需 store
+    // 可见（与 execute_tool 写类路径同款接线）。
+    let store = crate::undo::store_for(root)?;
+    let result = crate::undo::TXN_STORE
+        .scope(store, crate::undo::TXN_UID.scope(uid, f))
+        .await;
     match result {
         Ok(v) => {
             // commit 落盘进写门（与 undo/redo 恢复路径的 prune/rename 互斥）。

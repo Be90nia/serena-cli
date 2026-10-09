@@ -118,7 +118,10 @@ impl RecipeCtx {
     }
 }
 
-/// 失败报告 → wire 错误（RPC_ERROR，码集不变；reason = 紧凑 JSON 报告）。
+/// 失败报告 → wire 错误（RPC_ERROR，码集不变）。
+/// 杠精 07u5-6：原 reason 是 JSON 字符串塞进 wire message（双层编码，AI 要
+/// parse 两次）；步骤名 `ct_*` 是内部模块前缀，对外无意义。改为单层人话：
+/// 步骤名去 `ct_` 前缀，回滚账目关键数字（完成步/txn/undo 失败）显式入文。
 fn protocol_fail(
     name: &str,
     failed_step: &str,
@@ -127,18 +130,85 @@ fn protocol_fail(
     undo_results: Vec<Value>,
     err: &crate::ToolError,
 ) -> crate::ToolError {
+    let done: Vec<String> = steps.iter().map(|(n, _)| step_display(n)).collect();
+    let mut msg = format!(
+        "recipe {name} failed at step {}: {}; completed steps: [{}]",
+        step_display(failed_step),
+        err,
+        done.join(", ")
+    );
+    if !txn_ids.is_empty() {
+        let undo_failures: Vec<String> = undo_results
+            .iter()
+            .filter_map(|u| {
+                u.get("error")
+                    .and_then(Value::as_str)
+                    .map(|e| {
+                        format!(
+                            "txn {}: {e}",
+                            u.get("txn_id")
+                                .and_then(Value::as_u64)
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "?".into())
+                        )
+                    })
+            })
+            .collect();
+        if undo_failures.is_empty() {
+            msg.push_str(&format!(
+                "; rolled back {} write txn(s) {:?}",
+                txn_ids.len(),
+                txn_ids
+            ));
+        } else {
+            // 回滚失败必须显式记账不静默——盘上残留可见。
+            msg.push_str(&format!(
+                "; ROLLBACK INCOMPLETE ({} txn(s) attempted): {} — manual cleanup may be needed",
+                txn_ids.len(),
+                undo_failures.join("; ")
+            ));
+        }
+    }
     crate::ToolError::Protocol {
         tool: format!("recipe:{name}"),
-        reason: json!({
-            "failed_step": failed_step,
-            "error": err.to_string(),
-            "completed_steps": steps.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
-            "step_results": steps,
-            "txn_ids": txn_ids,
-            "undo_results": undo_results,
-        })
-        .to_string(),
+        reason: msg,
     }
+}
+
+/// 步骤名对外展示：剥内部 `ct_` 模块前缀（杠精 07u5-6：`ct_tldr` 这类名字
+/// 对 AI 是内部实现泄漏）。
+fn step_display(name: &str) -> String {
+    name.strip_prefix("ct_").unwrap_or(name).to_string()
+}
+
+/// bd serena-rust-4nuq：ct_verify 信封的 error 级诊断判定门。写步后的
+/// verify_after 出现 error 级条目（compact_one_diag 的 `[error]` 前缀）=
+/// 编辑把文件改坏 → 判定失败（失败即停 + 逆序回滚），不再 rc=0 报成功。
+/// before 段存量错误只报告不拦截（分析链不被既有错误挡住）。pending:true 时
+/// items 可能是陈旧快照，但 error 条目仍是硬信号——保守回滚到 recipe 前，无损。
+fn verify_errors_of(after: &Value) -> Option<crate::ToolError> {
+    let errs: Vec<&str> = after
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .filter(|s| s.starts_with("[error]"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if errs.is_empty() {
+        return None;
+    }
+    let mut detail = format!(
+        "post-edit verification failed: {} error-level diagnostic(s)",
+        errs.len()
+    );
+    for d in errs.iter().take(3) {
+        detail.push_str("; ");
+        detail.push_str(d);
+    }
+    Some(crate::ToolError::BadArgs { detail })
 }
 
 /// `recipe <name>` 入口：解析 name/位置参数/flags，分派 8 recipe。
@@ -298,6 +368,9 @@ async fn fix_bug(
         Ok(v) => v,
         Err(e) => return Err(ctx.fail("fix-bug", root, "ct_verify_after", e).await),
     };
+    if let Some(e) = verify_errors_of(&after) {
+        return Err(ctx.fail("fix-bug", root, "ct_verify_after", e).await);
+    }
     Ok(json!({
         "recipe": "fix-bug",
         "file": file_s,
@@ -429,6 +502,9 @@ async fn rename(
         Ok(v) => v,
         Err(e) => return Err(ctx.fail("rename", root, "ct_verify_after", e).await),
     };
+    if let Some(e) = verify_errors_of(&after) {
+        return Err(ctx.fail("rename", root, "ct_verify_after", e).await);
+    }
     Ok(json!({
         "recipe": "rename",
         "file": file,
@@ -567,6 +643,9 @@ async fn refactor_extract(
         Ok(v) => v,
         Err(e) => return Err(ctx.fail("refactor-extract", root, "ct_verify_after", e).await),
     };
+    if let Some(e) = verify_errors_of(&after) {
+        return Err(ctx.fail("refactor-extract", root, "ct_verify_after", e).await);
+    }
     Ok(json!({
         "recipe": "refactor-extract",
         "file": vf,
@@ -617,6 +696,9 @@ async fn refactor_rename(
         Ok(v) => v,
         Err(e) => return Err(ctx.fail("refactor-rename", root, "ct_verify_after", e).await),
     };
+    if let Some(e) = verify_errors_of(&after) {
+        return Err(ctx.fail("refactor-rename", root, "ct_verify_after", e).await);
+    }
     Ok(json!({
         "recipe": "refactor-rename",
         "symbol": sym_s,

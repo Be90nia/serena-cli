@@ -957,6 +957,35 @@ mod tests {
 
     const TOML: &str = include_str!("../servers.toml");
 
+    /// serena-rust-nodd：跨 run tempdir 残留清扫——每次套件启动删 >2h 的
+    /// serena 前缀残留（age 阈值避开并行 run 在用目录）。
+    #[test]
+    fn sweep_stale_serena_tempdirs() {
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            // serena-powershell 是 powershell LS 的运行时日志目录（非测试产物），不碰。
+            if name == "serena-powershell" || !name.starts_with("serena") {
+                continue;
+            }
+            let stale = ent
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t < cutoff)
+                .unwrap_or(false);
+            if stale {
+                let _ = if ent.path().is_dir() {
+                    std::fs::remove_dir_all(ent.path())
+                } else {
+                    std::fs::remove_file(ent.path())
+                };
+            }
+        }
+    }
+
     #[test]
     fn builtin_servers_toml_is_valid_and_parsed() {
         let parsed = parse(TOML).expect("内置表必须合法（编译期数据）");

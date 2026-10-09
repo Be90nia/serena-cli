@@ -269,6 +269,15 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
     if lang == "typescript_vts" {
         return Some(VTS.clone());
     }
+    // bd serena-rust-9z0x：语言被 external-servers.toml 条目拥有（ls-use 注册 /
+    // 用户手编，merged 命中 external = 用户显式胜出）时 T2 硬编码路由让位——
+    // supervisor 冷启动回落 ensure_launch 走注册条目（path_only 绝对路径可达）。
+    // 否则 ls-use 对 T2 语言（python→PYRIGHT 等）永远无效：adapter 自行 PATH
+    // 探测继续失败报 not installed，还建议用户重做已做过且无效的 ls-use
+    // （NitpickAI F1 实锤死循环）。
+    if config::spec_source(lang) == Some("external") {
+        return None;
+    }
     let id = LanguageId::from_str_opt(lang)?;
     Some(match id {
         // r8.5 adopt：devsense_php 是 T0 配置驱动（servers.toml npm 条目），无手写
@@ -382,6 +391,25 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         | LanguageId::Al
         | LanguageId::Hlsl => return None,
     })
+}
+
+/// bd serena-rust-c6pb：客户端侧同层复算「该语言 LS 在当前进程环境可否拉起」——
+/// 与 supervisor 冷启动同一判定层：T2 adapter 走 `launch_info`（纯路径解析，
+/// 不 spawn），否则走 `config::ensure_launch`（PATH / serena 缓存探测，
+/// auto_install=false 永不触网）。Ok = 可拉起（daemon 却报 LS_NOT_INSTALLED 即
+/// daemon spawn 环境/二进制与当前 shell 错位）；Err = 本机确实没有。
+pub async fn probe_launch(lang: &str, project_root: &Path) -> Result<(), String> {
+    let ctx = ls_adapters::ProjectCtx {
+        project_root: project_root.to_path_buf(),
+    };
+    if let Some(adapter) = adapter_for(lang) {
+        return adapter
+            .launch_info(&ctx)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"));
+    }
+    config::ensure_launch(lang, None, false, false).map(|_| ())
 }
 
 /// 内部语言名 → LSP didOpen 的 languageId。多数语言与内部名恒等；LSP 官方 languageId
@@ -511,6 +539,12 @@ mod tests {
             "csharp",
             "java",
         ] {
+            // bd serena-rust-9z0x：语言被 external-servers.toml 注册拥有时 T2 让位
+            // （adapter_for 返 None → 冷启动回落 ensure_launch 走注册条目）——本机
+            // 注册表存在该语言的 external 条目属预期形态，跳过而非误报。
+            if config::spec_source(lang) == Some("external") {
+                continue;
+            }
             let a = adapter_for(lang).unwrap_or_else(|| panic!("missing adapter for {lang}"));
             let b = adapter_for(lang).unwrap();
             assert!(Arc::ptr_eq(&a, &b), "singleton broken for {lang}");

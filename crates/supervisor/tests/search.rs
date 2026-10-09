@@ -22,8 +22,7 @@ async fn basic_match_returns_hits_with_correct_columns() {
     std::fs::write(root.join("b.cpp"), "func() {}\n").unwrap();
 
     let sup = new_sup().await;
-    let resp = sup
-        .tool_search_for_pattern(&root, "TODO", None, 100, false)
+    let resp = sup.tool_search_for_pattern(&root, "TODO", None, 100, false, &[], false)
         .await
         .expect("search ok");
     assert_eq!(resp.hits.len(), 2);
@@ -39,14 +38,12 @@ async fn case_sensitive_flag_filters_correctly() {
     std::fs::write(root.join("a.txt"), "Foo foo FOO\n").unwrap();
 
     let sup = new_sup().await;
-    let resp_cs = sup
-        .tool_search_for_pattern(&root, "foo", None, 100, true)
+    let resp_cs = sup.tool_search_for_pattern(&root, "foo", None, 100, true, &[], false)
         .await
         .unwrap();
     assert_eq!(resp_cs.hits.len(), 1, "cs should only match lowercase foo");
 
-    let resp_ci = sup
-        .tool_search_for_pattern(&root, "foo", None, 100, false)
+    let resp_ci = sup.tool_search_for_pattern(&root, "foo", None, 100, false, &[], false)
         .await
         .unwrap();
     assert_eq!(resp_ci.hits.len(), 3, "ci matches all 3 cases");
@@ -61,8 +58,7 @@ async fn path_glob_filters_files() {
     std::fs::write(root.join("c.txt"), "TODO here\n").unwrap();
 
     let sup = new_sup().await;
-    let resp = sup
-        .tool_search_for_pattern(&root, "TODO", Some("*.cpp"), 100, false)
+    let resp = sup.tool_search_for_pattern(&root, "TODO", Some("*.cpp"), 100, false, &[], false)
         .await
         .unwrap();
     let files: std::collections::HashSet<_> = resp.hits.iter().map(|h| h.file.clone()).collect();
@@ -78,8 +74,7 @@ async fn max_results_truncates() {
     std::fs::write(root.join("a.txt"), &lines).unwrap();
 
     let sup = new_sup().await;
-    let resp = sup
-        .tool_search_for_pattern(&root, "match_", None, 10, false)
+    let resp = sup.tool_search_for_pattern(&root, "match_", None, 10, false, &[], false)
         .await
         .unwrap();
     assert_eq!(resp.hits.len(), 10);
@@ -92,8 +87,7 @@ async fn bad_regex_returns_bad_args() {
     std::fs::write(root.join("a.txt"), "ok\n").unwrap();
 
     let sup = new_sup().await;
-    let err = sup
-        .tool_search_for_pattern(&root, "[unclosed", None, 100, false)
+    let err = sup.tool_search_for_pattern(&root, "[unclosed", None, 100, false, &[], false)
         .await
         .expect_err("bad regex");
     assert!(matches!(err, ToolError::BadArgs { .. }), "got {err:?}");
@@ -106,8 +100,7 @@ async fn binary_file_skipped_silently() {
     std::fs::write(root.join("blob.bin"), [0xff, 0xfe, 0x00, 0x01, 0x02]).unwrap();
 
     let sup = new_sup().await;
-    let resp = sup
-        .tool_search_for_pattern(&root, "match", None, 100, false)
+    let resp = sup.tool_search_for_pattern(&root, "match", None, 100, false, &[], false)
         .await
         .unwrap();
     // 只 hit 文本文件。
@@ -124,8 +117,7 @@ async fn respects_gitignore() {
     std::fs::write(root.join("keep.txt"), "needle\n").unwrap();
 
     let sup = new_sup().await;
-    let resp = sup
-        .tool_search_for_pattern(&root, "needle", None, 100, false)
+    let resp = sup.tool_search_for_pattern(&root, "needle", None, 100, false, &[], false)
         .await
         .unwrap();
     let files: Vec<_> = resp.hits.iter().map(|h| h.file.as_str()).collect();
@@ -142,8 +134,7 @@ async fn match_start_end_offsets_are_correct() {
     std::fs::write(root.join("a.txt"), "say hello world\n").unwrap();
 
     let sup = new_sup().await;
-    let resp = sup
-        .tool_search_for_pattern(&root, "hello", None, 100, false)
+    let resp = sup.tool_search_for_pattern(&root, "hello", None, 100, false, &[], false)
         .await
         .unwrap();
     assert_eq!(resp.hits.len(), 1);

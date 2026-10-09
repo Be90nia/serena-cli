@@ -47,8 +47,26 @@ fn http_client() -> reqwest::Client {
         .expect("reqwest client build")
 }
 
+/// 杠精 ke2a：66 个子命令无分组导读 → AI 一次 help 定位候选命令，减少盲猜轮次。
+const AFTER_HELP_GUIDE: &str = "\
+按用途找命令（全 66 个；用法细节 `<cmd> --help`）:
+  读/导航      overview symbol-tree read-file list-dir find-file search find-symbol symbol-body edit-context containing-symbol defining-symbol repo-map
+  语义查询     def refs hover find-implementations find-referencing-symbols find-referencing-code-snippets completion signature-help code-action document-highlight call-hierarchy type-hierarchy moniker document-link inlay-hint folding-range semantic-tokens code-lens
+  诊断         diagnostics workspace-diagnostic
+  写/编辑      replace-body replace-text-in-symbol insert-text-before-symbol insert-text-after-symbol delete-text-in-symbol insert-at-line replace-lines delete-lines rename-symbol safe-delete-symbol create-text-file format format-range
+  事务/工作流  undo redo diff find-test test recipe
+  LS/环境      status project-info change-history warm wait-ready stop-all install uninstall ls-use ls-list ls-remove doctor shell lint-shell
+
+约定: 行号一律 1-based 含端；失败输出 {\"ok\":false,\"error\":{code,message,retryable}}；
+写类命令支持全局 --dry-run（返 would_write[].patch 预览）；--max-tokens/--compress/--json 全局可用。";
+
 #[derive(Parser, Debug)]
-#[command(name = "serena-cli", version, about = "serena-rust LSP CLI")]
+#[command(
+    name = "serena-cli",
+    version,
+    about = "serena-rust LSP CLI",
+    after_help = AFTER_HELP_GUIDE
+)]
 struct Cli {
     /// 直连模式：单进程拉 LS 直调（M0 路径）。
     #[arg(long, conflicts_with = "daemon")]
@@ -71,7 +89,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "LANG")]
     lang: Option<String>,
 
-    /// 全局工具请求超时（毫秒）。Phase 4 基建 Task 22b。优先级最高：CLI > servers.toml
+    /// 全局工具请求超时（毫秒）。优先级最高：CLI > servers.toml
     /// `[defaults].timeout_ms` > 30s 默认。`--index-timeout` 单独覆盖 workspace/symbol
     /// 等长操作（默认 120s）。
     #[arg(long, global = true, value_name = "MS")]
@@ -90,14 +108,15 @@ struct Cli {
     #[arg(long, global = true)]
     compress: bool,
 
-    /// d3a：编排 invocation id（UUID v4）。缺省自动生成；显式指定用于
+    /// 编排 invocation id（UUID v4）。缺省自动生成；显式指定用于
     /// 幂等重放与跨 agent 排障（daemon 重放日志按此索引）。
     #[arg(long, global = true, value_name = "ID")]
     invocation_id: Option<String>,
 
-    /// A3b #3（bd i4a1/wlrr）：写类命令干跑——执行完整定位/计算/校验但不落盘、
-    /// 不进 undo 事务；成功返回附 dry_run:true 与 would_write[{file,content}]
-    /// 将写内容预览。仅写类命令消费，读类忽略。
+    /// 写类命令干跑——执行完整定位/计算/校验但不落盘、不进 undo 事务；
+    /// 成功返回附 `dry_run:true` + `applied:false` + `would_apply:true` 与
+    /// `would_write[{file,patch}]`（unified diff 预览，防大文件全文 token 炸弹）。
+    /// 仅写类命令消费，读类忽略。
     #[arg(long, global = true)]
     dry_run: bool,
 
@@ -111,7 +130,7 @@ enum Cmd {
     /// 列出文件顶层符号。
     Overview {
         file: String,
-        /// J（§11-J）：返上次调用以来增量（added/removed）而非全集；首次返全集。
+        /// 返上次调用以来增量（added/removed）而非全集；首次返全集。
         #[arg(long)]
         delta: bool,
     },
@@ -121,13 +140,13 @@ enum Cmd {
         /// 保险丝：最多扫描文件数（超出截断并标 truncated）。
         #[arg(long, value_name = "N", default_value_t = 200)]
         max_files: usize,
-        /// 只列符号名含此子串的条目（大小写不敏感；bd 6ooi）。
+        /// 只列符号名含此子串的条目（大小写不敏感）。
         #[arg(long, value_name = "PATTERN")]
         grep: Option<String>,
-        /// 只保留包含链深度 < N 的符号（顶层=0；bd 6ooi）。
+        /// 只保留包含链深度 < N 的符号（顶层=0）。
         #[arg(long, value_name = "N")]
         max_depth: Option<usize>,
-        /// 只列文件清单（零 LS 调用；bd 6ooi）。
+        /// 只列文件清单（零 LS 调用）。
         #[arg(long, default_value_t = false)]
         files_only: bool,
     },
@@ -138,7 +157,7 @@ enum Cmd {
         file: String,
         line: u32,
         col: u32,
-        /// J（§11-J）：返上次调用以来增量（added/removed）而非全集；首次返全集。
+        /// 返上次调用以来增量（added/removed）而非全集；首次返全集。
         #[arg(long)]
         delta: bool,
     },
@@ -158,11 +177,11 @@ enum Cmd {
         /// 上限。
         #[arg(long, default_value_t = 50)]
         limit: u32,
-        /// 输出形态（bd 51ib）：brief = `"name file:line:col"` 单串（最省）；
+        /// 输出形态：brief = `"name file:line:col"` 单串（最省）；
         /// full（默认）= 既有紧凑 wire；json = 全字段形态。
         #[arg(long, value_enum, default_value_t = OutFormat::Full)]
         format: OutFormat,
-        /// J（§11-J）：返上次调用以来增量（added/removed）而非全集；首次返全集。
+        /// 返上次调用以来增量（added/removed）而非全集；首次返全集。
         #[arg(long)]
         delta: bool,
     },
@@ -171,7 +190,7 @@ enum Cmd {
         file: String,
         line: u32,
         col: u32,
-        /// J（§11-J）：返上次调用以来增量（added/removed）而非全集；首次返全集。
+        /// 返上次调用以来增量（added/removed）而非全集；首次返全集。
         #[arg(long)]
         delta: bool,
     },
@@ -199,15 +218,23 @@ enum Cmd {
         /// 大小写敏感（默认不敏感）。
         #[arg(long, default_value_t = false)]
         case_sensitive: bool,
-        /// 同符号多行命中只留首条（zpzw；需命中带所属符号，未装饰行全保留）。
+        /// 同符号多行命中只留首条（需命中带所属符号，未装饰行全保留）。
         #[arg(long, default_value_t = false)]
         distinct_symbols: bool,
-        /// 输出形态（bd 51ib）：brief = grep 风格 `file:line:col: text` 单串；
+        /// 排除文件 glob（可多次；同 path_glob 语法，如 `*_measure.py`）。命中即跳过，
+        /// 不计数不读取（杠精 cv1e：测量脚本等噪音不进 token 账单）。
+        #[arg(long, value_name = "GLOB")]
+        exclude: Vec<String>,
+        /// 逃生：不尊重 .gitignore（.git/ 与内置 ignore 目录仍排除）。
+        #[arg(long, default_value_t = false)]
+        no_ignore: bool,
+        /// 输出形态：brief = grep 风格 `file:line:col: text` 单串；
         /// full（默认）= 既有全形态（search 无紧凑裁剪层，full 与 json 同形）。
         #[arg(long, value_enum, default_value_t = OutFormat::Full)]
         format: OutFormat,
     },
-    /// 按行范围读文件（1-based 含端）。
+    /// 按行范围读文件（1-based 含端）。`--start/--end` 为 `--start-line/--end-line`
+    /// 短别名（杠精 cqns：猜错旗标名 = 一轮浪费调用，别名 + 长名同价）。
     ReadFile {
         file: String,
         /// 起始行（1-based，默认 1）。
@@ -216,6 +243,12 @@ enum Cmd {
         /// 结束行（1-based 含端，默认 EOF）。
         #[arg(long)]
         end_line: Option<u32>,
+        /// `--start-line` 短别名（二选一，双给拒）。
+        #[arg(long)]
+        start: Option<u32>,
+        /// `--end-line` 短别名（二选一，双给拒）。
+        #[arg(long)]
+        end: Option<u32>,
     },
     /// 列出目录项（不递归）。
     ListDir { path: String },
@@ -229,7 +262,7 @@ enum Cmd {
         file: String,
         line: u32,
         col: u32,
-        /// 按 (container, file) 分桶聚合 + 翻页（ai-token §10-C）。
+        /// 按 (container, file) 分桶聚合 + 翻页。
         #[arg(long)]
         grouped: bool,
         #[arg(long, default_value_t = 1)]
@@ -263,7 +296,7 @@ enum Cmd {
         debug_raw: bool,
     },
     /// 取符号体切片（position-free；documentSymbol 定位）。符号名：位置第二参或
-    /// `--symbol`（二选一；kdye：与 find-referencing-code-snippets 参数形状对齐）。
+    /// `--symbol`（二选一；与 find-referencing-code-snippets 参数形状对齐）。
     SymbolBody {
         /// 目标文件（相对 root）。
         file: String,
@@ -273,7 +306,7 @@ enum Cmd {
         #[arg(long = "symbol", value_name = "NAME")]
         symbol_flag: Option<String>,
     },
-    /// AI 编辑主路径聚合：单次返回 body + callers + doc + tests（ai-token §10-B）。
+    /// AI 编辑主路径聚合：单次返回 body + callers + doc + tests。
     EditContext {
         /// 目标文件（相对 root）。
         file: String,
@@ -283,13 +316,13 @@ enum Cmd {
         #[arg(long = "symbol", value_name = "NAME")]
         symbol_flag: Option<String>,
     },
-    /// 全 workspace 符号地图（按调用热度 top N）。ai-token §10-E。
+    /// 全 workspace 符号地图（按调用热度 top N）。
     RepoMap {
         /// top N 符号（默认 20；超过按文件+顶层符号清单截断）。
         #[arg(long, default_value_t = 20)]
         top_n: u32,
     },
-    /// 预热 LS + 索引（ai-token §13-M）：开工前一发，首个真实工具调用免吃冷启动。
+    /// 预热 LS + 索引：开工前一发，首个真实工具调用免吃冷启动。
     /// 超时返 partial:true（LS 已启动、索引未确认），不阻塞。
     Warm {
         /// 要预热的语言。缺省时按项目根清单探测（Cargo.toml/pyproject.toml/
@@ -302,7 +335,7 @@ enum Cmd {
     // bd serena-rust-55m / bxd（内部追踪号，不入 --help）
     /// 阻塞到就绪：循环探测。`--stage symbol` =
     /// overview 首符号非空即就绪（符号索引层，秒级）；`--stage semantic`（默认，
-    /// 保持现行为）= hover contents 非空（类型分析层；未就绪响应带 we0 warning，
+    /// 保持现行为）= hover contents 非空（类型分析层；未就绪响应带 warning，
     /// 解析即判据）。就绪 exit 0；超时 exit 4。探测间隔 500ms 起指数退避到 2s
     /// 封顶，进度（含阶段）单行打 stderr。
     WaitReady {
@@ -310,10 +343,12 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         file: Option<String>,
         /// 就绪等待上限（秒）。可用环境变量 SERENA_WAIT_READY_TIMEOUT_SECS
-        /// 覆盖默认 120s（显式 --timeout 优先；非法值 warn + 用默认，对齐 j8b）。
+        /// 覆盖默认 120s（显式 --timeout 优先；非法值 warn + 用默认）。
         #[arg(long, value_name = "N")]
         timeout: Option<u64>,
-        /// 就绪档位：symbol = 符号索引可用；semantic = 类型分析可用。
+        /// 就绪档位：symbol = 符号索引可用；semantic = hover 类型分析可用；
+        /// def = 语义解析层可用（def 非空，与 def/refs 同层——hover 就绪后 def
+        /// 仍可能空窗，紧接着要跑 def/refs 的用这档）。
         #[arg(long, value_enum, default_value_t = WaitStage::Semantic)]
         stage: WaitStage,
     },
@@ -395,8 +430,8 @@ enum Cmd {
         expected_hash: Option<String>,
     },
     /// 新建文件（已存在 = 参数错）。写入自动进 undo 事务（created=true）。
-    /// 内容可走位置参数、`--with`、`--stdin` 或 `--content-file`（bd 4nqk：
-    /// 多行内容 shell 引号难写干净，stdin/文件退路 bash 友好）。
+    /// 内容可走位置参数、`--with`、`--stdin` 或 `--content-file`（多行内容
+    /// shell 引号难写干净，stdin/文件退路 bash 友好）。
     CreateTextFile {
         file: String,
         /// 文件完整内容。
@@ -439,11 +474,16 @@ enum Cmd {
         patch: bool,
     },
     /// 按启发式链找符号的测试（tests/ 镜像 → 测试目录/命名 → super:: 单测 → LS refs）。
+    /// 符号名：位置参数或 `--symbol`（二选一；杠精 cqns：与 symbol-body /
+    /// find-referencing-code-snippets 的 `--symbol` 形状对齐）。
     FindTest {
-        /// 符号名。
-        symbol: String,
+        /// 符号名（位置参数；给了 `--symbol` 可省）。
+        symbol: Option<String>,
+        /// 符号名别名旗标（与位置参数等价，双给拒）。
+        #[arg(long = "symbol", value_name = "NAME")]
+        symbol_flag: Option<String>,
     },
-    /// 预定义工作流编排（计划 §2 批4：8 recipe 单入口）。写步各自独立 undo
+    /// 预定义工作流编排（8 recipe 单入口）。写步各自独立 undo
     /// 事务；单步失败即停并逆序回滚已完成的写步（报告含 undo 结果）。
     Recipe {
         /// recipe 名：fix-bug|add-feature|rename|add-test|refactor-extract|refactor-rename|review-diff|explore
@@ -570,7 +610,7 @@ enum Cmd {
     Moniker { file: String, line: u32, col: u32 },
     /// workspace 级 pull diagnostics（workspace/diagnostic）。
     WorkspaceDiagnostic,
-    /// 项目元信息（bd v3yv）：project root + git branch/HEAD + daemon/LS 加载状态。
+    /// 项目元信息：project root + git branch/HEAD + daemon/LS 加载状态。
     /// 纯探测语义（同 status）：永不 lazy-spawn。
     ProjectInfo {
         /// 项目根（缺省顺序：--project > daemon active_project > 当前目录）。
@@ -579,7 +619,7 @@ enum Cmd {
     },
     /// daemon 状态（uptime / pid / loaded LS）。
     Status,
-    /// 变更历史（bd zyrg）：git log --follow 包装；--symbol 走 `-L :sym:file`
+    /// 变更历史：git log --follow 包装；--symbol 走 `-L :sym:file`
     /// 符号级跟踪。git 缺失 / 非 repo → exit 3 + stderr 原因。
     ChangeHistory {
         /// 仓库内相对路径（git 风格，正斜杠）。
@@ -650,7 +690,7 @@ enum Cmd {
         /// servers.toml 条目 id。
         id: String,
     },
-    /// 长连接 shell（stdin/stdout JSONL）。Task 18。
+    /// 长连接 shell（stdin/stdout JSONL）。
     ///
     /// 每行 stdin 一个 JSON 请求，响应逐行写 stdout。协议形状：
     ///   {"id":1,"cmd":"find-symbol","args":{"name_path":"foo","project_root":"D:/proj"}}
@@ -733,11 +773,18 @@ async fn cli_main() -> ExitCode {
     // 行号契约统一（bd serena-rust-7xv）：position 型子命令的 line/col 以 1-based
     // 收入，此处一次性就地转 LSP 0-based —— `--direct` 进程内直调与 HTTP 转发两条
     // 路径共用转换结果，supervisor / lsp-core 不感知。0 = 用法错（BAD_ARGS，exit 2）。
+    // 杠精 07u5-1：客户端校验错误走与 daemon 同形的 JSON error 对象（stderr 纯文本
+    // 「BAD_ARGS: …」对 JSON 解析方不可消费）。
     if let Some(sub) = cli.cmd.as_mut()
         && let Err(detail) = normalize_positions(sub)
     {
-        eprintln!("BAD_ARGS: {detail}");
-        return ExitCode::from(2);
+        return bad_args_exit(&detail);
+    }
+
+    // 杠精 07u5-3：--max-tokens 0 在参数层拒绝（否则截断器把整个响应清空，
+    // rc=0 静默空——比报错更伤：AI 无法区分「无结果」和「自己传错了」）。
+    if cli.max_tokens == Some(0) {
+        return bad_args_exit("--max-tokens must be >= 1 (got 0)");
     }
 
     // bd serena-rust-74b3：warm 缺省 LANG 按项目根清单探测（显式 --lang 优先）。
@@ -764,8 +811,7 @@ async fn cli_main() -> ExitCode {
     if let Some(sub) = cli.cmd.as_mut()
         && let Err(detail) = resolve_with_alias(sub)
     {
-        eprintln!("BAD_ARGS: {detail}");
-        return ExitCode::from(2);
+        return bad_args_exit(&detail);
     }
 
     let lock_path = daemon::serve::default_lock_path();
@@ -1074,15 +1120,18 @@ async fn forward_with_draining_retry(cli: &Cli, lock_path: &Path) -> Result<u8, 
 
 // ==== bd serena-rust-55m：wait-ready ====
 
-/// wait-ready 就绪档位（bd serena-rust-bxd）：symbol = 符号索引可用（秒级）；
+/// wait-ready 就绪档位：symbol = 符号索引可用（秒级）；
 /// semantic = 类型分析可用（大 workspace 可达 120s+，历史默认判据）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum WaitStage {
     Symbol,
     Semantic,
+    /// def 同层探针：hover 就绪 ≠ def/refs 就绪（hover ready 后 def 仍可能
+    /// items:[]）。ready = 语义解析层真可用。
+    Def,
 }
 
-/// 51ib：读类工具输出档位（find-symbol / search `--format`）。
+/// 读类工具输出档位（find-symbol / search `--format`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum OutFormat {
@@ -1143,6 +1192,16 @@ fn hover_ready(data: &serde_json::Value) -> bool {
 /// semantic 探针每轮 hover 候选符号上限：首符号 null 再试后续 1-2 个
 /// （bd serena-rust-7m8：csharp-ls 首符号 range=整声明行首 / astro 模板符号 hover 合法 null）。
 const SEMANTIC_PROBE_SYMBOLS: usize = 3;
+
+/// def 响应就绪判定（bd serena-rust-y3c1）：items 非空 = 语义解析层可用
+/// （与 def/refs 同层——def 空带 we0 warning 或 items:[] 均视为未就绪续等）。
+fn def_ready(data: &serde_json::Value) -> bool {
+    data.get("warning").is_none()
+        && data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+}
 
 /// 行内定位符号名的 UTF-16 列（LSP Position.character 契约）；只认**整词**命中
 /// （bd serena-rust-gqyp 精化：子串会把 `run` 打进 `running`/参数 `x` 吃进早位），
@@ -1454,6 +1513,7 @@ async fn cmd_wait_ready(
         .await;
         if let Err(e) = &overview {
             if let Some(code) = not_installed_exit(e, lang.as_deref()) {
+                ls_env_mismatch_hint(lang.as_deref(), &root).await;
                 return code;
             }
             // 7m8 观测补口：.ok() 静默吞错会让「恒 symbol-pending」无法与「真未就绪」
@@ -1498,6 +1558,36 @@ async fn cmd_wait_ready(
                 .unwrap_or_default();
             probe_count = positions.len();
             for (line, col) in positions {
+                if stage == WaitStage::Def {
+                    // bd serena-rust-y3c1：def 同层探针——F2 实锤 hover ready 0s 后
+                    // def 仍 items:[]（两能力不同层）。就绪判据直接用 def 非空，
+                    // ready 承诺 = def/refs 可开干。
+                    match probe_tool_call(
+                        &client,
+                        &base,
+                        &token,
+                        &root,
+                        "def",
+                        json!({"file": rel, "line": line, "col": col}),
+                        lang.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(data) if def_ready(&data) => {
+                            eprintln!("ready (def) in {}s", started.elapsed().as_secs());
+                            return ExitCode::SUCCESS;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            if let Some(code) = not_installed_exit(&e, lang.as_deref()) {
+                                ls_env_mismatch_hint(lang.as_deref(), &root).await;
+                                return code;
+                            }
+                            eprintln!("probe def error (keep waiting): {e}");
+                        }
+                    }
+                    continue;
+                }
                 match probe_tool_call(
                     &client,
                     &base,
@@ -1516,6 +1606,7 @@ async fn cmd_wait_ready(
                     Ok(_) => {}
                     Err(e) => {
                         if let Some(code) = not_installed_exit(&e, lang.as_deref()) {
+                            ls_env_mismatch_hint(lang.as_deref(), &root).await;
                             return code;
                         }
                         eprintln!("probe error (keep waiting): {e}");
@@ -1560,6 +1651,7 @@ async fn cmd_wait_ready(
                     Ok(_) => {}
                     Err(e) => {
                         if let Some(code) = not_installed_exit(&e, lang.as_deref()) {
+                            ls_env_mismatch_hint(lang.as_deref(), &root).await;
                             return code;
                         }
                         eprintln!("probe find-symbol error (keep waiting): {e}");
@@ -1569,6 +1661,9 @@ async fn cmd_wait_ready(
         }
         if Instant::now() >= deadline {
             eprintln!("wait-ready: not ready within {timeout_secs}s");
+            // bd serena-rust-y3c1：探针可能比实际工作负载更严（documentSymbol 层
+            // 与语义解析层就绪节奏因 LS 而异）——超时不封死开工路，给降级指引。
+            eprintln!("hint: documentSymbol-layer tools (overview / find-referencing-code-snippets / symbol-body) may already work; if a semantic tool returns empty, its warning field carries degraded-mode guidance");
             return ExitCode::from(4);
         }
         let progress = if symbol_up.is_some() {
@@ -1917,6 +2012,8 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             comments_only,
             case_sensitive,
             distinct_symbols,
+            exclude,
+            no_ignore,
             format,
         }) => (
             "search",
@@ -1927,6 +2024,8 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
                 "comments_only": comments_only,
                 "case_sensitive": case_sensitive,
                 "distinct_symbols": distinct_symbols,
+                "exclude": exclude,
+                "no_ignore": no_ignore,
                 "format": format,
             }),
         ),
@@ -1934,6 +2033,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             file,
             start_line,
             end_line,
+            ..
         }) => (
             "read-file",
             json!({
@@ -2278,7 +2378,10 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             }
             ("diff", a)
         }
-        Some(Cmd::FindTest { symbol }) => ("find-test", json!({"symbol": symbol})),
+        Some(Cmd::FindTest { symbol, .. }) => (
+            "find-test",
+            json!({"symbol": symbol.as_deref().expect("resolved by resolve_with_alias")}),
+        ),
         Some(Cmd::Recipe { name, args, new_body, to, as_name, target, tests_file, tests, run }) => {
             let mut a = json!({ "name": name, "pos": args });
             if let Some(v) = new_body { a["new_body"] = json!(v); }
@@ -2341,6 +2444,22 @@ fn unknown_tool_hint(err: &serde_json::Value) -> Option<&'static str> {
     (code == "BAD_ARGS" && msg.starts_with("unknown tool")).then_some(
         "daemon may have been started by an older binary; run `serena-cli stop-all` and retry",
     )
+}
+
+/// bd serena-rust-c6pb：daemon 报 LS_NOT_INSTALLED 时客户端同层复算（probe_launch：
+/// T2 launch_info / ensure_launch，与 daemon 冷启动同一判定层）——客户端可拉起而
+/// daemon 说不 installed = daemon spawn 环境（PATH 快照 / 旧二进制）与当前 shell
+/// 错位，不是"本机没有"；此时给重启指引而不是放任 install/ls-use 死循环
+/// （NitpickEdge F6 两轮实锤：pyright 在客户端 PATH，daemon 看不见）。
+async fn ls_env_mismatch_hint(lang: Option<&str>, root: &Path) {
+    let Some(lang) = lang else {
+        return;
+    };
+    if ls_registry::probe_launch(lang, root).await.is_ok() {
+        eprintln!(
+            "[hint] `{lang}` LS is launchable from this shell, but the daemon reports LS_NOT_INSTALLED — the daemon was spawned with a different PATH (or by an older binary); run `serena-cli stop-all` and retry"
+        );
+    }
 }
 
 /// 按子命令转发 HTTP。
@@ -2428,11 +2547,22 @@ async fn forward(
             if let Some(w) = data.get("warning").and_then(|v| v.as_str()) {
                 eprintln!("[warn] {w}");
             }
+            // bd serena-rust-c6pb：多语言聚合信封（find-symbol 等）把 per-lang
+            // NotInstalled 折进 warning 而非 error——warning 同判补环境错位 hint
+            // （语言不可定时无从复算，静默跳过）。
+            if data
+                .get("warning")
+                .and_then(|v| v.as_str())
+                .is_some_and(|w| w.contains("not installed"))
+            {
+                ls_env_mismatch_hint(lang, &project_root).await;
+            }
             // 空结果 + warning = 「没符号」可能是「没就绪」（we0/暖机窗口）→
             // 误导性最强的形态，额外给固定 hint；正常空（无 warning）不打，不误报。
+            // bd serena-rust-y3c1：hint 附降级指引——documentSymbol 层工具常已可用。
             if payload_is_empty(data) && data.get("warning").is_some() {
                 eprintln!(
-                    "[hint] index warming: semantic layer not ready, empty result may be false negative (rerun or use wait-ready)"
+                    "[hint] index warming: semantic layer not ready, empty result may be false negative (rerun or use wait-ready --stage def); documentSymbol-layer tools (find-referencing-code-snippets / overview / symbol-body) may already work"
                 );
             }
             print_json(data).map_err(|e| e.to_string())?;
@@ -2443,6 +2573,11 @@ async fn forward(
             eprintln!("tool error: {err}");
             if let Some(hint) = unknown_tool_hint(&err) {
                 eprintln!("[hint] {hint}");
+            }
+            // bd serena-rust-c6pb：LS_NOT_INSTALLED 先做客户端同层复算再定责——
+            // 客户端可拉起 = daemon 环境错位（补 stop-all 指引），不是本机没装。
+            if err.get("code").and_then(|c| c.as_str()) == Some("LS_NOT_INSTALLED") {
+                ls_env_mismatch_hint(lang, &project_root).await;
             }
             // Δ 43ae021：exit 码按 wire code 取（ARCH §6.3 / dto::wire_error_code_to_exit），
             // 不再一律 1 —— Internal→3、BadArgs→2，agent 据此免重试确定性失败。
@@ -3000,9 +3135,19 @@ fn cmd_ls_list(table: bool) -> ExitCode {
         } else {
             "not-installed"
         };
+        // bd serena-rust-9z0x：override 行显示 external 条目自身 languages——
+        // external 是完整条目替换（merge_pick §3），生效路由语言以它为准。此前
+        // 显示内置 spec.languages（如注册 [servers.pyright] languages=[python,
+        // pyright] 却显示 ["pyright"]），注册时并上的请求语言在清单里蒸发
+        // （NitpickAI F1 step4，与运行时行为相悖）。
+        let languages: Vec<String> = if overridden {
+            external.get(*id).map(|s| s.languages.clone()).unwrap_or_else(|| spec.languages.clone())
+        } else {
+            spec.languages.clone()
+        };
         let mut entry = json!({
             "id": id,
-            "languages": spec.languages,
+            "languages": languages,
             "state": state,
         });
         if overridden {
@@ -3298,16 +3443,63 @@ fn check_cargo_metadata(project_root: &Path) -> supervisor::doctor::Check {
     }
 }
 
+/// bd serena-rust-9z0x：external-servers.toml 注册感知的 doctor 后处理——
+/// external 是完整条目替换，被覆盖条目（priority ≥ 0）的「not on PATH」MISS
+/// 判据失真：改看注册二进制是否在盘（ls-use 恒写 canonical 绝对路径）。在盘 →
+/// OK 标注注册来源；缺盘 → 保持 MISS 但 detail 指向注册残链（可手修）。
+fn apply_external_registrations(report: &mut supervisor::doctor::DoctorReport) {
+    let Some(cfg) = ls_registry::config::external_servers_path() else {
+        return;
+    };
+    for (id, spec) in ls_registry::config::external_entries(&cfg) {
+        if spec.priority < 0 {
+            continue; // 负 priority = 显式让位内置，doctor 判定维持内置
+        }
+        let Some(po) = spec.path_only.as_ref() else {
+            continue; // 非 path_only 注册走原装态判据（缓存/PATH 探测已覆盖）
+        };
+        let on_disk = Path::new(&po.binary_name).is_file();
+        for c in report
+            .checks
+            .iter_mut()
+            .filter(|c| c.category == "ls" && c.id == id)
+        {
+            if c.status != supervisor::doctor::Status::Miss {
+                continue;
+            }
+            if on_disk {
+                c.status = supervisor::doctor::Status::Ok;
+                c.detail =
+                    format!("registered via external-servers.toml: {}", po.binary_name);
+                c.hint = None;
+            } else {
+                c.detail = format!(
+                    "{} (registered via external-servers.toml but binary missing on disk)",
+                    c.detail
+                );
+            }
+        }
+    }
+}
+
 /// `doctor` 子命令：6 类体检 + 可选 --fix 自动装 MISS 的 LS。
 async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path, project_root: &Path) -> ExitCode {
     let mut report = supervisor::doctor::run_all(lock_path);
     // workspace 类在 CLI 侧追加：检查目标（--project/cwd）是 CLI 会话概念，
     // supervisor::doctor 不感知（分层：doctor 库只做环境探测，ARCH §1）。
     report.checks.push(check_cargo_metadata(project_root));
+    // bd serena-rust-9z0x：external 注册感知（NitpickAI F1 step5——doctor 无视
+    // 已注册条目，`[MISS] pyright not on PATH` 与 ls-list/运行时三方相悖）。
+    apply_external_registrations(&mut report);
     // 可选：--fix 尝试装 MISS 的 server 类别条目
     if fix {
         for c in &report.checks {
             if c.status == supervisor::doctor::Status::Miss && c.category == "ls" {
+                // bd serena-rust-9z0x：已 external 注册的条目不自动安装——注册
+                // 二进制才是生效源，装内置条目等于悄悄改写用户注册意图。
+                if ls_registry::config::spec_source(c.id) == Some("external") {
+                    continue;
+                }
                 // `id` 是 server name（如 rust-analyzer）—— 不一定在 servers.toml
                 // （如 csharp-ls 是 dotnet tool）；只对 spec_for 能命中的跑 ensure_launch。
                 if ls_registry::config::spec_for(c.id).is_some() {
@@ -4353,6 +4545,89 @@ mod blindfix_c_tests {
         assert!(symbol.as_deref() == Some("divide") && symbol_flag.is_none());
     }
 
+    /// 杠精 cqns：find-test --symbol 旗与位置参数等价（merge 进同一 wire 键）。
+    #[test]
+    fn resolve_with_alias_merges_find_test_symbol_flag() {
+        let mut cmd = Cmd::FindTest {
+            symbol: None,
+            symbol_flag: Some("alpha".into()),
+        };
+        resolve_with_alias(&mut cmd).unwrap();
+        let Cmd::FindTest { symbol, .. } = &cmd else {
+            panic!("variant changed")
+        };
+        assert_eq!(symbol.as_deref(), Some("alpha"));
+
+        // 位置参数优先形态照常通过。
+        let mut cmd = Cmd::FindTest {
+            symbol: Some("beta".into()),
+            symbol_flag: None,
+        };
+        resolve_with_alias(&mut cmd).unwrap();
+
+        // 双给必拒；全缺必拒。
+        let mut both = Cmd::FindTest {
+            symbol: Some("a".into()),
+            symbol_flag: Some("b".into()),
+        };
+        assert!(resolve_with_alias(&mut both).is_err(), "双给必拒");
+        let mut neither = Cmd::FindTest {
+            symbol: None,
+            symbol_flag: None,
+        };
+        assert!(resolve_with_alias(&mut neither).is_err(), "全缺必拒");
+    }
+
+    /// 杠精 cqns：read-file --start/--end 短别名归一进 --start-line/--end-line。
+    #[test]
+    fn resolve_with_alias_merges_read_file_line_aliases() {
+        let mut cmd = Cmd::ReadFile {
+            file: "lib.rs".into(),
+            start_line: None,
+            end_line: None,
+            start: Some(3),
+            end: Some(7),
+        };
+        resolve_with_alias(&mut cmd).unwrap();
+        let Cmd::ReadFile {
+            start_line,
+            end_line,
+            ..
+        } = &cmd
+        else {
+            panic!("variant changed")
+        };
+        assert_eq!((*start_line, *end_line), (Some(3), Some(7)));
+
+        // 长名与别名混给同名对 = 拒；不同名对 = 各自归一。
+        let mut mixed = Cmd::ReadFile {
+            file: "lib.rs".into(),
+            start_line: Some(1),
+            end_line: None,
+            start: None,
+            end: Some(9),
+        };
+        resolve_with_alias(&mut mixed).unwrap();
+        let Cmd::ReadFile {
+            start_line,
+            end_line,
+            ..
+        } = &mixed
+        else {
+            panic!("variant changed")
+        };
+        assert_eq!((*start_line, *end_line), (Some(1), Some(9)));
+
+        let mut both = Cmd::ReadFile {
+            file: "lib.rs".into(),
+            start_line: Some(1),
+            end_line: None,
+            start: Some(2),
+            end: None,
+        };
+        assert!(resolve_with_alias(&mut both).is_err(), "双给必拒");
+    }
+
     #[test]
     fn resolve_with_alias_merges_and_rejects_symbol_forms() {
         let mut flag_only = Cmd::SymbolBody {
@@ -4409,6 +4684,39 @@ mod blindfix_c_tests {
             .expect("marksman in builtin table");
         let keys = builtin_binary_keys("marksman", spec);
         assert!(keys.contains(&"marksman".to_string()), "keys: {keys:?}");
+    }
+
+    #[test]
+    fn def_ready_criterion_items_nonempty_without_warning() {
+        // bd serena-rust-y3c1：def 同层就绪判据——items 非空且无 we0 warning。
+        assert!(def_ready(&json!({"items": [{"uri": "file:///x.py"}]})));
+        assert!(!def_ready(&json!({"items": []})), "空 items = 未就绪");
+        assert!(
+            !def_ready(&json!({"items": [{"uri": "x"}], "warning": "may not be ready"})),
+            "we0 warning 在场即未就绪（空窗形态）"
+        );
+        assert!(!def_ready(&json!({})), "无 items 键 = 未就绪");
+    }
+
+    #[test]
+    fn clap_parses_wait_ready_stage_def() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "serena-cli",
+            "--project",
+            ".",
+            "wait-ready",
+            "--stage",
+            "def",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::WaitReady {
+                stage: WaitStage::Def,
+                ..
+            })
+        ));
     }
 }
 
@@ -4532,6 +4840,22 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
             (None, None) => Err(format!("missing {label}: pass it positionally or via --{flag}")),
         }
     }
+    // 杠精 cqns：read-file 行别名（u32 形态的 merge；别名 = 同语义旗标对，二选一）。
+    fn merge_line(
+        long: &mut Option<u32>,
+        alias: &mut Option<u32>,
+        long_flag: &str,
+        alias_flag: &str,
+    ) -> Result<(), String> {
+        match (long.take(), alias.take()) {
+            (Some(t), None) | (None, Some(t)) => {
+                *long = Some(t);
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(format!("provide only one of --{long_flag} / --{alias_flag}")),
+            (None, None) => Ok(()),
+        }
+    }
     match cmd {
         Cmd::InsertTextBeforeSymbol { text, with, .. }
         | Cmd::InsertAtLine { text, with, .. }
@@ -4548,6 +4872,24 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
             symbol_flag,
             ..
         } => merge(symbol, symbol_flag, "symbol", "symbol"),
+        // 杠精 cqns：find-test 补 --symbol 旗（与 symbol-body 形状对齐）。
+        Cmd::FindTest {
+            symbol,
+            symbol_flag,
+            ..
+        } => merge(symbol, symbol_flag, "symbol", "symbol"),
+        // 杠精 cqns：read-file --start/--end 短别名归一进 --start-line/--end-line
+        // （wire 键名不变，别名只存在于 CLI 面）。
+        Cmd::ReadFile {
+            start_line,
+            start,
+            end_line,
+            end,
+            ..
+        } => {
+            merge_line(start_line, start, "start-line", "start")?;
+            merge_line(end_line, end, "end-line", "end")
+        }
         // bd 4nqk：内容四来源（位置 / --with / --stdin / --content-file）恰好一个。
         Cmd::CreateTextFile {
             content,
@@ -4611,6 +4953,16 @@ fn to_lsp_line(line: u32) -> Result<u32, String> {
         return Err(format!("line is 1-based (got line={line})"));
     }
     Ok(line - 1)
+}
+
+/// 杠精 07u5-1：客户端校验失败与 daemon 同形——stderr 打 wire JSON error 对象
+/// （{"code","message","retryable"}），rc=2。纯文本形态对 JSON 解析方不可消费。
+fn bad_args_exit(detail: &str) -> ExitCode {
+    eprintln!(
+        "{}",
+        serde_json::json!({"code": "BAD_ARGS", "message": detail, "retryable": false})
+    );
+    ExitCode::from(2)
 }
 
 /// 解析后统一转换：把 position 型子命令的 line/col 就地 -1 成 LSP 0-based。
@@ -4733,6 +5085,35 @@ fn inject_timeout_args(args: &mut serde_json::Value, req_ms: Option<u32>, idx_ms
 mod tests {
     use super::*;
 
+    /// serena-rust-nodd：跨 run tempdir 残留清扫——每次套件启动删 >2h 的
+    /// serena 前缀残留（age 阈值避开并行 run 在用目录）。
+    #[test]
+    fn sweep_stale_serena_tempdirs() {
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            // serena-powershell 是 powershell LS 的运行时日志目录（非测试产物），不碰。
+            if name == "serena-powershell" || !name.starts_with("serena") {
+                continue;
+            }
+            let stale = ent
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t < cutoff)
+                .unwrap_or(false);
+            if stale {
+                let _ = if ent.path().is_dir() {
+                    std::fs::remove_dir_all(ent.path())
+                } else {
+                    std::fs::remove_file(ent.path())
+                };
+            }
+        }
+    }
+
     /// --json：args 注入 `_compact=false`（supervisor envelope 走原始 LSP 形态）。
     #[test]
     fn json_flag_injects_compact_false() {
@@ -4837,6 +5218,8 @@ mod tests {
             file: "lib.rs".into(),
             start_line: Some(1),
             end_line: Some(2),
+            start: None,
+            end: None,
         };
         normalize_positions(&mut cmd).unwrap();
         let Cmd::ReadFile {

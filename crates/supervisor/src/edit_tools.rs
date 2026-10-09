@@ -470,7 +470,16 @@ pub(crate) fn apply_insert_at_line(
 pub(crate) fn apply_delete_lines(text: &str, start: u32, end: u32) -> EditResult<String> {
     let starts = line_starts(text);
     let total = starts.len() - 1;
-    if start == 0 || end < start || end as usize > total {
+    // 杠精 07u5-7：start>end 是「顺序错」不是「越界」——文案区分两种失败，
+    // AI 才能直接换算重试而不是盲目缩范围。
+    if start != 0 && end < start {
+        return Err(EditError::BadArgs {
+            detail: format!(
+                "line range {start}..{end}: wrong order — start_line must be <= end_line (both 1-based)"
+            ),
+        });
+    }
+    if start == 0 || end as usize > total {
         return Err(line_bounds_error(start, end, total));
     }
     let from = starts[(start - 1) as usize];
@@ -664,11 +673,12 @@ mod tests {
                 .to_string()
                 .contains("out of bounds")
         );
+        // 杠精 07u5-7：start>end 文案 = 顺序错，不再误报越界。
         assert!(
             apply_delete_lines("1\n2\n", 2, 1)
                 .unwrap_err()
                 .to_string()
-                .contains("out of bounds")
+                .contains("wrong order")
         );
         assert!(
             apply_delete_lines("1\n2\n", 0, 1)

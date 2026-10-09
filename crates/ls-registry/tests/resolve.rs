@@ -118,6 +118,11 @@ fn adapter_for_each_m3_language() {
         ("astro", "astro-ls"),
     ];
     for (lang, expected_id) in cases {
+        // bd serena-rust-9z0x：external-servers.toml 注册拥有该语言时 T2 让位
+        // （返 None → ensure_launch 走注册条目）——本机注册表有该语言条目属预期。
+        if ls_registry::config::spec_source(lang) == Some("external") {
+            continue;
+        }
         let ad =
             ls_registry::adapter_for(lang).unwrap_or_else(|| panic!("missing adapter for {lang}"));
         assert_eq!(ad.id(), *expected_id, "adapter id mismatch for {lang}");
@@ -144,6 +149,11 @@ fn adapter_for_is_idempotent() {
         "csharp",
         "java",
     ] {
+        // bd serena-rust-9z0x：external 注册拥有的语言 T2 让位（见
+        // adapter_for_each_m3_language 注）；仅对仍走 T2 的语言断言单例。
+        if ls_registry::config::spec_source(lang) == Some("external") {
+            continue;
+        }
         let a1 = ls_registry::adapter_for(lang).unwrap();
         let a2 = ls_registry::adapter_for(lang).unwrap();
         assert!(

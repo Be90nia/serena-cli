@@ -627,14 +627,7 @@ pub async fn find_test(sup: &crate::Supervisor, root: &Path, symbol: &str) -> Re
         push_hit(&mut hits, &rel, 1, 1, "mirror");
     }
     // H2/H3：全仓单词匹配 → 测试路径 / 命名约定 / super:: 单测惯例。
-    let resp = sup
-        .tool_search_for_pattern(
-            root,
-            &format!(r"\b{}\b", regex::escape(symbol)),
-            None,
-            FIND_TEST_SEARCH_LIMIT,
-            true,
-        )
+    let resp = sup.tool_search_for_pattern(root, &format!(r"\b{}\b", regex::escape(symbol)), None, FIND_TEST_SEARCH_LIMIT, true, &[], false)
         .await?;
     let sym_lower = symbol.to_ascii_lowercase();
     for h in &resp.hits {
