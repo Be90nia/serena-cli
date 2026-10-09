@@ -1235,6 +1235,8 @@ impl Supervisor {
     ///
     /// `wait_gen`：
     /// - `None`：自动基线（函数入口 generation +1），等下一次推送。
+    /// - `Some(0)`：立即返回当前快照（跳过 push 等待窗；冷启动首次拉取仍需
+    ///   LS 握手/分析往返，pending:true = 未确认）。
     /// - `Some(N>0)`：等 generation >= N，仍受 5s 上限；超时返 `{ items: [], pending: true }`。
     ///
     /// pending 语义（2026-09-23 裸 RA 探针 + live 复现实锤）：rust-analyzer 的 pull
@@ -1326,11 +1328,17 @@ impl Supervisor {
         // LS 不发 version（如 clangd）→ 回退 generation 达标判定（旧行为）。
         // 窗口 5s（50 × 100ms）。Some(N) 语义保留：gen 兜底路径下 N <= 当前 gen
         // → 立即返回（旧契约，测试锁定）。
+        // critic3-F12：wait_gen=0 承诺「立即返回当前」——target=0 恒达标，push
+        // 等待窗对它只剩白耗 5s（version 纪律 LS 的确认条件是版本匹配，与
+        // generation 无关，永远等不满条件）。跳过等待直接走快照路径（缓存 +
+        // pull 兜底，pending 语义不变）；冷启动首次拉取的 LS 握手/分析往返是
+        // 首拉成本，不属于等待窗。
         let before_gen = self.diag_generation.load(Ordering::Relaxed);
         let target = wait_gen.unwrap_or(before_gen + 1);
         let doc_cur = session.content_version_of(&path);
         let mut confirmed_items: Option<Vec<serde_json::Value>> = None;
-        for _ in 0..50 {
+        let wait_ticks = if wait_gen == Some(0) { 0 } else { 50 };
+        for _ in 0..wait_ticks {
             let hit = self
                 .diag_cache
                 .lock()
@@ -4155,29 +4163,47 @@ impl Supervisor {
             "position": { "line": pos.line, "character": pos.character },
         });
 
-        // 1) prepareRename —— null = 不能 rename。
-        let prep: Option<serde_json::Value> = session
+        // 1) prepareRename —— null = 不能 rename。-32602 交语义改判（critic3-F4）。
+        let prep: Option<serde_json::Value> = match session
             .request(
                 "textDocument/prepareRename",
                 pos_params.clone(),
                 TOOL_TIMEOUT,
             )
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(
+                    self.rename_error_reclassified(root, file, lang.as_str(), pos, e)
+                        .await,
+                );
+            }
+        };
         if prep.is_none() || prep.as_ref().is_some_and(|v| v.is_null()) {
             return Err(ToolError::BadArgs {
                 detail: "prepareRename rejected this position".into(),
             });
         }
 
-        // 2) textDocument/rename → WorkspaceEdit JSON。
+        // 2) textDocument/rename → WorkspaceEdit JSON。-32602 交语义改判。
         let edit_params = json!({
             "textDocument": { "uri": uri_str },
             "position": { "line": pos.line, "character": pos.character },
             "newName": new_name,
         });
-        let resp: Option<serde_json::Value> = session
+        let resp: Option<serde_json::Value> = match session
             .request("textDocument/rename", edit_params, TOOL_TIMEOUT)
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(
+                    self.rename_error_reclassified(root, file, lang.as_str(), pos, e)
+                        .await,
+                );
+            }
+        };
         let resp = resp.ok_or_else(|| ToolError::Protocol {
             tool: "rename_symbol".into(),
             reason: "rename returned null".into(),
@@ -5573,6 +5599,49 @@ fn slim_write_receipt(value: &mut serde_json::Value) {
     }
 }
 
+/// dry-run 成功信封的后处理（critic3-F11 抽出供单测锚定）：打 dry_run 标记 +
+/// applied/would_apply 语义翻转（杠精 wuhi）+ 预览 hunk 化（token 卫生）+
+/// **剥 `post_write_diagnostics`** —— 干跑没写盘，诊断无从谈起，挂着
+/// "pending" 字段只会误导调用方以为有写后反馈通道。
+fn dry_run_envelope(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    root: &Path,
+    preview: Vec<(String, String)>,
+) {
+    obj.insert("dry_run".into(), serde_json::Value::Bool(true));
+    // 杠精 wuhi：dry_run:true 与 applied:true 同现自相矛盾（AI 扫字段
+    // 误判已写入）——dry-run 语义 = applied:false + would_apply:true。
+    obj.insert("applied".into(), serde_json::Value::Bool(false));
+    obj.insert("would_apply".into(), serde_json::Value::Bool(true));
+    // 杠精 wuhi：content 全文预览在大文件上是 token 炸弹——默认 hunk 化
+    // （unified diff，盘上现内容 vs 将写内容；新建文件走 /dev/null 头）。
+    obj.insert(
+        "would_write".into(),
+        serde_json::Value::Array(
+            preview
+                .into_iter()
+                .map(|(p, c)| {
+                    let pb = std::path::PathBuf::from(&p);
+                    let rel = pb
+                        .strip_prefix(root)
+                        .unwrap_or(&pb)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let (before, created) = match std::fs::read_to_string(&pb) {
+                        Ok(s) => (s, false),
+                        Err(_) => (String::new(), true),
+                    };
+                    serde_json::json!({
+                        "file": p,
+                        "patch": recipe::unified_diff(&rel, &before, &c, created),
+                    })
+                })
+                .collect(),
+        ),
+    );
+    obj.remove("post_write_diagnostics");
+}
+
 /// 51ib：`format` = brief|full|json（默认 full = 既有 wire 逐字节不变）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutFormat {
@@ -5771,6 +5840,49 @@ fn semantic_not_ready_message() -> String {
      (typically ready 30-60s after symbol index on a fresh workspace; a non-empty symbol index \
      does not imply type analysis is ready)"
         .to_string()
+}
+
+/// -32602 语义改判（critic3-F4，纯函数供单测锚定）：RA 类型分析
+/// 未就绪时 rename 对**语法层合法的位置**抛 `rpc -32602: No references found
+/// at position` —— 用户按错误信息排查位置（实际位置正确），白耗排查时间。
+/// documentSymbol 覆盖该位置 = 位置合法 → 改判 `NotReady`（wire=LS_NOT_READY，
+/// retryable，带 wait-ready 指引）；其余一律保留原错误（真·位置无符号 /
+/// 语法层探测失败或空 / 非 -32602，均无从证明是未就绪）。
+fn rename_rpc_reclassify(
+    overview: Option<&[SymbolHit]>,
+    pos: Position,
+    err: CoreError,
+    file: &str,
+) -> ToolError {
+    if let CoreError::Rpc { code: -32602, message } = &err
+        && let Some(hits) = overview
+        && position_in_hits(hits, pos.line, pos.character)
+    {
+        return ToolError::Core(CoreError::NotReady {
+            cause: format!(
+                "rename rejected at a position that documentSymbol reports as inside a symbol \
+                 (rpc -32602: {message}); the language server's type analysis is not ready yet \
+                 — run `wait-ready --file {file} --stage semantic` and retry"
+            ),
+        });
+    }
+    ToolError::Core(err)
+}
+
+impl Supervisor {
+    /// prepareRename/rename 出错时的统一收口：documentSymbol 探测 + 语义改判
+    /// （两个请求错误分支共用，probe 失败 = None = 保守保留原错误）。
+    async fn rename_error_reclassified(
+        &self,
+        root: &Path,
+        file: &str,
+        lang: &str,
+        pos: Position,
+        err: CoreError,
+    ) -> ToolError {
+        let hits = self.tool_overview(root, file, Some(lang)).await.ok();
+        rename_rpc_reclassify(hits.as_deref(), pos, err, file)
+    }
 }
 
 /// hover 空结果判定（bd serena-rust-we0）：`null`（部分 LS 未就绪返 null）或
@@ -6373,37 +6485,7 @@ impl SupervisorTrait for Supervisor {
             if let Ok(v) = &mut r
                 && let Some(obj) = v.as_object_mut()
             {
-                obj.insert("dry_run".into(), serde_json::Value::Bool(true));
-                // 杠精 wuhi：dry_run:true 与 applied:true 同现自相矛盾（AI 扫字段
-                // 误判已写入）——dry-run 语义 = applied:false + would_apply:true。
-                obj.insert("applied".into(), serde_json::Value::Bool(false));
-                obj.insert("would_apply".into(), serde_json::Value::Bool(true));
-                // 杠精 wuhi：content 全文预览在大文件上是 token 炸弹——默认 hunk 化
-                // （unified diff，盘上现内容 vs 将写内容；新建文件走 /dev/null 头）。
-                obj.insert(
-                    "would_write".into(),
-                    serde_json::Value::Array(
-                        preview
-                            .into_iter()
-                            .map(|(p, c)| {
-                                let pb = std::path::PathBuf::from(&p);
-                                let rel = pb
-                                    .strip_prefix(root)
-                                    .unwrap_or(&pb)
-                                    .to_string_lossy()
-                                    .replace('\\', "/");
-                                let (before, created) = match std::fs::read_to_string(&pb) {
-                                    Ok(s) => (s, false),
-                                    Err(_) => (String::new(), true),
-                                };
-                                serde_json::json!({
-                                    "file": p,
-                                    "patch": recipe::unified_diff(&rel, &before, &c, created),
-                                })
-                            })
-                            .collect(),
-                    ),
-                );
+                dry_run_envelope(obj, root, preview);
             }
             r
         } else if undo::WRITE_TOOLS.contains(&tool) {
@@ -11583,6 +11665,135 @@ mod find_symbol_ls_error_tests {
             .expect("rust-only query on warm session");
         assert!(!hits.is_empty(), "rust-only query must still hit");
         assert!(warnings.is_empty(), "all-success must carry no warnings");
+    }
+}
+
+#[cfg(test)]
+mod rename_semantic_reclassify_tests {
+    //! critic3-F4（rename -32602 语义改判）+ critic3-F11（dry-run 剥
+    //! post_write_diagnostics）的纯函数契约，不触 LS。
+    use super::*;
+
+    fn hit(range_sl: u32, range_sc: u32, range_el: u32, range_ec: u32) -> SymbolHit {
+        SymbolHit {
+            name: "add".into(),
+            kind: SymbolKindTag::Function,
+            uri: "file:///t/lib.rs".into(),
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: range_sl,
+                    character: range_sc,
+                },
+                end: lsp_types::Position {
+                    line: range_el,
+                    character: range_ec,
+                },
+            },
+            container: None,
+        }
+    }
+
+    fn rpc_32602() -> CoreError {
+        CoreError::Rpc {
+            code: -32602,
+            message: "No references found at position".into(),
+        }
+    }
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    #[test]
+    fn rename_rpc_32602_inside_syntax_symbol_reclassifies_not_ready() {
+        // 位置在 documentSymbol 覆盖内 = 位置合法 → 改判 NotReady（wire
+        // LS_NOT_READY），cause 带 wait-ready 指引。
+        let hits = vec![hit(4, 7, 6, 20)];
+        let err = rename_rpc_reclassify(
+            Some(&hits),
+            pos(5, 8),
+            rpc_32602(),
+            "lib.rs",
+        );
+        let ToolError::Core(CoreError::NotReady { cause }) = err else {
+            panic!("expect NotReady reclassification, got {err:?}");
+        };
+        assert!(cause.contains("wait-ready"), "指引: {cause}");
+        assert!(cause.contains("lib.rs"), "带文件: {cause}");
+        assert!(cause.contains("-32602"), "保留原始信息: {cause}");
+    }
+
+    #[test]
+    fn rename_rpc_32602_outside_syntax_symbols_keeps_original() {
+        // 语法层也无符号 = 真·位置无符号 → 原错误语义保留。
+        let hits = vec![hit(4, 7, 6, 20)];
+        let err = rename_rpc_reclassify(
+            Some(&hits),
+            pos(50, 0),
+            rpc_32602(),
+            "lib.rs",
+        );
+        match err {
+            ToolError::Core(CoreError::Rpc { code: -32602, .. }) => {}
+            other => panic!("original Rpc must be preserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_rpc_32602_overview_probe_failed_keeps_original() {
+        // 语法层探测失败/空 = 无法证明位置合法 → 保守保留原错误。
+        for overview in [None, Some(Vec::<SymbolHit>::new())] {
+            let err = rename_rpc_reclassify(
+                overview.as_deref(),
+                pos(5, 8),
+                rpc_32602(),
+                "lib.rs",
+            );
+            assert!(
+                matches!(err, ToolError::Core(CoreError::Rpc { code: -32602, .. })),
+                "overview={:?} must keep original, got {err:?}",
+                overview.map(|h| h.len())
+            );
+        }
+    }
+
+    #[test]
+    fn rename_rpc_non_32602_passes_through_untouched() {
+        // 非 -32602（如 -32801 content modified）不归本判据管，原样透传。
+        let hits = vec![hit(4, 7, 6, 20)];
+        let err = rename_rpc_reclassify(
+            Some(&hits),
+            pos(5, 8),
+            CoreError::Rpc {
+                code: -32801,
+                message: "content modified".into(),
+            },
+            "lib.rs",
+        );
+        match err {
+            ToolError::Core(CoreError::Rpc { code: -32801, .. }) => {}
+            other => panic!("non-32602 must pass through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dry_run_envelope_strips_post_write_diagnostics() {
+        // critic3-F11：dry-run 没写盘，post_write_diagnostics 字段必须剥掉；
+        // applied 翻转与 would_write 预览管道不变。
+        let mut obj = serde_json::json!({
+            "files_modified": 1,
+            "post_write_diagnostics": "pending",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        dry_run_envelope(&mut obj, std::path::Path::new("/tmp"), vec![]);
+        assert!(obj.get("post_write_diagnostics").is_none(), "{obj:?}");
+        assert_eq!(obj["dry_run"], serde_json::json!(true));
+        assert_eq!(obj["applied"], serde_json::json!(false));
+        assert_eq!(obj["would_apply"], serde_json::json!(true));
+        assert!(obj["would_write"].is_array(), "{obj:?}");
+        assert_eq!(obj["files_modified"], serde_json::json!(1), "原字段不动");
     }
 }
 

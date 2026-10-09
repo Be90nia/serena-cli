@@ -47,9 +47,9 @@ fn http_client() -> reqwest::Client {
         .expect("reqwest client build")
 }
 
-/// 杠精 ke2a：66 个子命令无分组导读 → AI 一次 help 定位候选命令，减少盲猜轮次。
+/// 杠精 ke2a：65 个功能子命令无分组导读 → AI 一次 help 定位候选命令，减少盲猜轮次。
 const AFTER_HELP_GUIDE: &str = "\
-按用途找命令（全 66 个；用法细节 `<cmd> --help`）:
+按用途找命令（全 65 个，不含 help 元命令；用法细节 `<cmd> --help`）:
   读/导航      overview symbol-tree read-file list-dir find-file search find-symbol symbol-body edit-context containing-symbol defining-symbol repo-map
   语义查询     def refs hover find-implementations find-referencing-symbols find-referencing-code-snippets completion signature-help code-action document-highlight call-hierarchy type-hierarchy moniker document-link inlay-hint folding-range semantic-tokens code-lens
   诊断         diagnostics workspace-diagnostic
@@ -57,7 +57,7 @@ const AFTER_HELP_GUIDE: &str = "\
   事务/工作流  undo redo diff find-test test recipe
   LS/环境      status project-info change-history warm wait-ready stop-all install uninstall ls-use ls-list ls-remove doctor shell lint-shell
 
-约定: 行号一律 1-based 含端；失败输出 {\"ok\":false,\"error\":{code,message,retryable}}；
+约定: 行号一律 1-based 含端；stdout 只出 JSON（成功=data 载荷 / 失败=error 对象 {code,message,retryable}，用法错 rc=2 同流），stderr=[warn]/[hint]/[error] 人读行；
 写类命令支持全局 --dry-run（返 would_write[].patch 预览）；--max-tokens/--compress/--json 全局可用。";
 
 #[derive(Parser, Debug)]
@@ -1706,27 +1706,44 @@ async fn cmd_wait_ready(
                 }
             }
         }
+        let progress = wait_ready_progress(stage, symbol_up.is_some(), probe_count, &rel);
         if Instant::now() >= deadline {
-            eprintln!("wait-ready: not ready within {timeout_secs}s");
+            // bd fdmj-F5：超时消息带最后一次探测的具体症状（等哪层 pending /
+            // 探针有无落点），不再只给裸秒数让用户盲猜「再等等还是坏了」。
+            eprintln!("wait-ready: not ready within {timeout_secs}s; last probe: {progress}");
             // bd serena-rust-y3c1：探针可能比实际工作负载更严（documentSymbol 层
             // 与语义解析层就绪节奏因 LS 而异）——超时不封死开工路，给降级指引。
             eprintln!("hint: documentSymbol-layer tools (overview / find-referencing-code-snippets / symbol-body) may already work; if a semantic tool returns empty, its warning field carries degraded-mode guidance");
             return ExitCode::from(4);
         }
-        let progress = if symbol_up.is_some() {
-            // b8sp：候选全灭（符号名在探针文件内不可定位）时点明根因，不假装
-            // 「类型分析还在热身」——那是永不 ready 的死等。
-            if probe_count == 0 {
-                format!("symbol-ok hover-pending (no probeable identifier in {rel})")
-            } else {
-                "symbol-ok hover-pending".to_string()
-            }
-        } else {
-            "symbol-pending".to_string()
-        };
-        eprintln!("wait-ready: probe #{round} {progress}");
+        // bd fdmj-F5：进度行带累计等待秒数，与超时预算对照可见，盲等变可估。
+        eprintln!(
+            "wait-ready: probe #{round} {progress} (elapsed {}s/{timeout_secs}s)",
+            started.elapsed().as_secs()
+        );
         tokio::time::sleep(wait_ready_backoff(round)).await;
         round += 1;
+    }
+}
+
+/// bd fdmj-F5：进度行按等待档消歧——等哪层打哪层 pending，不再一律带 symbol-ok
+/// 前缀（documentSymbol 就绪对 semantic 等待者是前置态而非目标态，原形态
+/// "symbol-ok hover-pending" 让超时日志看起来像有进展）。b8sp 的「候选全灭
+/// 点明根因」文案保留；symbol/indexing 档语义不动（symbol-ok 即目标态）；
+/// def 档的 pending 字样与实际探针对齐（原误打 hover-pending）。
+fn wait_ready_progress(stage: WaitStage, symbol_up: bool, probe_count: usize, rel: &str) -> String {
+    match (symbol_up, stage) {
+        (false, _) => "symbol-pending".to_string(),
+        (true, WaitStage::Semantic) if probe_count == 0 => {
+            format!("hover-pending (no probeable identifier in {rel})")
+        }
+        (true, WaitStage::Semantic) => "hover-pending".to_string(),
+        (true, WaitStage::Def) if probe_count == 0 => {
+            format!("def-pending (no probeable identifier in {rel})")
+        }
+        (true, WaitStage::Def) => "def-pending".to_string(),
+        // 逻辑上不可达（symbol_up 即 return），穷尽性兜底保持符号层语义。
+        (true, WaitStage::Indexing | WaitStage::Symbol) => "symbol-ok".to_string(),
     }
 }
 
@@ -2672,7 +2689,11 @@ async fn forward(
             if err.get("code").and_then(|c| c.as_str()) == Some("LS_NOT_INSTALLED") {
                 ls_env_mismatch_hint(lang, &project_root).await;
             }
-            eprintln!("tool error: {err}");
+            // bd fdmj-F10：错误统一裸 JSON 走 stdout（与成功载荷/clap 用法错同流
+            // 同形，agent 不再分形态解析）；原 "tool error: " 人读前缀挪 stderr
+            // [error] 行——两流职责分明（stdout=JSON、stderr=人读诊断）。
+            eprintln!("[error] {err}");
+            println!("{err}");
             if let Some(hint) = unknown_tool_hint(&err) {
                 eprintln!("[hint] {hint}");
             }
@@ -5097,10 +5118,12 @@ fn to_lsp_line(line: u32) -> Result<u32, String> {
     Ok(line - 1)
 }
 
-/// 杠精 07u5-1：客户端校验失败与 daemon 同形——stderr 打 wire JSON error 对象
+/// 杠精 07u5-1：客户端校验失败与 daemon 同形——打 wire JSON error 对象
 /// （{"code","message","retryable"}），rc=2。纯文本形态对 JSON 解析方不可消费。
+/// bd fdmj-F3：JSON 统一走 **stdout**（成功载荷同流，agent 单流解析）；
+/// clap 渲染的 usage/人读文本留 stderr（clap_exit_to_json 里 err.print()）。
 fn bad_args_exit(detail: &str) -> ExitCode {
-    eprintln!(
+    println!(
         "{}",
         serde_json::json!({"code": "BAD_ARGS", "message": detail, "retryable": false})
     );
@@ -6482,6 +6505,51 @@ mod clap_exit_json_tests {
         assert!(
             matches!(cli.cmd, Some(Cmd::Status { .. })),
             "status --project X 必须解析为 Status 子命令（不得报 unexpected）"
+        );
+    }
+}
+
+/// bd fdmj-F5：进度行按档消歧的形态锁定。
+#[cfg(test)]
+mod wait_ready_progress_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_stage_drops_symbol_ok_prefix() {
+        let p = wait_ready_progress(WaitStage::Semantic, true, 3, "lib.rs");
+        assert_eq!(p, "hover-pending");
+        assert!(!p.contains("symbol-ok"), "symbol-ok 对 semantic 等待者是噪音");
+    }
+
+    #[test]
+    fn semantic_stage_no_probeable_identifier_keeps_root_cause_note() {
+        let p = wait_ready_progress(WaitStage::Semantic, true, 0, "lib.rs");
+        assert_eq!(p, "hover-pending (no probeable identifier in lib.rs)");
+    }
+
+    #[test]
+    fn def_stage_reports_def_pending_not_hover() {
+        let p = wait_ready_progress(WaitStage::Def, true, 2, "lib.rs");
+        assert_eq!(p, "def-pending");
+        assert!(!p.contains("hover"), "def 档不得误打 hover 字样");
+    }
+
+    #[test]
+    fn symbol_layer_down_reports_symbol_pending_for_all_stages() {
+        for stage in [WaitStage::Symbol, WaitStage::Semantic, WaitStage::Def] {
+            assert_eq!(
+                wait_ready_progress(stage, false, 0, "lib.rs"),
+                "symbol-pending",
+                "符号层未就绪时 pending 字样与档位无关"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_stage_keeps_symbol_ok_target_semantics() {
+        assert_eq!(
+            wait_ready_progress(WaitStage::Symbol, true, 1, "lib.rs"),
+            "symbol-ok"
         );
     }
 }

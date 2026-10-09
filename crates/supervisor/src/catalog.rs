@@ -157,7 +157,7 @@ pub fn catalog() -> serde_json::Value {
             "diagnostics": {
                 "args": {
                     "file": {"type": "string", "required": true},
-                    "wait_gen": {"type": "number", "required": false, "description": "block until generation >= N (5s upper bound)"}
+                    "wait_gen": {"type": "number", "required": false, "description": "block until generation >= N (5s upper bound); N=0 returns the current snapshot immediately (a cold start's first pull still needs an LS round trip)"}
                 }
             },
             "def": {
@@ -409,7 +409,7 @@ pub fn catalog() -> serde_json::Value {
             "recipe": {
                 "args": {
                     "name": {"type": "string", "required": true, "description": "recipe: fix-bug|add-feature|rename|add-test|refactor-extract|refactor-rename|review-diff|explore"},
-                    "pos": {"type": "array", "required": false, "description": "positional args; fix-bug/rename/refactor-extract = [file, sym], add-feature = [name], add-test/refactor-rename = [sym], explore = [path], review-diff = [txn-id]"},
+                    "pos": {"type": "array", "required": false, "description": "positional args; fix-bug/rename/refactor-extract = [file, sym], add-feature = [name], add-test/refactor-rename = [sym], explore = [file] (file, not a directory), review-diff = [txn-id]"},
                     "new_body": {"type": "string", "required": false, "description": "fix-bug: replacement function body (absent = analyze-only chain)"},
                     "to": {"type": "string", "required": false, "description": "rename / refactor-rename: new name"},
                     "as": {"type": "string", "required": false, "description": "refactor-extract: new fn name"},

@@ -83,6 +83,10 @@ pub struct ReadReport {
     pub total_bytes: usize,
     /// 是否被 max_tokens 砍到（false = 全文返回）。仅 max_tokens 给定可能为 true。
     pub truncated: bool,
+    /// end_line 是否被 clamp 到 EOF（critic4-F3）：clamp=true 且请求 end_line >
+    /// total_lines 时 true —— caller 凭此知道请求的窗口被截短，而非文件真有
+    /// 那么多行。mfxg/66al 的 clamp 行为本身不变，纯 additive 标记。
+    pub clamped: bool,
     /// 整文件估算 token（4B/T，与 apply_budget 同口径）；max_tokens 未给 = None。
     pub total_tokens: Option<usize>,
 }
@@ -255,6 +259,9 @@ pub async fn read_file(
         }
     };
     let total_tokens = max_tokens.map(|_| total_bytes / 4);
+    // critic4-F3：请求 end_line 超 EOF 且被 clamp 收短 → 显式标记（end_line=None
+    // 时 raw_e=total 不会触发；clamp=false 走 BAD_ARGS 到不了这里）。
+    let clamped = clamp && raw_e > total as u32;
     // 杠精 ke2a-6：CRLF 文件静默转 LF 的拼接写回防雷标记（\n 计数含 \r\n 内的）。
     let line_endings = {
         let crlf = text.matches("\r\n").count();
@@ -276,6 +283,7 @@ pub async fn read_file(
         line_endings,
         total_bytes,
         truncated,
+        clamped,
         total_tokens,
     })
 }
@@ -754,5 +762,38 @@ mod max_tokens_tests {
         );
         // start_line 不动（用户显式传 1）。
         assert_eq!(r.start_line, 1);
+    }
+
+    /// critic4-F3：clamp=true 且请求 end_line 超 EOF → 收到末行 + `clamped:true`
+    /// 显式标记（mfxg 的 clamp 行为本身不变，纯 additive 元数据）。
+    #[tokio::test]
+    async fn read_file_end_line_past_eof_sets_clamped_flag() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("f.txt"), "l1\nl2\nl3\n").expect("fixture");
+        let r = read_file(dir.path(), "f.txt", Some(1), Some(99), true, None)
+            .await
+            .expect("read ok");
+        assert!(r.clamped, "end_line 99 > total 3 必须标记 clamped");
+        assert_eq!(r.end_line, 3, "clamp 行为不变：收到末行");
+        assert_eq!(r.total_lines, 3);
+        assert_eq!(r.content, "l1\nl2\nl3");
+        assert!(!r.truncated, "clamped ≠ max_tokens 截断，两旗互不相干");
+    }
+
+    /// critic4-F3：窗口在 EOF 内 / 未指定 end_line → `clamped:false`（无截，
+    /// 客户端可凭 false 判「拿到请求的完整窗口」）。
+    #[tokio::test]
+    async fn read_file_clamped_false_when_window_within_file() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("f.txt"), "l1\nl2\nl3\n").expect("fixture");
+        let r = read_file(dir.path(), "f.txt", Some(1), Some(2), true, None)
+            .await
+            .expect("read ok");
+        assert!(!r.clamped, "窗口内未截");
+        assert_eq!(r.content, "l1\nl2");
+        let r = read_file(dir.path(), "f.txt", None, None, true, None)
+            .await
+            .expect("read ok");
+        assert!(!r.clamped, "未指定 end_line = 全文，无 clamp 发生");
     }
 }

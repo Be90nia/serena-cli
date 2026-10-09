@@ -196,3 +196,42 @@ async fn diagnostics_wait_gen_huge_times_out_with_empty_items() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// critic3-F12：wait_gen=0 承诺「立即返回当前」——跳过 push 等待窗（50×100ms）
+/// 后，暖会话只剩缓存读取 + 一次 pull 兜底。计时回归锁：暖会话 <2s
+/// （修复前 version 纪律 LS 语义下可能白耗满 5s 窗口）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_wait_gen_zero_returns_fast_on_warm_session() {
+    if !has_clangd() {
+        println!("skipped: clangd not in PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("serena-diag-wgen0-fast-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ok.cpp"), "int main() { return 0; }\n").unwrap();
+
+    let sup = Supervisor::direct().await.expect("supervisor");
+    // 先暖会话（建 session + didOpen），计时只看 wait_gen=0 这一跳。
+    let _ = sup
+        .tool_diagnostics(&dir, "ok.cpp", None, None)
+        .await
+        .expect("warm-up diagnostics");
+
+    let start = std::time::Instant::now();
+    let diag = sup
+        .tool_diagnostics(&dir, "ok.cpp", None, Some(0))
+        .await
+        .expect("diagnostics");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(2_000),
+        "wait_gen=0 must return current snapshot fast, took {elapsed:?}"
+    );
+    assert!(
+        diag.get("items").and_then(|i| i.as_array()).is_some(),
+        "expected items array, got: {diag}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

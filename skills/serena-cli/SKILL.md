@@ -39,19 +39,19 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 - **read-file 的 line_endings 字段**：`crlf/mixed` 时 content 已被归一为 LF 而 hash 按原字节——把读到的 content 拼接写回会转行尾，CRLF 文件慎用拼接写回（走行级三件套或带 hash 的整写）。
 - **read-file --max-tokens <N> 截 content 字段**（子命令私有，全局 `--max-tokens` 不冲突亦不生效）：content 超 `N*4-32` 字节按整行砍、刷新 `end_line` 到截断末行、响应附 `truncated:true` + `total_bytes`（整文件字节，始终填）+ `total_tokens`（整文件估算，`--max-tokens` 没给 = `null`）；hash 仍按整文件算（行级三件套 `expected_hash` 契约不动）；半行直接丢、不传半行回 client；`end_line < start_line`（含 `end_line:0`）= 首行就放不下、0 行被返回（输入参数仍必须 ≥1，输出端此形态属正常）；适用场景：先看一眼大文件头几十行再决定要不要全文。
 
-## 命令速查（66 个子命令，含 help；按类）
+## 命令速查（65 个功能子命令；按类；`--help` 所列 66 行含 help 元命令，不计入）
 
 | 类 | 命令 |
 |---|---|
-| 读/导航(7) | overview · symbol-tree · read-file(1-based 含端，回传 hash+line_endings+total_bytes+truncated+total_tokens；`--start/--end` 为 `--start-line/--end-line` 短别名；`--max-tokens <N>` 截 content) · list-dir · find-file · search(--exclude <GLOB> 可多次；默认尊重 .gitignore，`--no-ignore` 逃生) · hover |
+| 读/导航(7) | overview · symbol-tree · read-file(1-based 含端，回传 hash+line_endings+total_bytes+truncated+total_tokens+clamped；`--start/--end` 为 `--start-line/--end-line` 短别名；`--max-tokens <N>` 截 content) · list-dir · find-file · search(--exclude <GLOB> 可多次；默认尊重 .gitignore，`--no-ignore` 逃生) · hover |
 | 符号(8) | find-symbol · symbol-body · def · refs · find-implementations · find-referencing-symbols · find-referencing-code-snippets · containing-symbol |
-| 上下文聚合 | edit-context(改前必备) · repo-map(全 project 按文件顶层符号清单，LS 免热身) · defining-symbol · signature-help |
-| 诊断(2) | diagnostics(--wait-gen N) · workspace-diagnostic(LS 不支持时指路逐文件 diagnostics) |
-| 编辑(11) | replace-body · replace-text-in-symbol · insert-text-{before,after}-symbol · delete-text-in-symbol · insert-at-line · replace-lines · delete-lines(start>end 报「顺序错」非「越界」) · rename-symbol(跨文件自动同步) · safe-delete-symbol(有引用拒删) · create-text-file |
+| 上下文聚合(4) | edit-context(改前必备) · repo-map(全 project 按文件顶层符号清单，LS 免热身) · defining-symbol · signature-help |
+| 诊断(2) | diagnostics(--wait-gen N；N=0 立即返回当前快照——暖会话毫秒级，冷启动首次拉取仍需 LS 往返) · workspace-diagnostic(LS 不支持时指路逐文件 diagnostics) |
+| 编辑(11) | replace-body · replace-text-in-symbol · insert-text-{before,after}-symbol · delete-text-in-symbol · insert-at-line · replace-lines · delete-lines(start>end 报「顺序错」非「越界」) · rename-symbol(跨文件自动同步；语义未就绪窗口 -32602 改判 LS_NOT_READY retryable rc=5 带 wait-ready 指引，位置真无符号保留原错误) · safe-delete-symbol(有引用拒删) · create-text-file |
 | undo/redo(2) | undo(--steps N / --list；空栈返 nothing_to_undo:true，rc=0 非报错) · redo —— 事务级：rename 多文件一次回滚；新建文件 undo 即删；文件被外部改过则拒绝(WRITE_CONFLICT)；栈 20 步/200MB/30 天，重启升级不丢 |
 | recipe 工作流(4) | `test <target> [name]`(cargo/npm 双后端跑测试+解析失败清单) · `diff [txn-id] [--patch]`(写事务写前写后对照，--patch 出 unified hunk) · `find-test <sym>`(也收 `--symbol <NAME>`，与 symbol-body 同形) · `recipe <name> [args]`(8 工作流编排，见下) |
-| 补全/长尾 | completion · code-action · format · format-range · inlay-hint · folding-range · document-highlight · semantic-tokens · code-lens · call-hierarchy · type-hierarchy · moniker · document-link |
-| 管理(14) | status · project-info · change-history(--symbol 走 git -L 符号级) · warm · wait-ready(--stage symbol\|semantic\|def) · stop-all · install <lang> · uninstall <lang> · ls-use <lang\|id> <path> · ls-list · ls-remove <id> · doctor · shell(JSONL 长连接) · lint-shell |
+| 补全/长尾(13) | completion · code-action · format · format-range · inlay-hint · folding-range · document-highlight · semantic-tokens · code-lens · call-hierarchy · type-hierarchy · moniker · document-link |
+| 管理(14) | status · project-info · change-history(--symbol 走 git -L 符号级) · warm · wait-ready(--stage symbol\|semantic\|def\|indexing；RA 真就绪=Indexing progress end) · stop-all · install <lang> · uninstall <lang> · ls-use <lang\|id> <path> · ls-list · ls-remove <id> · doctor · shell(JSONL 长连接) · lint-shell |
 
 ## recipe 工作流（8 个，单命令多步编排）
 
@@ -66,15 +66,15 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 | refactor-extract | `<file> <sym> --as N` | ct_smart_edit(extract 整符号抽取) → ct_verify |
 | refactor-rename | `<sym> --to N` | ct_impact → [LSP rename workspace] → ct_verify(定义文件) |
 | review-diff | `[txn-id]` | ct_review_diff（diff + 关联测试 + 报告聚合） |
-| explore | `<path>` | ct_tldr → repo-map → ct_recent_activity |
+| explore | `<path>`（必须是文件；目录先 list-dir 定位源文件） | ct_tldr → repo-map → ct_recent_activity |
 
 ## 错误契约
 
-stdout = 紧凑 JSON（默认）+ 可能的 `[warn]` 前缀行；失败 `{"ok":false,"error":{code,message,retryable}}`（客户端侧校验错误同形打 stderr，rc=2）。高频码：`BAD_ARGS`(参数/文件类型错，不重试) · `WRITE_CONFLICT`(盘上内容与预期不符，先重读) · `LS_TIMEOUT`(retryable，重试) · `LS_NOT_INSTALLED`/`LS_SPAWN_FAILED`(环境问题，走下方处置流程)。退出码 **0**=成功 **1**=工具错(不可重试) **2**=参数错 **3**=INTERNAL(daemon/传输/序列化/IO 故障——重试同参大概率再败，先 `doctor`/`status` 查环境) **4**=就绪超时 **5**=可重试工具错(LS_TIMEOUT/LS_TERMINATED/LS_SPAWN_FAILED/LS_NOT_READY 瞬态，直接重试)。
+stdout = 纯 JSON 单流：成功 = data 载荷；失败 = 裸 error 对象 `{"code","message","retryable"}`（clap 用法错 rc=2 与工具级错误**同流同形**，无 `tool error:` 类人读前缀——前缀语义在 stderr `[error]` 行）。stderr = 人读诊断通道（`[warn]`/`[hint]`/`[error]`/clap usage/lazy-spawn 进度），永不混 JSON——解析只看 stdout。高频码：`BAD_ARGS`(参数/文件类型错，不重试) · `WRITE_CONFLICT`(盘上内容与预期不符，先重读) · `LS_TIMEOUT`(retryable，重试) · `LS_NOT_INSTALLED`/`LS_SPAWN_FAILED`(环境问题，走下方处置流程)。退出码 **0**=成功 **1**=工具错(不可重试) **2**=参数错 **3**=INTERNAL(daemon/传输/序列化/IO 故障——重试同参大概率再败，先 `doctor`/`status` 查环境) **4**=就绪超时 **5**=可重试工具错(LS_TIMEOUT/LS_TERMINATED/LS_SPAWN_FAILED/LS_NOT_READY 瞬态，直接重试)。
 
 ### stderr 消费契约（PowerShell / 编排脚本）
 
-CLI 故意把诊断信息（`[hint]`/`[warn]`/lazy-spawn 进度/工具错误全文）走 stderr——避免污染 stdout JSON 通道（agent 只看 stdout 第一行/单行 JSON 解析）。但 stderr 非空会触发 PowerShell `$LASTEXITCODE=1`（`NativeCommandError`），orchestrator 据此可能误判失败：
+CLI 故意把诊断信息（`[hint]`/`[warn]`/`[error]`/lazy-spawn 进度）走 stderr——避免污染 stdout JSON 通道（agent 只看 stdout，成功失败都是单流 JSON）。但 stderr 非空会触发 PowerShell `$LASTEXITCODE=1`（`NativeCommandError`），orchestrator 据此可能误判失败：
 
 ```powershell
 # ❌ 错：PowerShell 默认 $ErrorActionPreference 遇 stderr 非 0 行就置 $LASTEXITCODE=1

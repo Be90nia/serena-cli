@@ -123,6 +123,38 @@ fn fail_report_is_single_layer_message_with_required_facts() {
     );
 }
 
+// ============ explore 入口（critic3-F6：目录 = 带指引 BAD_ARGS，不触 LS） ============
+
+#[tokio::test]
+async fn explore_directory_is_bad_args_with_list_dir_guidance() {
+    let sup = sup_direct().await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    // 相对 root 目录形态。
+    std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+    let err = run(
+        &sup,
+        dir.path(),
+        &json!({"name": "explore", "pos": ["src"]}),
+    )
+    .await
+    .expect_err("directory path must fail with guidance");
+    let crate::ToolError::BadArgs { detail } = err else {
+        panic!("expect BadArgs, got {err:?}");
+    };
+    assert!(detail.contains("list-dir"), "指引指向 list-dir: {detail}");
+    assert!(detail.contains("explore"), "点名 explore 需文件: {detail}");
+
+    // 绝对路径目录形态（critic3 实测的入口）。
+    let err = run(
+        &sup,
+        dir.path(),
+        &json!({"name": "explore", "pos": [dir.path().join("src").to_string_lossy()]}),
+    )
+    .await
+    .expect_err("absolute directory path must fail with guidance");
+    assert!(matches!(err, crate::ToolError::BadArgs { .. }), "{err:?}");
+}
+
 // ============ 失败中断 + 逆序 undo（真 LS：rust-analyzer fixture） ============
 
 /// add-feature 在 stub 步注入失败（--target 指向非 .rs → append_or_create

@@ -221,7 +221,7 @@
           "type": "string"
         },
         "wait_gen": {
-          "description": "block until generation >= N (5s upper bound)",
+          "description": "block until generation >= N (5s upper bound); N=0 returns the current snapshot immediately (a cold start's first pull still needs an LS round trip)",
           "required": false,
           "type": "number"
         }
@@ -461,7 +461,7 @@
           "type": "string"
         },
         "pos": {
-          "description": "positional args; fix-bug/rename/refactor-extract = [file, sym], add-feature = [name], add-test/refactor-rename = [sym], explore = [path], review-diff = [txn-id]",
+          "description": "positional args; fix-bug/rename/refactor-extract = [file, sym], add-feature = [name], add-test/refactor-rename = [sym], explore = [file] (file, not a directory), review-diff = [txn-id]",
           "required": false,
           "type": "array"
         },

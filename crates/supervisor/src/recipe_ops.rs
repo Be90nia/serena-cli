@@ -734,11 +734,24 @@ async fn review_diff(
 }
 
 /// explore `<path>`：ct_tldr → repo-map → ct_recent_activity（三读步）。
+/// path 必须是**文件**（critic3-F6）：tldr 以单文件为锚，目录无 tldr 语义 ——
+/// 目录入口给带指引的参数错（list-dir 找文件），而非透传 LS 层
+/// "file not supported"（误导成 recipe 整体坏）。
 async fn explore(
     sup: &crate::Supervisor,
     root: &Path,
     path: &str,
 ) -> Result<Value, crate::ToolError> {
+    // 绝对与相对 root 两种形态都要识别目录（Path::join 绝对路径自带替换语义）。
+    let p_path = std::path::Path::new(path);
+    if p_path.is_dir() || root.join(path).is_dir() {
+        return Err(crate::ToolError::BadArgs {
+            detail: format!(
+                "recipe explore needs a file path, not a directory: {path}; \
+                 run `list-dir` to locate a source file, then `recipe explore <file>`"
+            ),
+        });
+    }
     let mut ctx = RecipeCtx::new(Some(path.into()), None);
     let p = ctx.file.clone().expect("constructor sets file");
     let tldr = match ctx
