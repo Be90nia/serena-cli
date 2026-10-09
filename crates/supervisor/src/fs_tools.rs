@@ -104,6 +104,54 @@ fn safe_join(root: &Path, sub: &str) -> FsResult<PathBuf> {
     Ok(canon_target)
 }
 
+/// bd serena-rust-p2zp：混合行尾切分（`\n` / 裸 `\r` / `\r\n` 都算终止符）。
+///
+/// `str::lines()` 只切 `\n`，对含裸 `\r`（Mac classic 行尾或 Windows 文件被某工具
+/// 改写遗留）的混合文件会少计行数，导致 `total_lines` 与内容切片均失真。本函数：
+/// - `\r\n` 整体计一个终止符（Windows 行为）；
+/// - 单独的 `\n` 计一个终止符（Unix 行为）；
+/// - 单独的 `\r`（紧邻非 `\n` 字符）也计一个终止符（Mac classic 与混合文件常见）；
+/// - 末尾无终止符的尾段按"最后一行"补一条（与现有 `.lines()` 对 `"abc\n"` 返
+///   `["abc"]` 的语义一致，但补 1 而非漏 1）。
+///
+/// 现有纯 LF / 纯 CRLF 文件路径输出与 `text.lines()` 完全相同（仅引入裸 `\r`
+/// 与末尾无终止符两个新分支），存量测试不受影响。
+fn split_lines_mixed(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                lines.push(&text[start..i]);
+                start = i + 1;
+                i += 1;
+            }
+            b'\r' => {
+                lines.push(&text[start..i]);
+                // \r\n 整体计一个终止符；裸 \r 紧邻非 \n 也是单终止符
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    start = i + 2;
+                    i += 2;
+                } else {
+                    start = i + 1;
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        // 末尾无终止符：保留尾段作为最后一行（与 .lines() 对 "abc" 返 ["abc"] 同源）
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
 /// 读 `root/file` 内容，可选 1-based 行切片。
 ///
 /// - `start_line=None, end_line=None`：全文件；
@@ -134,7 +182,12 @@ pub async fn read_file(
             FsError::Io(e)
         }
     })?;
-    let lines: Vec<&str> = text.lines().collect();
+    // bd serena-rust-p2zp：str::lines() 只切 \n，混合行尾（CRLF/LF/裸 CR）会少计：
+    //   "line1\r\nline2\nline3\rline4\nline5\r\n".lines() = 4 段
+    //   但编辑器视角是 5 行（line3/line4 用裸 \r 分隔）。改成同时识别 \n 与裸 \r
+    //   作为行终止符（\r\n 整体计 1）——total_lines 与 content 切片都走同一规则，
+    //   保持一致。
+    let lines: Vec<&str> = split_lines_mixed(&text);
     let total = lines.len();
     let s = start_line.unwrap_or(1);
     let raw_e = end_line.unwrap_or(total as u32);
@@ -422,5 +475,93 @@ mod binary_read_tests {
         ));
         let err = ensure_open_err("gone.py")(missing);
         assert!(matches!(err, crate::ToolError::Core(_)), "{err:?}");
+    }
+}
+
+/// bd serena-rust-p2zp：混合行尾（CRLF/LF/裸 CR）read_file 必须按行终止符
+/// 计 total_lines 并对 content 切片对齐——`text.lines()` 只切 \n 会少计。
+/// 端点 1：input = `line1\r\nline2\nline3\rline4\nline5\r\n`，5 行，content
+/// 按 \n 拼接归一（既有 ke2a-6 LF 归一契约）；端点 2：纯 CRLF 行为不变；端点 3：
+/// 末尾无终止符保留尾段；端点 4：纯 LF 行为不变；端点 5：空文件 = 0 行。
+#[cfg(test)]
+mod mixed_line_endings_tests {
+    use super::*;
+    #[tokio::test]
+    async fn read_file_counts_mixed_endings_as_five_lines() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("mixed.py");
+        std::fs::write(&path, b"line1\r\nline2\nline3\rline4\nline5\r\n").expect("fixture");
+        let r = read_file(dir.path(), "mixed.py", None, None, true)
+            .await
+            .expect("read ok");
+        // 修复前: total_lines=4（lines() 只切 \n，少计裸 \r 分隔的 line3/line4）
+        // 修复后: total_lines=5（line1/line2/line3/line4/line5 各占一行）
+        assert_eq!(r.total_lines, 5, "裸 \\r 与 \\r\\n/\\n 同视为行终止符");
+        assert_eq!(r.line_endings, "mixed");
+        // content 切片按行号也对齐（lines() 同样语义升级）
+        assert_eq!(r.content, "line1\nline2\nline3\nline4\nline5");
+        // 单行切片 line3 单独取出（裸 \r 被剥，等价 .lines() 对 "line3\r" 的处理）
+        let r3 = read_file(dir.path(), "mixed.py", Some(3), Some(3), true)
+            .await
+            .expect("slice ok");
+        assert_eq!(r3.content, "line3");
+        let r5 = read_file(dir.path(), "mixed.py", Some(5), Some(5), true)
+            .await
+            .expect("slice ok");
+        assert_eq!(r5.content, "line5");
+    }
+
+    #[tokio::test]
+    async fn read_file_pure_crlf_unchanged() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("crlf.py"), "a = 1\r\nb = 2\r\n").expect("fixture");
+        let r = read_file(dir.path(), "crlf.py", None, None, true)
+            .await
+            .expect("read ok");
+        assert_eq!(r.total_lines, 2);
+        assert_eq!(r.line_endings, "crlf");
+        assert_eq!(r.content, "a = 1\nb = 2");
+    }
+
+    #[tokio::test]
+    async fn read_file_pure_lf_unchanged() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("lf.py"), "a = 1\nb = 2\n").expect("fixture");
+        let r = read_file(dir.path(), "lf.py", None, None, true)
+            .await
+            .expect("read ok");
+        assert_eq!(r.total_lines, 2);
+        assert_eq!(r.line_endings, "lf");
+        assert_eq!(r.content, "a = 1\nb = 2");
+    }
+
+    #[tokio::test]
+    async fn read_file_no_trailing_newline_keeps_tail() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("notail.py"), "a\nb").expect("fixture");
+        let r = read_file(dir.path(), "notail.py", None, None, true)
+            .await
+            .expect("read ok");
+        assert_eq!(r.total_lines, 2, "末尾无终止符 = 仍有 2 行");
+        assert_eq!(r.content, "a\nb");
+    }
+
+    #[test]
+    fn split_lines_mixed_unit_table() {
+        // 直接验证 split_lines_mixed 的纯函数契约——所有典型边界全表。
+        assert_eq!(split_lines_mixed(""), Vec::<&str>::new());
+        assert_eq!(split_lines_mixed("\n"), vec![""]);
+        assert_eq!(split_lines_mixed("\r\n"), vec![""]);
+        assert_eq!(split_lines_mixed("a"), vec!["a"]);
+        assert_eq!(split_lines_mixed("a\n"), vec!["a"]);
+        assert_eq!(split_lines_mixed("a\nb"), vec!["a", "b"]);
+        assert_eq!(split_lines_mixed("a\nb\n"), vec!["a", "b"]);
+        assert_eq!(split_lines_mixed("a\r\nb"), vec!["a", "b"]);
+        assert_eq!(split_lines_mixed("a\rb"), vec!["a", "b"], "裸 \\r 终止");
+        assert_eq!(
+            split_lines_mixed("line1\r\nline2\nline3\rline4\nline5\r\n"),
+            vec!["line1", "line2", "line3", "line4", "line5"],
+            "混合行尾 = 5 行"
+        );
     }
 }

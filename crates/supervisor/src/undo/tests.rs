@@ -635,7 +635,14 @@ async fn list_reports_stack_overview() {
     assert_eq!(txns.len(), 1);
     assert_eq!(txns[0]["state"], "active");
     assert_eq!(txns[0]["files"], 2);
-    assert_eq!(txns[0]["summary"], "alpha.txt (+2 files)");
+    // bd serena-rust-mfht F8：list 摘要带行数 diff；多文件聚合 first 文件名 +
+    // 余文件 +/- 总量。alpha.txt "v1"→"v2" 行数 1→1 但内容变了（行数 +/-0
+    // 仍算 modify，非 no change），beta.txt 新建 1 行，总聚合 = alpha first
+    // + 1 余文件 +1/-0 总量。
+    assert_eq!(
+        txns[0]["summary"],
+        "alpha.txt +0/-0 lines (+1 files, +1/-0 total)"
+    );
 
     undo_at(&store, 1).await.unwrap();
     let r = list_at(&store).await.unwrap();
@@ -646,6 +653,49 @@ async fn list_reports_stack_overview() {
     let _ = redo_at(&store).await.unwrap();
     let r = list_at(&store).await.unwrap();
     assert_eq!(r["txns"][0]["state"], "discarded", "{r}");
+}
+
+/// bd serena-rust-mfht F8：list 摘要带行数 diff——单文件 modify 多行 + 新文件场景。
+/// agent 多步编辑后凭 summary 选 undo target 必须有信息量。
+#[tokio::test]
+async fn list_summary_carries_line_diff_for_selection() {
+    let work = tmpdir("summary_work");
+    let store = tmpdir("summary_store");
+    let a = work.join("alpha.rs");
+    let b = work.join("beta.rs");
+    std::fs::write(&a, "line1\nline2\nline3\n").unwrap();
+    let u = uid();
+    txn_write(&store, &a, "line1\nMODIFIED\nline3\nline4\n", u).await;
+    txn_write(&store, &b, "first\n", u).await;
+    commit_at(&store, u).await.unwrap();
+
+    let r = list_at(&store).await.unwrap();
+    let txns = r["txns"].as_array().unwrap();
+    assert_eq!(txns.len(), 1);
+    let s = txns[0]["summary"].as_str().unwrap();
+    // first 文件 alpha.rs 3 行→4 行（+1/-0，扩行不算减行）+ 余文件 beta.rs
+    // 新建 1 行 → 总量 +2/-0。
+    assert!(
+        s.contains("alpha.rs +1/-0 lines"),
+        "first 文件 modify 应带 +/- 行数: {s}"
+    );
+    assert!(
+        s.contains("+1 files, +2/-0 total"),
+        "余文件聚合应含 total: {s}"
+    );
+
+    // 单文件 create 场景：另一事务只新建一个文件。
+    let c = work.join("new.rs");
+    let u2 = uid();
+    txn_write(&store, &c, "x\ny\nz\n", u2).await;
+    commit_at(&store, u2).await.unwrap();
+    let r = list_at(&store).await.unwrap();
+    let txns = r["txns"].as_array().unwrap();
+    let newest = txns.iter().max_by_key(|t| t["txn_id"].as_u64().unwrap()).unwrap();
+    assert_eq!(
+        newest["summary"].as_str().unwrap(),
+        "new.rs created (+3 lines)"
+    );
 }
 
 /// 空栈 undo/redo = no-op，不报错（IDE 语义），skipped 恒在。

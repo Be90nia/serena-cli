@@ -71,6 +71,23 @@ description: 用 serena-cli 做符号级代码检索与编辑（LSP 后端，按
 
 stdout = 紧凑 JSON（默认）+ 可能的 `[warn]` 前缀行；失败 `{"ok":false,"error":{code,message,retryable}}`（客户端侧校验错误同形打 stderr，rc=2）。高频码：`BAD_ARGS`(参数/文件类型错，不重试) · `WRITE_CONFLICT`(盘上内容与预期不符，先重读) · `LS_TIMEOUT`(retryable，重试) · `LS_NOT_INSTALLED`/`LS_SPAWN_FAILED`(环境问题，走下方处置流程)。退出码 **0**=成功 **1**=工具错(不可重试) **2**=参数错 **3**=INTERNAL(daemon/传输/序列化/IO 故障——重试同参大概率再败，先 `doctor`/`status` 查环境) **4**=就绪超时 **5**=可重试工具错(LS_TIMEOUT/LS_TERMINATED/LS_SPAWN_FAILED/LS_NOT_READY 瞬态，直接重试)。
 
+### stderr 消费契约（PowerShell / 编排脚本）
+
+CLI 故意把诊断信息（`[hint]`/`[warn]`/lazy-spawn 进度/工具错误全文）走 stderr——避免污染 stdout JSON 通道（agent 只看 stdout 第一行/单行 JSON 解析）。但 stderr 非空会触发 PowerShell `$LASTEXITCODE=1`（`NativeCommandError`），orchestrator 据此可能误判失败：
+
+```powershell
+# ❌ 错：PowerShell 默认 $ErrorActionPreference 遇 stderr 非 0 行就置 $LASTEXITCODE=1
+$out = serena-cli find-symbol foo --lang python 2>$null  # 吞 stderr = 丢 hint
+$LASTEXITCODE  # 偶发 1 即便 stdout JSON 成功
+
+# ✅ 对：分离 stdout/stderr，按 $LASTEXITCODE 主判、stdout JSON 辅判
+$out = serena-cli find-symbol foo --lang python 2>$null
+if ($LASTEXITCODE -eq 0) { Parse-Json $out }  # rc=0 → 仅看 JSON
+else { Parse-Json $out; switch -Wildcard ($err) { "[hint][DAEMON_STALE]*" { stop-all } "[hint][LS_MISSING]*" { install } } }
+```
+
+要点：`$LASTEXITCODE=0` 是唯一的成败信号，stderr 永远当诊断通道不参与判定。bd serena-rust-p2zp 决定**不加 `--quiet` 旗**——stdout 纯净度优先，stderr 噪声治理归消费者侧契约。
+
 `diagnostics` / 写工具附带的 `post_write_diagnostics` 里 **`pending` 是新鲜度判定**（bd serena-rust-i52y）：`false` = LS 已确认本代，items 空=真无错；`true` = 等待窗口内 LS 未推新一代诊断，items 空**不代表无错**（快照可能陈旧）——用 `diagnostics <file> --wait-gen N` 显式复核后再当干净结论。
 
 ## 环境自检与 LS 故障处置

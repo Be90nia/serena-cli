@@ -1122,6 +1122,42 @@ pub(crate) async fn list(root: &Path) -> Result<serde_json::Value, ToolError> {
     list_at(&store_for(root)?).await
 }
 
+/// bd serena-rust-mfht F8：list 摘要升级——文件名 + 操作类型（created/modify）+
+/// 行数 +/-；多文件聚合 first 文件 + 余文件 +/- 总量。仅内嵌快照算行数（不读
+/// 旁路文件——列表高频访问，IO 风暴风险）；旁路走纯字节 +/- 形态。`text.lines()`
+/// 不识别裸 `\r`（fs_tools `split_lines_mixed` 形态），但 undo 写入源统一 `\n`
+/// 近似够用。
+fn count_lines(s: &str) -> usize {
+    if s.is_empty() {
+        return 0;
+    }
+    let nl = s.bytes().filter(|b| *b == b'\n').count();
+    if s.as_bytes().last() == Some(&b'\n') {
+        nl
+    } else {
+        nl + 1
+    }
+}
+
+/// 单文件 diff 形态（行数）。created → 只算 after；before 为 None；纯文本替换
+/// after == before 时退化为 "no change"。
+fn file_diff_text(f: &FileRec) -> String {
+    if f.created {
+        let after_lines = f.after.as_deref().map(count_lines).unwrap_or(0);
+        return format!("created (+{after_lines} lines)");
+    }
+    let before = f.before.as_deref();
+    let after = f.after.as_deref();
+    if before == after {
+        return "no change".to_string();
+    }
+    let before_lines = before.map(count_lines).unwrap_or(0);
+    let after_lines = after.map(count_lines).unwrap_or(0);
+    let added = after_lines.saturating_sub(before_lines);
+    let removed = before_lines.saturating_sub(after_lines);
+    format!("+{added}/-{removed} lines")
+}
+
 /// [`list`] 的存储路径注入版（单测用）。
 pub(crate) async fn list_at(store: &Path) -> Result<serde_json::Value, ToolError> {
     let _gate = crate::write_gate::acquire("undo-list").await?;
@@ -1141,15 +1177,37 @@ pub(crate) async fn list_at(store: &Path) -> Result<serde_json::Value, ToolError
             let dir = ent.path();
             let (files, summary, ts) = match read_manifest(&dir).await {
                 Ok(m) => {
-                    let first = m.files.first().map(|f| {
+                    let first_name = m.files.first().map(|f| {
                         Path::new(&f.path)
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| f.path.clone())
                     });
-                    let summary = match (&first, m.files.len()) {
-                        (Some(f), 1) => f.clone(),
-                        (Some(f), n) => format!("{f} (+{n} files)"),
+                    let summary = match (&first_name, m.files.first(), m.files.len()) {
+                        (Some(name), Some(first), 1) => {
+                            format!("{name} {}", file_diff_text(first))
+                        }
+                        (Some(name), Some(first), n) => {
+                            let mut added = 0usize;
+                            let mut removed = 0usize;
+                            for f in &m.files {
+                                if f.created {
+                                    added = added.saturating_add(
+                                        f.after.as_deref().map(count_lines).unwrap_or(0),
+                                    );
+                                } else {
+                                    let bl = f.before.as_deref().map(count_lines).unwrap_or(0);
+                                    let al = f.after.as_deref().map(count_lines).unwrap_or(0);
+                                    added = added.saturating_add(al.saturating_sub(bl));
+                                    removed = removed.saturating_add(bl.saturating_sub(al));
+                                }
+                            }
+                            format!(
+                                "{name} {} (+{} files, +{added}/-{removed} total)",
+                                file_diff_text(first),
+                                n - 1
+                            )
+                        }
                         _ => String::new(),
                     };
                     (m.files.len(), summary, m.timestamp)

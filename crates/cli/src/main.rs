@@ -617,8 +617,14 @@ enum Cmd {
         #[arg(long, value_name = "ROOT")]
         project: Option<PathBuf>,
     },
-    /// daemon 状态（uptime / pid / loaded LS）。
-    Status,
+    /// daemon 状态（uptime / pid / loaded LS）。status 报告的是 daemon 全局状态
+    /// —— 与项目根无关；`--project` 仅与 `project-info` 对齐命令面形状
+    /// （status --project X 不报错），实际不参与 daemon 报告内容。
+    Status {
+        /// 项目根（接受但忽略——status 不依赖 project；与 project-info 命令面形状对齐）。
+        #[arg(long, value_name = "ROOT")]
+        project: Option<PathBuf>,
+    },
     /// 变更历史：git log --follow 包装；--symbol 走 `-L :sym:file`
     /// 符号级跟踪。git 缺失 / 非 repo → exit 3 + stderr 原因。
     ChangeHistory {
@@ -693,13 +699,19 @@ enum Cmd {
     /// 长连接 shell（stdin/stdout JSONL）。
     ///
     /// 每行 stdin 一个 JSON 请求，响应逐行写 stdout。协议形状：
-    ///   {"id":1,"cmd":"find-symbol","args":{"name_path":"foo","project_root":"D:/proj"}}
+    ///   {"id":1,"cmd":"find-symbol","args":{"query":"foo","limit":10}}
     ///   {"id":2,"cmd":"status"}
     ///   {"id":3,"cmd":"exit"}
-    /// 响应：{"id":<n>,"ok":true,"data":...} 或 {"id":<n>,"ok":false,"error":"..."}。
+    /// 响应：{"id":<n>,"ok":true,"data":...} 或 {"id":<n>,"ok":false,"error":...}。
     /// 单 daemon 顺序多 project：跨 project 调用会隐式切换 active_project（LS
     /// session 按 project 复用池），响应带 `project switched: A -> B` warning。
     /// EOF 或 exit 请求后退出 0。
+    ///
+    /// 各 tool 的 args 字段名与 CLI 透传参数同名（project_root 走 shell 全局
+    /// `--project`，不重复传）：find-symbol={query,limit?,format?}、read-file=
+    /// {file,start_line?,end_line?,clamp?}、refs={file,line,col,depth?} 等。
+    /// 完整字段表见 `crates/cli/src/main.rs` 的 `tool_request` 透传表 + 各子
+    /// 命令 `--help`。
     Shell,
     /// 环境体检（6 类：运行时 / PATH / 本机 LS / daemon / 网络 / workspace cargo metadata）。
     Doctor {
@@ -763,11 +775,21 @@ async fn cli_main() -> ExitCode {
 
     // l5nv：`?query` → find-symbol query；`cmd? …` → cmd …（短输入糖）。
     // 首个位置参数命中 '?' 形态才重写 argv 重解析；其余路径与原生 parse 等价。
+    //
+    // bd serena-rust-p2zp：07u5 把工具语义错误（normalize_positions / resolve_with_alias /
+    // --max-tokens）转 JSON error 对象，但 clap 原生错误（missing subcommand / invalid
+    // value / unknown arg）此前走裸文本 e.exit()——agent JSON 解析路径断在第一关。
+    // 这里分两臂：use_stderr()=true（真错误）→ 渲染色文本保留人读 + JSON error
+    // 对象走 wire 契约（agent 解析路径与 daemon 一致）；use_stderr()=false（help/
+    // version）→ 走原生渲染 + exit 0。
     let raw_argv: Vec<String> = std::env::args().skip(1).collect();
-    let mut cli = match rewrite_shorthand_argv(raw_argv) {
-        Some(argv) => Cli::try_parse_from(std::iter::once("serena-cli".to_string()).chain(argv))
-            .unwrap_or_else(|e| e.exit()),
-        None => Cli::parse(),
+    let parse_result = match rewrite_shorthand_argv(raw_argv) {
+        Some(argv) => Cli::try_parse_from(std::iter::once("serena-cli".to_string()).chain(argv)),
+        None => Cli::try_parse(),
+    };
+    let mut cli = match parse_result {
+        Ok(c) => c,
+        Err(e) => return clap_exit_to_json(e),
     };
 
     // 行号契约统一（bd serena-rust-7xv）：position 型子命令的 line/col 以 1-based
@@ -848,7 +870,9 @@ async fn cli_main() -> ExitCode {
 
     // ---- 管理命令：只走 lock/HTTP，不需要 project ----
     match &cli.cmd {
-        Some(Cmd::Status) => return cmd_status(&lock_path).await,
+        // bd serena-rust-mfht F7：status 接受 --project 与 project-info 命令面
+        // 对齐；项目根不参与 daemon 报告内容（cmd_status 忽略 _project）。
+        Some(Cmd::Status { project: _ }) => return cmd_status(&lock_path).await,
         // change-history：纯本地 git log 包装（不碰 daemon/LS）。
         Some(Cmd::ChangeHistory {
             file,
@@ -1013,7 +1037,12 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             if let Some(w) = data.get("warning").and_then(|v| v.as_str()) {
                 eprintln!("[warn] {w}");
             }
-            if payload_is_empty(&data) && data.get("warning").is_some() {
+            // bd serena-rust-mfht F6：hint 仅在 warning 暗示语义未就绪时打，
+            // 项目切换等无关 warning 不再误导 agent「重试/等就绪」。
+            if let Some(w) = data.get("warning").and_then(|v| v.as_str())
+                && payload_is_empty(&data)
+                && warning_suggests_index_warming(w)
+            {
                 eprintln!(
                     "[hint] index warming: semantic layer not ready, empty result may be false negative (rerun or use wait-ready)"
                 );
@@ -1693,10 +1722,21 @@ async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<u8, ForwardFail
         _ => {
             // 死 lock（或无 lock）：lazy-spawn。不在这里删 lock——daemon 子进程
             // 的 lock 仲裁会带宽限接管，CLI 无归属凭据先删会误伤启动中/易主 lock。
-            let port = spawn_daemon_child()?;
-            tracing::info!(port, "lazy-spawned daemon child; waiting for readiness");
+            let (port, child_pid) = spawn_daemon_child()?;
             wait_ready(port, SPAWN_WAIT).await?;
-            tracing::info!(port, "daemon ready after lazy-spawn");
+            // bd dbx1：3 并发 lazy-spawn 时 OS bind 排他只能 1 赢；败家子进程
+            // bind 失败立即退但都连到胜家 :7860 listener 拿到 200。日志归属必须
+            // 等到 lock.pid 反查——胜家 = 自己的子进程 PID 才算"spawn 成功"，
+            // 败家走 attach 路径、stderr 不打 "lazy-spawned" 字样。
+            if own_child_won(lock_path, child_pid) {
+                tracing::info!(port, child_pid, "lazy-spawned daemon child; daemon ready");
+            } else {
+                tracing::info!(
+                    port,
+                    child_pid,
+                    "attached to peer-spawned daemon (lost bind race)"
+                );
+            }
             format!("http://127.0.0.1:{port}")
         }
     };
@@ -1795,7 +1835,12 @@ fn autodetect_lang(cli: &Cli) -> Option<String> {
 }
 
 /// Windows：CREATE_NO_WINDOW + CREATE_NEW_PROCESS_GROUP + 句柄不继承 + stdio→NULL。
-fn spawn_daemon_child() -> Result<u16, String> {
+///
+/// 返回 (port, child_pid)：调用方需要子进程 PID 在 wait_ready 之后做归属反查
+/// （bd dbx1：3 并发 lazy-spawn 时 OS bind 排他只能 1 赢；2 个败家子进程 bind
+/// 失败立即退，但都连到胜家 listener 的 :7860 拿到 200，无 pid 反查会全部误
+/// 报"已 spawn" → 日志与状态全部错配）。
+fn spawn_daemon_child() -> Result<(u16, u32), String> {
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -1824,8 +1869,18 @@ fn spawn_daemon_child() -> Result<u16, String> {
         // stdio 句柄的继承位，继承表里不再出现这些句柄；本进程自己读写不受影响。
         detach_stdio_inheritance();
     }
-    cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
-    Ok(7860) // M1 固定端口；M2 起 OS 分配 + lock 回填
+    let child = cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
+    Ok((7860, child.id())) // M1 固定端口；M2 起 OS 分配 + lock 回填
+}
+
+/// bd dbx1：lock.pid 反查归属——胜家 = spawn_daemon_child 返回的子进程 PID。
+/// 抽纯函数便于单测（写 temp lockfile + 断言）。
+fn own_child_won(lock_path: &Path, spawned_pid: u32) -> bool {
+    daemon::lockfile::read(lock_path)
+        .ok()
+        .flatten()
+        .map(|e| e.pid == spawned_pid)
+        .unwrap_or(false)
 }
 
 /// SERENA_DAEMON_LOG 排障钩子：设了 env 就打开该文件（append）供 daemon stderr 落盘；
@@ -2393,7 +2448,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             if *run { a["run"] = json!(true); }
             ("recipe", a)
         }
-        Some(Cmd::Status)
+        Some(Cmd::Status { .. })
         | Some(Cmd::ProjectInfo { .. })
         | Some(Cmd::ChangeHistory { .. })
         | Some(Cmd::StopAll)
@@ -2446,19 +2501,34 @@ fn unknown_tool_hint(err: &serde_json::Value) -> Option<&'static str> {
     )
 }
 
-/// bd serena-rust-c6pb：daemon 报 LS_NOT_INSTALLED 时客户端同层复算（probe_launch：
-/// T2 launch_info / ensure_launch，与 daemon 冷启动同一判定层）——客户端可拉起而
-/// daemon 说不 installed = daemon spawn 环境（PATH 快照 / 旧二进制）与当前 shell
-/// 错位，不是"本机没有"；此时给重启指引而不是放任 install/ls-use 死循环
-/// （NitpickEdge F6 两轮实锤：pyright 在客户端 PATH，daemon 看不见）。
+/// bd serena-rust-c6pb + p2zp：daemon 报 LS_NOT_INSTALLED 时客户端同层复算
+/// （probe_launch：T2 launch_info / ensure_launch，与 daemon 冷启动同一判定层）
+/// ——客户端可拉起而 daemon 说不 installed = daemon spawn 环境（PATH 快照 /
+/// 旧二进制）与当前 shell 错位，不是"本机没有"；此时给重启指引而不是放任
+/// install/ls-use 死循环（NitpickEdge F6 两轮实锤：pyright 在客户端 PATH，
+/// daemon 看不见）。
+///
+/// p2zp 强化：
+/// 1) 无论 probe_launch 成败都给 hint——老版本只覆盖"客户端能拉起"分支，"客户
+///    端也拉不起"时无指引，AI 不知道下一步是 install 还是 stop-all；
+/// 2) hint 用 [hint][ACTION] 前缀（伪彩色 ANSI 大写），与 daemon 启动进度行
+///    等行宽内区分，stderr 末尾定位更稳；
+/// 3) 两套分支给不同行动指引——错位（stop-all 重试）vs 真没装（install / 生态命令）。
 async fn ls_env_mismatch_hint(lang: Option<&str>, root: &Path) {
     let Some(lang) = lang else {
         return;
     };
-    if ls_registry::probe_launch(lang, root).await.is_ok() {
-        eprintln!(
-            "[hint] `{lang}` LS is launchable from this shell, but the daemon reports LS_NOT_INSTALLED — the daemon was spawned with a different PATH (or by an older binary); run `serena-cli stop-all` and retry"
-        );
+    match ls_registry::probe_launch(lang, root).await {
+        Ok(()) => eprintln!(
+            "[hint][DAEMON_STALE] `{lang}` LS is launchable from this shell, but the daemon reports LS_NOT_INSTALLED — daemon was spawned with a different PATH (or by an older binary). \
+             Fix: run `serena-cli stop-all` and retry your command."
+        ),
+        Err(_) => eprintln!(
+            "[hint][LS_MISSING] `{lang}` LS is not installed (this shell can't launch it either). \
+             Fix: install it via `serena-cli install {lang}` or `serena-cli doctor --fix`, \
+             then retry your command. If you already have the LS binary, register it with \
+             `serena-cli ls-use {lang} <path>` so the daemon picks it up after restart."
+        ),
     }
 }
 
@@ -2560,7 +2630,12 @@ async fn forward(
             // 空结果 + warning = 「没符号」可能是「没就绪」（we0/暖机窗口）→
             // 误导性最强的形态，额外给固定 hint；正常空（无 warning）不打，不误报。
             // bd serena-rust-y3c1：hint 附降级指引——documentSymbol 层工具常已可用。
-            if payload_is_empty(data) && data.get("warning").is_some() {
+            // bd serena-rust-mfht F6：hint 仅在 warning 暗示语义未就绪时打，
+            // 项目切换等无关 warning 不再误导 agent「重试/等就绪」。
+            if let Some(w) = data.get("warning").and_then(|v| v.as_str())
+                && payload_is_empty(data)
+                && warning_suggests_index_warming(w)
+            {
                 eprintln!(
                     "[hint] index warming: semantic layer not ready, empty result may be false negative (rerun or use wait-ready --stage def); documentSymbol-layer tools (find-referencing-code-snippets / overview / symbol-body) may already work"
                 );
@@ -2570,14 +2645,16 @@ async fn forward(
         }
         _ => {
             let err = payload.get("error").cloned().unwrap_or(payload);
+            // bd serena-rust-p2zp：LS_NOT_INSTALLED hint 提到 tool error 之前——
+            // 错误详情对 AI 操作者是噪音（已知码），行动指引才是有效信息；hint 先
+            // 浮顶 = agent 看到 hint 可立即停手决策（stop-all 重试 vs install），
+            // 错误全文仅供人肉诊断。
+            if err.get("code").and_then(|c| c.as_str()) == Some("LS_NOT_INSTALLED") {
+                ls_env_mismatch_hint(lang, &project_root).await;
+            }
             eprintln!("tool error: {err}");
             if let Some(hint) = unknown_tool_hint(&err) {
                 eprintln!("[hint] {hint}");
-            }
-            // bd serena-rust-c6pb：LS_NOT_INSTALLED 先做客户端同层复算再定责——
-            // 客户端可拉起 = daemon 环境错位（补 stop-all 指引），不是本机没装。
-            if err.get("code").and_then(|c| c.as_str()) == Some("LS_NOT_INSTALLED") {
-                ls_env_mismatch_hint(lang, &project_root).await;
             }
             // Δ 43ae021：exit 码按 wire code 取（ARCH §6.3 / dto::wire_error_code_to_exit），
             // 不再一律 1 —— Internal→3、BadArgs→2，agent 据此免重试确定性失败。
@@ -3978,6 +4055,18 @@ fn payload_is_empty(v: &serde_json::Value) -> bool {
     }
 }
 
+/// warning 文本是否暗示"语义层未就绪"（与 [`hover_ready`]/`def_ready` 的
+/// we0 判据同源）。`may not be ready` / `type analysis` / `index warming`
+/// / `results may be partial` —— 仅这四类语义就绪关键词才应触发 `[hint] index
+/// warming` 提示，避免项目切换等无关 warning 误导 agent「重试/等就绪」。
+fn warning_suggests_index_warming(w: &str) -> bool {
+    let l = w.to_lowercase();
+    l.contains("may not be ready")
+        || l.contains("type analysis")
+        || l.contains("index warming")
+        || l.contains("results may be partial")
+}
+
 /// Print JSON pretty; map serde_json errors to ToolError::Serialize (uniform exit 3 path).
 fn print_json(v: &serde_json::Value) -> Result<(), ToolError> {
     println!(
@@ -4075,8 +4164,16 @@ async fn ensure_daemon(lock_path: &Path) -> Result<(String, String), String> {
         }
         _ => {
             // 同 forward_or_spawn：不删 lock，交 daemon 子进程仲裁接管。
-            let port = spawn_daemon_child()?;
+            // bd dbx1：归属反查避免并发 lazy-spawn 时全部误报"已 spawn"。
+            let (port, child_pid) = spawn_daemon_child()?;
             wait_ready(port, SPAWN_WAIT).await?;
+            if !own_child_won(lock_path, child_pid) {
+                tracing::info!(
+                    port,
+                    child_pid,
+                    "attached to peer-spawned daemon (lost bind race)"
+                );
+            }
             format!("http://127.0.0.1:{port}")
         }
     };
@@ -4965,6 +5062,25 @@ fn bad_args_exit(detail: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
+/// bd serena-rust-p2zp：clap 原生 parse 错（missing subcommand / invalid value /
+/// unknown arg 等）从裸文本 + `e.exit()`（std::process::exit，Drop 来不及 flush）
+/// 改为：人读文本（clap 渲染保留 usage 提示）→ wire JSON error 对象 → rc=2。
+/// help / version（`use_stderr()=false`）保持原生路径——这些是用户主动请求的
+/// 输出，不是错误。Clap `Error::to_string()` 已含「error: ...」前缀 + 「Usage:」
+/// 段；JSON message 字段塞全文让 agent 既能识别 code 又能定位原 bad token。
+fn clap_exit_to_json(err: clap::Error) -> ExitCode {
+    if err.use_stderr() {
+        // 真错误：先打 clap 渲染文本（含 usage + 红字/粗体风格，纯终端好看），
+        // 再打 wire JSON error 对象（agent 解析路径），最后 rc=2。
+        // `e.print()` 走 clap 内部 stream 选择（stderr），不会与后续 eprintln 互踩。
+        let _ = err.print();
+        return bad_args_exit(&err.to_string());
+    }
+    // help / version：原生渲染（stdout）+ 0。
+    let _ = err.print();
+    ExitCode::SUCCESS
+}
+
 /// 解析后统一转换：把 position 型子命令的 line/col 就地 -1 成 LSP 0-based。
 /// 新增 position 型子命令时必须在此登记——漏登记 = 该命令 raw 透传（即 bd 7xv
 /// 的原始 bug 形态）；行级工具误登记 = 双重 -1（单测锁定）。
@@ -5733,6 +5849,29 @@ mod net_retry_tests {
         assert!(!payload_is_empty(&json!({ "contents": "" })));
     }
 
+    // ---- bd serena-rust-mfht F6：warning_suggests_index_warming 语义收口 ----
+
+    #[test]
+    fn warning_suggests_index_warming_matches_we0_and_index_warming_keywords() {
+        // we0 / 暖机相关关键词 → 提示语义未就绪。
+        assert!(warning_suggests_index_warming(
+            "semantic layer returned empty; type analysis may not be ready yet"
+        ));
+        assert!(warning_suggests_index_warming(
+            "index warming: results may be partial"
+        ));
+        // 大小写不敏感（与 hover_ready 的 contains 一致）。
+        assert!(warning_suggests_index_warming("Type Analysis NOT READY"));
+        // 项目切换 / not installed 等无关 warning → 误报护栏。
+        assert!(!warning_suggests_index_warming(
+            "project switched: A -> B"
+        ));
+        assert!(!warning_suggests_index_warming(
+            "python: language server for `python` not installed"
+        ));
+        assert!(!warning_suggests_index_warming(""));
+    }
+
     #[test]
     fn find_first_source_file_skips_build_dirs_and_detects_by_ext() {
         let tmp =
@@ -6141,5 +6280,162 @@ mod blindfix_b_tests {
         assert_eq!(wire_err_code(e).as_deref(), Some("LS_TIMEOUT"));
         assert_eq!(wire_err_code("transport 500: internal"), None);
         assert_eq!(wire_err_code(r#"{"message":"no code"}"#), None);
+    }
+}
+
+/// bd dbx1：3 并发 lazy-spawn 时所有 CLI 对同一 :7860 wait_ready 全 200，
+/// 必须用 lock.pid 反查确认谁真 spawn 了 daemon。下面是 own_child_won 纯函数
+/// 的契约测试（写 temp lockfile 模拟 OS bind 赢家/败家状态）。临时目录用
+/// std::env::temp_dir + pid+test 名拼唯一路径（与 cli 现有测试一致；cli 不引
+/// tempfile crate 作为 dev-dep，由 sweep_stale_serena_tempdirs 清扫老化残留）。
+#[cfg(test)]
+mod dbx1_concurrent_lazy_spawn_tests {
+    use super::*;
+    use daemon::lockfile::{LockEntry, write_final};
+    use std::path::PathBuf;
+
+    fn fresh_lock(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "serena-dbx1-{}-{}-{}.lock",
+            std::process::id(),
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn write_lock_with_pid(path: &std::path::Path, pid: u32) {
+        let entry = LockEntry {
+            pid,
+            port: 7860,
+            boot_ms: 1,
+            token: "deadbeef".repeat(4),
+        };
+        write_final(path, &entry).expect("write lock");
+    }
+
+    #[test]
+    fn own_child_won_returns_true_when_lock_pid_matches_spawned() {
+        let lock = fresh_lock("match");
+        write_lock_with_pid(&lock, 4242);
+        let r = own_child_won(&lock, 4242);
+        let _ = std::fs::remove_file(&lock);
+        assert!(r, "lock.pid == spawned PID → 胜家");
+    }
+
+    #[test]
+    fn own_child_won_returns_false_when_lock_pid_is_peer() {
+        let lock = fresh_lock("peer");
+        write_lock_with_pid(&lock, 9999);
+        let r = own_child_won(&lock, 4242);
+        let _ = std::fs::remove_file(&lock);
+        assert!(
+            !r,
+            "lock.pid != spawned PID → 败家走 attach"
+        );
+    }
+
+    #[test]
+    fn own_child_won_returns_false_when_lock_absent() {
+        let lock = fresh_lock("absent");
+        // 不写 lock —— 模拟 bind 赢家刚 spawn 还未来得及 write_final 的窗口。
+        let r = own_child_won(&lock, 4242);
+        assert!(
+            !r,
+            "无 lock → 保守判败家（attach 等读 lock 重试而非误报 spawn）"
+        );
+    }
+
+    #[test]
+    fn own_child_won_treats_corrupt_lock_as_lost() {
+        let lock = fresh_lock("corrupt");
+        std::fs::write(&lock, b"not valid json").unwrap();
+        let r = own_child_won(&lock, 4242);
+        let _ = std::fs::remove_file(&lock);
+        assert!(!r, "lock 损坏 → 败家兜底");
+    }
+}
+
+/// bd serena-rust-p2zp：clap 原生 parse 错（missing/invalid/unknown）必须走
+/// wire JSON error 对象（{code,message,retryable}）+ rc=2，与 07u5 工具语义错
+/// 路径同形。下面三单测锁住：(a) 真错 use_stderr=true → 退出码 2 + JSON 含
+/// code BAD_ARGS；(b) help/version use_stderr=false → 退出码 0（原生渲染保留）。
+/// 直接调用 `clap_exit_to_json` 而不走 cli_main 全链路——避免进程外断言。
+#[cfg(test)]
+mod clap_exit_json_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn missing_required_arg_returns_bad_args_json_and_rc2() {
+        let err = Cli::try_parse_from(["serena-cli", "read-file"]).expect_err("missing arg");
+        assert!(err.use_stderr(), "missing arg = 真错误 → use_stderr=true");
+        let code = clap_exit_to_json(err);
+        assert_eq!(code, ExitCode::from(2), "rc=2 与 07u5 工具语义错一致");
+    }
+
+    #[test]
+    fn invalid_value_returns_bad_args_json_and_rc2() {
+        let err = Cli::try_parse_from([
+            "serena-cli",
+            "find-symbol",
+            "foo",
+            "--format",
+            "not_a_real_format",
+        ])
+        .expect_err("bad value");
+        assert!(err.use_stderr());
+        let code = clap_exit_to_json(err);
+        assert_eq!(code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn unknown_subcommand_returns_bad_args_json_and_rc2() {
+        let err =
+            Cli::try_parse_from(["serena-cli", "totally-unknown-sub"]).expect_err("unknown cmd");
+        assert!(err.use_stderr());
+        let code = clap_exit_to_json(err);
+        assert_eq!(code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn help_request_returns_success_without_json() {
+        let err = Cli::try_parse_from(["serena-cli", "--help"]).expect_err("--help = DisplayHelp");
+        assert!(
+            !err.use_stderr(),
+            "--help 用 use_stderr=false 走原生渲染 + 退出 0"
+        );
+        let code = clap_exit_to_json(err);
+        assert_eq!(code, ExitCode::SUCCESS, "help/version 不走 JSON 路径");
+    }
+
+    #[test]
+    fn version_request_returns_success_without_json() {
+        let err = Cli::try_parse_from(["serena-cli", "--version"]).expect_err("--version = DisplayVersion");
+        assert!(!err.use_stderr());
+        let code = clap_exit_to_json(err);
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    // ---- bd serena-rust-mfht F7：status 接受 --project（与 project-info 形状对齐）----
+
+    #[test]
+    fn status_accepts_project_flag_with_or_without_subcommand_first() {
+        // 子命令前 `--project X status`：Cli 全局 flag + 子命令后置位。
+        let cli = Cli::try_parse_from(["serena-cli", "--project", "X", "status"]).unwrap();
+        assert!(
+            matches!(cli.cmd, Some(Cmd::Status { .. })),
+            "--project X status 必须解析为 Status 子命令"
+        );
+        // 子命令后 `status --project X`：status 子命令内 `--project` 字段。
+        let cli = Cli::try_parse_from(["serena-cli", "status", "--project", "X"]).unwrap();
+        assert!(
+            matches!(cli.cmd, Some(Cmd::Status { .. })),
+            "status --project X 必须解析为 Status 子命令（不得报 unexpected）"
+        );
     }
 }

@@ -21,22 +21,65 @@
 //! 本 helper 不承诺对抗本机攻击者。
 
 use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 
 /// 把 agent 输入的 `file`（相对 `root`）解析为 root 内绝对路径；越界返回
 /// 人读 detail（调用方转 `ToolError::BadArgs`）。
+///
+/// 编排主路径支持 `--project <root> <root内绝对路径>`（bd serena-rust-rdcd）：
+/// drive-rooted 绝对路径（`C:\…` / `C:/…`）在词法归一 + canonical 校验后
+/// 放行，只要最终路径仍在 canon_root 内。
 pub(crate) fn guarded_join(root: &Path, file: &str) -> Result<PathBuf, String> {
     if file.is_empty() {
         return Err("invalid file path: empty".into());
     }
     let raw = Path::new(file);
-    if raw.components().any(|c| {
-        matches!(c, Component::Prefix(_) | Component::RootDir)
-    }) {
-        return Err(format!("path escapes project root: {file}"));
+    let canon_root = dunce::canonicalize(root)
+        .map_err(|e| format!("project root not resolvable: {} ({e})", root.display()))?;
+
+    // 阶段 1：检查 prefix 形态，仅拒绝真正危险的换盘 / 长路径绕过：
+    //   - 纯 RootDir（`/foo`）→ 换当前盘根
+    //   - Verbatim / VerbatimDisk（`\\?\…`）→ 长路径绕过
+    //   - UNC（`\\server\share`）/ DeviceNS（`\\.\COM1`）
+    //   - Drive Prefix 但缺 RootDir（`C:foo` 盘符相对，整体换盘）
+    // 放行：Drive Prefix + RootDir（`C:\foo` / `C:/foo`）→ 走阶段 3。
+    let raw_comps: Vec<Component<'_>> = raw.components().collect();
+    let mut drive_prefix_idx: Option<usize> = None;
+    for (i, c) in raw_comps.iter().enumerate() {
+        match c {
+            Component::RootDir if drive_prefix_idx.is_none() => {
+                return Err(format!("path escapes project root: {file}"));
+            }
+            Component::Prefix(p) => match p.kind() {
+                Prefix::Verbatim(_)
+                | Prefix::VerbatimUNC(_, _)
+                | Prefix::VerbatimDisk(_)
+                | Prefix::UNC(_, _)
+                | Prefix::DeviceNS(_) => {
+                    return Err(format!("path escapes project root: {file}"));
+                }
+                Prefix::Disk(_) => {
+                    drive_prefix_idx = Some(i);
+                    let tail = &raw_comps[i + 1..];
+                    if !tail.iter().any(|c| matches!(c, Component::RootDir)) {
+                        // `C:foo` 盘符相对：Path::join 整体换盘 → 拒。
+                        return Err(format!("path escapes project root: {file}"));
+                    }
+                }
+            },
+            _ => {}
+        }
     }
+
+    if drive_prefix_idx.is_some() {
+        // 阶段 3：drive-rooted 绝对路径。词法归一（.. 上卷至盘根停），再沿
+        // 祖先链 canonicalize，最后 starts_with(canon_root) 终检。
+        return check_absolute_in_root(raw, &canon_root, file);
+    }
+
+    // 阶段 2：相对路径（原逻辑）。
     let mut norm: Vec<OsString> = Vec::new();
-    for comp in raw.components() {
+    for comp in &raw_comps {
         match comp {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -45,14 +88,10 @@ pub(crate) fn guarded_join(root: &Path, file: &str) -> Result<PathBuf, String> {
                 }
             }
             Component::Normal(c) => norm.push(c.to_os_string()),
-            _ => unreachable!("Prefix/RootDir 已在上方拒绝"),
+            _ => unreachable!(),
         }
     }
-    let canon_root = dunce::canonicalize(root)
-        .map_err(|e| format!("project root not resolvable: {} ({e})", root.display()))?;
     let candidate = norm.iter().fold(canon_root.clone(), |acc, c| acc.join(c));
-    // 目标已存在 → canonical 即答案；不存在（create 新建语义）→ 上卷到最近
-    // 存在祖先 canonicalize（解析祖先链 symlink），剩余分量纯 Normal 重接。
     let mut base = candidate.clone();
     let mut tail: Vec<OsString> = Vec::new();
     let canon_base = loop {
@@ -74,6 +113,76 @@ pub(crate) fn guarded_join(root: &Path, file: &str) -> Result<PathBuf, String> {
     };
     let checked = tail.into_iter().fold(canon_base, |acc, c| acc.join(c));
     if !checked.starts_with(&canon_root) {
+        return Err(format!("path escapes project root: {file}"));
+    }
+    Ok(checked)
+}
+
+/// Drive-rooted 绝对路径校验：词法归一 .. / . 后，沿祖先链 canonicalize
+/// （解析 symlink + 处理不存在的尾部分量），再 starts_with(canon_root) 终检。
+fn check_absolute_in_root(
+    raw: &Path,
+    canon_root: &Path,
+    file: &str,
+) -> Result<PathBuf, String> {
+    // 词法归一 .. / . ：.. 在自身前缀层级上卷，盘根处不再 pop。
+    let mut drive: Option<OsString> = None;
+    let mut has_root = false;
+    let mut stack: Vec<OsString> = Vec::new();
+    for comp in raw.components() {
+        match comp {
+            Component::Prefix(p) => drive = Some(p.as_os_str().to_os_string()),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // stack 顶部是 `\` 或 `/` 时已在盘根后；空 stack 也是盘根位置——不动。
+                let at_drive_root = match stack.last() {
+                    Some(last) => {
+                        let s = last.to_string_lossy();
+                        s == "\\" || s == "/"
+                    }
+                    None => true,
+                };
+                if !at_drive_root {
+                    stack.pop();
+                }
+            }
+            Component::Normal(c) => stack.push(c.to_os_string()),
+        }
+    }
+    let mut candidate = PathBuf::new();
+    if let Some(d) = drive {
+        candidate.push(d);
+    }
+    if has_root {
+        candidate.push(std::path::MAIN_SEPARATOR.to_string());
+    }
+    for c in &stack {
+        candidate.push(c);
+    }
+
+    // 沿祖先链 canonicalize（目标不存在 → 上卷到存在祖先）。
+    let mut base = candidate.clone();
+    let mut tail: Vec<OsString> = Vec::new();
+    let canon_base = loop {
+        match dunce::canonicalize(&base) {
+            Ok(canon) => break canon,
+            Err(_) => {
+                let name = base
+                    .file_name()
+                    .map(|n| n.to_os_string())
+                    .ok_or_else(|| format!("path escapes project root: {file}"))?;
+                let parent = base
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .ok_or_else(|| format!("path escapes project root: {file}"))?;
+                tail.insert(0, name);
+                base = parent;
+            }
+        }
+    };
+    let checked = tail.into_iter().fold(canon_base, |acc, c| acc.join(c));
+    if !checked.starts_with(canon_root) {
         return Err(format!("path escapes project root: {file}"));
     }
     Ok(checked)
@@ -153,6 +262,64 @@ mod tests {
         let got = guarded_join(&root, "newdir/deep/new.rs").unwrap();
         assert!(got.starts_with(&root), "{got:?} 必须在 root 内");
         assert!(got.ends_with("newdir/deep/new.rs") || got.ends_with("newdir\\deep\\new.rs"));
+    }
+
+    #[test]
+    fn absolute_path_inside_root_allowed() {
+        // bd serena-rust-rdcd：--project <root> + 绝对路径在 root 内必须放行
+        // （编排主路径：agent 持绝对路径 + 显式 root）。canonicalize 后判 starts_with。
+        let dir = scratch("absok");
+        let root = root_of(&dir, "absok");
+        let target = root.join("main.rs");
+        let got = guarded_join(&root, &target.to_string_lossy()).unwrap();
+        assert_eq!(got, target);
+        // 子目录也存在。
+        let sub = root.join("sub").join("a.txt");
+        let got = guarded_join(&root, &sub.to_string_lossy()).unwrap();
+        assert_eq!(got, sub);
+    }
+
+    #[test]
+    fn absolute_path_create_semantics_in_root_allowed() {
+        // 绝对路径在 root 内、目标不存在（create 语义）——词法归一后走祖先链
+        // canonicalize 仍判 starts_with 通过。
+        let dir = scratch("abscreate");
+        let root = root_of(&dir, "abscreate");
+        let target = root.join("newdir").join("deep").join("new.rs");
+        let got = guarded_join(&root, &target.to_string_lossy()).unwrap();
+        assert!(got.starts_with(&root), "{got:?} 必须在 root 内");
+        assert!(got.ends_with("newdir\\deep\\new.rs") || got.ends_with("newdir/deep/new.rs"));
+    }
+
+    #[test]
+    fn absolute_path_outside_root_rejected() {
+        // bd serena-rust-rdcd 防线：绝对路径在 root 外（含 .. 词法逃逸）仍必须拒。
+        let dir = scratch("absout");
+        let root = root_of(&dir, "absout");
+        // 1. 跨盘符（构造一个不同盘符的 temp 路径）。
+        let other_drive = if cfg!(windows) {
+            // 任何与 root 不同盘符的位置。
+            let tmp = std::env::temp_dir();
+            if tmp.to_string_lossy().starts_with(r"\\") {
+                // UNC temp：跨盘形态不一定可构造，跳过形态 1 走形态 2
+                tmp.clone()
+            } else {
+                let bytes = tmp.to_string_lossy().into_owned().into_bytes();
+                if bytes.first().copied().unwrap_or(b'C') == b'C' {
+                    PathBuf::from("D:/evil.txt")
+                } else {
+                    PathBuf::from("C:/evil.txt")
+                }
+            }
+        } else {
+            PathBuf::from("/etc/passwd")
+        };
+        let err = guarded_join(&root, &other_drive.to_string_lossy()).unwrap_err();
+        assert!(err.contains("escapes project root"), "{err}");
+        // 2. 词法 .. 上卷后越界（绝对路径内 .. 跳出 root）。
+        let escape = root.join("..").join("outside.txt");
+        let err = guarded_join(&root, &escape.to_string_lossy()).unwrap_err();
+        assert!(err.contains("escapes project root"), "{err}");
     }
 
     #[test]
