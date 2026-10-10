@@ -1623,19 +1623,28 @@ fn compact_diags(items: &[serde_json::Value]) -> Vec<String> {
     items.iter().map(compact_one_diag).collect()
 }
 
+/// blindtest v5.2 P1-B：裸 .rs 语义工具 warmup 超预算的降级文案。单测钉两个可
+/// 操作性锚——冷启动量级 ~15s（v5.1 P2-C 实测 standalone 分析常态 ~15s，原
+/// "can take minutes" 与体感不符吓退用户）+ `wait-ready --stage indexing` 预热指路。
+const RUST_STANDALONE_PENDING_WARNING: &str = "rust language server is still analyzing this file (no Cargo.toml under root; standalone-file analysis can take ~15s on a cold start; warm it up by running `wait-ready --stage indexing`); overview did not finish within the warmup budget — retry shortly";
+
 /// bd dmsm：空 pending 出口的降级判定（纯函数，测试钉死语义）。
-/// `count` = 含本轮的连续空 pending 轮数；`elapsed` = 距首轮的时长。
-/// blindtest v5.1 P3-E：阈值按累计时长而非轮数下限——原「≥3 轮且 ≥10s」的与门
-/// 让快空（<10s 累计）永不降级（vue 3×25ms 零停手信号 pending:true 永卡）。
-/// 达标（≥3 轮，或 ≥2 轮且 ≥10s 累计）→ `pending:false` + warning（不再暗示
-/// "再等等"）；未达标 → 原 `pending:true` 形态逐字节不变。
+/// `count` = 含本轮的连续空 pending 轮数；`elapsed` = 距首轮的真实 wall-clock
+/// 累计时长（`Instant::now() - 首轮 Instant`，与客户端 step-timeout 大小无关）。
+/// 判据统一一处：要么连续 ≥3 轮，要么累计 ≥10s wall-clock 时 ≥2 轮。命中即
+/// `pending:false` + warning（不再暗示"再等等"）；未命中 → 原 `pending:true`
+/// 形态逐字节不变。blindtest v5.1 P3-E 修快空永卡：vue 3×25ms 即降级；
+/// blindtest v5.2 P2-D 实锤 dmsm 判定不读客户端 step-timeout——driver 30s 与
+/// specials 15s timeout 同一 (root,uri) 走同一累计计时，行为一致。
 const PENDING_STREAK_MIN_ROUNDS: u32 = 3;
 const PENDING_STREAK_MIN_ELAPSED: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn pending_no_diag_response(count: u32, elapsed: std::time::Duration) -> serde_json::Value {
-    // 快空：3 轮即降级（不看时长）；慢空：累计 ≥10s 时 2 轮（MIN_ROUNDS-1）即可。
+    // OR 双轨：快空（≥3 轮累计无所谓）/ 慢空（≥2 轮且累计 ≥10s）。
+    // 表达式不再 `count + 1 >= MIN_ROUNDS` 这种绕绕写法——直接写 >=2 让判据一处可读。
     let enough_rounds = count >= PENDING_STREAK_MIN_ROUNDS;
-    let enough_time = count + 1 >= PENDING_STREAK_MIN_ROUNDS && elapsed >= PENDING_STREAK_MIN_ELAPSED;
+    let enough_time =
+        count >= PENDING_STREAK_MIN_ROUNDS - 1 && elapsed >= PENDING_STREAK_MIN_ELAPSED;
     if enough_rounds || enough_time {
         serde_json::json!({
             "items": [],
@@ -7199,7 +7208,7 @@ impl Supervisor {
                                 "items": [],
                                 "degraded": "semantic-pending",
                                 "warmup": { "stage": "indexing", "progress": null, "retry_after_warm": true },
-                                "warning": "rust language server is still analyzing this file (no Cargo.toml under root; standalone-file analysis can take minutes); overview did not finish within the warmup budget — retry shortly",
+                                "warning": RUST_STANDALONE_PENDING_WARNING,
                             }));
                         }
                     }
@@ -9594,6 +9603,47 @@ mod pull_diagnostics_tests {
             super::pending_no_diag_response(4, Duration::from_secs(60))["pending"],
             serde_json::json!(false),
             "≥3 语义"
+        );
+    }
+
+    #[test]
+    fn rust_standalone_pending_warning_actionable() {
+        // blindtest v5.2 P1-B：慢墙文案可见化——"can take minutes" 与体感不符
+        // （standalone 分析常态 ~15s），必须给量级 + 预热指路两个可操作锚。
+        let w = super::RUST_STANDALONE_PENDING_WARNING;
+        assert!(w.contains("~15s on a cold start"), "量级锚: {w}");
+        assert!(
+            w.contains("wait-ready --stage indexing"),
+            "预热指路锚: {w}"
+        );
+        assert!(!w.contains("can take minutes"), "旧夸大文案必须消失: {w}");
+    }
+
+    #[test]
+    fn pending_no_diag_response_step_window_agnostic() {
+        // blindtest v5.2 P2-D（dmsm 判据统一收口）：判定只吃 (count, 距首轮
+        // wall-clock 累计)，与客户端 step-timeout 无关——driver 30s/步 与
+        // specials 15s/步 在同一 (count, elapsed) 轨迹点上必须同判定，判据不许
+        // 按步窗分叉（register_empty_pending_exit 单收敛点的语义面）。
+        use std::time::Duration;
+        // 两轮累计 30s：15s/步两轮即此点；30s/步两轮 = 60s 也在慢空轨内——
+        // 同为降级，不看每步多长。
+        assert_eq!(
+            super::pending_no_diag_response(2, Duration::from_secs(30))["pending"],
+            serde_json::json!(false),
+            "两轮 30s 累计即降级（15s/步与 30s/步同判）"
+        );
+        assert_eq!(
+            super::pending_no_diag_response(2, Duration::from_secs(60))["pending"],
+            serde_json::json!(false),
+            "30s/步两轮 60s 累计同判降级"
+        );
+        // 单轮无论累计多久都不降（防单轮误判；step timeout 30s 的 driver 单轮
+        // 45s 超时也不触发降级）。
+        assert_eq!(
+            super::pending_no_diag_response(1, Duration::from_secs(45))["pending"],
+            serde_json::json!(true),
+            "单轮 45s 仍 pending"
         );
     }
 
@@ -13159,14 +13209,22 @@ mod path_traversal_tests {
 
     #[test]
     fn registered_extension_gets_no_adapter_message() {
-        // blindtest v5 P1-1：.rb 在 servers.toml 有登记（ruby_lsp extensions）→
-        // 「注册了但无 adapter」+ ls-use 指引，不再是裸 unsupported。
-        let err = resolve_lang_for_file("main.rb", None).unwrap_err();
+        // blindtest v5.2 P2-D：.rb 已收 EXT_TABLE（LanguageId::Ruby）→ resolve 层
+        // 直通 Ok("ruby")，不再有 BAD_ARGS（gem 缺失改走会话层 LS_NOT_INSTALLED +
+        // install hint，与首答同一张嘴）。
+        assert_eq!(
+            resolve_lang_for_file("main.rb", None).expect(".rb 必须可路由"),
+            "ruby"
+        );
+        // blindtest v5 P1-1 分流文案由 .m 活体覆盖：.m 在 servers.toml 有登记
+        // （matlab extensions，MATLAB 歧义刻意不收 EXT_TABLE）→「注册了但无
+        // adapter」+ ls-use 指引，不是裸 unsupported。
+        let err = resolve_lang_for_file("main.m", None).unwrap_err();
         let ToolError::BadArgs { detail } = err else {
             panic!("应为 BAD_ARGS");
         };
         assert!(
-            detail.contains("registered but no adapter for ruby") && detail.contains("ls-use"),
+            detail.contains("registered but no adapter for matlab") && detail.contains("ls-use"),
             "{detail}"
         );
     }

@@ -15,8 +15,8 @@ use ls_registry::spec;
 const SERVERS_TOML: &str = include_str!("../servers.toml");
 
 /// A 类批量收录的 23 个新 download 条目（矩阵 §1-§25 顺序，eclipse_jdtls 跳过；
-/// al 于 langs20 R2 转 path_only——marketplace vspackage 变 gzip 包 zip，download
-/// schema 无两级解包，2026-09-30）。
+/// al 于 langs20 R2 转 path_only——marketplace 资产改 gzip 包 zip 形态，download
+/// schema 不支持两级解包，见 servers.toml [servers.al] 注释）。
 const NEW_DOWNLOAD_IDS: &[&str] = &[
     "ada",
     "bsl",
@@ -1865,4 +1865,47 @@ fn w3b_pyrefly_angular_doors_wired() {
     assert_eq!(LanguageId::from_extension("html"), Some(LanguageId::Html));
     // didOpen 官方口径：主会话是 tsls。
     assert_eq!(ls_registry::lsp_language_id("angular"), "typescript");
+}
+
+/// blindtest v5.2 P1-A：al 装机指引只留 actionable 步骤（fetch → gunzip →
+/// zipfile 解包 → 二进制落位）。开发者 digest 笔记（marketplace 资产形态考据、
+/// 日期戳、"schema 无两级解包"）不得回流——hint 原样进 ls-list / doctor /
+/// install 失败文案的用户面。
+#[test]
+fn al_install_hint_is_actionable_not_dev_digest() {
+    let servers = parsed_servers();
+    let po = servers["al"].path_only.as_ref().expect("al: path_only table");
+    let windows_hint = po.install_hint_windows.as_deref().unwrap_or("");
+    assert!(!windows_hint.is_empty(), "windows 平台化指引必须在");
+    for banned in [
+        "marketplace vspackage now serves",
+        "no two-stage",
+        "gunzip+unzip",
+        "2026-09-30",
+    ] {
+        assert!(
+            !po.install_hint.contains(banned),
+            "unix hint 含 digest 残留 {banned:?}: {}",
+            po.install_hint
+        );
+        assert!(
+            !windows_hint.contains(banned),
+            "windows hint 含 digest 残留 {banned:?}: {windows_hint}"
+        );
+    }
+    for anchor in [
+        "gunzip",
+        "zipfile",
+        "Microsoft.Dynamics.Nav.EditorServices.Host",
+    ] {
+        assert!(
+            po.install_hint.contains(anchor),
+            "unix hint 缺 actionable 锚 {anchor:?}: {}",
+            po.install_hint
+        );
+        assert!(
+            windows_hint.contains(anchor),
+            "windows hint 缺 actionable 锚 {anchor:?}: {windows_hint}"
+        );
+    }
 }

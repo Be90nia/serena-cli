@@ -106,6 +106,14 @@ pub(crate) const EXT_TABLE: &[(&str, LanguageId)] = &[
     ("tfvars", LanguageId::Terraform),
     ("cue", LanguageId::Cue),
     ("nix", LanguageId::Nix),
+    // blindtest v5.2 P2-D：elixir LS (expert-lsp / elixir-ls) 实拉起 + insert/diag
+    // 走通；扩展名 .ex/.exs/.heex 三族（Helix 上游兼容清单）。无 .m/.lua 冲突。
+    ("ex", LanguageId::Elixir),
+    ("exs", LanguageId::Elixir),
+    ("heex", LanguageId::Elixir),
+    // blindtest v5.2 P2-D：ruby_lsp 条目（gem）languages=["ruby"]，.rb 补路由
+    // （先例同 elixir；solargraph 变体条目仍仅 --lang 显式路由）。
+    ("rb", LanguageId::Ruby),
     // W2 批：svelte 单文件组件；sass 双扩展（.css 留在 css 门，上游把 .css 也给
     // some-sass 的路由我们不抄）。deno 不进本表——TS 家族归 TypeScript 门，
     // 仅 --lang deno 显式路由可达（pgsql/mysql 先例）。
@@ -263,13 +271,16 @@ pub fn resolve_lang_name(path: &Path) -> Option<&'static str> {
 /// 反向失真标 unroutable（elixir LS 真拉起、pgsql 367ms insert、mysql 全链通）——
 /// 扩展名覆盖表与适配器清单对不齐的缝，恰落在这批「languages 真名 ≠ 条目 id、
 /// 走 ensure_launch」的 T0 条目上。显式清单而非推断（docker 同款原则）。
+/// v5.2 P2-D 起 elixir 另获 .ex/.exs/.heex 扩展名路由，名单保留（--lang 显式
+/// 路径独立于扩展名表，删了会让 `--lang elixir` 依赖 EXT_TABLE 状态）。
 const T0_EXPLICIT_ROUTE_LANGS: &[&str] = &["elixir", "pgsql", "mysql"];
 
 /// 语言在当前注册状态下是否存在真实请求路径（blindtest v5 P1-1 判据源，与安装态
 /// 正交：installed 只代表缓存包在盘）。true = external 注册拥有（ls-use 生效面）/
 /// T2 adapter 直路由 / EXT_TABLE 扩展名路由（T0 配置驱动）/ `--lang` 显式路由
 /// （T0_EXPLICIT_ROUTE_LANGS）四者任一；false = 该语言目前无从文件名或显式
-/// --lang 到达（.rb/.m 类——包在盘也路由失败，BAD_ARGS unsupported）。
+/// --lang 到达（.m 类——包在盘也路由失败，BAD_ARGS unsupported；.rb 已于
+/// v5.2 P2-D 收口）。
 pub fn language_routable(lang: &str) -> bool {
     let l = lang.to_ascii_lowercase();
     if config::spec_source(&l) == Some("external") {
@@ -291,7 +302,8 @@ pub fn language_routable(lang: &str) -> bool {
 /// （[servers.csharp_ls] / [servers.omnisharp] / [servers.pyright] 注释先例：
 /// "X 语言路由归 Y 条目 / 手写 adapter 接管，本条仅按 id 显式安装"）——真语言
 /// 经家族门路由。entry_routable 的折算表；家族语言不可路由时条目仍如实 false
-/// （solargraph→ruby：.rb 无映射，两代都 false）。
+/// （matlab 自名无 LanguageId 即现例；solargraph→ruby 随 v5.2 P2-D .rb 收口翻
+/// true）。
 const VARIANT_ENTRY_FAMILY: &[(&str, &str)] = &[
     ("pyright", "python"),
     ("jedi", "python"),
@@ -410,6 +422,12 @@ pub fn adapter_for(lang: &str) -> Option<Arc<dyn LanguageServerAdapter>> {
         LanguageId::Toml | LanguageId::Terraform | LanguageId::Cue | LanguageId::Nix => {
             return None;
         }
+        // T0 配置驱动（blindtest v5.2 P2-D）：elixir (expert-lsp) 条目，ensure_launch
+        // 接管；扩展名 .ex/.exs/.heex 已收（v5.2 P2-D 拍板补全）。
+        LanguageId::Elixir => return None,
+        // T0 配置驱动（blindtest v5.2 P2-D）：ruby (ruby_lsp gem) 条目，同 elixir
+        // 模式 ensure_launch 接管；.rb 已收 EXT_TABLE。
+        LanguageId::Ruby => return None,
         // T0 配置驱动（W3 批）：php(phpactor/intelephense 双条目，--lang intelephense
         // 按 entry id 显式路由)/lua(LuaLS)/swift(sourcekit-lsp path_only) 走
         // servers.toml 条目，ensure_launch 接管。
@@ -978,8 +996,9 @@ mod tests {
     }
 
     /// blindtest v5 P1-1：routable 判据与安装态正交——installed 只代表缓存包在盘。
-    /// 可路由 = EXT_TABLE 扩展名路由（含 T0）或 T2 adapter；.rb/.m 无映射即 false
-    /// （对应 v5「包在盘但首答 unsupported extension」的 13/40 谎报面）。
+    /// 可路由 = EXT_TABLE 扩展名路由（含 T0）或 T2 adapter；.m 无映射即 false
+    /// （对应 v5「包在盘但首答 unsupported extension」的 13/40 谎报面；.rb 已于
+    /// v5.2 P2-D 收口）。
     #[test]
     fn language_routable_tracks_request_paths_not_install_state() {
         // T2 adapter 门。
@@ -987,7 +1006,7 @@ mod tests {
             assert!(language_routable(lang), "{lang}: T2 门可路由");
         }
         // T0 但 EXT_TABLE 有扩展名路由。
-        for lang in ["kotlin", "ada", "markdown", "sql"] {
+        for lang in ["kotlin", "ada", "markdown", "sql", "ruby"] {
             assert!(language_routable(lang), "{lang}: T0 扩展名路由可达");
         }
         // blindtest v5.1 P2-B：T0 --lang 显式路由（无扩展名映射、无 adapter）——
@@ -995,8 +1014,9 @@ mod tests {
         for lang in ["elixir", "pgsql", "mysql"] {
             assert!(language_routable(lang), "{lang}: T0 --lang 显式路由可达");
         }
-        // 无扩展名映射、无 adapter：包在盘也路由失败（v5 实锤类）。
-        for lang in ["ruby", "matlab", "solargraph", "unknown_lang_xx"] {
+        // 无扩展名映射、无 adapter：包在盘也路由失败（v5 实锤类；.rb v5.2 起已
+        // 映射挪出本名单）。
+        for lang in ["matlab", "solargraph", "unknown_lang_xx"] {
             assert!(!language_routable(lang), "{lang}: 必须判不可路由");
         }
         // 大小写归一。
@@ -1004,7 +1024,8 @@ mod tests {
     }
 
     /// blindtest v5 P1-1：条目级判据——T2 install-face 条目（languages 占位避撞）
-    /// 按家族语言折算；家族语言本身不可路由（ruby 系）则仍如实 false。
+    /// 按家族语言折算；家族语言不可路由时仍如实 false（现存示例 matlab——自名
+    /// 无 LanguageId；ruby 系 v5.2 P2-D 起 .rb 已映射，随家族翻 true）。
     #[test]
     fn entry_routable_folds_variant_entries_to_family_language() {
         let langs = |s: &str| vec![s.to_string()];
@@ -1024,10 +1045,11 @@ mod tests {
         assert!(entry_routable("elixir", &langs("elixir")));
         assert!(entry_routable("pgls", &langs("pgsql")));
         assert!(entry_routable("sqls-mysql", &langs("mysql")));
-        // ruby 家族不可路由（.rb 无 EXT_TABLE 映射）：包在盘也如实 false。
-        for id in ["solargraph", "ruby_lsp"] {
-            assert!(!entry_routable(id, &langs(id)), "{id}: ruby 家族不可路由");
-        }
+        // blindtest v5.2 P2-D：.rb 入 EXT_TABLE 后 ruby 家族翻可路由。ruby_lsp 的
+        // languages 本就是真语言 ["ruby"]（非变体）→ languages 门直通；solargraph
+        // 才是变体条目（languages 占位同 id，经家族折算）。
+        assert!(entry_routable("ruby_lsp", &langs("ruby")), "ruby_lsp: languages 直通");
+        assert!(entry_routable("solargraph", &langs("solargraph")), "solargraph: 家族折算");
         assert!(!entry_routable("matlab", &langs("matlab")));
         // 未知条目。
         assert!(!entry_routable("zz_entry_xx", &langs("zz_entry_xx")));

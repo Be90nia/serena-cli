@@ -73,10 +73,15 @@ fn resolve_all_m3_languages() {
 fn resolve_unknown_extension_is_none() {
     // 真正未知后缀（不在 EXT_TABLE 里）。（曾用 foo.lua 当未知样本，W3 批收编
     // lua 后换 foo.rkt——rb/zig 无 LanguageId 值仍走 None，语义不变。W4 批收编
-    // zig/zon 后 zig 样本再迁 foo.nim——迁移轨迹即语言收编史。）
+    // zig/zon 后 zig 样本再迁 foo.nim——迁移轨迹即语言收编史。v5.2 P2-D 收编
+    // .rb → Ruby，样本随之迁出未知名单。）
     assert_eq!(ls_registry::resolve(Path::new("foo.rkt")), None);
-    assert_eq!(ls_registry::resolve(Path::new("foo.rb")), None);
     assert_eq!(ls_registry::resolve(Path::new("foo.nim")), None);
+    // .rb 正向断言（v5.2 P2-D：ruby_lsp gem 门扩展名路由）。
+    assert_eq!(
+        ls_registry::resolve(Path::new("foo.rb")),
+        Some(LanguageId::Ruby)
+    );
 }
 
 #[test]

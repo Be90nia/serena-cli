@@ -118,10 +118,20 @@ pub enum LanguageId {
     /// T0 配置驱动（W1a 批，servers.toml cue 条目 = cue CLI 内置 LSP，Δ 收录：
     /// 上游无独立 cue 适配器，v0.16.1 cmd/cue/cmd/lsp.go 实锚 `cue lsp`）。
     Cue,
-    /// T0 配置驱动（W1a 批，servers.toml nixd 条目 = source 构建形态）。
+    /// T0 配置驱动（servers.toml nixd 条目 = source 构建形态）。
     /// ↖ mirror: nixd_ls.py@43ae0211（上游同样要求 Nix 工具链；release 无预编译
     /// 资产，CI 冒烟 HOST skip）。
     Nix,
+    /// T0 配置驱动（servers.toml elixir 条目 = expert-lsp expert 二进制）。
+    /// ↖ mirror: elixir_tools/elixir_tools.py@7a296833。扩展名 .ex/.exs/.heex
+    /// 三大主流（.eex/.leex/.iex/.credo.exs 等不收，Helix/treesitter-elixir
+    /// 上游同口径）。expert-lsp 与 elixir-ls 同款官方 languageId "elixir"
+    /// （LSP 官方口径，恒等走 lsp_language_id 默认臂）。
+    Elixir,
+    /// T0 配置驱动（servers.toml ruby_lsp 条目 = ruby-lsp gem；blindtest v5.2
+    /// P2-D 补 .rb 扩展名路由，先例同 elixir）。官方 languageId "ruby"（恒等走
+    /// lsp_language_id 默认臂）；solargraph 变体条目仍仅 --lang 显式路由。
+    Ruby,
     /// T2 手写 hybrid 双服务器适配器（W2 批，svelte.rs，上游 7a296833）：主
     /// svelteserver + 伴生 typescript-language-server 挂 typescript-svelte-plugin，
     /// 扩展名 .svelte。
@@ -319,6 +329,8 @@ impl LanguageId {
             Self::Terraform => "terraform",
             Self::Cue => "cue",
             Self::Nix => "nix",
+            Self::Elixir => "elixir",
+            Self::Ruby => "ruby",
             Self::Svelte => "svelte",
             Self::Deno => "deno",
             Self::Sass => "sass",
@@ -396,6 +408,8 @@ impl LanguageId {
             "terraform" => Some(Self::Terraform),
             "cue" => Some(Self::Cue),
             "nix" => Some(Self::Nix),
+            "elixir" => Some(Self::Elixir),
+            "ruby" => Some(Self::Ruby),
             "svelte" => Some(Self::Svelte),
             "deno" => Some(Self::Deno),
             "sass" => Some(Self::Sass),
@@ -487,6 +501,15 @@ impl LanguageId {
             "tf" | "tfvars" => Some(Self::Terraform),
             "cue" => Some(Self::Cue),
             "nix" => Some(Self::Nix),
+            // blindtest v5.2 P2-D：elixir LS (expert-lsp) 实拉起 + insert/diag 走通，
+            // 但 .ex/.exs 扩展名未 EXT_TABLE .language_by_ext 收口——resolve 落 BAD_ARGS
+            // "unsupported extension"。补 .ex/.exs/.heex（Helix 上游对三家 elixir-ls
+            // 与 expert-lsp 兼容扩展清单，无 .m / .lua 等存量冲突）。
+            "ex" | "exs" | "heex" => Some(Self::Elixir),
+            // blindtest v5.2 P2-D：ruby_lsp 条目 languages=["ruby"]，.rb 此前无映射
+            // → resolve 落 BAD_ARGS "unsupported extension"（.rb/.m 类反向失真）。
+            // 只收 .rb 主形态（.rake/.gemspec 等派生后缀不收，M3 主线子集口径）。
+            "rb" => Some(Self::Ruby),
             // pgsql/mysql（bd 56a）无专属扩展名：.sql 归 Sql 门（上游 get_priority
             // superset 的默认归属语义），本两门经 --lang pgsql|mysql 显式路由。
             // W3 批：php/lua/scala/swift 各自独占扩展名（.phtml 等上游 intelephense
@@ -625,6 +648,11 @@ fn probe_extensions(lang: &LanguageId) -> &'static [&'static str] {
         LanguageId::Terraform => &["tf", "tfvars"],
         LanguageId::Cue => &["cue"],
         LanguageId::Nix => &["nix"],
+        // blindtest v5.2 P2-D：elixir 探针用 .ex（实际项目里 Elixir 必有 lib/foo.ex，
+        // mix 项目必生 lib 树）；.exs/.heex 模板不收（MIX_ENV=test 时 .exs 也常驻）。
+        LanguageId::Elixir => &["ex"],
+        // ruby-lsp 探针用 .rb（Ruby 项目必有 lib/*.rb 或 bin/*）；.rake/.gemspec 不收。
+        LanguageId::Ruby => &["rb"],
         LanguageId::Svelte => &["svelte"],
         // deno：TS 家族扩展名不抢 → 探针候选名单（.gitignore/README 等）兜底。
         LanguageId::Deno => &[],

@@ -3405,6 +3405,64 @@ fn cache_versions(id_dir: &Path) -> Vec<(String, PathBuf, u64)> {
     v
 }
 
+/// blindtest v5.2 E：ls-list 状态判定收敛一处。优先级 external-override >
+/// installed-incomplete > installed-unroutable > installed > not-installed——
+/// 完整性（产物齐全）优先于可路由：半装且 unroutable 的条目（solargraph/matlab
+/// 等）也要暴露 missing，否则用户连重装指引都看不到；installed-unroutable 的
+/// "无路由"语义只在产物齐全时才有意义。
+fn ls_list_state(
+    overridden: bool,
+    has_versions: bool,
+    artifact_missing: Option<String>,
+    routable: bool,
+) -> (&'static str, Option<String>) {
+    if overridden {
+        ("external-override", None)
+    } else if has_versions {
+        match artifact_missing {
+            Some(m) => ("installed-incomplete", Some(m)),
+            None if !routable => ("installed-unroutable", None),
+            None => ("installed", None),
+        }
+    } else {
+        ("not-installed", None)
+    }
+}
+
+#[cfg(test)]
+mod ls_list_state_tests {
+    use super::*;
+
+    /// blindtest v5.2 E：状态优先级钉死——完整性（产物齐全）优先于可路由。
+    #[test]
+    fn completeness_outranks_routability() {
+        let m = || Some("missing runtime `x` not on PATH: hint".to_string());
+        // external-override 最高（外部接管条目不谈完整性）。
+        assert_eq!(
+            ls_list_state(true, true, m(), false),
+            ("external-override", None)
+        );
+        // 半装且 unroutable → installed-incomplete + missing（v5.2 翻转：此前
+        // unroutable 吃掉 missing，用户看不到重装指引）。
+        assert_eq!(
+            ls_list_state(false, true, m(), false),
+            ("installed-incomplete", m())
+        );
+        // 产物齐 + unroutable → installed-unroutable。
+        assert_eq!(
+            ls_list_state(false, true, None, false),
+            ("installed-unroutable", None)
+        );
+        // 产物齐 + routable → installed。
+        assert_eq!(ls_list_state(false, true, None, true), ("installed", None));
+        // 缓存目录都不在 → not-installed（missing 未探测也如实）。
+        assert_eq!(
+            ls_list_state(false, false, None, true),
+            ("not-installed", None)
+        );
+    }
+}
+
 /// ls-list：内置表全条目 × 实装状态（installed / installed-incomplete（v5.1 P2-A：
 /// 版本目录在盘但关键产物缺失，missing 字段列缺口）/ installed-unroutable（v5 P1-1：
 /// 包在盘但无请求路由）/ external-override / not-installed）+ 每条 routable 标志
@@ -3441,24 +3499,17 @@ fn cmd_ls_list(table: bool) -> ExitCode {
         // （adapter / EXT_TABLE / external 注册 / 避撞变体的家族语言 / T0 --lang 显式
         // 路由），判据源 ls_registry::entry_routable。
         let routable = overridden || ls_registry::entry_routable(id, &languages);
-        // blindtest v5.1 P2-A：版本目录在盘 ≠ 可拉起——半包（目录空/仅 lock/缺声明
-        // 入口/二进制不在 PATH）首答 LS_NOT_INSTALLED 的 9/12 抽验失真实锤。完整性
-        // 判定复用 ensure_launch 同层探测，state 与首答同一张嘴；unroutable 优先
-        // （无路由时完整性无从谈起，v5 诚实态语义不变）。
-        let (state, missing) = if overridden {
-            ("external-override", None)
-        } else if !versions.is_empty() && !routable {
-            // 诚实态：包在盘但无路由（.rb/.m 类）——避免「installed 实际不可用」
-            // 的 13/40 谎报面。
-            ("installed-unroutable", None)
-        } else if !versions.is_empty() {
-            match ls_registry::config::launch_artifact_missing(id) {
-                Some(m) => ("installed-incomplete", Some(m)),
-                None => ("installed", None),
-            }
+        // blindtest v5.1 P2-A：版本目录在盘 ≠ 可拉起——完整性判定复用 ensure_launch
+        // 同层探测（auto_install=false 纯 fs/PATH 探测，不触网不 spawn），state 与
+        // 首答同一张嘴。判定收敛进 ls_list_state 纯函数（v5.2 E：优先级 + 回归测
+        // 单一锚点）；探测保持惰性——versions 空的条目不跑 ensure_launch。
+        let artifact_missing = if versions.is_empty() {
+            None
         } else {
-            ("not-installed", None)
+            ls_registry::config::launch_artifact_missing(id)
         };
+        let (state, missing) =
+            ls_list_state(overridden, !versions.is_empty(), artifact_missing, routable);
         let mut entry = json!({
             "id": id,
             "languages": languages,
@@ -3820,7 +3871,8 @@ fn apply_external_registrations(report: &mut supervisor::doctor::DoctorReport) {
 }
 
 /// blindtest v5 P1-1：installed-unroutable 解释行——包已装但无请求路由的条目
-/// （.rb/.m 类），doctor 不解释则「installed」与运行时 BAD_ARGS 三方相悖
+/// （.m 类；.rb 已于 v5.2 P2-D 收口），doctor 不解释则「installed」与运行时
+/// BAD_ARGS 三方相悖
 /// （serena-rust-9z0x 同款三方一致性问题）。doctor 的 ls 检查 id 是二进制名/
 /// 规格 id 精选集，非全目录逐条——聚合单行覆盖全部 unroutable 条目。
 fn annotate_unroutable_installed(report: &mut supervisor::doctor::DoctorReport) {
