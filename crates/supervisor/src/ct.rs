@@ -252,7 +252,7 @@ pub(crate) async fn ct_impact(
             detail: "symbol must not be empty".into(),
         });
     }
-    let (items, _) = sup.tool_find_symbol(root, symbol, 20, None).await?;
+    let (items, _, _) = sup.tool_find_symbol(root, symbol, 20, None).await?;
     let Some(hit) = items.iter().find(|i| i.name == symbol) else {
         return Err(ToolError::BadArgs {
             detail: format!("symbol `{symbol}` not found by workspace/symbol"),
@@ -549,7 +549,7 @@ pub(crate) async fn def_hit(
     root: &Path,
     symbol: &str,
 ) -> Result<DefHit, ToolError> {
-    let (items, _) = sup.tool_find_symbol(root, symbol, 20, None).await?;
+    let (items, _, _) = sup.tool_find_symbol(root, symbol, 20, None).await?;
     let Some(hit) = items.iter().find(|i| i.name == symbol) else {
         return Err(ToolError::BadArgs {
             detail: format!("symbol `{symbol}` not found by workspace/symbol"),
@@ -1061,7 +1061,7 @@ pub(crate) async fn ct_pick(
     let mut query_errors: Vec<String> = Vec::new();
     for q in &queries {
         match sup.tool_find_symbol(root, q, PICK_QUERY_LIMIT, None).await {
-            Ok((items, _)) => {
+            Ok((items, _, _)) => {
                 for h in items {
                     let name = h.name.clone();
                     let file = crate::uri_to_path(&h.uri)
@@ -1245,7 +1245,7 @@ pub(crate) async fn ct_define_feature(
             detail: "name must not be empty".into(),
         });
     }
-    let (items, _) = sup.tool_find_symbol(root, name, 10, None).await?;
+    let (items, _, _) = sup.tool_find_symbol(root, name, 10, None).await?;
     if let Some(hit) = items.iter().find(|i| i.name == name) {
         let Some(path) = crate::uri_to_path(&hit.uri) else {
             return Err(ToolError::BadArgs {
@@ -1289,7 +1289,9 @@ pub(crate) async fn ct_define_feature(
             "name": name,
             "exists": false,
             "stub": { "written": false, "content": rust_stub(name) },
-            "stub_note": "no target file; caller writes via create-text-file",
+            // 批2-F：文案对齐实际行为——本步不落盘；落盘方是 recipe add-feature
+            // 的 write-stub 步（--target），或调用方自选途径，并非固定 create-text-file。
+            "stub_note": "stub not written; content is in stub.content — recipe add-feature writes it to --target, otherwise create the file yourself",
         }));
     };
     if !target.ends_with(".rs") {

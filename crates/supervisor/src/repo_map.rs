@@ -37,6 +37,36 @@ pub struct RepoMapReport {
 /// 文件数保险丝（万级文件目录不拖垮扫描；与 symbol-tree 同量级）。
 const CANDIDATE_SCAN_LIMIT: usize = 5000;
 
+/// 批1-D：repo-map 只计"真符号" kind（API 面）。参数/局部变量（pyright documentSymbol
+/// 报 Variable）与文件/字面量 kind 是纯字节噪音（盲测 v4.5 实锤 `items` 参数计入
+/// top 符号）。匹配 wire kind 字符串的小写形态（SymbolKindTag 序列化首字母大写 +
+/// text_scan 兜底路径小写，两侧同表）。
+const REPO_MAP_SYMBOL_KINDS: &[&str] = &[
+    "function",
+    "method",
+    "class",
+    "struct",
+    "impl",
+    "interface",
+    "trait",
+    "enum",
+    "enummember",
+    "module",
+    "namespace",
+    "package",
+    "constant",
+    "constructor",
+    "property",
+    "field",
+    "type",
+];
+
+/// 批1-D：kind 是否为可计入 top 的真符号（空 kind / Variable / 字面量 / 未知码全排除）。
+fn is_real_symbol_kind(kind: &str) -> bool {
+    let k = kind.to_ascii_lowercase();
+    REPO_MAP_SYMBOL_KINDS.contains(&k.as_str())
+}
+
 /// repo-map 主入口。`lang = None` → 走 multi-lang 自动探测。
 pub async fn build(
     sup: &Supervisor,
@@ -91,15 +121,21 @@ fn flatten_symbols(tree: Option<serde_json::Value>) -> Vec<RepoMapEntry> {
             else {
                 continue;
             };
+            let kind = s
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // 批1-D：参数/局部变量等非 API 面 kind 不进符号地图（top_n 截断前排除，
+            // 否则白烧字节后才丢）。
+            if !is_real_symbol_kind(&kind) {
+                continue;
+            }
             out.push(RepoMapEntry {
                 name: name.to_string(),
                 container: s.get("container").and_then(|v| v.as_str()).map(String::from),
                 file: file.to_string(),
-                kind: s
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                kind,
             });
         }
     }
@@ -307,7 +343,8 @@ mod tests {
         assert_eq!((alpha.file.as_str(), alpha.kind.as_str()), ("a.rs", "function"));
     }
 
-    /// flatten：entries[].symbols[] 拉平、空名剔除、tree=None 空。
+    /// flatten：entries[].symbols[] 拉平、空名剔除、tree=None 空；批1-D 非真符号
+    /// kind（Variable=pyright 参数/局部变量、字面量、未知码）不进符号地图。
     #[test]
     fn flatten_symbols_pairs_file_with_symbols() {
         let tree = serde_json::json!({
@@ -317,16 +354,38 @@ mod tests {
                     {"name": "meth", "kind": "method", "container": "alpha"},
                 ]},
                 {"file": "b.rs", "symbols": [{"name": "", "kind": "unknown"}]},
+                {"file": "c.py", "symbols": [
+                    {"name": "items", "kind": "Variable", "container": "parse"},
+                    {"name": "self", "kind": "variable", "container": "parse"},
+                ]},
             ]
         });
         let out = flatten_symbols(Some(tree));
-        assert_eq!(out.len(), 2, "空名剔除: {out:?}");
+        assert_eq!(out.len(), 2, "空名剔除 + 非真符号 kind 过滤: {out:?}");
         assert_eq!(out[0].file, "a.rs");
         assert_eq!(out[0].name, "alpha");
         assert!(out[0].container.is_none());
         assert_eq!(out[1].container.as_deref(), Some("alpha"));
+        assert!(
+            out.iter().all(|e| e.name != "items" && e.name != "self"),
+            "参数/局部变量（Variable kind）不得入图: {out:?}"
+        );
         assert!(flatten_symbols(None).is_empty());
         assert!(flatten_symbols(Some(serde_json::json!({"entries": []}))).is_empty());
+    }
+
+    /// 批1-D：真符号 kind 词表覆盖 wire 首字母大写与 text_scan 小写两侧形态。
+    #[test]
+    fn real_symbol_kind_accepts_api_surface_only() {
+        for k in ["Function", "Method", "Class", "Struct", "Module", "Interface", "Enum"] {
+            assert!(is_real_symbol_kind(k), "API 面 kind 应放行: {k}");
+        }
+        for k in ["function", "trait", "impl", "enummember", "constant", "type"] {
+            assert!(is_real_symbol_kind(k), "text_scan 小写 kind 应放行: {k}");
+        }
+        for k in ["Variable", "variable", "Parameter", "File", "String", "", "Other(99)", "unknown"] {
+            assert!(!is_real_symbol_kind(k), "噪音 kind 应排除: {k:?}");
+        }
     }
 
     /// 修饰符剥离顺序：带括号形态先于裸词（否则 pub 先剥掉 pub(crate) 前缀）。

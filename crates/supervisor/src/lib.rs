@@ -115,6 +115,36 @@ pub fn effective_index_timeout(lang: Option<&str>, args: &serde_json::Value) -> 
     Duration::from_millis(ms as u64)
 }
 
+/// 批2-F：recipe 步进度行的边带文件（temp 目录单文件；单机单 daemon :7860
+/// 不撞）。daemon 模式下 supervisor 的 eprintln 落 daemon stderr（默认 NULL），
+/// CLI 转发 recipe 请求期间中继该文件增量到本进程 stderr——长步不再哑语。
+pub const RECIPE_PROGRESS_FILE: &str = "serena-recipe-progress.log";
+
+/// 批2-A：语义工具渐进首答——重量级语义请求的就绪等待上限（find-symbol 的
+/// workspace/symbol）。120s 死等改为默认 15s：15s 内 LS 答复 → 全量结果无降级；
+/// 超时 → 降级返回（degraded/warmup 标记 + 人话 warning），AI 不再把首答当挂死。
+/// 三层合并对齐 [`effective_index_timeout`]：`args._warmup_ms`（CLI
+/// `--warmup-timeout`）> `SERENA_WARMUP_TIMEOUT_MS` > 默认。
+pub const WARMUP_BUDGET_DEFAULT: Duration = Duration::from_secs(15);
+
+pub fn effective_warmup_budget(lang: Option<&str>, args: &serde_json::Value) -> Duration {
+    if let Some(ms) = args
+        .get("_warmup_ms")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+    {
+        return Duration::from_millis(ms as u64);
+    }
+    let _ = lang; // 预留 per-LS 覆盖（servers.toml warmup_ms），当前无消费者。
+    parse_warmup_env().unwrap_or(WARMUP_BUDGET_DEFAULT)
+}
+
+fn parse_warmup_env() -> Option<Duration> {
+    let raw = std::env::var("SERENA_WARMUP_TIMEOUT_MS").ok()?;
+    let ms = raw.trim().parse::<u64>().ok()?;
+    Some(Duration::from_millis(ms))
+}
+
 /// 写类工具（rename / replace-body）入口的索引等待上限，与 on_server_ready 的 30s
 /// 对齐（PLAN Phase 3.2）。超时只 warn 不阻断 —— 工具自身请求负责最终报错。
 const INDEX_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -483,6 +513,11 @@ pub struct Supervisor {
     /// 索引爬升波动（实测 9→4→6+），经既有 warning 通道透出 partial 信号。
     /// 键用 key_root_identity 归一（Windows 大小写双重身份惯例）。
     ls_warmup: Mutex<HashMap<String, LsWarmup>>,
+    /// 批2-A：语义工具渐进首答的就绪等待上限（ms）。execute_tool 入口按
+    /// [`effective_warmup_budget`] 刷新（args._warmup_ms / env / 15s 默认）；
+    /// recipe/ct 内部嵌套调用无 args 上下文，读此处当前值即本次请求的预算。
+    /// Atomic：Arc 共享下的跨请求覆盖竞态无害（进程级配置，非请求级状态）。
+    warmup_budget_ms: AtomicU64,
 }
 
 /// 单 root 的 LS 暖机记账。
@@ -660,6 +695,7 @@ impl Supervisor {
             idle_buffers_reclaim_counter: AtomicU64::new(0),
             cache_hit_counter: AtomicU64::new(0),
             ls_warmup: Mutex::new(HashMap::new()),
+            warmup_budget_ms: AtomicU64::new(WARMUP_BUDGET_DEFAULT.as_millis() as u64),
             #[cfg(test)]
             _idle_ttl_override: std::sync::Arc::new(Mutex::new(None)),
         })
@@ -2373,6 +2409,11 @@ impl Supervisor {
         }
     }
 
+    /// 批2-A：本次请求的语义就绪等待预算（execute_tool 入口刷新）。
+    fn warmup_budget(&self) -> Duration {
+        Duration::from_millis(self.warmup_budget_ms.load(Ordering::Relaxed))
+    }
+
     /// 语义层曾非空成功（任一语义工具）→ 引用类空结果可信（真·无 caller）。
     fn semantic_ok(&self, root: &Path) -> bool {
         self.ls_warmup
@@ -2976,14 +3017,18 @@ impl Supervisor {
     /// 见 `combined_all_failed_error`）；部分成功 → hits 只含成功 lang，
     /// warnings 逐条描述失败 lang（execute_tool 落到结果顶层 `warning` 键）。
     ///
-    /// 索引可能慢（>10s），用 `INDEX_TIMEOUT` 而不是 `TOOL_TIMEOUT`。
+    /// 批2-A 第三元素 = 降级标记：`Some(SemanticPending)`（预算内无 lang 答复，
+    /// 空结果不可信）/ `Some(Partial)`（部分 lang 未答，结果不完整）；None = 全量。
+    ///
+    /// 索引可能慢（>10s）：请求 timeout 走 `warmup_budget()`（批2-A 默认 15s，
+    /// 可配置），不再是 120s 死等——超时即降级返回，AI 不把首答当挂死。
     pub async fn tool_find_symbol(
         &self,
         root: &Path,
         query: &str,
         limit: usize,
         lang_override: Option<&str>,
-    ) -> ToolResult<(Vec<SymbolHit>, Vec<String>)> {
+    ) -> ToolResult<(Vec<SymbolHit>, Vec<String>, Option<Degraded>)> {
         use std::collections::BTreeSet;
 
         if query.is_empty() {
@@ -3003,8 +3048,8 @@ impl Supervisor {
         if let Some(mut cached) = self.symbol_cache_get(&cache_key) {
             cached.truncate(limit);
             // 命中路径不过 session_for；带 warning 的结果本就不写缓存（见下），
-            // 命中即全成功快照 → warnings 恒空。
-            return Ok((cached, Vec::new())); // cache_hit
+            // 命中即全成功快照 → warnings/degraded 恒空。
+            return Ok((cached, Vec::new(), None)); // cache_hit
         }
 
         // 决定要查的 lang 集合 (BTreeSet = 字母序, 顺序稳定)。命中缓存时直接复用 walked_langs。
@@ -3036,6 +3081,7 @@ impl Supervisor {
             return Err(combined_all_failed_error(failures));
         }
         let query = query.to_string();
+        let budget = self.warmup_budget();
         let mut tasks = Vec::with_capacity(sessions.len());
         for session in sessions {
             let q = query.clone();
@@ -3044,35 +3090,56 @@ impl Supervisor {
                 // 审计 P1-2：workspace/symbol 在 classify_method 归 Background
                 // （重量级索引），但本工具是用户主动搜索 —— 必须显式 High，
                 // 否则落在 TokenBucket 限流 + BG 路径，与设计注释承诺相悖。
+                // 批2-A：timeout = warmup 预算；超时不再吞成空结果，按类别上抛
+                //（timeout → 降级标记；其他错误 → 部分失败可见）。
                 let resp: Vec<lsp_types::SymbolInformation> = match session
                     .request_at(
                         "workspace/symbol",
                         params,
-                        INDEX_TIMEOUT,
+                        budget,
                         lsp_core::client::Priority::High,
                     )
                     .await
                 {
                     Ok(r) => r,
-                    Err(_) => return Vec::<SymbolHit>::new(),
+                    Err(e) => {
+                        return (
+                            Vec::<SymbolHit>::new(),
+                            Some(matches!(e, CoreError::Timeout { .. })),
+                        );
+                    }
                 };
-                resp.into_iter()
-                    .map(|si| SymbolHit {
-                        name: si.name,
-                        kind: kind_from_lsp(&si.kind),
-                        uri: si.location.uri.to_string(),
-                        range: si.location.range,
-                        container: si.container_name,
-                    })
-                    .collect()
+                (
+                    resp.into_iter()
+                        .map(|si| SymbolHit {
+                            name: si.name,
+                            kind: kind_from_lsp(&si.kind),
+                            uri: si.location.uri.to_string(),
+                            range: si.location.range,
+                            container: si.container_name,
+                        })
+                        .collect(),
+                    None,
+                )
             }));
         }
         let mut merged: Vec<SymbolHit> = Vec::new();
+        let mut timed_out = 0usize;
+        let mut errored = 0usize;
         for t in tasks {
-            if let Ok(v) = t.await {
+            if let Ok((v, err)) = t.await {
+                match err {
+                    Some(true) => timed_out += 1,
+                    Some(false) => errored += 1,
+                    None => {}
+                }
                 merged.extend(v);
             }
         }
+        // 批1-C：workspace/symbol 出界过滤（先于对齐/缓存，保证缓存是净快照）。
+        // 实锤：tsserver inferred project 对无 tsconfig workspace 沿父链解析
+        // node_modules/@types，单字母查询 50 条 100% 落 home（盲测 v4.5）。
+        let filtered_out = Self::retain_symbols_within_root(&mut merged, root);
         // bd qvv9（AI-6）：部分失败 warning 的取舍 —— 查询已被其它 lang 回答
         // （merged 非空）时，NotInstalled 的安装广告是纯噪声（169B/call，盲测 18%
         // 调用全噪声）；空结果时 warning 解释「为什么空」（x67 可见性语义保留）。
@@ -3086,6 +3153,19 @@ impl Supervisor {
         } else {
             Vec::new()
         };
+        // 批2-A：就绪预算内未答复的 lang → 结构化降级（契约：15s 内就绪 → 全量
+        // 无标记；超时 → 降级返回）。空结果 + 超时/请求错误 = semantic-pending
+        // （明确告知「未就绪/不可信」而非「无符号」，禁把 pending 伪装成权威空——
+        // 冷启动窗口 LS 也可能以 Rpc 错误快速回绝而非挂到超时，同样不可信）；
+        // 有部分结果 = partial。判定提取纯函数供单测。
+        let degraded = classify_find_symbol_degraded(timed_out, errored, !merged.is_empty());
+        if timed_out > 0 {
+            warnings.push(semantic_warming_warning());
+        } else if errored > 0 {
+            warnings.push(format!(
+                "workspace/symbol request failed on {errored} language server(s); results may be incomplete"
+            ));
+        }
         // 空结果路径不写缓存：warning 只在本次调用产生（命中路径不过 session_for，
         // 无法重现），缓存会让重查静默丢失败信息 —— 宁重查不可错缓存。非空结果
         // （qvv9 过滤后 warnings 恒空）正常入缓存。
@@ -3106,8 +3186,29 @@ impl Supervisor {
         if warnings.is_empty() && self.index_warming_warnings(root).is_empty() {
             self.symbol_cache_put(cache_key, merged.clone()); // cache_miss → 写入（截断前全量）
         }
+        // 批1-C：过滤计数在缓存判定之后才转 warning —— 出界过滤是常态信息
+        // （无 tsconfig 的 TS workspace 每查必现），进缓存门会让命中集永不入缓存。
+        if filtered_out > 0 {
+            warnings.push(format!(
+                "filtered {filtered_out} symbol hits outside project root (LS leaked beyond workspace); \
+                 narrow with --lang or a more precise query"
+            ));
+        }
         merged.truncate(limit);
-        Ok((merged, warnings))
+        Ok((merged, warnings, degraded))
+    }
+
+    /// 批1-C：workspace/symbol 出界过滤。AI 消费者语义 = 符号查询只返回用户
+    /// project root 内结果；uri_to_path 已归一盘符大小写，`Path::starts_with`
+    /// 在 Windows 上组件比较天然不敏感。uri 反解失败（非 file://）保守保留。
+    /// 返回过滤条数（调用方转 warning，不静默）。
+    fn retain_symbols_within_root(hits: &mut Vec<SymbolHit>, root: &Path) -> usize {
+        let before = hits.len();
+        hits.retain(|h| match uri_to_path(&h.uri) {
+            Some(p) => p.starts_with(root),
+            None => true,
+        });
+        before - hits.len()
     }
 
     /// workspace/symbol 结果与磁盘的一致性对齐（bd serena-rust-0em B 层）。
@@ -3534,7 +3635,7 @@ impl Supervisor {
         if exact.is_empty() && prefix.is_empty() {
             for attempt in 0..2 {
                 match self.tool_find_symbol(root, name, 50, lang).await {
-                    Ok((hits, _)) => {
+                    Ok((hits, _, _)) => {
                         for h in &hits {
                             let Some(path) = uri_to_path(&h.uri) else {
                                 continue;
@@ -4014,9 +4115,9 @@ impl Supervisor {
     ///
     /// 设计要点（Task 19）：
     /// - 走 `ignore` crate：自动尊重 `.gitignore` / `.ignore` / global ignores
-    /// - 默认排除 binary / >5MB 大文件（合理启发）
+    /// - 默认排除 binary / >1MB 大文件（批1-B 防噪启发）
     /// - `path_glob`：可选 glob 过滤（如 `"*.cpp"` `"src/**/*.py"`）
-    /// - `max_results` 默认 100：超过返回 truncated 标记
+    /// - `max_results` 默认 50（批1-B 防噪硬上限）：超过返回 truncated + hint 标记
     /// - 不动 LS —— 这是 fs 工具，不需要 LSP
     // 与 tool_format_range/symbol_tree 等同款：tool 层透传形参天然偏宽，逐调用点
     // 结构化反而加一层；allow 为既定 house pattern。
@@ -4071,6 +4172,8 @@ impl Supervisor {
             hits,
             truncated,
             files_scanned,
+            // 批1-B：截断即给降噪 hint（旗标语义不变，防裸打脏目录 12.8KB 复演）。
+            hint: truncated.then(|| SEARCH_NOISE_HINT.to_string()),
         })
     }
 
@@ -4137,7 +4240,8 @@ impl Supervisor {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if metadata.len() > 5 * 1024 * 1024 {
+            // 批1-B：>1MB 跳过（盲测实锤大文件是字节坑；ripgrep 默认大文件不搜）。
+            if metadata.len() > 1024 * 1024 {
                 continue;
             }
 
@@ -4146,6 +4250,11 @@ impl Supervisor {
                 Ok(c) => c,
                 Err(_) => continue,
             };
+            // 批1-B：合法 UTF-8 但含 NUL 字节 = 二进制，跳过（ripgrep 同款判定；
+            // 非 UTF-8 文件已被上面的 read Err 路径排除）。
+            if content.as_bytes().contains(&0) {
+                continue;
+            }
 
             for (line_idx, line) in content.lines().enumerate() {
                 if truncated {
@@ -4958,12 +5067,19 @@ pub struct SearchHit {
     /// 覆盖符号的容器名（如 method 所在 class/impl；顶层符号为 None）。
     pub container: Option<String>,
 }
+/// 批1-B：裸 search 无护栏时脏目录可吞 12.8KB（盲测 v4.5）——默认上限截断时
+/// 响应带此 hint 指路降噪旗标。
+const SEARCH_NOISE_HINT: &str = "add --path-glob / --max-results";
+
 /// 搜索响应。
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
     pub truncated: bool,
     pub files_scanned: usize,
+    /// 批1-B：默认上限截断时的降噪 hint（None 不序列化，旧 wire 零扰动）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// 拍平 `DocumentSymbolResponse` → `Vec<SymbolHit>`。
@@ -5830,6 +5946,80 @@ pub fn attach_warning(value: &mut serde_json::Value, warnings: &[String]) {
     }
 }
 
+/// 批2-A：语义工具渐进首答的降级标记（wire additive 字段）。`semantic-pending`
+/// 明确告知「语义层未就绪」而非「权威空结果」（禁把 pending 伪装成真空）；
+/// `partial` 表示语义层部分结果。（syntax-only 标记位留给未来的 documentSymbol
+/// 替代层——本票无产生路径，不设死变体。）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Degraded {
+    /// 语义层部分结果（部分 lang 未就绪/超时）。
+    Partial,
+    /// 语义层未就绪，空结果不可信（hover/def/find-symbol 超时路径）。
+    SemanticPending,
+}
+
+impl Degraded {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::SemanticPending => "semantic-pending",
+        }
+    }
+}
+
+/// warmup 结构化标记（wire additive）：stage 固定 indexing；progress 在 lsp-core
+/// 索引跟踪提供百分比粒度前恒 null（现有 IndexProgressTracker 只有在飞计数，
+/// 无 0-1 进度——契约允许 null）；retry_after_warm 恒 true（降级结果可重查）。
+fn warmup_marker_json() -> serde_json::Value {
+    serde_json::json!({
+        "stage": "indexing",
+        "progress": null,
+        "retry_after_warm": true,
+    })
+}
+
+/// 降级响应组装：顶层插 `degraded`（字符串标记）+ `warmup`（结构化标记）。
+/// 调用时序约定在 attach_warning 之后——warning 非空已把裸 null/标量/数组升级
+/// 为对象形态，此处对象直插键；非对象（调用方未先 attach_warning）按同型升级，
+/// 保证字段总能落到 wire。
+pub(crate) fn attach_degraded(value: &mut serde_json::Value, degraded: Degraded) {
+    let d = serde_json::Value::String(degraded.as_str().to_string());
+    let warmup = warmup_marker_json();
+    if value.is_object() {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("degraded".to_string(), d);
+            obj.insert("warmup".to_string(), warmup);
+        }
+    } else {
+        let items = std::mem::take(value);
+        *value = serde_json::json!({ "items": items, "degraded": d, "warmup": warmup });
+    }
+}
+
+/// 降级场景的人话 warning（契约文案）：告诉 AI 不是挂死、不是真空，给出自救路径。
+pub(crate) fn semantic_warming_warning() -> String {
+    "semantic index warming; results are partial — run `wait-ready --stage indexing` or retry in ~30s"
+        .to_string()
+}
+
+/// 批2-A：find-symbol 降级分类。任一 lang 超时或请求错误 → 全量性破坏：
+/// 有结果 = partial；空结果 = semantic-pending（空不可信，无论 LS 是挂满预算
+/// 还是快速回错）。全部 lang 正常答复 → None（全量，无标记）。
+fn classify_find_symbol_degraded(
+    timed_out: usize,
+    errored: usize,
+    has_hits: bool,
+) -> Option<Degraded> {
+    if timed_out == 0 && errored == 0 {
+        return None;
+    }
+    Some(if has_hits {
+        Degraded::Partial
+    } else {
+        Degraded::SemanticPending
+    })
+}
+
 /// LS 报告的 window 消息是否为 workspace 加载失败（bd serena-rust-xzb）。
 /// 特征词取自 cargo/RA 的真实错误文本：
 /// - RA load_workspace 失败经 window/showMessage 转发的 `FetchWorkspaceError(...)`；
@@ -6216,14 +6406,15 @@ fn extract_install_hint(msg: &str) -> String {
         .to_string()
 }
 
-/// Phase 4 基建 Task 22b：从 args 中移除 `_timeout_ms` / `_index_timeout_ms` 私有字段，
-/// 返回清理后的 args clone。`execute_tool` 入口调用，避免污染后续 `required_file` 等
+/// Phase 4 基建 Task 22b：从 args 中移除 `_timeout_ms` / `_index_timeout_ms` / `_warmup_ms`
+/// 私有字段，返回清理后的 args clone。`execute_tool` 入口调用，避免污染后续 `required_file` 等
 /// 私有 helper（它们只看业务字段如 `file`/`line`，忽略下划线前缀；清掉是为了
 /// JSONL 反序列化时 `_timeout_ms` 不会泄漏到 tool 输出）。
 fn sanitize_timeout_args(mut args: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = args.as_object_mut() {
         obj.remove("_timeout_ms");
         obj.remove("_index_timeout_ms");
+        obj.remove("_warmup_ms");
     }
     args
 }
@@ -6563,6 +6754,12 @@ impl SupervisorTrait for Supervisor {
         // per-call override，并清掉这两个私有字段（避免传染给具体 tool 的 args 解析）。
         // 实际 timeout 在 tool_* 内部通过 `effective_tool_timeout(lang, &args)` 拿到。
         let args = sanitize_timeout_args(args);
+        // 批2-A：刷新本次请求的语义就绪等待预算（_warmup_ms / env / 15s 默认）。
+        // recipe/ct 嵌套调用不经过入口，读 Supervisor 当前值即本次预算。
+        self.warmup_budget_ms.store(
+            effective_warmup_budget(lang, &args).as_millis() as u64,
+            Ordering::Relaxed,
+        );
         // 修 P1 #2（TTL 生产执行者）：throttled reclaim。每 32 次调用扫一次所有
         // 在线 Session 的空闲 FileBuffer（ref_count=0 + 超 60 s）→ didClose + 移表。
         // 这是 TTL 窗口的实际触发点；daemon 周期性或 CLI 流式调用下都能覆盖。
@@ -6841,7 +7038,8 @@ impl Supervisor {
                         }
                         _ => None,
                     };
-                let (mut raw, mut warnings) = self.tool_find_symbol(root, query, limit, lang).await?;
+                let (mut raw, mut warnings, degraded) =
+                    self.tool_find_symbol(root, query, limit, lang).await?;
                 if let Some(kinds) = &kind_filter {
                     raw.retain(|h| kinds.contains(&h.kind));
                 }
@@ -6855,7 +7053,9 @@ impl Supervisor {
                 // bd serena-rust-bxd O4：LS 暖机窗口内符号索引仍在爬升（结果数实测
                 // 波动 9→4→6+），成功响应同样附 partial 提示，AI 不会把中间态当
                 // 全量；窗口关闭（10s 或首语义成功）后自动消失，wire 零新字段。
-                warnings.extend(self.index_warming_warnings(root));
+                let warming = self.index_warming_warnings(root);
+                let warming_active = !warming.is_empty();
+                warnings.extend(warming);
                 let mut value = match out_format(args)? {
                     // 51ib：brief = 单串 `"name file:line:col"`（grep 友好，最省）。
                     OutFormat::Brief => {
@@ -6870,6 +7070,22 @@ impl Supervisor {
                     OutFormat::Json => symbol_hits_envelope(&raw, false),
                 };
                 attach_warning(&mut value, &warnings);
+                // 批2-A：降级标记 additive 落 wire（degraded + warmup 结构化字段）。
+                // 三路：请求层超时/错误（tool 层判定）＞暖机窗口（clangd 类 LS 对
+                // workspace/symbol 未就绪时**成功回空**而非挂起——空+窗口内 =
+                // semantic-pending 非权威空；非空+窗口内 = partial，O4 波动语义）。
+                if let Some(d) = degraded {
+                    attach_degraded(&mut value, d);
+                } else if warming_active {
+                    attach_degraded(
+                        &mut value,
+                        if raw.is_empty() {
+                            Degraded::SemanticPending
+                        } else {
+                            Degraded::Partial
+                        },
+                    );
+                }
                 let root_key = format!("{}|{}|{}", root.display(), query, limit);
                 Ok(self
                     .maybe_delta("find-symbol", &root_key, value, delta)
@@ -7117,10 +7333,13 @@ impl Supervisor {
                 // bd serena-rust-xzb：workspace 加载错误无条件透出（结果不可信）。
                 let mut ws = self.workspace_error_warnings(root);
                 if hover_is_empty(&value) {
-                    ws.extend(
-                        self.semantic_not_ready_warnings(root, &file, line, col, lang)
-                            .await,
-                    );
+                    let not_ready = self
+                        .semantic_not_ready_warnings(root, &file, line, col, lang)
+                        .await;
+                    // 批2-A：未就绪窗口的空 hover = semantic-pending（非权威空），
+                    // 结构化告知 AI 重查而非接受 null。
+                    let pending = !not_ready.is_empty();
+                    ws.extend(not_ready);
                     // 杠精 ke2a-5：裸 null 5 字符无法区分「位置无符号」和「未就绪」；
                     // 未就绪已由 we0 warning 表达，就绪态的空结果补静态 hint 收口。
                     if ws.is_empty() {
@@ -7129,11 +7348,15 @@ impl Supervisor {
                                 .into(),
                         );
                     }
+                    attach_warning(&mut value, &ws);
+                    if pending {
+                        attach_degraded(&mut value, Degraded::SemanticPending);
+                    }
                 } else {
                     // bd serena-rust-bxd O2/O4：首个语义成功 → 关暖机窗口。
                     self.mark_semantic_ready(root);
+                    attach_warning(&mut value, &ws);
                 }
-                attach_warning(&mut value, &ws);
                 Ok(value)
             }
             "diagnostics" => {
@@ -7154,14 +7377,20 @@ impl Supervisor {
                 // bd serena-rust-xzb：workspace 加载错误无条件透出。
                 let mut ws = self.workspace_error_warnings(root);
                 if empty {
-                    ws.extend(
-                        self.semantic_not_ready_warnings(root, &file, line, col, lang)
-                            .await,
-                    );
+                    let not_ready = self
+                        .semantic_not_ready_warnings(root, &file, line, col, lang)
+                        .await;
+                    // 批2-A：未就绪窗口的空 def = semantic-pending（非权威空）。
+                    let pending = !not_ready.is_empty();
+                    ws.extend(not_ready);
+                    attach_warning(&mut value, &ws);
+                    if pending {
+                        attach_degraded(&mut value, Degraded::SemanticPending);
+                    }
                 } else {
                     self.mark_semantic_ready(root);
+                    attach_warning(&mut value, &ws);
                 }
-                attach_warning(&mut value, &ws);
                 Ok(value)
             }
 
@@ -7249,7 +7478,8 @@ impl Supervisor {
                         detail: "missing 'pattern'".into(),
                     })?;
                 let path_glob = args.get("path_glob").and_then(|v| v.as_str());
-                let max_results = arg_limit(args, "max_results", 100) as usize;
+                // 批1-B：默认 50 硬上限（ripgrep 对标；旗标显式传值语义不变）。
+                let max_results = arg_limit(args, "max_results", 50) as usize;
                 let case_sensitive = args
                     .get("case_sensitive")
                     .and_then(|v| v.as_bool())
@@ -7315,6 +7545,7 @@ impl Supervisor {
                         });
                         if resp.truncated {
                             v["truncated"] = serde_json::json!(true);
+                            v["hint"] = serde_json::json!(SEARCH_NOISE_HINT);
                         }
                         Ok(v)
                     }
@@ -9549,6 +9780,37 @@ mod symbol_cache_tests {
         }
     }
 
+    /// 批1-C：workspace/symbol 出界过滤 —— root 外符号（tsserver inferred project
+    /// 沿父链解析 node_modules/@types 的实锤形态）被丢弃并计数，root 内保留。
+    #[test]
+    fn retain_symbols_within_root_filters_out_of_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let in_root = root.join("a.py");
+        std::fs::write(&in_root, "x = 1\n").unwrap();
+        let out_dir = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let out_of_root = out_dir.join("leaked.py");
+        std::fs::write(&out_of_root, "y = 2\n").unwrap();
+
+        let mk = |name: &str, p: &Path| SymbolHit {
+            name: name.to_string(),
+            kind: SymbolKindTag::Function,
+            uri: path_to_uri_str(p),
+            range: Default::default(),
+            container: None,
+        };
+        let mut hits = vec![
+            mk("inside", &in_root),
+            mk("leaked", &out_of_root),
+        ];
+        let filtered = Supervisor::retain_symbols_within_root(&mut hits, &root);
+        assert_eq!(filtered, 1, "root 外条目必须被过滤");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "inside");
+    }
+
     /// bd serena-rust-e0hi/8vo9：引用类空结果降级判定——semantic_ok 未证就绪前
     /// 警示（类型分析窗口 refs 静默返空不可信），证就绪后空即真值不警示。
     #[tokio::test]
@@ -10034,7 +10296,7 @@ mod symbol_cache_tests {
         );
 
         let t0 = Instant::now();
-        let (out, warnings) = sup
+        let (out, warnings, _) = sup
             .tool_find_symbol(root, "parse", 2, Some("rust"))
             .await
             .unwrap();
@@ -11084,6 +11346,80 @@ mod timeout_resolution_tests {
         assert_eq!(d, Duration::from_secs(120), "index 默认 120s");
     }
 
+    // ==== 批2-A：语义工具渐进首答 ====
+
+    #[test]
+    fn effective_warmup_budget_defaults_15s_and_honors_warmup_ms() {
+        let args = json!({});
+        assert_eq!(
+            effective_warmup_budget(Some("python"), &args),
+            Duration::from_secs(15),
+            "批2-A 默认 15s（120s 死等收紧）"
+        );
+        let args = json!({"_warmup_ms": 250, "query": "q"});
+        assert_eq!(
+            effective_warmup_budget(None, &args),
+            Duration::from_millis(250),
+            "args._warmup_ms（CLI --warmup-timeout）优先"
+        );
+    }
+
+    #[test]
+    fn degraded_names_match_wire_contract() {
+        assert_eq!(Degraded::Partial.as_str(), "partial");
+        assert_eq!(Degraded::SemanticPending.as_str(), "semantic-pending");
+    }
+
+    #[test]
+    fn classify_find_symbol_degraded_covers_timeout_and_error_paths() {
+        assert_eq!(classify_find_symbol_degraded(0, 0, false), None);
+        assert_eq!(classify_find_symbol_degraded(0, 0, true), None);
+        // 超时：空 = pending，有结果 = partial。
+        assert_eq!(
+            classify_find_symbol_degraded(1, 0, false),
+            Some(Degraded::SemanticPending)
+        );
+        assert_eq!(
+            classify_find_symbol_degraded(1, 0, true),
+            Some(Degraded::Partial)
+        );
+        // 请求错误（冷启动窗口 LS 快速回错而非挂满预算）：空结果同样不可信。
+        assert_eq!(
+            classify_find_symbol_degraded(0, 2, false),
+            Some(Degraded::SemanticPending)
+        );
+        assert_eq!(
+            classify_find_symbol_degraded(0, 2, true),
+            Some(Degraded::Partial)
+        );
+    }
+
+    #[test]
+    fn attach_degraded_inserts_fields_and_upgrades_null() {
+        // 对象形态：顶层插键，既有键不动。
+        let mut v = json!({"items": [], "raw_count": 0});
+        attach_degraded(&mut v, Degraded::SemanticPending);
+        assert_eq!(v["degraded"], json!("semantic-pending"));
+        assert_eq!(v["warmup"]["stage"], json!("indexing"));
+        assert_eq!(v["warmup"]["retry_after_warm"], json!(true));
+        assert_eq!(v["warmup"]["progress"], serde_json::Value::Null);
+        assert_eq!(v["raw_count"], json!(0), "既有键不动");
+
+        // 裸 null（hover 空结果在无 warning 时的兜底）：升级为对象形态。
+        let mut v = serde_json::Value::Null;
+        attach_degraded(&mut v, Degraded::Partial);
+        assert_eq!(v["items"], serde_json::Value::Null);
+        assert_eq!(v["degraded"], json!("partial"));
+    }
+
+    #[test]
+    fn sanitize_timeout_args_strips_warmup_ms() {
+        let args = json!({"query": "q", "_warmup_ms": 100});
+        let out = sanitize_timeout_args(args);
+        assert!(out.get("_warmup_ms").is_none(), "_warmup_ms 不外泄 tool args");
+        assert_eq!(out["query"], json!("q"));
+    }
+
     #[test]
     fn sanitize_timeout_args_strips_private_fields() {
         let args = json!({
@@ -11905,7 +12241,7 @@ mod find_symbol_ls_error_tests {
         // RA 符号索引就绪窗口内 workspace/symbol 可能静默空 → 轮询非空（60s 上限）。
         let deadline = Instant::now() + Duration::from_secs(60);
         let (hits, warnings) = loop {
-            let (h, w) = sup
+            let (h, w, _) = sup
                 .tool_find_symbol(dir.path(), "alpha_main", 50, None)
                 .await
                 .expect("partial LS failure must not fail the call");
@@ -11926,7 +12262,7 @@ mod find_symbol_ls_error_tests {
 
         // 空结果路径：查询只存在于 py 文件且 pyright 缺失 → hits 空且 warning
         // 归属 python（x67「为什么空」语义保留）。
-        let (hits, warnings) = sup
+        let (hits, warnings, _) = sup
             .tool_find_symbol(dir.path(), "py_foo", 50, None)
             .await
             .expect("python-only query with pyright missing must not fail the call");
@@ -11937,7 +12273,7 @@ mod find_symbol_ls_error_tests {
         );
 
         // 分支 3：同 root 仅查 rust（session 已 warm、索引已就绪）→ 全成功无 warning。
-        let (hits, warnings) = sup
+        let (hits, warnings, _) = sup
             .tool_find_symbol(dir.path(), "alpha_main", 50, Some("rust"))
             .await
             .expect("rust-only query on warm session");
@@ -13045,6 +13381,7 @@ mod sweep_a3a_unit_tests {
             hits: vec![mk("a.rs"), mk("a.rs"), mk("b.rs")],
             truncated: false,
             files_scanned: 9,
+            hint: None,
         };
         assert_eq!(search_summary(&resp), "3 hits in 2 files");
         resp.truncated = true;

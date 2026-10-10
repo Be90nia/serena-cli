@@ -51,6 +51,18 @@ fn http_client() -> reqwest::Client {
         .expect("reqwest client build")
 }
 
+/// 批3 可发现性（ADR serena-rust-ai-experience-9.5 批3）：help 首屏高频 5 命令
+/// 速查。高频依据 = 盲测 v4.5 三任务链（T1 warm→overview / T2 find-symbol→
+/// replace-body→diagnostics / T3 rename→undo）跨链交集 + 安全网。
+const BEFORE_HELP_GUIDE: &str = "\
+高频 5 命令速查（全量清单见文末按用途分组；细节 <cmd> --help）:
+  warm <LANG>                                 预热 LS+索引，开工先发（或 --lang <LANG>）
+  find-symbol <QUERY>                         按名找符号（精确名；宽查询加 --lang/--limit）
+  symbol-body <FILE> <SYMBOL>                 按名取符号体（读类最省）
+  replace-body <FILE> <SYMBOL> --with <NEW>   换符号体（先 --dry-run 看 patch 预览）
+  undo                                        回滚上一步写操作（事务级，一次全回）
+";
+
 /// 杠精 ke2a：65 个功能子命令无分组导读 → AI 一次 help 定位候选命令，减少盲猜轮次。
 const AFTER_HELP_GUIDE: &str = "\
 按用途找命令（全 65 个，不含 help 元命令；用法细节 `<cmd> --help`）:
@@ -69,6 +81,7 @@ const AFTER_HELP_GUIDE: &str = "\
     name = "serena-cli",
     version,
     about = "serena-rust LSP CLI",
+    before_help = BEFORE_HELP_GUIDE,
     after_help = AFTER_HELP_GUIDE,
     // 复测4 yim0-邻接: 零参数 cmd=None 曾直通 forward 的 expect panic(rc=101), 改为 usage rc=2
     arg_required_else_help = true
@@ -104,6 +117,11 @@ struct Cli {
     /// 索引型工具（workspace/symbol、workspace/diagnostic 等）超时（毫秒）。默认 120s。
     #[arg(long, global = true, value_name = "MS")]
     index_timeout: Option<u32>,
+
+    /// 批2-A：语义工具渐进首答的就绪等待上限（毫秒）。默认 15s——预算内 LS
+    /// 答复则全量结果；超时立即降级返回（degraded/warmup 标记），不再 120s 死等。
+    #[arg(long, global = true, value_name = "MS")]
+    warmup_timeout: Option<u32>,
 
     /// 限制响应大小（soft limit，约 4 字节 ≈ 1 token）。集合型响应超限时截断
     /// 条目并标 `truncated:true`（仍是成功，退出码不变）。
@@ -215,8 +233,8 @@ enum Cmd {
         /// glob 过滤文件路径（如 **/*.cpp）。
         #[arg(long)]
         path_glob: Option<String>,
-        /// 最大结果数。
-        #[arg(long, default_value_t = 100)]
+        /// 最大结果数（默认 50；批1-B 防噪硬上限）。
+        #[arg(long, default_value_t = 50)]
         max_results: u32,
         /// 仅保留注释行命中（I：--comments-only）。
         #[arg(long, default_value_t = false)]
@@ -338,6 +356,9 @@ enum Cmd {
         /// 要预热的语言。缺省时按项目根清单探测（Cargo.toml/pyproject.toml/
         /// tsconfig.json/package.json）；探测失败 rc=2。
         lang: Option<String>,
+        /// 双形态：与位置参 LANG 等价（`warm --lang rust` ≡ `warm rust`）。
+        #[arg(long = "lang", value_name = "LANG")]
+        lang_flag: Option<String>,
         /// 就绪等待上限（秒）。
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
@@ -368,8 +389,8 @@ enum Cmd {
     ReplaceBody {
         file: String,
         symbol: String,
-        /// 新符号体完整文本。
-        #[arg(long = "with")]
+        /// 新符号体完整文本（`--new-body` 同义别名，与 recipe fix-bug 互通）。
+        #[arg(long = "with", visible_alias = "new-body")]
         new_body: String,
     },
     /// 在 symbol 体内替换 old → new（行级字节切片）。
@@ -507,8 +528,9 @@ enum Cmd {
         /// review-diff = [txn-id]。
         #[arg(value_name = "ARG")]
         args: Vec<String>,
-        /// fix-bug：替换后的新函数体（缺省 = 只跑分析链，不写）。
-        #[arg(long)]
+        /// fix-bug：替换后的新函数体（缺省 = 只跑分析链，不写；`--with` 同义
+        /// 别名，与 replace-body 互通）。
+        #[arg(long, visible_alias = "with")]
         new_body: Option<String>,
         /// rename / refactor-rename：新名。
         #[arg(long)]
@@ -767,7 +789,7 @@ fn main() -> ExitCode {
     // tokio multi_thread runtime 语义不变（属性宏挂在内层 async fn）。
     match std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
-        .spawn(cli_main)
+        .spawn(|| build_runtime().block_on(cli_main()))
         .expect("spawn cli main thread")
         .join()
     {
@@ -779,7 +801,20 @@ fn main() -> ExitCode {
 
 // worker_threads=4（2026-09-23 压测实锤）：2 worker 下 RA 冷启动+分析会把 runtime
 // 吃满，HTTP/轮询 task 饿死（post_diag 循环错过推送窗口 → pending 误报）。
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+// thread_stack_size=16MB（批2-F 实锤）：execute_tool→tool_find_symbol→session_for
+// →RA launch/wait_indexing 的 await 深链 poll 帧压爆 tokio worker 默认 2MB 栈
+// （`tokio-rt-worker has overflowed its stack`，recipe add-feature 多 lang fixture
+// 实锤）——poll 帧深 = await 链长度，Future 层 Box::pin 截不断它，扩线程栈是唯一
+// 治本点；多 lang 工具组合的 poll 链只会更深。
+fn build_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(16 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("tokio runtime (worker_threads=4, stack=16MB)")
+}
+
 async fn cli_main() -> ExitCode {
     #[cfg(windows)]
     unsafe {
@@ -825,7 +860,15 @@ async fn cli_main() -> ExitCode {
         return bad_args_exit("--max-tokens must be >= 1 (got 0)");
     }
 
-    // bd serena-rust-74b3：warm 缺省 LANG 按项目根清单探测（显式 --lang 优先）。
+    // 批3 可发现性：warm 位置参双形态——`warm <LANG>` 与 `warm --lang <LANG>`
+    // 等价（三来源二选一归一，8cx5 同款契约）；皆缺才走下方项目清单探测。
+    if let Some(Cmd::Warm { lang, lang_flag, .. }) = cli.cmd.as_mut()
+        && let Err(detail) = warm_lang_forms(lang, lang_flag, cli.lang.as_deref())
+    {
+        return bad_args_exit(&detail);
+    }
+
+    // bd serena-rust-74b3：warm 缺省 LANG 按项目根清单探测（位置参/`--lang` 皆缺才探测）。
     if let Some(Cmd::Warm { lang, .. }) = cli.cmd.as_mut()
         && lang.is_none()
     {
@@ -2240,9 +2283,11 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             }),
         ),
         Some(Cmd::RepoMap { top_n }) => ("repo-map", json!({"top_n": top_n})),
-        Some(Cmd::Warm { lang, timeout_secs }) => {
-            ("warm", json!({"lang": lang, "timeout_secs": timeout_secs}))
-        }
+        Some(Cmd::Warm {
+            lang,
+            timeout_secs,
+            ..
+        }) => ("warm", json!({"lang": lang, "timeout_secs": timeout_secs})),
         Some(Cmd::ReplaceBody {
             file,
             symbol,
@@ -2545,7 +2590,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
 /// `_compact` envelope（§10-H）、`_max_tokens`/`_compress` 末尾后处理（§10-G）。
 /// 两条路径同一注入 = 同一输出契约（kns）。
 fn inject_private_args(args: &mut serde_json::Value, cli: &Cli) {
-    inject_timeout_args(args, cli.request_timeout, cli.index_timeout);
+    inject_timeout_args(args, cli.request_timeout, cli.index_timeout, cli.warmup_timeout);
     if cmd_requests_delta(&cli.cmd)
         && let Some(obj) = args.as_object_mut()
     {
@@ -2647,6 +2692,15 @@ async fn forward(
     });
 
     let url = format!("{base}/tools/{tool}");
+    // 批2-F：recipe 长步的 daemon→CLI stderr 中继。daemon 模式下 supervisor
+    // （daemon 进程）的步进度行落 daemon stderr（默认 NULL）——CLI 看不到，长步
+    // 哑语。转发期间轮询边带文件增量中继到本进程 stderr（--direct 进程内直打，
+    // 不经此路径）。非 recipe 工具零开销（不 spawn）。
+    let relay = if tool == "recipe" {
+        Some(RecipeProgressRelay::start())
+    } else {
+        None
+    };
     let send_once = |token: &String| {
         client
             .post(&url)
@@ -2676,6 +2730,10 @@ async fn forward(
 
     let status = resp.status();
     let payload: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    // 批2-F：响应已回，缓冲收 daemon 侧最后几行（step done）再停中继。
+    if let Some(r) = relay {
+        r.finish().await;
+    }
 
     if !status.is_success() {
         // 403/503 等传输层错；503 DAEMON_DRAINING 单独分类供上层自愈重试（g0m）。
@@ -2756,6 +2814,79 @@ async fn forward(
             Ok(code.map_or(1u8, daemon::dto::wire_error_code_to_exit))
         }
     }
+}
+
+/// 批2-F：recipe 步进度的 daemon→CLI stderr 中继。daemon 模式下 supervisor
+/// （daemon 进程）的进度行 eprintln 落 daemon stderr（默认 NULL）——CLI 看不见。
+/// 转发 recipe 请求期间轮询边带文件（temp/`RECIPE_PROGRESS_FILE`，supervisor
+/// 步级 append），把含 `[recipe]` 的增量行打到本进程 stderr。单机单 daemon
+///（:7860 lock 仲裁）→ temp 单文件无归属歧义。Drop 兜底停止（错误路径不泄漏）。
+struct RecipeProgressRelay {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl RecipeProgressRelay {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let path = std::env::temp_dir().join(supervisor::RECIPE_PROGRESS_FILE);
+        let _ = std::fs::write(&path, b""); // 清上一轮残留，本轮 offset 从 0 起
+        let stop2 = stop.clone();
+        let handle = tokio::spawn(async move {
+            let mut offset = 0u64;
+            while !stop2.load(Ordering::Relaxed) {
+                offset = relay_progress_lines(&path, offset);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        Self { stop, handle }
+    }
+
+    /// 正常收尾：缓冲 300ms 让 daemon 的结束行落盘，再停轮询（循环 100ms 内
+    /// 自停；Drop 兜底 abort，无需 join——CLI 进程存活远长于 100ms）。
+    async fn finish(&self) {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for RecipeProgressRelay {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle.abort();
+    }
+}
+
+/// 读 path 自 offset 起的新增字节，打印含 `[recipe]` 的行；返回新 offset。
+/// 打不开/没新增/读失败都原样返回（中继是 best-effort 人读反馈，不参与成败）。
+fn relay_progress_lines(path: &Path, offset: u64) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return offset;
+    };
+    let len = match f.metadata().map(|m| m.len()) {
+        Ok(l) => l,
+        Err(_) => return offset,
+    };
+    if len <= offset {
+        return offset;
+    }
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        return offset;
+    }
+    let mut buf = vec![0u8; (len - offset) as usize];
+    if f.read_exact(&mut buf).is_err() {
+        return offset;
+    }
+    for line in String::from_utf8_lossy(&buf).lines() {
+        if line.contains("[recipe]") {
+            eprintln!("{line}");
+        }
+    }
+    len
 }
 
 /// `install` 子命令（Task 21）：配置驱动 LS 安装（幂等——已装即返回路径）。
@@ -4613,6 +4744,134 @@ mod warm_lang_detect_tests {
     }
 }
 
+/// 批3 可发现性（ADR serena-rust-ai-experience-9.5 批3）：--new-body/--with 互通、
+/// warm 位置参双形态、help 首屏速查——三票回归。
+#[cfg(test)]
+mod discoverability_batch3_tests {
+    use super::*;
+
+    // ==== E：--new-body / --with 互通（replace-body ↔ recipe fix-bug）====
+
+    #[test]
+    fn replace_body_accepts_new_body_alias_and_canonical_with() {
+        use clap::Parser as _;
+        for flag in ["--new-body", "--with"] {
+            let cli = Cli::try_parse_from([
+                "serena-cli",
+                "replace-body",
+                "a.py",
+                "sym",
+                flag,
+                "NEW",
+            ])
+            .unwrap_or_else(|e| panic!("{flag}: {e}"));
+            let Some(Cmd::ReplaceBody { new_body, .. }) = cli.cmd else {
+                panic!("expected replace-body ({flag})");
+            };
+            assert_eq!(new_body, "NEW", "{flag} 必须归一到 new_body 字段");
+        }
+    }
+
+    #[test]
+    fn recipe_fix_bug_accepts_with_alias_and_canonical_new_body() {
+        use clap::Parser as _;
+        for flag in ["--with", "--new-body"] {
+            let cli = Cli::try_parse_from([
+                "serena-cli",
+                "recipe",
+                "fix-bug",
+                "a.py",
+                "sym",
+                flag,
+                "NEW",
+            ])
+            .unwrap_or_else(|e| panic!("{flag}: {e}"));
+            let Some(Cmd::Recipe { new_body, .. }) = cli.cmd else {
+                panic!("expected recipe ({flag})");
+            };
+            assert_eq!(new_body.as_deref(), Some("NEW"), "{flag} 必须落 new_body");
+        }
+    }
+
+    // ==== warm 位置参双形态（`warm <LANG>` ≡ `warm --lang <LANG>`）====
+
+    #[test]
+    fn warm_lang_forms_merges_flag_into_positional() {
+        let mut pos = None;
+        let mut flag = Some("rust".into());
+        warm_lang_forms(&mut pos, &mut flag, None).unwrap();
+        assert_eq!(pos.as_deref(), Some("rust"));
+        assert!(flag.is_none(), "flag 归一后清空");
+
+        // 前置全局 --lang（`--lang X warm`，global flag 不传播进子命令）第三来源。
+        let mut pos = None;
+        warm_lang_forms(&mut pos, &mut None, Some("rust")).unwrap();
+        assert_eq!(pos.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn warm_lang_forms_keeps_positional_when_others_absent() {
+        let mut pos = Some("python".into());
+        warm_lang_forms(&mut pos, &mut None, None).unwrap();
+        assert_eq!(pos.as_deref(), Some("python"));
+    }
+
+    #[test]
+    fn warm_lang_forms_rejects_multiple_forms() {
+        let mut pos = Some("python".into());
+        let mut flag = Some("rust".into());
+        let err = warm_lang_forms(&mut pos, &mut flag, None).unwrap_err();
+        assert!(err.contains("not multiple forms"), "{err}");
+
+        let mut pos = None;
+        let mut flag = Some("rust".into());
+        let err = warm_lang_forms(&mut pos, &mut flag, Some("go")).unwrap_err();
+        assert!(err.contains("not multiple forms"), "{err}");
+    }
+
+    #[test]
+    fn warm_flag_form_parses_via_subcommand_lang() {
+        use clap::Parser as _;
+        // flag 形态：--lang 落子命令字段，位置参保持空（归一由 cli_main 接线完成）。
+        let cli = Cli::try_parse_from(["serena-cli", "warm", "--lang", "rust"]).unwrap();
+        let Some(Cmd::Warm { lang, lang_flag, .. }) = cli.cmd else {
+            panic!("expected warm");
+        };
+        assert!(lang.is_none(), "flag 形态不得占位置参");
+        assert_eq!(lang_flag.as_deref(), Some("rust"));
+        // 位置参形态（既有行为不破）。
+        let cli = Cli::try_parse_from(["serena-cli", "warm", "rust"]).unwrap();
+        let Some(Cmd::Warm { lang, lang_flag, .. }) = cli.cmd else {
+            panic!("expected warm");
+        };
+        assert_eq!(lang.as_deref(), Some("rust"));
+        assert!(lang_flag.is_none());
+        // 前置全局形态（既有行为不破，第三来源）。
+        let cli = Cli::try_parse_from(["serena-cli", "--lang", "python", "warm"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Warm { .. })));
+        assert_eq!(cli.lang.as_deref(), Some("python"));
+    }
+
+    // ==== help 首屏高频 5 命令速查 ====
+
+    #[test]
+    fn help_first_screen_carries_top5_quick_reference() {
+        use clap::Parser as _;
+        let err = Cli::try_parse_from(["serena-cli", "--help"]).expect_err("--help = DisplayHelp");
+        let rendered = err.render().to_string();
+        assert!(rendered.contains("高频 5 命令速查"), "首屏缺速查标题");
+        for line in [
+            "warm <LANG>",
+            "find-symbol <QUERY>",
+            "symbol-body <FILE> <SYMBOL>",
+            "replace-body <FILE> <SYMBOL> --with <NEW>",
+            "undo",
+        ] {
+            assert!(rendered.contains(line), "速查缺: {line}");
+        }
+    }
+}
+
 /// bd serena-rust-8cx5：`--with` 别名归一（合并/冲突/缺失三态）+ clap 端到端解析。
 #[cfg(test)]
 mod with_alias_tests {
@@ -5259,6 +5518,27 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
     }
 }
 
+/// 批3 可发现性：warm 双形态归一——位置参 LANG 与子命令级 `--lang` 二选一，
+/// 统一落回位置参字段（wire args 键名不变，8cx5 同款契约）。global 是前置全局
+/// `--lang`（clap global flag 不传播进子命令，仅 `--lang X warm` 形态可达），
+/// 第三来源同判二选一。
+fn warm_lang_forms(
+    pos: &mut Option<String>,
+    flag: &mut Option<String>,
+    global: Option<&str>,
+) -> Result<(), String> {
+    let given = usize::from(pos.is_some()) + usize::from(flag.is_some()) + usize::from(global.is_some());
+    if given > 1 {
+        return Err(
+            "provide the warm LANG positionally or via --lang (once), not multiple forms".into(),
+        );
+    }
+    if pos.is_none() {
+        *pos = flag.take().or(global.map(str::to_string));
+    }
+    Ok(())
+}
+
 /// 1-based (line, col) → LSP 0-based Position；0 为用法错误。
 fn to_lsp_pos(line: u32, col: u32) -> Result<(u32, u32), String> {
     if line == 0 {
@@ -5409,11 +5689,17 @@ fn inject_compact_arg(args: &mut serde_json::Value, json_flag: bool) {
     }
 }
 
-/// Phase 4 基建 Task 22b：把 CLI flag `--request-timeout` / `--index-timeout` 注入
-/// `args._timeout_ms` / `args._index_timeout_ms` 私有字段（supervisor
-/// `execute_tool` 入口 `sanitize_timeout_args` 会清掉）。`args` 必须是 object
-/// 形态；其他形态（少见，子命令可能返 null/array）静默跳过。
-fn inject_timeout_args(args: &mut serde_json::Value, req_ms: Option<u32>, idx_ms: Option<u32>) {
+/// Phase 4 基建 Task 22b：把 CLI flag `--request-timeout` / `--index-timeout` /
+/// `--warmup-timeout`（批2-A）注入 `args._timeout_ms` / `args._index_timeout_ms` /
+/// `args._warmup_ms` 私有字段（supervisor `execute_tool` 入口 `sanitize_timeout_args`
+/// 会清掉）。`args` 必须是 object 形态；其他形态（少见，子命令可能返 null/array）
+/// 静默跳过。
+fn inject_timeout_args(
+    args: &mut serde_json::Value,
+    req_ms: Option<u32>,
+    idx_ms: Option<u32>,
+    warm_ms: Option<u32>,
+) {
     let Some(obj) = args.as_object_mut() else {
         return;
     };
@@ -5422,6 +5708,9 @@ fn inject_timeout_args(args: &mut serde_json::Value, req_ms: Option<u32>, idx_ms
     }
     if let Some(ms) = idx_ms {
         obj.insert("_index_timeout_ms".into(), serde_json::json!(ms));
+    }
+    if let Some(ms) = warm_ms {
+        obj.insert("_warmup_ms".into(), serde_json::json!(ms));
     }
 }
 

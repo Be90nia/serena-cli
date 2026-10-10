@@ -27,6 +27,7 @@ pub fn catalog() -> serde_json::Value {
                     "file": {"type": "string", "required": true, "description": "repo-relative path"},
                     "_timeout_ms": {"type": "number", "required": false, "description": "per-call override (private)"},
                     "_index_timeout_ms": {"type": "number", "required": false, "description": "per-call override (private)"},
+                    "_warmup_ms": {"type": "number", "required": false, "description": "batch2-A: semantic warmup budget override (private)"},
                     "_compact": {"type": "bool", "required": false, "default": true, "description": "compact envelope (private)"},
                     "_delta": {"type": "bool", "required": false, "default": false, "description": "incremental delta (private)"},
                     "_max_tokens": {"type": "number", "required": false, "description": "soft budget on list output (private)"},
@@ -213,7 +214,7 @@ pub fn catalog() -> serde_json::Value {
                 "args": {
                     "pattern": {"type": "string", "required": true},
                     "path_glob": {"type": "string", "required": false},
-                    "max_results": {"type": "number", "required": false, "default": 100, "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"},
+                    "max_results": {"type": "number", "required": false, "default": 50, "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set; 批1-B default 50 防噪"},
                     "case_sensitive": {"type": "bool", "required": false, "default": false},
                     "comments_only": {"type": "bool", "required": false, "default": false, "description": "I: filter to comment lines only"},
                     "distinct_symbols": {"type": "bool", "required": false, "default": false, "description": "bd zpzw: keep first hit per enriched symbol name (symbol=null rows kept)"},

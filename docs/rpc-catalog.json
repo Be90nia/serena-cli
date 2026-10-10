@@ -729,6 +729,11 @@
           "required": false,
           "type": "number"
         },
+        "_warmup_ms": {
+          "description": "batch2-A: semantic warmup budget override (private)",
+          "required": false,
+          "type": "number"
+        },
         "_max_tokens": {
           "description": "soft budget on list output (private)",
           "required": false,
@@ -963,8 +968,8 @@
           "type": "string"
         },
         "max_results": {
-          "default": 100,
-          "description": "bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set",
+          "default": 50,
+          "description": "批1-B: default 50 noise cap; bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set",
           "required": false,
           "type": "number"
         },

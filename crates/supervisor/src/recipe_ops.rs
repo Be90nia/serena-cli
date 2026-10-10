@@ -21,15 +21,22 @@ struct RecipeCtx {
     txn_ids: Vec<u64>,
     /// findings = 已完成步（步名 → 信封，完成序；后续步与顶层响应读取）。
     findings: Vec<(String, Value)>,
+    /// 批2-F：计划步数（进度行 N/M；按编排入口的参数静态可算，exists/缺参
+    /// 短路时实际步数 < 计划数——进程即刻结束，偏大无妨）。
+    total_steps: usize,
+    /// 已开始的步计数（进度行序号）。
+    done_steps: usize,
 }
 
 impl RecipeCtx {
-    fn new(file: Option<String>, sym: Option<String>) -> Self {
+    fn new(file: Option<String>, sym: Option<String>, total_steps: usize) -> Self {
         Self {
             file,
             sym,
             txn_ids: Vec::new(),
             findings: Vec::new(),
+            total_steps,
+            done_steps: 0,
         }
     }
 
@@ -47,7 +54,10 @@ impl RecipeCtx {
     where
         F: Future<Output = Result<Value, crate::ToolError>>,
     {
-        let v = fut.await?;
+        let n = self.begin_step(name);
+        let started = std::time::Instant::now();
+        let v = run_step_with_warn(name, fut).await?;
+        emit_recipe_line(&format_step_done(n, self.total_steps, name, started.elapsed()));
         self.findings.push((name.to_string(), v.clone()));
         Ok(v)
     }
@@ -66,14 +76,28 @@ impl RecipeCtx {
     where
         F: Future<Output = Result<Value, crate::ToolError>>,
     {
+        let n = self.begin_step(name);
+        let started = std::time::Instant::now();
         let fut = Box::pin(fut);
-        let (mut v, txn_id) = crate::ct::ct_txn(root, fut).await?;
+        let (mut v, txn_id) = crate::ct::ct_txn(root, async { run_step_with_warn(name, fut).await }).await?;
+        emit_recipe_line(&format_step_done(n, self.total_steps, name, started.elapsed()));
         self.txn_ids.push(txn_id);
         if let Some(o) = v.as_object_mut() {
             o.insert("txn_id".into(), json!(txn_id));
         }
         self.findings.push((name.to_string(), v.clone()));
         Ok(v)
+    }
+
+    /// 批2-F：步开始记账 + stderr 进度行（`[recipe] step N/M: label...`）。
+    fn begin_step(&mut self, name: &str) -> usize {
+        self.done_steps += 1;
+        emit_recipe_line(&format_step_start(
+            self.done_steps,
+            self.total_steps,
+            name,
+        ));
+        self.done_steps
     }
 
     /// 失败收口：逆序 undo 已完成写步（回滚到 recipe 前），undo 失败逐条
@@ -177,6 +201,66 @@ fn protocol_fail(
 /// 对 AI 是内部实现泄漏）。
 fn step_display(name: &str) -> String {
     name.strip_prefix("ct_").unwrap_or(name).to_string()
+}
+
+// ==== 批2-F：recipe 步进度行（stderr + 边带文件）与步级超时警告 ====
+
+/// 步级超时预算：单步超过此时长打一行 stderr 警告并继续等（不禁死——LS 冷启
+/// /测试执行本来就慢，警告只消解「哑语 120s = 挂死」的误判）。
+const STEP_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 执行单步 fut，每 [`STEP_WARN_EVERY`] 打一次警告（fut Box::pin 堆上，timeout
+/// 轮询不丢 poll 状态——同 [`RecipeCtx::write_step`] 的栈溢出约束）。
+async fn run_step_with_warn<F>(
+    label: &str,
+    fut: F,
+) -> Result<Value, crate::ToolError>
+where
+    F: Future<Output = Result<Value, crate::ToolError>>,
+{
+    let mut fut = Box::pin(fut);
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        match tokio::time::timeout(STEP_WARN_EVERY, fut.as_mut()).await {
+            Ok(res) => return res,
+            Err(_) => {
+                waited += STEP_WARN_EVERY;
+                emit_recipe_line(&format_step_warn(label, waited));
+            }
+        }
+    }
+}
+
+/// 进度行出口：eprintln! 直达本进程 stderr（--direct = CLI stderr；daemon =
+/// daemon stderr，默认 NULL → 靠边带文件）。append 失败不救（stderr 已有同款行，
+/// 边带文件是 daemon 模式下 CLI 中继的补充通道）。
+fn emit_recipe_line(line: &str) {
+    eprintln!("{line}");
+    let path = std::env::temp_dir().join(crate::RECIPE_PROGRESS_FILE);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn format_step_start(n: usize, total: usize, label: &str) -> String {
+    format!("[recipe] step {n}/{total}: {}...", step_display(label))
+}
+
+fn format_step_done(n: usize, total: usize, label: &str, elapsed: std::time::Duration) -> String {
+    format!(
+        "[recipe] step {n}/{total} {} done in {}s",
+        step_display(label),
+        elapsed.as_secs()
+    )
+}
+
+fn format_step_warn(label: &str, waited: std::time::Duration) -> String {
+    format!(
+        "[recipe] step {} still running after {}s — continuing to wait",
+        step_display(label),
+        waited.as_secs()
+    )
 }
 
 /// bd serena-rust-4nuq：ct_verify 信封的 error 级诊断判定门。写步后的
@@ -317,7 +401,8 @@ async fn fix_bug(
     sym: &str,
     new_body: Option<&str>,
 ) -> Result<Value, crate::ToolError> {
-    let mut ctx = RecipeCtx::new(Some(file.into()), Some(sym.into()));
+    let total = if new_body.map(|b| !b.is_empty()).unwrap_or(false) { 5 } else { 3 };
+    let mut ctx = RecipeCtx::new(Some(file.into()), Some(sym.into()), total);
     let file_s = ctx.file.clone().expect("constructor sets file");
     let sym_s = ctx.sym.clone().expect("constructor sets sym");
     if let Err(e) = ctx
@@ -390,7 +475,14 @@ async fn add_feature(
     target: Option<&str>,
     args: &Value,
 ) -> Result<Value, crate::ToolError> {
-    let mut ctx = RecipeCtx::new(target.map(str::to_string), None);
+    // 计划步数：define 1 + 落盘（--target 给定）1 + 测试步（两参同给）1。
+    let total = 1
+        + usize::from(target.map(|t| !t.is_empty()).unwrap_or(false))
+        + usize::from(
+            args.get("tests_file").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+                && args.get("tests").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false),
+        );
+    let mut ctx = RecipeCtx::new(target.map(str::to_string), None, total);
     let defined = match ctx
         .read_step("ct_define_feature", crate::ct::ct_define_feature(sup, root, name, None))
         .await
@@ -480,7 +572,7 @@ async fn rename(
     sym: &str,
     new_name: String,
 ) -> Result<Value, crate::ToolError> {
-    let mut ctx = RecipeCtx::new(Some(file.into()), Some(sym.into()));
+    let mut ctx = RecipeCtx::new(Some(file.into()), Some(sym.into()), 3);
     let sym_s = ctx.sym.clone().expect("constructor sets sym");
     if let Err(e) = ctx
         .read_step("ct_impact", crate::ct::ct_impact(sup, root, &sym_s))
@@ -544,7 +636,7 @@ async fn add_test(
     sym: &str,
     run_tests: bool,
 ) -> Result<Value, crate::ToolError> {
-    let mut ctx = RecipeCtx::new(None, Some(sym.into()));
+    let mut ctx = RecipeCtx::new(None, Some(sym.into()), if run_tests { 3 } else { 2 });
     let sym_s = ctx.sym.clone().expect("constructor sets sym");
     let found = match ctx
         .read_step("find-test", crate::recipe::find_test(sup, root, &sym_s))
@@ -638,7 +730,7 @@ async fn refactor_extract(
     sym: &str,
     new_name: String,
 ) -> Result<Value, crate::ToolError> {
-    let mut ctx = RecipeCtx::new(Some(file.into()), Some(sym.into()));
+    let mut ctx = RecipeCtx::new(Some(file.into()), Some(sym.into()), 2);
     let file_s = ctx.file.clone().expect("constructor sets file");
     let sym_s = ctx.sym.clone().expect("constructor sets sym");
     let smart = match ctx
@@ -681,7 +773,7 @@ async fn refactor_rename(
     sym: &str,
     new_name: String,
 ) -> Result<Value, crate::ToolError> {
-    let mut ctx = RecipeCtx::new(None, Some(sym.into()));
+    let mut ctx = RecipeCtx::new(None, Some(sym.into()), 3);
     let sym_s = ctx.sym.clone().expect("constructor sets sym");
     let impact = match ctx
         .read_step("ct_impact", crate::ct::ct_impact(sup, root, &sym_s))
@@ -733,7 +825,7 @@ async fn review_diff(
     root: &Path,
     txn_id: Option<u64>,
 ) -> Result<Value, crate::ToolError> {
-    let mut ctx = RecipeCtx::new(None, None);
+    let mut ctx = RecipeCtx::new(None, None, 1);
     let report = match ctx
         .read_step("ct_review_diff", crate::ct::ct_review_diff(sup, root, txn_id))
         .await
@@ -770,7 +862,7 @@ async fn explore(
             ),
         });
     }
-    let mut ctx = RecipeCtx::new(Some(path.into()), None);
+    let mut ctx = RecipeCtx::new(Some(path.into()), None, 3);
     let p = ctx.file.clone().expect("constructor sets file");
     let tldr = match ctx
         .read_step("ct_tldr", crate::ct::ct_tldr(sup, root, &p))

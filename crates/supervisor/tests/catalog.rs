@@ -154,6 +154,7 @@ fn catalog_private_prefixes_are_consistent_with_sanitize() {
     let known_private = [
         "_timeout_ms",
         "_index_timeout_ms",
+        "_warmup_ms",
         "_compact",
         "_delta",
         "_max_tokens",

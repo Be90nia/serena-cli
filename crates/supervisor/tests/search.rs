@@ -143,3 +143,74 @@ async fn match_start_end_offsets_are_correct() {
     assert_eq!(h.match_end, 9);
     assert_eq!(h.text, "say hello world");
 }
+
+// ==== 批1-B：search 默认防噪 ====
+
+/// 批1-B③：合法 UTF-8 但含 NUL 字节 = 二进制，跳过（ripgrep 同款判定）。
+#[tokio::test]
+async fn nul_byte_utf8_file_skipped() {
+    let root = scratch("nulutf8");
+    std::fs::write(root.join("keep.txt"), "needle here\n").unwrap();
+    // UTF-8 合法但藏 NUL —— read_to_string 成功，必须靠 NUL 检测排除。
+    std::fs::write(root.join("nul.bin"), "needle\x00here\n").unwrap();
+
+    let sup = new_sup().await;
+    let resp = sup
+        .tool_search_for_pattern(&root, "needle", None, 50, false, &[], false)
+        .await
+        .unwrap();
+    assert_eq!(resp.hits.len(), 1, "NUL 文件必须跳过: {resp:?}");
+    assert!(resp.hits[0].file.ends_with("keep.txt"));
+}
+
+/// 批1-B③：>1MB 大文件跳过（盲测实锤大文件是字节坑）。
+#[tokio::test]
+async fn big_file_skipped() {
+    let root = scratch("bigfile");
+    std::fs::write(root.join("small.txt"), "needle\n").unwrap();
+    // 1.2MB 全是 needle 的文件 —— 修前会贡献海量命中。
+    let big: String = std::iter::repeat_n("needle\n", 200_000).collect();
+    assert!(big.len() > 1024 * 1024);
+    std::fs::write(root.join("big.txt"), &big).unwrap();
+
+    let sup = new_sup().await;
+    let resp = sup
+        .tool_search_for_pattern(&root, "needle", None, 50, false, &[], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.hits.iter().filter(|h| h.file.ends_with("small.txt")).count(),
+        1
+    );
+    assert!(
+        !resp.hits.iter().any(|h| h.file.ends_with("big.txt")),
+        ">1MB 文件必须跳过"
+    );
+}
+
+/// 批1-B②：默认上限语义 —— max_results=50 截断时 truncated + hint 同现。
+#[tokio::test]
+async fn default_cap_truncates_with_hint() {
+    let root = scratch("cap50");
+    let lines: String = (0..60).map(|i| format!("match_{i}\n")).collect();
+    std::fs::write(root.join("a.txt"), &lines).unwrap();
+
+    let sup = new_sup().await;
+    let resp = sup
+        .tool_search_for_pattern(&root, "match_", None, 50, false, &[], false)
+        .await
+        .unwrap();
+    assert_eq!(resp.hits.len(), 50, "默认上限 50");
+    assert!(resp.truncated);
+    assert_eq!(
+        resp.hint.as_deref(),
+        Some("add --path-glob / --max-results"),
+        "截断必须带降噪 hint"
+    );
+    // 未截断时 hint 不出现（wire 零扰动）。
+    let clean = sup
+        .tool_search_for_pattern(&root, "nomatch", None, 50, false, &[], false)
+        .await
+        .unwrap();
+    assert!(clean.hint.is_none(), "未截断不得带 hint: {clean:?}");
+}

@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use supervisor::Supervisor;
+// 批2-A 降级测试走 execute_tool（SupervisorTrait trait 方法）。
+use supervisor::SupervisorTrait;
 
 fn has_clangd() -> bool {
     if std::env::var_os("SERENA_SKIP_LS_E2E").is_some() {
@@ -80,7 +82,7 @@ async fn workspace_symbol_finds_known_functions() {
         .await
         .expect("overview");
 
-    let (hits, warnings) = sup
+    let (hits, warnings, _) = sup
         .tool_find_symbol(&root, "alpha_func", 50, None)
         .await
         .expect("find_symbol");
@@ -129,7 +131,7 @@ async fn limit_caps_results() {
 
     // alpha / beta / gamma 都含 `_helper` / `_func` / `_method`？没有共同子串。
     // 用空 pattern 之前的 nil；改用一个只匹配一个的 query：alpha_func。
-    let (hits, _warnings) = sup
+    let (hits, _warnings, _) = sup
         .tool_find_symbol(&root, "alpha_func", 1, None)
         .await
         .expect("find_symbol");
@@ -159,7 +161,7 @@ async fn lang_override_skips_root_probe() {
         .expect("overview");
 
     // 指定 lang=cpp → 只查 clangd。
-    let (hits, warnings) = sup
+    let (hits, warnings, _) = sup
         .tool_find_symbol(&root, "alpha_func", 50, Some("cpp"))
         .await
         .expect("find_symbol with lang=cpp");
@@ -168,6 +170,65 @@ async fn lang_override_skips_root_probe() {
         !hits.is_empty(),
         "lang=cpp should find alpha_func via clangd, got 0 hits"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 批2-A：语义工具渐进首答——就绪预算耗尽 → 降级返回（degraded=semantic-pending
+/// + warmup 标记 + warning），不再死等；降级结果不入缓存（就绪后重查可拿全量）。
+/// 1ms 预算必超时（进程间往返 >1ms），不依赖冷启动时长 → 稳定。真 clangd。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn find_symbol_degrades_to_semantic_pending_when_budget_expires() {
+    if !has_clangd() {
+        println!("skipped: clangd not in PATH");
+        return;
+    }
+    let root = scratch("degrade");
+    let sup = Supervisor::direct().await.expect("supervisor");
+
+    // 冷 spawn 后立即查（不预热），_warmup_ms=1 → workspace/symbol 必超时降级。
+    let args = serde_json::json!({"query": "alpha_func", "limit": 50, "_warmup_ms": 1});
+    let v = sup
+        .execute_tool("find-symbol", &root.to_string_lossy(), args, None)
+        .await
+        .expect("degraded call is still a success (rc=0)");
+    assert!(
+        v.get("degraded").and_then(|x| x.as_str()) == Some("semantic-pending"),
+        "wire must carry degraded=semantic-pending, got: {v}"
+    );
+    assert_eq!(v["warmup"]["stage"], "indexing", "warmup marker: {v}");
+    assert_eq!(v["warmup"]["retry_after_warm"], true, "warmup marker: {v}");
+    let warning = v.get("warning").and_then(|x| x.as_str()).unwrap_or_default();
+    assert!(
+        warning.contains("warming") || warning.contains("incomplete"),
+        "人话 warning 必须在场（超时 warming / 请求失败 / 暖机窗口任一形态）: {warning}"
+    );
+
+    // 就绪后重查（默认预算）：不再降级且有真结果（降级路径未污染缓存）。
+    // clangd 小 fixture 就绪需数秒——轮询直到命中（同 partial-failure 测试形态）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        // clangd 把 TU 加进 workspace/symbol 索引需要 didOpen（既有测试同款预热：
+        // workspace_symbol_finds_known_functions 先 overview 再查，不预热恒空——
+        // 「未接线」不是「未就绪」，等再久也无效）。
+        let _ = sup.tool_overview(&root, "alpha.cpp", None).await;
+        let (hits, _, degraded) = sup
+            .tool_find_symbol(&root, "alpha_func", 50, None)
+            .await
+            .expect("warm requery");
+        if !hits.is_empty() {
+            assert!(
+                degraded.is_none(),
+                "warm requery must not degrade: {degraded:?}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "warm requery never hit within 60s (degraded cache pollution?)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 
     let _ = std::fs::remove_dir_all(&root);
 }

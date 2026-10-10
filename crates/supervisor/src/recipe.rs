@@ -655,7 +655,7 @@ pub async fn find_test(sup: &crate::Supervisor, root: &Path, symbol: &str) -> Re
     let mut ls_refs_skipped: Option<String> = None;
     if hits.is_empty() {
         match sup.tool_find_symbol(root, symbol, 20, None).await {
-            Ok((items, _)) => {
+            Ok((items, _, _)) => {
                 if let Some(hit) = items.iter().find(|i| i.name == symbol) {
                     ls_refs_skipped = refs_to_test_hits(sup, root, hit, &mut hits).await;
                 } else {
