@@ -352,7 +352,7 @@ source_commit = "43ae0211"
 
 [servers.al.path_only]
 binary_name = "Microsoft.Dynamics.Nav.EditorServices.Host"
-install_hint = "marketplace vspackage 现为 gzip 包 zip（1f8b→PK，2026-09-30 实锚，字节稳定但 sha 非 zip 真值且 install schema 无 gz+zip 两级解包）——经 curl+gunzip+python3 -m zipfile 解出 extension/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host（self-contained，includedFrameworks 8.0.24 自带 runtime）install 到 /usr/local/bin；见 smoke_langs.toml al 门 install 行"
+install_hint = "marketplace vspackage now serves a gzip-wrapped zip (2026-09-30; download schema has no two-stage gunzip+unzip) — fetch the vspackage, gunzip it, then extract with python3 -m zipfile and copy extension/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host (self-contained, bundles .NET 8.0.24) to /usr/local/bin"
 
 [servers.bsl]
 languages = ["bsl"]
@@ -752,6 +752,8 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 
 [servers.matlab]
 languages = ["matlab"]
+# v5 P1-1：仅报错文案分流读（.m 因 MATLAB 歧义不进 EXT_TABLE 的裁决不变）。
+extensions = [".m"]
 install = "download"
 exec = ["node", "{bin}", "--stdio"]
 source_commit = "43ae0211"
@@ -1486,6 +1488,9 @@ tool = "csharp-ls"
 
 [servers.ruby_lsp]
 languages = ["ruby"]
+# v5 P1-1：仅报错文案分流读（registered_lang_for_extension）；路由权威仍归
+# EXT_TABLE（.rb 无映射 = ruby 判 unroutable，ls-list routable:false 如实）。
+extensions = [".rb"]
 install = "gem"
 source_commit = "43ae0211"
 [servers.ruby_lsp.gem]

@@ -518,6 +518,32 @@ pub struct Supervisor {
     /// recipe/ct 内部嵌套调用无 args 上下文，读此处当前值即本次请求的预算。
     /// Atomic：Arc 共享下的跨请求覆盖竞态无害（进程级配置，非请求级状态）。
     warmup_budget_ms: AtomicU64,
+    /// blindtest v5 P3-H：同 (root, lang) 最近一次 LS 生命周期失败的进程内 memo。
+    /// 命中（TTL 内）→ 后续调用不再重复 spawn/请求，快速失败带恢复指引——失败
+    /// 语言错误重放占盲测 token 61%（al 四步 ×687B）。stop-all 杀 daemon 即清账。
+    failure_memo: Mutex<HashMap<(PathBuf, String), FailureMemoEntry>>,
+}
+
+/// memo 记账类别（重建同 wire 类错误用；NotInstalled 短 TTL——装上 LS 即可自愈，
+/// 不该被 300s 长账挡住）。
+enum MemoKind {
+    NotInstalled { language: String, hint: String },
+    Launch { message: String },
+    Terminated { cause: String },
+}
+
+struct FailureMemoEntry {
+    kind: MemoKind,
+    at: std::time::Instant,
+}
+
+impl MemoKind {
+    fn ttl_secs(&self) -> u64 {
+        match self {
+            Self::NotInstalled { .. } => 60,
+            Self::Launch { .. } | Self::Terminated { .. } => 300,
+        }
+    }
 }
 
 /// 单 root 的 LS 暖机记账。
@@ -696,6 +722,7 @@ impl Supervisor {
             cache_hit_counter: AtomicU64::new(0),
             ls_warmup: Mutex::new(HashMap::new()),
             warmup_budget_ms: AtomicU64::new(WARMUP_BUDGET_DEFAULT.as_millis() as u64),
+            failure_memo: Mutex::new(HashMap::new()),
             #[cfg(test)]
             _idle_ttl_override: std::sync::Arc::new(Mutex::new(None)),
         })
@@ -967,6 +994,23 @@ impl Supervisor {
             self.instances.lock().unwrap().remove(&key);
         }
 
+        // 双检后仍无可用会话。blindtest v5 P3-H：先查失败 memo（TTL 内同类失败
+        // 直接短路，不 spawn 不请求）；上一会话 Failed（LS 终止/握手败）记入 memo，
+        // 本调用即按「第 2 次同错」快速失败（PM 拍板：第 2 次起带 hint）。
+        if let Some(e) = self.failure_memo_check(&key.root, lang) {
+            return Err(e);
+        }
+        if let Some(s) = &cached
+            && let lsp_core::session::SessionState::Failed(cause) = s.state()
+        {
+            self.failure_memo_record(
+                &key.root,
+                lang,
+                MemoKind::Terminated { cause },
+            );
+            return Err(self.failure_memo_check(&key.root, lang).expect("just recorded"));
+        }
+
         // 双路径（Task 21）：手写 T2 adapter 优先；servers.toml 条目（T0 配置驱动）
         // 走 config::ensure_launch——PATH 探测 / 安装缓存命中，永不触网（auto_install=false，
         // design §0 路径 A；显式下载走 CLI `install` 命令）。
@@ -975,17 +1019,33 @@ impl Supervisor {
         };
         let t2 = ls_registry::adapter_for(lang);
         let launch = match &t2 {
-            Some(adapter) => adapter.launch_info(&ctx).await.map_err(|e| {
-                let msg = format!("{e:#}");
-                if msg.contains("not found in PATH") {
-                    ToolError::NotInstalled {
-                        language: lang.to_string(),
-                        hint: extract_install_hint(&msg),
+            Some(adapter) => adapter
+                .launch_info(&ctx)
+                .await
+                .map_err(|e| {
+                    let msg = format!("{e:#}");
+                    if msg.contains("not found in PATH") {
+                        self.failure_memo_record(
+                            &key.root,
+                            lang,
+                            MemoKind::NotInstalled {
+                                language: lang.to_string(),
+                                hint: extract_install_hint(&msg),
+                            },
+                        );
+                        ToolError::NotInstalled {
+                            language: lang.to_string(),
+                            hint: extract_install_hint(&msg),
+                        }
+                    } else {
+                        self.failure_memo_record(
+                            &key.root,
+                            lang,
+                            MemoKind::Launch { message: msg.clone() },
+                        );
+                        ToolError::Launch(e)
                     }
-                } else {
-                    ToolError::Launch(e)
-                }
-            })?,
+                })?,
             None => {
                 let Some((_, spec)) = ls_registry::config::spec_for(lang) else {
                     return Err(ToolError::BadArgs {
@@ -993,9 +1053,19 @@ impl Supervisor {
                     });
                 };
                 let (_, args) = ls_registry::config::ensure_launch(lang, None, false, false)
-                    .map_err(|msg| ToolError::NotInstalled {
-                        language: lang.to_string(),
-                        hint: msg,
+                    .map_err(|msg| {
+                        self.failure_memo_record(
+                            &key.root,
+                            lang,
+                            MemoKind::NotInstalled {
+                                language: lang.to_string(),
+                                hint: msg.clone(),
+                            },
+                        );
+                        ToolError::NotInstalled {
+                            language: lang.to_string(),
+                            hint: msg,
+                        }
                     })?;
                 // expand_exec 返回完整 argv（exec 模板首元素即 {bin}）。
                 // spec.env：spawn 注入表（PATH 类键追加原值语义，见 spawn_env）；
@@ -1015,8 +1085,11 @@ impl Supervisor {
                 .unwrap()
                 .insert(key.clone(), PathBuf::from(exe));
         }
-        let child = ls_runtime::process::Child::spawn(launch)
-            .map_err(|e| ToolError::Launch(anyhow::anyhow!("runtime spawn error: {e}")))?;
+        let child = ls_runtime::process::Child::spawn(launch).map_err(|e| {
+            let msg = format!("runtime spawn error: {e}");
+            self.failure_memo_record(&key.root, lang, MemoKind::Launch { message: msg.clone() });
+            ToolError::Launch(anyhow::anyhow!("{msg}"))
+        })?;
         let mut params = base_initialize_params();
         let uri = lsp_types::Uri::from_str(&path_to_uri_str(&key.root)).map_err(|e| {
             ToolError::BadArgs {
@@ -1065,7 +1138,29 @@ impl Supervisor {
             deep_merge_json(slot, opts);
         }
 
-        let session = Session::start(Some(child), params).await?;
+        // blindtest v5 P2-D：Terminated 错误的 `ls` 字段用真实 server id（此前恒
+        // "ls"——kotlin 报 `"ls":"ls"` 失真）。spec_for 命中即条目 id（kotlin 等
+        // T0 = servers.toml 键）；未命中回落语言名。
+        let ls_name = ls_registry::config::spec_for(lang)
+            .map(|(id, _)| id)
+            .unwrap_or(lang);
+        let session = Session::start_named(ls_name, Some(child), params)
+            .await
+            .map_err(|e| {
+                match &e {
+                    CoreError::Terminated { cause, .. } => self.failure_memo_record(
+                        &key.root,
+                        lang,
+                        MemoKind::Terminated { cause: cause.clone() },
+                    ),
+                    _ => self.failure_memo_record(
+                        &key.root,
+                        lang,
+                        MemoKind::Launch { message: format!("LS handshake failed: {e}") },
+                    ),
+                }
+                ToolError::Core(e)
+            })?;
         // didOpen 的 languageId 用 adapter 真实语言（默认 "cpp" 对 rust-analyzer
         // 等严格 LS 是错语言 → 文档拒收）。session_for 是唯一 spawn 点，此处注入
         // 覆盖全部会话路径。lsp_language_id 换算 LSP 官方名（docker→dockerfile）。
@@ -1296,8 +1391,10 @@ impl Supervisor {
     ///
     /// 主路径 = **push 等待**：generation 只计非空推送（见 handler），gen 越基线 =
     /// didOpen/didChange 之后的新一代推送到达（cache 即新鲜 items）。窗口尽未达标
-    /// → pull 做兜底但**一律标 pending: true**（快照可能陈旧）；items 空**不代表
-    /// 无错**，AI 应回头复核。
+    /// → pull 做兜底。pending 语义（blindtest v5 P3-I 修订）：items 空 = 未确认
+    /// （可能 pending:true，连续 3 轮空走 dmsm 降级）；**items 非空 = pending:false**
+    ///（结果存在即非 in-progress；陈旧快照风险由 pull 预算收紧 v5 P2-F 间接缩小，
+    /// AI 应回头复核的提示由空结果路径承担）。
     pub async fn tool_diagnostics(
         &self,
         root: &Path,
@@ -1347,13 +1444,17 @@ impl Supervisor {
         // LS 的 full 报告为"确认无错"，同 push 缓存的确认语义）。
         if hybrid_companion {
             if supports_pull {
+                // blindtest v5 P2-F：pull 请求吃 warmup 预算（默认 15s），不吃
+                // 30s TOOL_TIMEOUT——冷启动窗口 LS 未就绪时 30s 拉满会顶穿 CLI
+                // 超时窗（csharp 30s×3=90s 三连 TIMEOUT，降级 JSON 到不了调用方）。
+                let pull_timeout = self.warmup_budget();
                 for _ in 0..40 {
                     let pulled = session
                         .client()
                         .request::<serde_json::Value>(
                             "textDocument/diagnostic",
                             json!({ "textDocument": { "uri": uri.clone() } }),
-                            TOOL_TIMEOUT,
+                            pull_timeout,
                         )
                         .await
                         .ok()
@@ -1444,12 +1545,14 @@ impl Supervisor {
         if items.is_empty()
             && supports_pull
             && !stale_entry
+            // blindtest v5 P2-F：同 hybrid 路径——warmup 预算而非 30s；超时经
+            // `let Ok` 落空 → register_empty_pending_exit 的 dmsm 式降级。
             && let Ok(value) = session
                 .client()
                 .request::<serde_json::Value>(
                     "textDocument/diagnostic",
                     json!({ "textDocument": { "uri": uri.clone() } }),
-                    TOOL_TIMEOUT,
+                    self.warmup_budget(),
                 )
                 .await
             && let Some(pull) = Self::extract_pull_items(&value)
@@ -1463,7 +1566,10 @@ impl Supervisor {
         }
         // items 非空（可能是陈旧快照）不是「LS 无诊断」信号：清零记账，行为不变。
         self.reset_pending_streak(&key.root, &uri);
-        Ok(json!({ "items": compact_diags(&items), "pending": true }))
+        // blindtest v5 P3-I：found>0 不再自称 in-progress（json 实锤 found 与
+        // pending:true 并存误导调用方）。陈旧快照风险由 v5 P2-F 预算收紧间接
+        // 缩小；push 等待窗已按 version 精确比对。
+        Ok(json!({ "items": compact_diags(&items), "pending": false }))
     }
 
     /// bd dmsm：`tool_diagnostics` 的空 pending 出口统一记账。连续空 pending 轮数
@@ -2412,6 +2518,45 @@ impl Supervisor {
     /// 批2-A：本次请求的语义就绪等待预算（execute_tool 入口刷新）。
     fn warmup_budget(&self) -> Duration {
         Duration::from_millis(self.warmup_budget_ms.load(Ordering::Relaxed))
+    }
+
+    /// blindtest v5 P3-H：memo 命中 → 重建同 wire 类错误 + 追加恢复指引（进程内
+    /// 短路，不 spawn 不请求）。TTL 过期清账返 None。
+    fn failure_memo_check(&self, root: &Path, lang: &str) -> Option<ToolError> {
+        let mut memo = self.failure_memo.lock().unwrap();
+        let k = (root.to_path_buf(), lang.to_ascii_lowercase());
+        let entry = memo.get(&k)?;
+        let elapsed = entry.at.elapsed();
+        if elapsed.as_secs() >= entry.kind.ttl_secs() {
+            memo.remove(&k);
+            return None;
+        }
+        let hint = format!(
+            "; previous call failed identically {:.0}s ago; run `serena-cli stop-all` and retry",
+            elapsed.as_secs_f32()
+        );
+        Some(match &entry.kind {
+            MemoKind::NotInstalled { language, hint: h } => ToolError::NotInstalled {
+                language: language.clone(),
+                hint: format!("{h}{hint}"),
+            },
+            MemoKind::Launch { message } => {
+                ToolError::Launch(anyhow::anyhow!("{message}{hint}"))
+            }
+            MemoKind::Terminated { cause } => ToolError::Core(CoreError::Terminated {
+                ls: lang.to_string(),
+                cause: format!("{cause}{hint}"),
+            }),
+        })
+    }
+
+    /// memo 记账（同类覆盖写，幂等）。
+    fn failure_memo_record(&self, root: &Path, lang: &str, kind: MemoKind) {
+        let k = (root.to_path_buf(), lang.to_ascii_lowercase());
+        self.failure_memo
+            .lock()
+            .unwrap()
+            .insert(k, FailureMemoEntry { kind, at: std::time::Instant::now() });
     }
 
     /// 语义层曾非空成功（任一语义工具）→ 引用类空结果可信（真·无 caller）。
@@ -5981,8 +6126,8 @@ fn warmup_marker_json() -> serde_json::Value {
 /// 降级响应组装：顶层插 `degraded`（字符串标记）+ `warmup`（结构化标记）。
 /// 调用时序约定在 attach_warning 之后——warning 非空已把裸 null/标量/数组升级
 /// 为对象形态，此处对象直插键；非对象（调用方未先 attach_warning）按同型升级，
-/// 保证字段总能落到 wire。
-pub(crate) fn attach_degraded(value: &mut serde_json::Value, degraded: Degraded) {
+/// 保证字段总能落到 wire。daemon 侧复用（blindtest v5 P2-E 切换后空结果标记）。
+pub fn attach_degraded(value: &mut serde_json::Value, degraded: Degraded) {
     let d = serde_json::Value::String(degraded.as_str().to_string());
     let warmup = warmup_marker_json();
     if value.is_object() {
@@ -6370,6 +6515,48 @@ async fn lsp_position_from_byte(
     Ok(Position::new(pos.line, pos.character))
 }
 
+/// blindtest v5 P1-2：裸 .rs 目录（无 Cargo.toml）RA 无工程可加载，语义类工具
+/// 全链挂死（v5 实测 415s 超时零降级）。只读语义工具在 dispatch 入口短路：fs
+/// 探测 ~0ms，墙钟 ≤2s。语法类（overview/edit-context/read）与写类不经此门。
+/// 限定 root 直下 Cargo.toml：monorepo 无根 manifest 的形态不在本门覆盖内
+/// （warning 文案即告知根因，用户可自行判读）。
+const RUST_SEMANTIC_GATE_TOOLS: [&str; 7] = [
+    "hover",
+    "def",
+    "find-implementations",
+    "find-referencing-code-snippets",
+    "signature-help",
+    "document-highlight",
+    "diagnostics",
+];
+
+fn rust_semantic_gate(
+    tool: &str,
+    root: &Path,
+    args: &serde_json::Value,
+    lang_override: Option<&str>,
+) -> Option<serde_json::Value> {
+    if !RUST_SEMANTIC_GATE_TOOLS.contains(&tool) {
+        return None;
+    }
+    let lang = lang_override
+        .map(|l| l.to_ascii_lowercase())
+        .or_else(|| {
+            args.get("file")
+                .and_then(|f| f.as_str())
+                .and_then(|f| resolve_lang_for_file(f, None).ok())
+        })?;
+    if lang != "rust" || root.join("Cargo.toml").is_file() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "items": [],
+        "degraded": "semantic-pending",
+        "warmup": { "stage": "indexing", "progress": null, "retry_after_warm": false },
+        "warning": "rust LS requires a Cargo project (no Cargo.toml under root); semantic tools unavailable, syntax tools still work",
+    }))
+}
+
 /// 解析 lang: 有 override 直接用 (大小写折叠), 否则按文件扩展名探测
 /// （内置 EXT_TABLE → external-servers.toml extensions 兜底）。
 /// EXT_TABLE 只看扩展名；再落 file_detect（文件名/shebang）兜底无扩展名文件
@@ -6384,10 +6571,19 @@ fn resolve_lang_for_file(file: &str, lang_override: Option<&str>) -> ToolResult<
         .ok_or_else(|| ToolError::BadArgs {
             // 杠精 F3：与路径守卫拒绝（"path escapes project root"）文案分流——
             // 带扩展名时点明扩展名，用户能直接分清文件类型错 vs 路径错。
+            // blindtest v5 P1-1：扩展名在 servers.toml 有登记（.rb/.m 类）→ 不是
+            // 真未知类型，是「注册了但无 adapter 路由」，给 ls-use 指引而非裸
+            // unsupported（保留原语义给真未知扩展名）。
             detail: match Path::new(file).extension().and_then(|e| e.to_str()) {
-                Some(ext) => format!(
-                    "unsupported extension .{ext}: {file} (pass --lang <lang> to override)"
-                ),
+                Some(ext) => match ls_registry::registered_lang_for_extension(ext) {
+                    Some(lang) => format!(
+                        "registered but no adapter for {lang} (.{ext}); use ls-use to \
+                         register an external server: {file}"
+                    ),
+                    None => format!(
+                        "unsupported extension .{ext}: {file} (pass --lang <lang> to override)"
+                    ),
+                },
                 None => format!(
                     "file not supported: {file} (no extension/filename language match; \
                      pass --lang <lang> to override)"
@@ -6941,6 +7137,10 @@ impl Supervisor {
             .get("_delta")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // blindtest v5 P1-2：裸 .rs 目录语义类工具短路（见 rust_semantic_gate）。
+        if let Some(v) = rust_semantic_gate(tool, root, args, lang) {
+            return Ok(v);
+        }
         let mut value: serde_json::Value = match tool {
             "overview" => {
                 let file = required_file(args)?;
@@ -12829,6 +13029,92 @@ mod path_traversal_tests {
             panic!("应为 BAD_ARGS");
         };
         assert!(detail.contains("file not supported"), "{detail}");
+    }
+
+    #[test]
+    fn registered_extension_gets_no_adapter_message() {
+        // blindtest v5 P1-1：.rb 在 servers.toml 有登记（ruby_lsp extensions）→
+        // 「注册了但无 adapter」+ ls-use 指引，不再是裸 unsupported。
+        let err = resolve_lang_for_file("main.rb", None).unwrap_err();
+        let ToolError::BadArgs { detail } = err else {
+            panic!("应为 BAD_ARGS");
+        };
+        assert!(
+            detail.contains("registered but no adapter for ruby") && detail.contains("ls-use"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn rust_semantic_gate_fires_only_for_rust_without_cargo_manifest() {
+        // blindtest v5 P1-2：裸 .rs 目录 → hover 短路 degraded；有 Cargo.toml /
+        // 非 rust / 非语义工具 → 不拦。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let args = serde_json::json!({ "file": "main.rs", "line": 0, "col": 3 });
+
+        let v = rust_semantic_gate("hover", root, &args, None).expect("裸 rust 目录必拦");
+        assert_eq!(v["degraded"], serde_json::json!("semantic-pending"));
+        assert_eq!(v["warmup"]["retry_after_warm"], serde_json::json!(false));
+        assert!(
+            v["warning"]
+                .as_str()
+                .unwrap()
+                .contains("rust LS requires a Cargo project"),
+            "{}",
+            v["warning"]
+        );
+        // 语法类工具不在门内。
+        assert!(rust_semantic_gate("overview", root, &args, None).is_none());
+        // 有 Cargo.toml 不拦。
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert!(rust_semantic_gate("hover", root, &args, None).is_none());
+        std::fs::remove_file(root.join("Cargo.toml")).unwrap();
+        // 非 rust 语言不拦。
+        std::fs::write(root.join("app.py"), "x = 1\n").unwrap();
+        let py_args = serde_json::json!({ "file": "app.py", "line": 0, "col": 0 });
+        assert!(rust_semantic_gate("hover", root, &py_args, None).is_none());
+        // --lang override 优先于扩展名。
+        assert!(rust_semantic_gate("hover", root, &args, Some("rust")).is_some());
+        assert!(rust_semantic_gate("hover", root, &args, Some("python")).is_none());
+    }
+
+    #[tokio::test]
+    async fn failure_memo_short_circuits_second_call_with_hint() {
+        // blindtest v5 P3-H：记账后第二次检查快速失败并带恢复指引；TTL 过期清账。
+        let sup = Supervisor::direct().await.unwrap();
+        let root = std::path::Path::new("D:/does/not/matter");
+        sup.failure_memo_record(
+            root,
+            "al",
+            MemoKind::NotInstalled {
+                language: "al".into(),
+                hint: "install the runtime".into(),
+            },
+        );
+        let err = sup
+            .failure_memo_check(root, "AL")
+            .expect("同 root 不同大小写 lang 也要命中（键归一）");
+        let ToolError::NotInstalled { hint, .. } = &err else {
+            panic!("应重建 NotInstalled 同 wire 类");
+        };
+        assert!(
+            hint.contains("previous call failed identically") && hint.contains("stop-all"),
+            "{hint}"
+        );
+        // Terminated 类重建保 wire 类（LS_TERMINATED）。
+        sup.failure_memo_record(
+            root,
+            "kotlin",
+            MemoKind::Terminated { cause: "stdout pump EOF".into() },
+        );
+        let err = sup.failure_memo_check(root, "kotlin").unwrap();
+        let ToolError::Core(CoreError::Terminated { ls, cause }) = &err else {
+            panic!("应重建 Terminated 同 wire 类");
+        };
+        assert_eq!(ls, "kotlin");
+        assert!(cause.contains("stdout pump EOF"), "{cause}");
     }
 
     #[tokio::test]

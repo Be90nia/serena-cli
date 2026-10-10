@@ -289,6 +289,12 @@ impl Client {
         guard.extend(methods.into_iter().map(Into::into));
     }
 
+    /// 服务器标识（blindtest v5 P2-D：Failed 会话的 Terminated 错误 `ls` 字段
+    /// 数据源——此前 session.rs 侧硬编码 "ls"，与 Client 实名脱节）。
+    pub(crate) fn ls_name(&self) -> &str {
+        &self.inner.ls_name
+    }
+
     /// 测试观察口（bd xht）：生产注册路径（Session::start →
     /// set_content_modified_retry）的白名单快照，防 RETRY_ON_CONTENT_MODIFIED
     /// 注册点被删/常量漂移后「机制存在≠接线生效」复发。

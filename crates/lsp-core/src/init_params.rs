@@ -7,6 +7,8 @@
 //!
 //! 关键能力声明（ARCHITECTURE §3.2 注：与 client.rs 的 ContentModified 重试机制一致）：
 //! - `text_document.document_symbol.hierarchical_document_symbol_support = true`
+//! - `text_document.publish_diagnostics`（bd v5 P2-G：TLS 以此为诊断引擎总闸，缺声明
+//!   = LS 侧诊断整体关闭；机制存在≠接线第四例——缺声明点）
 //! - `general.stale_request_support = { cancel: true, retry_on_content_modified: [...] }`
 //! - `general.position_encodings = [utf-16, utf-8]`（clangd 默认 utf-16；mock_ls capabilities 同）
 //! - `window.work_done_progress = true`（$/progress 上报门，bd 0vj1：不声明则 RA 全量静默）
@@ -15,8 +17,9 @@
 
 use lsp_types::{
     ClientCapabilities, DocumentSymbolClientCapabilities, GeneralClientCapabilities,
-    InitializeParams, PositionEncodingKind, StaleRequestSupportClientCapabilities,
-    TextDocumentClientCapabilities, WindowClientCapabilities, WorkspaceClientCapabilities,
+    InitializeParams, PositionEncodingKind, PublishDiagnosticsClientCapabilities,
+    StaleRequestSupportClientCapabilities, TextDocumentClientCapabilities,
+    WindowClientCapabilities, WorkspaceClientCapabilities,
 };
 
 /// 默认客户端信息。CLI 在 supervisor 层组装时（Task 10）可改 name/version；本模块只给个稳定默认。
@@ -61,6 +64,13 @@ pub fn base_initialize_params() -> InitializeParams {
                 hierarchical_document_symbol_support: Some(true),
                 ..Default::default()
             }),
+            // blindtest v5 P2-G 帧实锚（TS 5.1.3 cli.mjs）：TLS 的诊断引擎以客户端
+            // 声明的 `textDocument.publishDiagnostics` 能力为总闸
+            // （`features.diagnosticsSupport = Boolean(publishDiagnostics)`）——
+            // 未声明 → TLS 全程零 publishDiagnostics（tsserver 侧诊断回调不挂），
+            // 注入错误全漏报且与 languageId 无关。「机制存在≠接线生效」第四例
+            // （缺声明点）。最小声明：不虚报 tag/relatedInformation 特性位。
+            publish_diagnostics: Some(PublishDiagnosticsClientCapabilities::default()),
             ..Default::default()
         }),
         general: Some(GeneralClientCapabilities {

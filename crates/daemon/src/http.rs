@@ -339,6 +339,22 @@ async fn tools_post(
                         None => switch,
                     };
                     supervisor::attach_warning(&mut data, &[combined]);
+                    // blindtest v5 P2-E：切换后首个查询的空 items 是「新 project 的
+                    // LS 会话未就绪」而非权威空（csharp/angular 实锤 hover 语义通、
+                    // ov 空）——禁止静默空数组，结构化标 degraded 让 AI 重查。
+                    // 限定 overview：find-symbol 等已有自身 not-ready 降级机器；
+                    // list-dir/find-file 空结果是 fs 权威，不在此列。
+                    if name == "overview"
+                        && data
+                            .get("items")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|a| a.is_empty())
+                    {
+                        supervisor::attach_degraded(
+                            &mut data,
+                            supervisor::Degraded::SemanticPending,
+                        );
+                    }
                 }
             }
             let facts = CallFacts {
@@ -859,6 +875,9 @@ mod tests {
         /// 按工具名回显模式（batch 用）：`slow_x` 延迟 50ms 后 Ok("x")，
         /// `bad_*` → Err(BadArgs)，其余 Ok(tool)。并发下完成序 ≠ 请求序。
         echo: bool,
+        /// v5 P2-E：可重复 Ok(value)——switch 场景断言需同一 AppState 内多调
+        /// （active_project/switch_reported 在 state 里，换 state 即丢记忆）。
+        always: Option<serde_json::Value>,
         result: tokio::sync::Mutex<
             Option<Box<dyn FnOnce() -> Result<serde_json::Value, supervisor::ToolError> + Send>>,
         >,
@@ -869,13 +888,23 @@ mod tests {
             Self {
                 delay: None,
                 echo: false,
+                always: None,
                 result: tokio::sync::Mutex::new(Some(Box::new(move || Ok(data)))),
+            }
+        }
+        fn ok_repeat(data: serde_json::Value) -> Self {
+            Self {
+                delay: None,
+                echo: false,
+                always: Some(data),
+                result: tokio::sync::Mutex::new(None),
             }
         }
         fn err(e: supervisor::ToolError) -> Self {
             Self {
                 delay: None,
                 echo: false,
+                always: None,
                 result: tokio::sync::Mutex::new(Some(Box::new(move || Err(e)))),
             }
         }
@@ -883,6 +912,7 @@ mod tests {
             Self {
                 delay: Some(delay),
                 echo: false,
+                always: None,
                 result: tokio::sync::Mutex::new(Some(Box::new(move || Ok(data)))),
             }
         }
@@ -890,6 +920,7 @@ mod tests {
             Self {
                 delay: None,
                 echo: true,
+                always: None,
                 result: tokio::sync::Mutex::new(None),
             }
         }
@@ -900,6 +931,7 @@ mod tests {
             Self {
                 delay: Some(std::time::Duration::from_millis(150)),
                 echo: false,
+                always: None,
                 result: tokio::sync::Mutex::new(Some(Box::new(move || {
                     let _ = tx.try_send("done");
                     Ok(json!("replace-body"))
@@ -931,6 +963,9 @@ mod tests {
             }
             if let Some(d) = self.delay {
                 tokio::time::sleep(d).await;
+            }
+            if let Some(v) = &self.always {
+                return Ok(v.clone());
             }
             let f = self.result.lock().await.take().expect("mock called once");
             f()
@@ -1113,6 +1148,42 @@ mod tests {
         let (_, body) = oneshot_json(router, call("D:/proj-b")).await;
         let body = body.expect("json body");
         assert_eq!(body["data"], json!("overview"), "同 project 无 warning");
+    }
+
+    /// blindtest v5 P2-E：切换后首个 overview 空 items = LS 未就绪而非权威空 →
+    /// 结构化 degraded + warmup 标记，禁静默空数组；非空结果与重复切换不标。
+    #[tokio::test]
+    async fn switch_first_empty_overview_gets_degraded_marker() {
+        let st = state("secret", MockSupervisor::ok_repeat(json!([])));
+        let router = router(st);
+        let call = |root: &str| {
+            req_post(
+                "/tools/overview",
+                Some("secret"),
+                json!({ "project_root": root, "args": {} }),
+            )
+        };
+        // 首调 proj-a：active_project 尚为 None → 无 switch，data 保持裸数组。
+        let (_, body) = oneshot_json(router.clone(), call("D:/proj-a")).await;
+        let body = body.expect("json body");
+        assert_eq!(body["data"], json!([]));
+        assert!(body["data"].get("degraded").is_none());
+
+        // 切到 proj-b：warning + degraded + warmup 三标记齐上。
+        let (_, body) = oneshot_json(router.clone(), call("D:/proj-b")).await;
+        let body = body.expect("json body");
+        assert_eq!(body["data"]["degraded"], json!("semantic-pending"));
+        assert_eq!(
+            body["data"]["warmup"]["retry_after_warm"],
+            json!(true),
+            "切换场景可重查（与 rust-no-cargo 的 false 相区隔）"
+        );
+        assert!(body["data"]["items"].as_array().unwrap().is_empty());
+
+        // 同 project 重复调用（B→B 无 switch）：不再标。
+        let (_, body) = oneshot_json(router, call("D:/proj-b")).await;
+        let body = body.expect("json body");
+        assert!(body["data"].get("degraded").is_none());
     }
 
     /// bd ts9d：同 (from,to) 对 daemon 生命周期内只报一次——A→B 二次调用

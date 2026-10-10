@@ -335,22 +335,33 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
+    /// [`Session::start_named`] 的默认名形态（lsp-core 直连路径——supervisor 生产
+    /// spawn 走 [`Session::start_named`] 注入真实 server id，blindtest v5 P2-D）。
+    pub async fn start(child: Option<ChildHandle>, params: InitializeParams) -> Result<Arc<Self>> {
+        Self::start_named("ls", child, params).await
+    }
+
     /// 启动 session：spawn 已就绪的 child → 起 3 泵 → 握手（initialize + initialized）→
     /// Ready。失败返回 `CoreError`，调用方不得到 Arc。
+    /// `ls_name` 进 Terminated 错误的 `ls` 字段（此前恒 "ls"，kotlin 报 `"ls":"ls"`）。
     ///
     /// 行为契约（PLAN Task 6 acceptance #1 + ARCH §5）：
     /// - 成功 → `Arc<Session>`，state == Ready。
     /// - 失败 → `CoreError`，无 Arc（child 由 pumps 持 Job 保活，pumps drop 灭树）。
     ///
     /// 不重试：失败语义由 supervisor 决策（PLAN Global Constraints）。
-    pub async fn start(child: Option<ChildHandle>, params: InitializeParams) -> Result<Arc<Self>> {
+    pub async fn start_named(
+        ls_name: &str,
+        child: Option<ChildHandle>,
+        params: InitializeParams,
+    ) -> Result<Arc<Self>> {
         // 拆 child + 起 3 泵（架构要求 writer 独占 stdin、stdout 泵内联分发、stderr 泵日志）。
         // P0B：outbound channel 改 `OutboundItem`（带 priority），writer 走 priority-aware
         // 三路路由 + TokenBucket；详见 `transport::stdio::pump_with_priority`。
         let (out_tx, out_rx) = mpsc::channel::<OutboundItem>(64);
         let (reply_tx, reply_rx) = mpsc::channel::<JsonRpc>(8);
 
-        let client = Client::with_name("ls".into(), out_tx.clone());
+        let client = Client::with_name(ls_name.to_string(), out_tx.clone());
         // bd serena-rust-s3u：位置类方法的 -32801 ContentModified 必须在 client 层内部
         // 重试消化（3 次 × 200ms），否则并发首击 RA 类型分析重算窗口时硬错误外泄 wire。
         // 白名单与 init_params::RETRY_ON_CONTENT_MODIFIED 同源。
@@ -760,7 +771,7 @@ impl Session {
         match snap {
             SessionState::Ready => self.client.request(method, params, timeout).await,
             SessionState::Failed(cause) => Err(CoreError::Terminated {
-                ls: "ls".into(),
+                ls: self.client.ls_name().to_string(),
                 cause: format!("session failed: {cause}"),
             }),
             SessionState::Uninitialized | SessionState::Initializing => Err(CoreError::NotReady {
@@ -811,7 +822,7 @@ impl Session {
                     .await
             }
             SessionState::Failed(cause) => Err(CoreError::Terminated {
-                ls: "ls".into(),
+                ls: self.client.ls_name().to_string(),
                 cause: format!("session failed: {cause}"),
             }),
             SessionState::Uninitialized | SessionState::Initializing => Err(CoreError::NotReady {

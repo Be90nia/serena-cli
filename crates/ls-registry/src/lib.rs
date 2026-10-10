@@ -257,6 +257,68 @@ pub fn resolve_lang_name(path: &Path) -> Option<&'static str> {
         .or_else(|| config::external_table().and_then(|t| config::match_external_ext(t, &ext)))
 }
 
+/// 语言在当前注册状态下是否存在真实请求路径（blindtest v5 P1-1 判据源，与安装态
+/// 正交：installed 只代表缓存包在盘）。true = external 注册拥有（ls-use 生效面）/
+/// T2 adapter 直路由 / EXT_TABLE 扩展名路由（T0 配置驱动）三者任一；false = 该
+/// 语言目前无从文件名到达（.rb/.m 类——包在盘也路由失败，BAD_ARGS unsupported）。
+pub fn language_routable(lang: &str) -> bool {
+    let l = lang.to_ascii_lowercase();
+    if config::spec_source(&l) == Some("external") {
+        return true;
+    }
+    if adapter_for(&l).is_some() {
+        return true;
+    }
+    if let Some(id) = LanguageId::from_str_opt(&l) {
+        return EXT_TABLE.iter().any(|(_, t)| *t == id);
+    }
+    false
+}
+
+/// 避撞变体条目 → LS 家族真语言。这些条目的 `languages` 用自身 id 占位避撞
+/// （[servers.csharp_ls] / [servers.omnisharp] / [servers.pyright] 注释先例：
+/// "X 语言路由归 Y 条目 / 手写 adapter 接管，本条仅按 id 显式安装"）——真语言
+/// 经家族门路由。entry_routable 的折算表；家族语言不可路由时条目仍如实 false
+/// （solargraph→ruby：.rb 无映射，两代都 false）。
+const VARIANT_ENTRY_FAMILY: &[(&str, &str)] = &[
+    ("pyright", "python"),
+    ("jedi", "python"),
+    ("python_ty", "python"),
+    ("basedpyright", "python"),
+    ("csharp_ls", "csharp"),
+    ("omnisharp", "csharp"),
+    ("typescript_ls", "typescript"),
+    ("crystalline_source", "crystal"),
+    ("phpantom", "php"),
+    ("solargraph", "ruby"),
+];
+
+/// ls-list/doctor 条目级 routable（blindtest v5 P1-1 判据源）：语言门任一可路由，
+/// 或条目 id 本身可路由，或为家族语言可路由的避撞变体条目。
+pub fn entry_routable(id: &str, languages: &[String]) -> bool {
+    if languages.iter().any(|l| language_routable(l)) || language_routable(id) {
+        return true;
+    }
+    let Some((_, fam)) = VARIANT_ENTRY_FAMILY.iter().find(|(v, _)| *v == id) else {
+        return false;
+    };
+    language_routable(fam)
+}
+
+/// 扩展名是否被内置 servers.toml 条目的 `extensions` 字段登记 → 返回该条目首选
+/// 语言名。仅供 resolve 失败分支的报错文案分流（「注册了但无 adapter」vs「真未知
+/// 扩展名」）；路由本身不读此表（文件探测权威归 EXT_TABLE，spec.rs 字段注释）。
+pub fn registered_lang_for_extension(ext: &str) -> Option<&'static str> {
+    let e = ext.trim_start_matches('.').to_ascii_lowercase();
+    config::builtin_entries().into_iter().find_map(|(_, spec)| {
+        let hit = spec
+            .extensions
+            .iter()
+            .any(|x| x.trim_start_matches('.').eq_ignore_ascii_case(&e));
+        hit.then(|| spec.languages.first().map(String::as_str))?
+    })
+}
+
 /// 语言字符串 → adapter 单例。M3 覆盖 7 手写语言。
 ///
 /// T0 配置驱动语言（servers.toml，如 markdown）**不走此处**——它们的启动经
@@ -443,6 +505,12 @@ pub fn lsp_language_id(lang: &str) -> String {
         // smoke R4：typescript_vts 变体门的 didOpen 官方口径是 "typescript"
         // （vtsls 消费 TS 文档；变体门 pgsql→sql 同款换算）。
         "typescript_vts" => "typescript".to_string(),
+        // blindtest v5 P2-G 帧实锚（SERENA_RECORD tsrec.jsonl）：--lang
+        // typescript_ls 走 T0 spec 路由时 didOpen languageId 发内部变体名
+        // "typescript_ls" → TLS 不把文档纳入 TS 诊断管线（零 publishDiagnostics、
+        // hover/symbol 靠 URI 兜底仍活）→ 注入错误全漏报。官方口径 "typescript"
+        // （pyright→python 同款显式映射，不赌 LS 对自名的宽容）。
+        "typescript_ls" => "typescript".to_string(),
         // 上游对拍采纳 W6（批次 A 锚）：ty_server.py:68-70 / pyrefly_server.py:226-228
         // `_get_language_id_for_file` 强制发 "python"——两 LS 不赌自名宽容
         // （pyright→python 同款显式映射）。
@@ -895,5 +963,61 @@ mod tests {
         ] {
             assert_eq!(resolve(&PathBuf::from(path)), Some(want), "{path}");
         }
+    }
+
+    /// blindtest v5 P1-1：routable 判据与安装态正交——installed 只代表缓存包在盘。
+    /// 可路由 = EXT_TABLE 扩展名路由（含 T0）或 T2 adapter；.rb/.m 无映射即 false
+    /// （对应 v5「包在盘但首答 unsupported extension」的 13/40 谎报面）。
+    #[test]
+    fn language_routable_tracks_request_paths_not_install_state() {
+        // T2 adapter 门。
+        for lang in ["rust", "csharp", "python", "vue"] {
+            assert!(language_routable(lang), "{lang}: T2 门可路由");
+        }
+        // T0 但 EXT_TABLE 有扩展名路由。
+        for lang in ["kotlin", "ada", "markdown", "sql"] {
+            assert!(language_routable(lang), "{lang}: T0 扩展名路由可达");
+        }
+        // 无扩展名映射、无 adapter：包在盘也路由失败（v5 实锤类）。
+        for lang in ["ruby", "matlab", "solargraph", "unknown_lang_xx"] {
+            assert!(!language_routable(lang), "{lang}: 必须判不可路由");
+        }
+        // 大小写归一。
+        assert!(language_routable("Rust"));
+    }
+
+    /// blindtest v5 P1-1：条目级判据——T2 install-face 条目（languages 占位避撞）
+    /// 按家族语言折算；家族语言本身不可路由（ruby 系）则仍如实 false。
+    #[test]
+    fn entry_routable_folds_variant_entries_to_family_language() {
+        let langs = |s: &str| vec![s.to_string()];
+        // T2 install-face / 避撞变体：真语言路由可达。
+        for id in ["pyright", "jedi", "basedpyright", "python_ty"] {
+            assert!(entry_routable(id, &langs(id)), "{id}: python 家族可路由");
+        }
+        assert!(entry_routable("csharp_ls", &langs("csharp_ls")));
+        assert!(entry_routable("omnisharp", &langs("omnisharp")));
+        assert!(entry_routable("typescript_ls", &langs("typescript_ls")));
+        assert!(entry_routable("crystalline_source", &langs("crystalline_source")));
+        // 语言门直通的条目（languages 即真语言）。
+        assert!(entry_routable("kotlin", &langs("kotlin")));
+        assert!(entry_routable("ada", &langs("ada")));
+        // ruby 家族不可路由（.rb 无 EXT_TABLE 映射）：包在盘也如实 false。
+        for id in ["solargraph", "ruby_lsp"] {
+            assert!(!entry_routable(id, &langs(id)), "{id}: ruby 家族不可路由");
+        }
+        assert!(!entry_routable("matlab", &langs("matlab")));
+        // 未知条目。
+        assert!(!entry_routable("zz_entry_xx", &langs("zz_entry_xx")));
+    }
+
+    /// blindtest v5 P1-1：resolve 失败分支的文案分流判据——.rb/.m 在内置表有登记
+    /// （extensions 字段），报「注册了但无 adapter」；真未知扩展名返 None。
+    #[test]
+    fn registered_lang_for_extension_splits_error_copy() {
+        assert_eq!(registered_lang_for_extension("rb"), Some("ruby"));
+        assert_eq!(registered_lang_for_extension(".rb"), Some("ruby"));
+        assert_eq!(registered_lang_for_extension("m"), Some("matlab"));
+        assert_eq!(registered_lang_for_extension("zzunsup99"), None);
     }
 }

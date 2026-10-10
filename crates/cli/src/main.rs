@@ -3405,8 +3405,9 @@ fn cache_versions(id_dir: &Path) -> Vec<(String, PathBuf, u64)> {
     v
 }
 
-/// ls-list：内置表全条目 × 实装状态（installed / external-override /
-/// not-installed）+ external 新语言条目 + 总计（installed 数 / 可释放字节）。
+/// ls-list：内置表全条目 × 实装状态（installed / installed-unroutable（v5 P1-1：
+/// 包在盘但无请求路由）/ external-override / not-installed）+ 每条 routable 标志
+/// + external 新语言条目 + 总计（installed 数 / 可释放字节）。
 fn cmd_ls_list(table: bool) -> ExitCode {
     let cache_root = ls_registry::config::dirs_cache_root();
     let external: std::collections::BTreeMap<String, ls_registry::spec::ServerSpec> =
@@ -3425,13 +3426,6 @@ fn cmd_ls_list(table: bool) -> ExitCode {
         let versions = cache_versions(&cache_root.join(id));
         let bytes: u64 = versions.iter().map(|(_, _, b)| *b).sum();
         let overridden = external.get(*id).is_some_and(|s| s.priority >= 0);
-        let state = if overridden {
-            "external-override"
-        } else if !versions.is_empty() {
-            "installed"
-        } else {
-            "not-installed"
-        };
         // bd serena-rust-9z0x：override 行显示 external 条目自身 languages——
         // external 是完整条目替换（merge_pick §3），生效路由语言以它为准。此前
         // 显示内置 spec.languages（如注册 [servers.pyright] languages=[python,
@@ -3442,10 +3436,26 @@ fn cmd_ls_list(table: bool) -> ExitCode {
         } else {
             spec.languages.clone()
         };
+        // blindtest v5 P1-1：installed 只代表缓存包在盘；routable = 请求路径存在
+        // （adapter / EXT_TABLE / external 注册 / 避撞变体的家族语言），判据源
+        // ls_registry::entry_routable。
+        let routable = overridden || ls_registry::entry_routable(id, &languages);
+        let state = if overridden {
+            "external-override"
+        } else if !versions.is_empty() && !routable {
+            // 诚实态：包在盘但无路由（.rb/.m 类）——避免「installed 实际不可用」
+            // 的 13/40 谎报面。
+            "installed-unroutable"
+        } else if !versions.is_empty() {
+            "installed"
+        } else {
+            "not-installed"
+        };
         let mut entry = json!({
             "id": id,
             "languages": languages,
             "state": state,
+            "routable": routable,
         });
         if overridden {
             entry["binary_name"] = external[*id]
@@ -3471,6 +3481,12 @@ fn cmd_ls_list(table: bool) -> ExitCode {
         if state == "not-installed" {
             entry["install_hint"] = json!(format!("serena-cli install {id}"));
         }
+        if state == "installed-unroutable" {
+            entry["hint"] = json!(
+                "package installed but no adapter routes this language; requests will fail — \
+                 use ls-use to register an external server"
+            );
+        }
         servers.push(entry);
     }
     // external 新语言条目（id 不在内置表）——与 ls-use --list 条目同形。
@@ -3482,6 +3498,8 @@ fn cmd_ls_list(table: bool) -> ExitCode {
                 "id": id,
                 "languages": s.languages,
                 "binary_name": s.path_only.as_ref().map(|p| p.binary_name.clone()),
+                // ls-use 注册即生效路由（external extensions 参与扩展名解析）。
+                "routable": true,
             })
         })
         .collect();
@@ -3501,21 +3519,28 @@ fn cmd_ls_list(table: bool) -> ExitCode {
                 .unwrap_or_default();
             let state = e["state"].as_str().unwrap_or("");
             let detail = match state {
-                "installed" => e["versions"]
-                    .as_array()
-                    .map(|vs| {
-                        vs.iter()
-                            .map(|v| {
-                                format!(
-                                    "{} ({} bytes)",
-                                    v["version"].as_str().unwrap_or("?"),
-                                    v["bytes"].as_u64().unwrap_or(0)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default(),
+                "installed" | "installed-unroutable" => {
+                    let versions = e["versions"]
+                        .as_array()
+                        .map(|vs| {
+                            vs.iter()
+                                .map(|v| {
+                                    format!(
+                                        "{} ({} bytes)",
+                                        v["version"].as_str().unwrap_or("?"),
+                                        v["bytes"].as_u64().unwrap_or(0)
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    if state == "installed-unroutable" {
+                        format!("{versions} [no adapter; requests will fail]")
+                    } else {
+                        versions
+                    }
+                }
                 "external-override" => e["binary_name"].as_str().unwrap_or("").to_string(),
                 _ => e["install_hint"].as_str().unwrap_or("").to_string(),
             };
@@ -3779,6 +3804,38 @@ fn apply_external_registrations(report: &mut supervisor::doctor::DoctorReport) {
     }
 }
 
+/// blindtest v5 P1-1：installed-unroutable 解释行——包已装但无请求路由的条目
+/// （.rb/.m 类），doctor 不解释则「installed」与运行时 BAD_ARGS 三方相悖
+/// （serena-rust-9z0x 同款三方一致性问题）。doctor 的 ls 检查 id 是二进制名/
+/// 规格 id 精选集，非全目录逐条——聚合单行覆盖全部 unroutable 条目。
+fn annotate_unroutable_installed(report: &mut supervisor::doctor::DoctorReport) {
+    let cache_root = ls_registry::config::dirs_cache_root();
+    let unroutable: Vec<String> = ls_registry::config::builtin_entries()
+        .into_iter()
+        .filter(|(id, spec)| {
+            let has_cache = !cache_versions(&cache_root.join(id)).is_empty();
+            has_cache && !ls_registry::entry_routable(id, &spec.languages)
+        })
+        .map(|(id, _)| id.to_string())
+        .collect();
+    if unroutable.is_empty() {
+        return;
+    }
+    report.checks.push(supervisor::doctor::Check {
+        category: "ls",
+        id: "routability",
+        label: "installed entries without adapter route",
+        status: supervisor::doctor::Status::Warn,
+        detail: format!(
+            "{}: package installed but no adapter routes these languages — file requests \
+             fail with \"registered but no adapter\"; use `serena-cli ls-use` to register \
+             an external server if you need them",
+            unroutable.join(", ")
+        ),
+        hint: None,
+    });
+}
+
 /// `doctor` 子命令：6 类体检 + 可选 --fix 自动装 MISS 的 LS。
 async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path, project_root: &Path) -> ExitCode {
     let mut report = supervisor::doctor::run_all(lock_path);
@@ -3788,6 +3845,8 @@ async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path, project_root: &Path
     // bd serena-rust-9z0x：external 注册感知（NitpickAI F1 step5——doctor 无视
     // 已注册条目，`[MISS] pyright not on PATH` 与 ls-list/运行时三方相悖）。
     apply_external_registrations(&mut report);
+    // blindtest v5 P1-1：installed-unroutable 解释行。
+    annotate_unroutable_installed(&mut report);
     // 可选：--fix 尝试装 MISS 的 server 类别条目
     if fix {
         for c in &report.checks {

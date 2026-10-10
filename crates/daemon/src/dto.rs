@@ -187,7 +187,15 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
                 format!("{method} timed out after {secs}s"),
             ),
             supervisor::CoreErrorWire::Terminated { ls, cause } => {
-                (WireErrorCode::LsTerminated, format!("{ls}: {cause}"))
+                (
+                    WireErrorCode::LsTerminated,
+                    // blindtest v5 P2-D：零 hint → 加恢复指引（stop-all + retry；
+                    // 懒 spawn 语义下次调用自动重拉）。
+                    format!(
+                        "{ls}: {cause}; the language server process exited — run \
+                         `serena-cli stop-all` and retry (a fresh LS spawns lazily on the next call)"
+                    ),
+                )
             }
             supervisor::CoreErrorWire::ServerCancelled { method } => (
                 WireErrorCode::RpcError,
