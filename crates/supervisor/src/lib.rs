@@ -1623,10 +1623,19 @@ fn compact_diags(items: &[serde_json::Value]) -> Vec<String> {
     items.iter().map(compact_one_diag).collect()
 }
 
-/// blindtest v5.2 P1-B：裸 .rs 语义工具 warmup 超预算的降级文案。单测钉两个可
-/// 操作性锚——冷启动量级 ~15s（v5.1 P2-C 实测 standalone 分析常态 ~15s，原
-/// "can take minutes" 与体感不符吓退用户）+ `wait-ready --stage indexing` 预热指路。
-const RUST_STANDALONE_PENDING_WARNING: &str = "rust language server is still analyzing this file (no Cargo.toml under root; standalone-file analysis can take ~15s on a cold start; warm it up by running `wait-ready --stage indexing`); overview did not finish within the warmup budget — retry shortly";
+/// blindtest v5.2 P1-B / v5.3 P2-1：裸 .rs 工具 warmup 超预算的降级文案，overview
+/// 与行级写类共用一份前缀（禁第二份），超预算的工具名由调用方传入。单测钉三个
+/// 可操作性锚——冷启动量级 ~15s（v5.1 P2-C 实测 standalone 分析常态 ~15s，原
+/// "can take minutes" 与体感不符吓退用户）+ `wait-ready --stage indexing` 预热
+/// 指路 + 谁没跑完（工具名）。
+fn rust_standalone_pending_warning(tool: &str) -> String {
+    format!(
+        "rust language server is still analyzing this file (no Cargo.toml under root; \
+         standalone-file analysis can take ~15s on a cold start; warm it up by running \
+         `wait-ready --stage indexing`); {tool} did not finish within the warmup budget — \
+         retry shortly"
+    )
+}
 
 /// bd dmsm：空 pending 出口的降级判定（纯函数，测试钉死语义）。
 /// `count` = 含本轮的连续空 pending 轮数；`elapsed` = 距首轮的真实 wall-clock
@@ -1649,7 +1658,7 @@ fn pending_no_diag_response(count: u32, elapsed: std::time::Duration) -> serde_j
         serde_json::json!({
             "items": [],
             "pending": false,
-            "warning": "LS returned no diagnostics after repeated empty-pending polls — it may not support diagnostics for this language"
+            "warning": "LS returned no diagnostics after repeated empty-pending polls (timeout budget exhausted); run `wait-ready` or give up diagnostics for this file"
         })
     } else {
         serde_json::json!({ "items": [], "pending": true })
@@ -2532,6 +2541,35 @@ impl Supervisor {
     /// 批2-A：本次请求的语义就绪等待预算（execute_tool 入口刷新）。
     fn warmup_budget(&self) -> Duration {
         Duration::from_millis(self.warmup_budget_ms.load(Ordering::Relaxed))
+    }
+
+    /// blindtest v5.3 P2-1：行级写类 warmup 预算门（overview B 票同款）。判据复用
+    /// [`rust_no_cargo`] 单收敛点。超预算 → 结构化降级（applied:false + warning），
+    /// 不再 45s 静默超时——v5.2/v5.3 双轮实锤：裸 .rs 冷启动时 overview 的预算
+    /// 超时会把 session_for 连带缓存写入一起掐掉，下一个无门工具重新走慢路径，
+    /// 卡在 rust 适配器 wait_indexing（无 Cargo.lock 120s 档）直到客户端断连。
+    /// 取消点实际落在 session_for（写尚未开始，盘面零副作用）；若未来写路径本身
+    /// 可能吃满预算，applied:false 的语义需重审。
+    async fn rust_line_write_budget(
+        &self,
+        tool: &'static str,
+        root: &Path,
+        lang: Option<&str>,
+        file: &str,
+        fut: impl Future<Output = ToolResult<serde_json::Value>>,
+    ) -> ToolResult<serde_json::Value> {
+        if !rust_no_cargo(root, lang, file) {
+            return fut.await;
+        }
+        match tokio::time::timeout(self.warmup_budget(), fut).await {
+            Ok(r) => r,
+            Err(_) => Ok(json!({
+                "applied": false,
+                "degraded": "semantic-pending",
+                "warmup": { "stage": "indexing", "progress": null, "retry_after_warm": true },
+                "warning": rust_standalone_pending_warning(tool),
+            })),
+        }
     }
 
     /// blindtest v5 P3-H：memo 命中 → 重建同 wire 类错误 + 追加恢复指引（进程内
@@ -7197,9 +7235,11 @@ impl Supervisor {
                 };
                 // blindtest v5.1 P2-C：rust 无 Cargo 场景语法层也受 warmup 预算——
                 // 裸 .rs 的 RA standalone 分析可慢墙 120s+（v5.1 实测 overview 120.1s
-                // 静默慢墙；行级写类 insert/replace-lines 不等分析、秒回，无此问题）。
-                // 超预算 → 结构化降级（retry_after_warm:true：分析完成后重查即快，
-                // 与语义门 rust-no-cargo 的 false 相区隔）。
+                // 静默慢墙）。超预算 → 结构化降级（retry_after_warm:true：分析完成后
+                // 重查即快，与语义门 rust-no-cargo 的 false 相区隔）。
+                // v5.3 P2-1 更正：行级写类并非"秒回无此问题"——预算超时把 session_for
+                // 连带缓存写入掐掉后，下一个无门写工具重走慢路径卡 wait_indexing
+                // 120s 档（45s 静默超时双轮实锤），同样走 rust_line_write_budget。
                 let raw = if rust_no_cargo(root, lang, &file) {
                     match tokio::time::timeout(self.warmup_budget(), overview).await {
                         Ok(r) => r?,
@@ -7208,7 +7248,7 @@ impl Supervisor {
                                 "items": [],
                                 "degraded": "semantic-pending",
                                 "warmup": { "stage": "indexing", "progress": null, "retry_after_warm": true },
-                                "warning": RUST_STANDALONE_PENDING_WARNING,
+                                "warning": rust_standalone_pending_warning("overview"),
                             }));
                         }
                     }
@@ -8229,22 +8269,27 @@ impl Supervisor {
                         detail: "missing 'content'".into(),
                     })?
                     .to_owned();
-                let (end_line, end_col) = self
-                    .tool_insert_at_line(
-                        root,
-                        &file,
-                        line,
-                        &content,
-                        opt_expected_hash(args).as_deref(),
-                        lang,
-                    )
-                    .await?;
-                let diag = self.post_diag_for_write(root, &file, lang).await;
-                Ok(serde_json::json!({
-                    "end_line": end_line,
-                    "end_col": end_col,
-                    "post_write_diagnostics": diag,
-                }))
+                // v5.3 P2-1：rust 无 Cargo 场景行级写同受 warmup 预算（见
+                // rust_line_write_budget），超预算结构化降级而非静默超时。
+                self.rust_line_write_budget("insert-at-line", root, lang, &file, async {
+                    let (end_line, end_col) = self
+                        .tool_insert_at_line(
+                            root,
+                            &file,
+                            line,
+                            &content,
+                            opt_expected_hash(args).as_deref(),
+                            lang,
+                        )
+                        .await?;
+                    let diag = self.post_diag_for_write(root, &file, lang).await;
+                    Ok(serde_json::json!({
+                        "end_line": end_line,
+                        "end_col": end_col,
+                        "post_write_diagnostics": diag,
+                    }))
+                })
+                .await
             }
             "replace-lines" => {
                 let (file, start_line, end_line) = required_line_range(args)?;
@@ -8255,40 +8300,46 @@ impl Supervisor {
                         detail: "missing 'content'".into(),
                     })?
                     .to_owned();
-                self.tool_replace_lines(
-                    root,
-                    &file,
-                    start_line,
-                    end_line,
-                    &content,
-                    opt_expected_hash(args).as_deref(),
-                    lang,
-                )
-                .await?;
-                let diag = self.post_diag_for_write(root, &file, lang).await;
-                Ok(serde_json::json!({
-                    "applied": true,
-                    "file": file,
-                    "post_write_diagnostics": diag,
-                }))
+                self.rust_line_write_budget("replace-lines", root, lang, &file, async {
+                    self.tool_replace_lines(
+                        root,
+                        &file,
+                        start_line,
+                        end_line,
+                        &content,
+                        opt_expected_hash(args).as_deref(),
+                        lang,
+                    )
+                    .await?;
+                    let diag = self.post_diag_for_write(root, &file, lang).await;
+                    Ok(serde_json::json!({
+                        "applied": true,
+                        "file": file,
+                        "post_write_diagnostics": diag,
+                    }))
+                })
+                .await
             }
             "delete-lines" => {
                 let (file, start_line, end_line) = required_line_range(args)?;
-                self.tool_delete_lines(
-                    root,
-                    &file,
-                    start_line,
-                    end_line,
-                    opt_expected_hash(args).as_deref(),
-                    lang,
-                )
-                .await?;
-                let diag = self.post_diag_for_write(root, &file, lang).await;
-                Ok(serde_json::json!({
-                    "applied": true,
-                    "file": file,
-                    "post_write_diagnostics": diag,
-                }))
+                self.rust_line_write_budget("delete-lines", root, lang, &file, async {
+                    self.tool_delete_lines(
+                        root,
+                        &file,
+                        start_line,
+                        end_line,
+                        opt_expected_hash(args).as_deref(),
+                        lang,
+                    )
+                    .await?;
+                    let diag = self.post_diag_for_write(root, &file, lang).await;
+                    Ok(serde_json::json!({
+                        "applied": true,
+                        "file": file,
+                        "post_write_diagnostics": diag,
+                    }))
+                })
+                .await
             }
             // ==== IDE undo/redo（事务版快照栈）====
             "undo" => {
@@ -9593,7 +9644,7 @@ mod pull_diagnostics_tests {
         assert_eq!(
             c["warning"],
             serde_json::json!(
-                "LS returned no diagnostics after repeated empty-pending polls — it may not support diagnostics for this language"
+                "LS returned no diagnostics after repeated empty-pending polls (timeout budget exhausted); run `wait-ready` or give up diagnostics for this file"
             )
         );
         // 慢空 ≥10s 累计 2 轮即降级（按累计时长而非轮数下限）。
@@ -9610,13 +9661,69 @@ mod pull_diagnostics_tests {
     fn rust_standalone_pending_warning_actionable() {
         // blindtest v5.2 P1-B：慢墙文案可见化——"can take minutes" 与体感不符
         // （standalone 分析常态 ~15s），必须给量级 + 预热指路两个可操作锚。
-        let w = super::RUST_STANDALONE_PENDING_WARNING;
+        // v5.3 P2-1：文案收敛为 fn，工具名由调用方传入（overview 与行级写共用）。
+        let w = super::rust_standalone_pending_warning("overview");
         assert!(w.contains("~15s on a cold start"), "量级锚: {w}");
         assert!(
             w.contains("wait-ready --stage indexing"),
             "预热指路锚: {w}"
         );
         assert!(!w.contains("can take minutes"), "旧夸大文案必须消失: {w}");
+        assert!(
+            w.contains("overview did not finish"),
+            "工具名锚（overview 回归字节不变）: {w}"
+        );
+        let ins = super::rust_standalone_pending_warning("insert-at-line");
+        assert!(
+            ins.contains("insert-at-line did not finish"),
+            "行级写工具名锚: {ins}"
+        );
+    }
+
+    /// blindtest v5.3 P2-1：行级写类 warmup 预算门——预算内透传原响应；超预算
+    /// 结构化降级（applied:false + 工具名/量级/指路三锚），不再 45s 静默超时。
+    /// 合成 future 驱动，不拉真 LS。
+    #[tokio::test]
+    async fn rust_line_write_budget_passthrough_and_degrade() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let sup = Supervisor::direct().await.expect("supervisor");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let root = dir.path();
+        // 判据单收敛点复验：裸 .rs（root 直下无 Cargo.toml）→ 预算门生效。
+        assert!(super::rust_no_cargo(root, None, "a.rs"));
+
+        // 快路径：预算内完成 → 原响应透传（无 degraded 痕迹）。
+        let fast = sup
+            .rust_line_write_budget("insert-at-line", root, None, "a.rs", async {
+                Ok(json!({ "end_line": 1, "end_col": 1 }))
+            })
+            .await
+            .unwrap();
+        assert_eq!(fast["end_line"], json!(1), "{fast}");
+        assert!(fast.get("degraded").is_none(), "{fast}");
+
+        // 慢路径：内层挂死 → 预算到点返回结构化降级（不无限等）。
+        sup.warmup_budget_ms.store(200, Ordering::Relaxed);
+        let slow = sup
+            .rust_line_write_budget("insert-at-line", root, None, "a.rs", async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(json!({ "end_line": 2 }))
+            })
+            .await
+            .unwrap();
+        assert_eq!(slow["applied"], json!(false), "{slow}");
+        assert_eq!(slow["degraded"], json!("semantic-pending"), "{slow}");
+        assert_eq!(
+            slow["warmup"]["retry_after_warm"],
+            json!(true),
+            "与语义门 false 相区隔: {slow}"
+        );
+        let w = slow["warning"].as_str().unwrap();
+        assert!(w.contains("insert-at-line did not finish"), "工具名锚: {w}");
+        assert!(w.contains("~15s on a cold start"), "量级锚: {w}");
+        assert!(w.contains("wait-ready --stage indexing"), "指路锚: {w}");
     }
 
     #[test]
