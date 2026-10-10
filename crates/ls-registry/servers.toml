@@ -896,10 +896,17 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 "linux-x86_64" = "tar.gz"
 "linux-aarch64" = "tar.gz"
 [servers.pascal.download.bin_path_per_platform]
+"windows-x86_64" = "pasls-x86_64-win64/pasls.exe"
 "linux-x86_64" = "pasls-x86_64-linux/pasls"
 "linux-aarch64" = "pasls-aarch64-linux/pasls"
-# zip 组（M/Ma/W）包内根均为 pasls（win zip 内无 .exe 后缀）；linux 组 tar.gz 内层包
-# 一层同名目录（R2 实锚 2026-09-30，双 tarball 本机下载逐字节列目录：sha=entry pin
+"macos-x86_64" = "pasls-x86_64-darwin/pasls"
+"macos-aarch64" = "pasls-aarch64-darwin/pasls"
+# win zip 实锚 2026-10-10（v0.2.0 本机下载逐字节列目录）：内层 = pasls-x86_64-win64/
+# pasls.exe（一层同名目录 + .exe 后缀）；mac 双 zip 同日实锚：内层 = pasls-x86_64-darwin/
+# pasls / pasls-aarch64-darwin/pasls（一层同名目录，无 .exe）——旧注释"zip 组包内根均
+# 为 pasls（win 无 .exe 后缀）"三组全误锚，本轮 install pascal 报 bin_path `pasls`
+# missing after extract + 三 zip 本机列目录实锤。linux 组 tar.gz
+# 内层包一层同名目录（R2 实锚 2026-09-30，双 tarball 逐字节列目录：sha=entry pin
 # 逐字一致，内层 = pasls-x86_64-linux/pasls / pasls-aarch64-linux/pasls）。sha 三方
 # 一致（embed=API=官方 checksums，矩阵 §18 复核）。运行 env PP/FPCDIR/LAZARUSDIR/
 # FPCTARGET* 可选（上游仅 settings 显式配置时注入，pasls 对标准布局 fpc 自发现）；

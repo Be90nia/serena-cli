@@ -36,3 +36,6 @@ target-*/
 # expert 引擎本地日志（.expert/expert.log，不入库）
 .expert/
 
+# 仓库根 Temp/ 测试产物快照（blindv55 驱动落点，不入库）
+Temp/
+
