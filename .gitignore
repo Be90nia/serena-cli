@@ -33,3 +33,6 @@ scripts/smoke_fixtures/**/bin/
 target-a3b/
 target-*/
 
+# expert 引擎本地日志（.expert/expert.log，不入库）
+.expert/
+
