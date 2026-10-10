@@ -149,6 +149,24 @@ impl DownloadSpec {
 pub struct PathOnlySpec {
     pub binary_name: String,
     pub install_hint: String,
+    /// Windows 专用指引覆盖（blindtest v5.1 P3-F：al 的 vspackage 解包路径
+    /// `extension/bin/linux/…` + `/usr/local/bin` 是 unix 口径，Windows 照抄即误导）。
+    /// 省略 = 全平台共用 `install_hint`。
+    #[serde(default)]
+    pub install_hint_windows: Option<String>,
+}
+
+impl PathOnlySpec {
+    /// 当前平台的安装指引（windows 命中 `install_hint_windows` 优先）。
+    pub fn hint(&self) -> &str {
+        #[cfg(windows)]
+        {
+            if let Some(h) = &self.install_hint_windows {
+                return h;
+            }
+        }
+        &self.install_hint
+    }
 }
 
 /// npm 子表：安装期 `npm install --prefix {cache}/{id}/{version} <pkg>[@<ver>] ...`，

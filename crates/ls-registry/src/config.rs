@@ -652,7 +652,7 @@ pub fn to_install_spec(
                 id: id.to_string(),
                 kind: InstallKind::PathOnly {
                     binary_name: po.binary_name.clone(),
-                    install_hint: po.install_hint.clone(),
+                    install_hint: po.hint().to_string(),
                 },
                 exec: spec.exec.clone(),
             })
@@ -855,7 +855,8 @@ pub fn ensure_launch(
             }
             Err(format!(
                 "missing runtime `{}` not on PATH: {}",
-                po.binary_name, po.install_hint
+                po.binary_name,
+                po.hint()
             ))
         }
         Some(crate::spec::KindRef::Npm(npm)) => {
@@ -979,6 +980,16 @@ pub fn ensure_launch(
 /// 实现锚在 `ls_runtime::install::default_cache_root`（adapter 需要同款缓存根，事实源下沉）。
 pub fn dirs_cache_root() -> PathBuf {
     ls_runtime::install::default_cache_root()
+}
+
+/// blindtest v5.1 P2-A：装机完整性判定——缓存版本目录在盘但关键产物缺失（半包/
+/// 目录空/缺声明入口/PATH 无二进制）→ `Some(缺失描述)`，ls-list 据此标
+/// `installed-incomplete`。判定层 = [`ensure_launch`]（auto_install=false 纯 fs/PATH
+/// 探测，不触网不 spawn），与首答 `LS_NOT_INSTALLED` 同一判据——state 字段不再
+/// 比首答乐观（fsharp/hlsl 空目录、al 仅 lock、ts_vts/solidity 缺内层二进制、
+/// pascal 有盘上产物但探测不认，9/12 抽验失真实锤）。None = 可拉起（完整）。
+pub fn launch_artifact_missing(id: &str) -> Option<String> {
+    ensure_launch(id, None, false, false).err()
 }
 
 /// 卸载安全门转发（实现锚 `ls_runtime::install::ensure_within_cache_root`；

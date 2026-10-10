@@ -353,6 +353,9 @@ source_commit = "43ae0211"
 [servers.al.path_only]
 binary_name = "Microsoft.Dynamics.Nav.EditorServices.Host"
 install_hint = "marketplace vspackage now serves a gzip-wrapped zip (2026-09-30; download schema has no two-stage gunzip+unzip) — fetch the vspackage, gunzip it, then extract with python3 -m zipfile and copy extension/bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host (self-contained, bundles .NET 8.0.24) to /usr/local/bin"
+# blindtest v5.1 P3-F：上一条是 unix 口径（extension/bin/linux + /usr/local/bin），
+# Windows 照抄即误导——平台化指引（PathOnlySpec::hint 按 cfg(windows) 择一）。
+install_hint_windows = "marketplace vspackage now serves a gzip-wrapped zip (2026-09-30; download schema has no two-stage gunzip+unzip) — fetch the vspackage, gunzip it, then extract with python -m zipfile, and put the directory containing Microsoft.Dynamics.Nav.EditorServices.Host.exe (self-contained, bundles .NET 8.0.24) on PATH (Windows has no /usr/local/bin; e.g. copy it to a folder already on PATH or extend PATH via Settings > Environment Variables)"
 
 [servers.bsl]
 languages = ["bsl"]

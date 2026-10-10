@@ -1625,17 +1625,22 @@ fn compact_diags(items: &[serde_json::Value]) -> Vec<String> {
 
 /// bd dmsm：空 pending 出口的降级判定（纯函数，测试钉死语义）。
 /// `count` = 含本轮的连续空 pending 轮数；`elapsed` = 距首轮的时长。
-/// 达标（≥3 轮且 ≥10s）→ `pending:false` + warning（不再暗示"再等等"）；
-/// 未达标 → 原 `pending:true` 形态逐字节不变。
+/// blindtest v5.1 P3-E：阈值按累计时长而非轮数下限——原「≥3 轮且 ≥10s」的与门
+/// 让快空（<10s 累计）永不降级（vue 3×25ms 零停手信号 pending:true 永卡）。
+/// 达标（≥3 轮，或 ≥2 轮且 ≥10s 累计）→ `pending:false` + warning（不再暗示
+/// "再等等"）；未达标 → 原 `pending:true` 形态逐字节不变。
 const PENDING_STREAK_MIN_ROUNDS: u32 = 3;
 const PENDING_STREAK_MIN_ELAPSED: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn pending_no_diag_response(count: u32, elapsed: std::time::Duration) -> serde_json::Value {
-    if count >= PENDING_STREAK_MIN_ROUNDS && elapsed >= PENDING_STREAK_MIN_ELAPSED {
+    // 快空：3 轮即降级（不看时长）；慢空：累计 ≥10s 时 2 轮（MIN_ROUNDS-1）即可。
+    let enough_rounds = count >= PENDING_STREAK_MIN_ROUNDS;
+    let enough_time = count + 1 >= PENDING_STREAK_MIN_ROUNDS && elapsed >= PENDING_STREAK_MIN_ELAPSED;
+    if enough_rounds || enough_time {
         serde_json::json!({
             "items": [],
             "pending": false,
-            "warning": "LS returned no diagnostics after 3 polls — it may not support diagnostics for this language"
+            "warning": "LS returned no diagnostics after repeated empty-pending polls — it may not support diagnostics for this language"
         })
     } else {
         serde_json::json!({ "items": [], "pending": true })
@@ -2566,6 +2571,18 @@ impl Supervisor {
             .unwrap()
             .get(&key_root_identity(root))
             .is_some_and(|w| w.semantic_ok)
+    }
+
+    /// blindtest v5.1 P3-D：会话已拉起（mark_ls_started 记账在案）但首个非空语义
+    /// 结果未到——切换/冷启动窗口，空结果不可信。与 v5 P2-E 的 daemon「切换后
+    /// 首个响应」单发标记不同：按会话状态判定，并发在途请求不再漏标，窗口在
+    /// mark_semantic_ready 前持续生效。
+    fn session_unwarmed(&self, root: &Path) -> bool {
+        self.ls_warmup
+            .lock()
+            .unwrap()
+            .get(&key_root_identity(root))
+            .is_some_and(|w| !w.semantic_ok)
     }
 
     /// find-referencing-*/edit-context 空 hits 的降级警示（bd serena-rust-e0hi/8vo9）。
@@ -6126,7 +6143,8 @@ fn warmup_marker_json() -> serde_json::Value {
 /// 降级响应组装：顶层插 `degraded`（字符串标记）+ `warmup`（结构化标记）。
 /// 调用时序约定在 attach_warning 之后——warning 非空已把裸 null/标量/数组升级
 /// 为对象形态，此处对象直插键；非对象（调用方未先 attach_warning）按同型升级，
-/// 保证字段总能落到 wire。daemon 侧复用（blindtest v5 P2-E 切换后空结果标记）。
+/// 保证字段总能落到 wire。supervisor overview 臂复用（blindtest v5.1 P3-D 切换/
+/// 冷启动窗口的空结果标记，按会话状态判定）。
 pub fn attach_degraded(value: &mut serde_json::Value, degraded: Degraded) {
     let d = serde_json::Value::String(degraded.as_str().to_string());
     let warmup = warmup_marker_json();
@@ -6529,6 +6547,19 @@ const RUST_SEMANTIC_GATE_TOOLS: [&str; 7] = [
     "document-highlight",
     "diagnostics",
 ];
+
+/// blindtest v5.1 P2-C：rust 语法层预算门判据——与 [`rust_semantic_gate`] 同一
+/// 工程判定（--lang override 优先，否则按扩展名解析；root 直下无 Cargo.toml）。
+/// monorepo 无根 manifest 同样不在覆盖内（同门注释）。
+fn rust_no_cargo(root: &Path, lang_override: Option<&str>, file: &str) -> bool {
+    let is_rust = lang_override
+        .map(|l| l.to_ascii_lowercase())
+        .or_else(|| {
+            resolve_lang_for_file(file, None).ok()
+        })
+        .is_some_and(|l| l == "rust");
+    is_rust && !root.join("Cargo.toml").is_file()
+}
 
 fn rust_semantic_gate(
     tool: &str,
@@ -7146,11 +7177,38 @@ impl Supervisor {
                 let file = required_file(args)?;
                 // bd P2-1：LS 不支持 documentSymbol（-32601）→ 优雅降级 + 指路，
                 // 不再裸 RPC_ERROR rc=1（ct_verify format_skipped 同款显式降级先例）。
-                let raw = match self.tool_overview(root, &file, lang).await {
-                    Ok(v) => v,
-                    Err(ToolError::Core(CoreError::Rpc {
-                        code: -32601, ..
-                    })) => {
+                let overview = async {
+                    match self.tool_overview(root, &file, lang).await {
+                        Ok(v) => Ok(Some(v)),
+                        Err(ToolError::Core(CoreError::Rpc {
+                            code: -32601, ..
+                        })) => Ok(None),
+                        Err(e) => Err(e),
+                    }
+                };
+                // blindtest v5.1 P2-C：rust 无 Cargo 场景语法层也受 warmup 预算——
+                // 裸 .rs 的 RA standalone 分析可慢墙 120s+（v5.1 实测 overview 120.1s
+                // 静默慢墙；行级写类 insert/replace-lines 不等分析、秒回，无此问题）。
+                // 超预算 → 结构化降级（retry_after_warm:true：分析完成后重查即快，
+                // 与语义门 rust-no-cargo 的 false 相区隔）。
+                let raw = if rust_no_cargo(root, lang, &file) {
+                    match tokio::time::timeout(self.warmup_budget(), overview).await {
+                        Ok(r) => r?,
+                        Err(_) => {
+                            return Ok(json!({
+                                "items": [],
+                                "degraded": "semantic-pending",
+                                "warmup": { "stage": "indexing", "progress": null, "retry_after_warm": true },
+                                "warning": "rust language server is still analyzing this file (no Cargo.toml under root; standalone-file analysis can take minutes); overview did not finish within the warmup budget — retry shortly",
+                            }));
+                        }
+                    }
+                } else {
+                    overview.await?
+                };
+                let raw = match raw {
+                    Some(v) => v,
+                    None => {
                         return Ok(json!({
                             "symbols": [],
                             "overview_skipped":
@@ -7158,11 +7216,11 @@ impl Supervisor {
                                  use read-file / search to inspect the file structure",
                         }));
                     }
-                    Err(e) => return Err(e),
                 };
+                let empty = raw.is_empty();
                 // bd kq6e：`summary:true` 升级为 {summary, symbols} 对象（头部一行概要
                 // + 符号数）；默认维持裸数组 wire 不变。
-                let value = if args
+                let mut value = if args
                     .get("summary")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
@@ -7171,6 +7229,14 @@ impl Supervisor {
                 } else {
                     serde_json::to_value(raw).map_err(|e| ToolError::Serialize(e.into()))?
                 };
+                // blindtest v5.1 P3-D：会话未热身（切换/冷启动窗口）的空 overview =
+                // 「新 LS 会话未就绪」而非权威空——按会话状态标记（v5 P2-E 的 daemon
+                // 全局单发标记已撤除），并发在途请求不再漏标，首个非空语义结果前
+                // 持续生效。
+                if empty && self.session_unwarmed(root) {
+                    attach_warning(&mut value, &[semantic_not_ready_message()]);
+                    attach_degraded(&mut value, Degraded::SemanticPending);
+                }
                 let root_key = format!("{}|{}", root.display(), file);
                 Ok(self.maybe_delta("overview", &root_key, value, delta).await)
             }
@@ -9499,20 +9565,31 @@ mod pull_diagnostics_tests {
         let a = super::pending_no_diag_response(1, Duration::from_secs(0));
         assert_eq!(a["pending"], serde_json::json!(true));
         assert!(a.get("warning").is_none(), "未达标不带 warning: {a}");
-        let b = super::pending_no_diag_response(3, Duration::from_secs(9));
+        // blindtest v5.1 P3-E：快空 2 轮（<10s 累计）仍不降级——单轮误判防护。
+        let b = super::pending_no_diag_response(2, Duration::from_secs(9));
         assert_eq!(
             b["pending"],
             serde_json::json!(true),
-            "轮数够但时长不够不降级: {b}"
+            "轮数与时长均不够不降级: {b}"
+        );
+        // 快空 3 轮（<10s 累计）→ 降级（v5.1 实锤 vue 3×25ms 曾永卡 pending:true）。
+        let b2 = super::pending_no_diag_response(3, Duration::from_secs(0));
+        assert_eq!(
+            b2["pending"],
+            serde_json::json!(false),
+            "快空 3 轮不看时长也降级: {b2}"
         );
         let c = super::pending_no_diag_response(3, Duration::from_secs(10));
         assert_eq!(c["pending"], serde_json::json!(false), "达标降级: {c}");
         assert_eq!(
             c["warning"],
             serde_json::json!(
-                "LS returned no diagnostics after 3 polls — it may not support diagnostics for this language"
+                "LS returned no diagnostics after repeated empty-pending polls — it may not support diagnostics for this language"
             )
         );
+        // 慢空 ≥10s 累计 2 轮即降级（按累计时长而非轮数下限）。
+        let d = super::pending_no_diag_response(2, Duration::from_secs(10));
+        assert_eq!(d["pending"], serde_json::json!(false), "慢空 2 轮 10s 降级: {d}");
         assert_eq!(
             super::pending_no_diag_response(4, Duration::from_secs(60))["pending"],
             serde_json::json!(false),
@@ -9541,12 +9618,27 @@ mod pull_diagnostics_tests {
             r["warning"]
                 .as_str()
                 .unwrap()
-                .contains("no diagnostics after 3 polls"),
+                .contains("no diagnostics after repeated empty-pending polls"),
             "{r}"
         );
         // 降级即清账：下一轮从头计数 → pending:true。
         let r = sup.register_empty_pending_exit(root, uri);
         assert_eq!(r["pending"], serde_json::json!(true), "清账后重计: {r}");
+        // blindtest v5.1 P3-E：快空 3 连（<10s 累计）同样降级，不再永卡 pending:true。
+        let fast_uri = "file:///Z:/no/such/dmsm_proj/fast_empty.vue";
+        assert_eq!(
+            sup.register_empty_pending_exit(root, fast_uri)["pending"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            sup.register_empty_pending_exit(root, fast_uri)["pending"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            sup.register_empty_pending_exit(root, fast_uri)["pending"],
+            serde_json::json!(false),
+            "快空 3 连不看时长也降级"
+        );
         // reset（确认/非空 items 路径）清零。
         sup.reset_pending_streak(root, uri);
         assert!(
@@ -10079,6 +10171,40 @@ mod symbol_cache_tests {
             },
         );
         assert!(sup.index_warming_warnings(stale_root).is_empty());
+    }
+
+    /// blindtest v5.1 P3-D：overview 空结果降级判定按会话状态（session_unwarmed），
+    /// 不再依赖 daemon 全局单发标记——记账在案且语义未证 → 未热身（并发在途同样
+    /// 命中）；语义证毕 / 无记账 → false。
+    #[tokio::test]
+    async fn overview_unwarmed_marker_tracks_session_state() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/p3d-proj");
+        // 无记账（LS 从未拉起）→ 不标。
+        assert!(!sup.session_unwarmed(root));
+        // 记账在案（mark_ls_started：切换/冷启动窗口）+ 语义未证 → 未热身。
+        sup.mark_ls_started(root);
+        assert!(sup.session_unwarmed(root), "切换后未热身窗口必须标");
+        // 首个非空语义结果 → 窗口关闭。
+        sup.mark_semantic_ready(root);
+        assert!(!sup.session_unwarmed(root), "热身后不标");
+    }
+
+    /// blindtest v5.1 P2-C：rust 语法层预算门判据——--lang 优先、扩展名兜底、
+    /// root 直下无 Cargo.toml 才生效（monorepo 无根 manifest 不在覆盖内）。
+    #[test]
+    fn rust_no_cargo_predicate_tracks_lang_and_manifest() {
+        let root = Path::new("Z:/no/such");
+        assert!(rust_no_cargo(root, Some("rust"), "x.rs"));
+        assert!(!rust_no_cargo(root, Some("python"), "x.rs"), "非 rust 不判");
+        assert!(!rust_no_cargo(root, None, "x.py"), "扩展名分流");
+        // root 直下有 Cargo.toml → 不判（临时目录真实探测）。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert!(
+            !rust_no_cargo(dir.path(), Some("rust"), "src/main.rs"),
+            "有根 manifest 不判（有 Cargo 工程，LS 正常路由）"
+        );
     }
 
     /// bd serena-rust-bxd O3：--symbol 直查解析（documentSymbol 缓存路径）。

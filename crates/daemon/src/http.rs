@@ -339,22 +339,9 @@ async fn tools_post(
                         None => switch,
                     };
                     supervisor::attach_warning(&mut data, &[combined]);
-                    // blindtest v5 P2-E：切换后首个查询的空 items 是「新 project 的
-                    // LS 会话未就绪」而非权威空（csharp/angular 实锤 hover 语义通、
-                    // ov 空）——禁止静默空数组，结构化标 degraded 让 AI 重查。
-                    // 限定 overview：find-symbol 等已有自身 not-ready 降级机器；
-                    // list-dir/find-file 空结果是 fs 权威，不在此列。
-                    if name == "overview"
-                        && data
-                            .get("items")
-                            .and_then(|v| v.as_array())
-                            .is_some_and(|a| a.is_empty())
-                    {
-                        supervisor::attach_degraded(
-                            &mut data,
-                            supervisor::Degraded::SemanticPending,
-                        );
-                    }
+                    // blindtest v5.1 P3-D：v5 P2-E 在此附带的「切换后首个空 overview
+                    // degraded 标记」已上收 supervisor（会话状态判定 session_unwarmed，
+                    // 并发在途不漏标）；daemon 只保留 ts9d 的 switch warning 去重。
                 }
             }
             let facts = CallFacts {
@@ -1150,10 +1137,11 @@ mod tests {
         assert_eq!(body["data"], json!("overview"), "同 project 无 warning");
     }
 
-    /// blindtest v5 P2-E：切换后首个 overview 空 items = LS 未就绪而非权威空 →
-    /// 结构化 degraded + warmup 标记，禁静默空数组；非空结果与重复切换不标。
+    /// blindtest v5.1 P3-D：daemon 不再单发 degraded 标记——该职责上收 supervisor
+    /// （session_unwarmed 会话状态判定，并发在途不漏标）；daemon 层只保留 ts9d 的
+    /// switch warning 去重，wire 不再被硬塞标记。
     #[tokio::test]
-    async fn switch_first_empty_overview_gets_degraded_marker() {
+    async fn switch_response_carries_warning_without_daemon_degraded_marker() {
         let st = state("secret", MockSupervisor::ok_repeat(json!([])));
         let router = router(st);
         let call = |root: &str| {
@@ -1169,21 +1157,20 @@ mod tests {
         assert_eq!(body["data"], json!([]));
         assert!(body["data"].get("degraded").is_none());
 
-        // 切到 proj-b：warning + degraded + warmup 三标记齐上。
+        // 切到 proj-b：只附 switch warning；degraded/warmup 归 supervisor 会话
+        // 状态判定（mock 不经过），daemon 层不再单发。
         let (_, body) = oneshot_json(router.clone(), call("D:/proj-b")).await;
         let body = body.expect("json body");
-        assert_eq!(body["data"]["degraded"], json!("semantic-pending"));
-        assert_eq!(
-            body["data"]["warmup"]["retry_after_warm"],
-            json!(true),
-            "切换场景可重查（与 rust-no-cargo 的 false 相区隔）"
+        assert!(
+            body["data"].get("warning").is_some(),
+            "switch warning 必须在: {}",
+            body["data"]
         );
-        assert!(body["data"]["items"].as_array().unwrap().is_empty());
-
-        // 同 project 重复调用（B→B 无 switch）：不再标。
-        let (_, body) = oneshot_json(router, call("D:/proj-b")).await;
-        let body = body.expect("json body");
-        assert!(body["data"].get("degraded").is_none());
+        assert!(
+            body["data"].get("degraded").is_none(),
+            "daemon 层不再单发 degraded 标记: {}",
+            body["data"]
+        );
     }
 
     /// bd ts9d：同 (from,to) 对 daemon 生命周期内只报一次——A→B 二次调用

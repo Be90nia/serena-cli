@@ -3405,7 +3405,8 @@ fn cache_versions(id_dir: &Path) -> Vec<(String, PathBuf, u64)> {
     v
 }
 
-/// ls-list：内置表全条目 × 实装状态（installed / installed-unroutable（v5 P1-1：
+/// ls-list：内置表全条目 × 实装状态（installed / installed-incomplete（v5.1 P2-A：
+/// 版本目录在盘但关键产物缺失，missing 字段列缺口）/ installed-unroutable（v5 P1-1：
 /// 包在盘但无请求路由）/ external-override / not-installed）+ 每条 routable 标志
 /// + external 新语言条目 + 总计（installed 数 / 可释放字节）。
 fn cmd_ls_list(table: bool) -> ExitCode {
@@ -3437,19 +3438,26 @@ fn cmd_ls_list(table: bool) -> ExitCode {
             spec.languages.clone()
         };
         // blindtest v5 P1-1：installed 只代表缓存包在盘；routable = 请求路径存在
-        // （adapter / EXT_TABLE / external 注册 / 避撞变体的家族语言），判据源
-        // ls_registry::entry_routable。
+        // （adapter / EXT_TABLE / external 注册 / 避撞变体的家族语言 / T0 --lang 显式
+        // 路由），判据源 ls_registry::entry_routable。
         let routable = overridden || ls_registry::entry_routable(id, &languages);
-        let state = if overridden {
-            "external-override"
+        // blindtest v5.1 P2-A：版本目录在盘 ≠ 可拉起——半包（目录空/仅 lock/缺声明
+        // 入口/二进制不在 PATH）首答 LS_NOT_INSTALLED 的 9/12 抽验失真实锤。完整性
+        // 判定复用 ensure_launch 同层探测，state 与首答同一张嘴；unroutable 优先
+        // （无路由时完整性无从谈起，v5 诚实态语义不变）。
+        let (state, missing) = if overridden {
+            ("external-override", None)
         } else if !versions.is_empty() && !routable {
             // 诚实态：包在盘但无路由（.rb/.m 类）——避免「installed 实际不可用」
             // 的 13/40 谎报面。
-            "installed-unroutable"
+            ("installed-unroutable", None)
         } else if !versions.is_empty() {
-            "installed"
+            match ls_registry::config::launch_artifact_missing(id) {
+                Some(m) => ("installed-incomplete", Some(m)),
+                None => ("installed", None),
+            }
         } else {
-            "not-installed"
+            ("not-installed", None)
         };
         let mut entry = json!({
             "id": id,
@@ -3463,6 +3471,10 @@ fn cmd_ls_list(table: bool) -> ExitCode {
                 .as_ref()
                 .map(|p| json!(p.binary_name.clone()))
                 .unwrap_or(serde_json::Value::Null);
+        }
+        if let Some(m) = missing {
+            entry["missing"] = json!([m]);
+            entry["hint"] = json!(format!("entry incomplete — run `serena-cli install {id}` to repair"));
         }
         if !versions.is_empty() {
             installed_count += 1;
@@ -3519,7 +3531,7 @@ fn cmd_ls_list(table: bool) -> ExitCode {
                 .unwrap_or_default();
             let state = e["state"].as_str().unwrap_or("");
             let detail = match state {
-                "installed" | "installed-unroutable" => {
+                "installed" | "installed-unroutable" | "installed-incomplete" => {
                     let versions = e["versions"]
                         .as_array()
                         .map(|vs| {
@@ -3537,6 +3549,9 @@ fn cmd_ls_list(table: bool) -> ExitCode {
                         .unwrap_or_default();
                     if state == "installed-unroutable" {
                         format!("{versions} [no adapter; requests will fail]")
+                    } else if state == "installed-incomplete" {
+                        let m = e["missing"][0].as_str().unwrap_or("");
+                        format!("{versions} [incomplete: {m}]")
                     } else {
                         versions
                     }

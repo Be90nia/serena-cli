@@ -257,16 +257,28 @@ pub fn resolve_lang_name(path: &Path) -> Option<&'static str> {
         .or_else(|| config::external_table().and_then(|t| config::match_external_ext(t, &ext)))
 }
 
+/// T0 配置驱动、仅 `--lang` 显式路由可达的语言（无 EXT_TABLE 扩展名映射、无 T2
+/// adapter）。blindtest v5.1 P2-B 实锤：language_routable 的三门（external/adapter/
+/// EXT_TABLE）都不覆盖「--lang 显式路由」这第四条请求路径，把实际全通的三个语言
+/// 反向失真标 unroutable（elixir LS 真拉起、pgsql 367ms insert、mysql 全链通）——
+/// 扩展名覆盖表与适配器清单对不齐的缝，恰落在这批「languages 真名 ≠ 条目 id、
+/// 走 ensure_launch」的 T0 条目上。显式清单而非推断（docker 同款原则）。
+const T0_EXPLICIT_ROUTE_LANGS: &[&str] = &["elixir", "pgsql", "mysql"];
+
 /// 语言在当前注册状态下是否存在真实请求路径（blindtest v5 P1-1 判据源，与安装态
 /// 正交：installed 只代表缓存包在盘）。true = external 注册拥有（ls-use 生效面）/
-/// T2 adapter 直路由 / EXT_TABLE 扩展名路由（T0 配置驱动）三者任一；false = 该
-/// 语言目前无从文件名到达（.rb/.m 类——包在盘也路由失败，BAD_ARGS unsupported）。
+/// T2 adapter 直路由 / EXT_TABLE 扩展名路由（T0 配置驱动）/ `--lang` 显式路由
+/// （T0_EXPLICIT_ROUTE_LANGS）四者任一；false = 该语言目前无从文件名或显式
+/// --lang 到达（.rb/.m 类——包在盘也路由失败，BAD_ARGS unsupported）。
 pub fn language_routable(lang: &str) -> bool {
     let l = lang.to_ascii_lowercase();
     if config::spec_source(&l) == Some("external") {
         return true;
     }
     if adapter_for(&l).is_some() {
+        return true;
+    }
+    if T0_EXPLICIT_ROUTE_LANGS.contains(&l.as_str()) {
         return true;
     }
     if let Some(id) = LanguageId::from_str_opt(&l) {
@@ -978,6 +990,11 @@ mod tests {
         for lang in ["kotlin", "ada", "markdown", "sql"] {
             assert!(language_routable(lang), "{lang}: T0 扩展名路由可达");
         }
+        // blindtest v5.1 P2-B：T0 --lang 显式路由（无扩展名映射、无 adapter）——
+        // 曾被反向失真标 unroutable，实测三语言路由全通。
+        for lang in ["elixir", "pgsql", "mysql"] {
+            assert!(language_routable(lang), "{lang}: T0 --lang 显式路由可达");
+        }
         // 无扩展名映射、无 adapter：包在盘也路由失败（v5 实锤类）。
         for lang in ["ruby", "matlab", "solargraph", "unknown_lang_xx"] {
             assert!(!language_routable(lang), "{lang}: 必须判不可路由");
@@ -1002,6 +1019,11 @@ mod tests {
         // 语言门直通的条目（languages 即真语言）。
         assert!(entry_routable("kotlin", &langs("kotlin")));
         assert!(entry_routable("ada", &langs("ada")));
+        // blindtest v5.1 P2-B：语言门经 T0 --lang 显式路由直通的条目（languages
+        // 真名 ≠ id，曾反向失真标 unroutable；doctor 聚合行同源自动修正）。
+        assert!(entry_routable("elixir", &langs("elixir")));
+        assert!(entry_routable("pgls", &langs("pgsql")));
+        assert!(entry_routable("sqls-mysql", &langs("mysql")));
         // ruby 家族不可路由（.rb 无 EXT_TABLE 映射）：包在盘也如实 false。
         for id in ["solargraph", "ruby_lsp"] {
             assert!(!entry_routable(id, &langs(id)), "{id}: ruby 家族不可路由");
