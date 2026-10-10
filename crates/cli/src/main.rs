@@ -458,6 +458,8 @@ enum Cmd {
         content_file: Option<String>,
     },
     /// 回滚最近的写事务（IDE undo）。project_root 由 --project 或 cwd 定位。
+    /// 遇外部编辑冲突（sha 不符）：该事务 discarded 并**立即停止**——不回滚
+    /// 更老事务（时间线已乱），返回已处理部分 + rc=2（stopped_early 标记）。
     Undo {
         /// 回滚事务数。
         #[arg(long, value_name = "N", default_value_t = 1)]
@@ -511,7 +513,8 @@ enum Cmd {
         /// rename / refactor-rename：新名。
         #[arg(long)]
         to: Option<String>,
-        /// refactor-extract：抽取出的新 fn 名。
+        /// refactor-extract：抽取出的新 fn 名。目标限 .rs（该重构仅 Rust 实现；
+        /// 其他语言拒绝并说明原因）。
         #[arg(long = "as", value_name = "NEW")]
         as_name: Option<String>,
         /// add-feature：stub 落盘目标文件（.rs）。
@@ -523,7 +526,7 @@ enum Cmd {
         /// add-feature：测试代码全文。
         #[arg(long)]
         tests: Option<String>,
-        /// add-test：写模板后跑一次测试后端。
+        /// add-test：写模板后跑一次测试后端（add-test 仅支持 .rs 目标）。
         #[arg(long)]
         run: bool,
     },
@@ -2712,8 +2715,18 @@ async fn forward(
                     "[hint] index warming: semantic layer not ready, empty result may be false negative (rerun or use wait-ready --stage def); documentSymbol-layer tools (find-referencing-code-snippets / overview / symbol-body) may already work"
                 );
             }
+            // bd e1f4：undo 遇 sha 冲突 discard 后立即停止（时间线乱，禁
+            // fall-through）——载荷仍是成功形态（undone/skipped 可解析），但
+            // 部分完成非完全成功 → rc=2。其余工具成功恒 rc=0。
+            let exit = if tool == "undo"
+                && data.get("stopped_early").is_some_and(|v| !v.is_null())
+            {
+                2u8
+            } else {
+                0u8
+            };
             print_json(data).map_err(|e| e.to_string())?;
-            Ok(0)
+            Ok(exit)
         }
         _ => {
             let err = payload.get("error").cloned().unwrap_or(payload);

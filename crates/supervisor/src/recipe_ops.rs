@@ -7,8 +7,6 @@
 //! undo_results}（wire RPC_ERROR，码集不变）；单步截断（truncated）→ 继续
 //! （截断是各步预算内自限，非错误）。
 
-use lsp_core::docsync::path_to_uri_str;
-use lsp_core::offsets::OffsetEncoding;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -467,8 +465,14 @@ async fn add_feature(
 }
 
 /// rename `<file> <sym> --to N`：
-/// ct_impact → [LSP rename 单文件写（跨文件 edits 过滤进 skipped，93q 先例）]
-/// → ct_verify。
+/// ct_impact → [LSP rename（与手动 `rename-symbol` 同一内部路径
+/// `tool_rename_symbol`：index 等待 + -32602 语义改判 + 跨文件 edits 一个事务）
+/// ] → ct_verify。
+/// bd d1hs：旧实现在本函数内自拼 prepareRename/rename，且位置取 documentSymbol
+/// 的 `range.start`（全 range 起点，python 落在 `def` 关键字/装饰器行）+ Rust 专用
+/// 的 `fn` 关键字精修——python 定位必错，prepareRename 恒拒（盲测 v4：0/2 必败）。
+/// 现定位走 `def_hit`（workspace/symbol，range 即标识符，refactor-rename 同款且
+/// python 已证）+ `name_position`；写路径完全复用手动 rename-symbol。
 async fn rename(
     sup: &crate::Supervisor,
     root: &Path,
@@ -477,7 +481,6 @@ async fn rename(
     new_name: String,
 ) -> Result<Value, crate::ToolError> {
     let mut ctx = RecipeCtx::new(Some(file.into()), Some(sym.into()));
-    let file_s = ctx.file.clone().expect("constructor sets file");
     let sym_s = ctx.sym.clone().expect("constructor sets sym");
     if let Err(e) = ctx
         .read_step("ct_impact", crate::ct::ct_impact(sup, root, &sym_s))
@@ -485,10 +488,22 @@ async fn rename(
     {
         return Err(ctx.fail("rename", root, "ct_impact", e).await);
     }
-    let nn = new_name.clone();
+    // file 寻址契约保留：符号必须存在于指定文件（错误文案与旧实现一致）。
+    let hits = sup.tool_overview(root, file, None).await?;
+    if !hits.iter().any(|h| h.name == sym) {
+        return Err(crate::ToolError::BadArgs {
+            detail: format!("symbol `{sym}` not found in {file}"),
+        });
+    }
+    let def = crate::ct::def_hit(sup, root, &sym_s).await?;
+    let (line, col) = crate::ct::name_position(sup, root, sym, &def).await;
+    let (f2, nn) = (def.file.clone(), new_name.clone());
     if let Err(e) = ctx
         .write_step("rename-in-file", root, async move {
-            rename_in_file(sup, root, &file_s, &sym_s, &nn).await
+            let report = sup
+                .tool_rename_symbol(root, &f2, line - 1, col - 1, &nn, None)
+                .await?;
+            Ok(report_to_env(&report))
         })
         .await
     {
@@ -496,7 +511,7 @@ async fn rename(
     }
     let txn = ctx.txn_ids.last().copied();
     let after = match ctx
-        .read_step("ct_verify_after", crate::ct::ct_verify(sup, root, file, txn))
+        .read_step("ct_verify_after", crate::ct::ct_verify(sup, root, &def.file, txn))
         .await
     {
         Ok(v) => v,
@@ -510,6 +525,7 @@ async fn rename(
         "file": file,
         "symbol": sym,
         "new_name": new_name,
+        "definition_file": def.file,
         "txn_id": txn,
         "impact": ctx.take("ct_impact"),
         "rename": ctx.take("rename-in-file"),
@@ -727,7 +743,9 @@ async fn review_diff(
     };
     Ok(json!({
         "recipe": "review-diff",
-        "txn_id": txn_id,
+        // bd P2-9a：顶层 = 实际 diff 的事务 id（None = 最近事务时此前恒 null，
+        // 与 report.txn_id 自相矛盾）。
+        "txn_id": report.get("txn_id").cloned().unwrap_or(Value::Null),
         "report": report,
         "steps": into_steps(&ctx),
     }))
@@ -867,125 +885,6 @@ fn report_to_env(r: &crate::RenameReport) -> Value {
         "files": r.files,
         "skipped": r.skipped,
     })
-}
-
-/// 单文件 LSP rename（计划 §2 批4 rename 规格）：定位名字 token →
-/// prepareRename/rename → WorkspaceEdit 过滤到 `file` 所在文件（跨文件项计入
-/// skipped，93q 先例），仅应用单文件 edits（同一写步事务）。
-/// 前置：ct_impact 已跑通语义查询（语义索引已热，免 index-wait）。
-async fn rename_in_file(
-    sup: &crate::Supervisor,
-    root: &Path,
-    file: &str,
-    symbol: &str,
-    new_name: &str,
-) -> Result<Value, crate::ToolError> {
-    let hits = sup.tool_overview(root, file, None).await?;
-    let Some(h) = hits.iter().find(|h| h.name == symbol) else {
-        return Err(crate::ToolError::BadArgs {
-            detail: format!("symbol `{symbol}` not found in {file}"),
-        });
-    };
-    let def = crate::ct::DefHit {
-        file: file.to_string(),
-        line0: h.range.start.line,
-        col0: h.range.start.character,
-    };
-    let (line, col) = crate::ct::name_position(sup, root, symbol, &def).await;
-    let lang = crate::resolve_lang_for_file(file, None)?;
-    let session = sup.session_for(root, &lang).await?;
-    let path = crate::path_guard::guarded_join(root, file)
-        .map_err(|detail| crate::ToolError::BadArgs { detail })?;
-    let uri_str = path_to_uri_str(&path);
-    let _guard = session.ensure_open(&path).await.map_err(crate::ToolError::Core)?;
-    let _gate = crate::write_gate::acquire("recipe-rename").await?;
-    let pos = crate::lsp_position_from_byte(&path, file, line - 1, col - 1, OffsetEncoding::Utf16).await?;
-    let params = json!({
-        "textDocument": { "uri": uri_str },
-        "position": { "line": pos.line, "character": pos.character },
-    });
-    let prep: Option<Value> = session
-        .request("textDocument/prepareRename", params.clone(), crate::TOOL_TIMEOUT)
-        .await?;
-    if prep.is_none() || prep.as_ref().is_some_and(Value::is_null) {
-        return Err(crate::ToolError::BadArgs {
-            detail: "prepareRename rejected this position".into(),
-        });
-    }
-    let resp: Option<Value> = session
-        .request(
-            "textDocument/rename",
-            json!({ "textDocument": { "uri": uri_str.clone() }, "position": { "line": pos.line, "character": pos.character }, "newName": new_name }),
-            crate::TOOL_TIMEOUT,
-        )
-        .await?;
-    let resp = resp.ok_or_else(|| crate::ToolError::Protocol {
-        tool: "recipe:rename".into(),
-        reason: "rename returned null".into(),
-    })?;
-    let by_uri = crate::parse_workspace_edit(&resp).ok_or_else(|| crate::ToolError::Protocol {
-        tool: "recipe:rename".into(),
-        reason: "rename response has neither `changes` map nor `documentChanges`".into(),
-    })?;
-    let root_canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let want_abs = dunce::canonicalize(&path).unwrap_or_else(|_| path.clone());
-    let mut report = json!({
-        "files_modified": 0,
-        "edits_applied": 0,
-        "files": [],
-        "skipped": [],
-    });
-    for (uri, mut edits) in by_uri {
-        edits.sort_by_key(|e| std::cmp::Reverse(e.0));
-        let abs = match crate::uri_to_path(&uri) {
-            Some(p) => p,
-            None => {
-                push_skipped(&mut report, &uri, "uri not resolvable");
-                continue;
-            }
-        };
-        if abs != want_abs {
-            // 计划 rename 规格：跨文件 edits 不应用，计入 skipped 清单报告。
-            let rel = crate::recipe::rel_forward(root, &abs.to_string_lossy());
-            push_skipped(&mut report, &rel, "cross-file edit filtered by recipe rename (single-file scope)");
-            continue;
-        }
-        let (abs, content, new_content) =
-            match crate::prepare_rename_file(&root_canon, &uri, &edits).await {
-                Ok(v) => v,
-                Err(skip) => {
-                    push_skipped(&mut report, &skip.file, &skip.reason);
-                    continue;
-                }
-            };
-        if new_content == content {
-            continue;
-        }
-        crate::undo::recorded_write(&abs, &new_content)
-            .await
-            .map_err(|e| crate::ToolError::WriteConflict {
-                path: abs.display().to_string(),
-                reason: format!("atomic write failed: {e}"),
-            })?;
-        // 全量 didChange（ensure_open mtime 检测路径），content_version 单调。
-        let _refreshed = session.ensure_open(&abs).await.map_err(crate::ToolError::Core)?;
-        report["files_modified"] = json!(report["files_modified"].as_u64().unwrap_or(0) + 1);
-        report["edits_applied"] =
-            json!(report["edits_applied"].as_u64().unwrap_or(0) + edits.len() as u64);
-        if let Some(files) = report.get_mut("files").and_then(Value::as_array_mut) {
-            files.push(Value::String(crate::recipe::rel_forward(
-                root,
-                &abs.to_string_lossy(),
-            )));
-        }
-    }
-    Ok(report)
-}
-
-fn push_skipped(report: &mut Value, file: &str, reason: &str) {
-    if let Some(skipped) = report.get_mut("skipped").and_then(Value::as_array_mut) {
-        skipped.push(json!({"file": file, "reason": reason}));
-    }
 }
 
 #[cfg(test)]

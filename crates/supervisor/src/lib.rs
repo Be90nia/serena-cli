@@ -173,7 +173,12 @@ pub type ToolResult<T> = std::result::Result<T, ToolError>;
 /// 信号位双因子（P2-18h）：同 mtime 粒度窗口内的外部改写靠 size 检出 —— 对齐
 /// docsync `ensure_open` 的 mtime+size 双对账（Windows mtime 缓存 / FAT 2s 粒度
 /// 会漏检同粒度改写，命中旧 SymbolHit → replace-body 切片错位）。
-type SymbolCacheKey = (PathBuf, String, Option<(SystemTime, u64)>);
+/// 第 4 位 = 用户显式 `--lang` override（小写归一）：bd 8ges——此前 (root,file,mtime)
+/// 键让 override 调用被先前无 override 的缓存结果静默遮蔽（Dockerfile --lang python
+/// 返回 docker 符号）。键用**原始 override**而非解析后 lang：缓存命中必须先于
+/// lang 解析（不可解析扩展名也命中，测试锁定）；None 平面（扩展名路由）与
+/// Some 平面（override 路由）天然分键、互不遮蔽。
+type SymbolCacheKey = (PathBuf, String, Option<(SystemTime, u64)>, Option<String>);
 
 /// O3 解析候选：(file 相对路径, 符号名, 符号全范围)。
 type SymbolCandidates = Vec<(String, String, lsp_types::Range)>;
@@ -182,13 +187,15 @@ type SymbolCandidates = Vec<(String, String, lsp_types::Range)>;
 type SymbolNameRanges = Vec<(String, lsp_types::Range)>;
 
 /// overview / symbol-body 的缓存 key；文件不可 stat（不存在/失败）→ None（确定性 key）。
-fn doc_symbol_cache_key(root: &Path, file: &str) -> SymbolCacheKey {
+/// `lang_override`：用户显式 `--lang`（bd 8ges，见 [`SymbolCacheKey`] 注）。
+fn doc_symbol_cache_key(root: &Path, file: &str, lang_override: Option<&str>) -> SymbolCacheKey {
     (
         root.to_path_buf(),
         file.to_string(),
         std::fs::metadata(root.join(file))
             .ok()
             .and_then(|m| Some((m.modified().ok()?, m.len()))),
+        lang_override.map(|l| l.to_ascii_lowercase()),
     )
 }
 
@@ -206,6 +213,7 @@ fn find_symbol_cache_key(
         root.to_path_buf(),
         format!("ws?{query}"),
         root_mtime.map(|m| (m, 0)),
+        None,
     )
 }
 
@@ -434,6 +442,11 @@ pub struct Supervisor {
     /// 道对旧内容分析的推送）不得凭 generation 达标误确认（bd serena-rust-76d）；
     /// 从不发 version 的 LS（clangd）→ 保留 generation 判定（旧行为不回退）。
     version_seen: std::sync::Arc<Mutex<HashMap<(PathBuf, String), bool>>>,
+    /// bd dmsm：连续空 pending 轮次记账 (root, uri) → (连续轮数, 首轮时刻)。
+    /// LS 对该文件连续多轮 (≥3 轮且 ≥10s) 只给 `pending:true` + 空 items 时，
+    /// 第 3 轮起降级为 `pending:false` + warning（"LS 不支持该语言的诊断"），
+    /// 禁止 AI 消费者无限重试。任何非空/确认结果清零。
+    diag_pending_streak: Mutex<HashMap<(PathBuf, String), (u32, std::time::Instant)>>,
     /// 写后一致性窗口（bd serena-rust-0em）：写工具收尾标记 (root, file_lowercase)
     /// → 写入时刻。find_symbol 在 TTL 内对这些文件强制 documentSymbol 对齐 ——
     /// RA wssym 写后可能**缺条目**（命中集缩水，基线实测），行号比对检不出缺失。
@@ -639,6 +652,7 @@ impl Supervisor {
             diag_generation: std::sync::Arc::new(AtomicU64::new(0)),
             pull_diag_supported: std::sync::Arc::new(Mutex::new(HashMap::new())),
             version_seen: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            diag_pending_streak: Mutex::new(HashMap::new()),
             recent_writes: Mutex::new(HashMap::new()),
             workspace_errors: std::sync::Arc::new(Mutex::new(HashMap::new())),
             symbol_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
@@ -1313,13 +1327,15 @@ impl Supervisor {
                             .iter()
                             .any(|d| d.get("severity").and_then(|s| s.as_i64()) == Some(1));
                         if has_error {
+                            self.reset_pending_streak(&key.root, &uri);
                             return Ok(json!({ "items": compact_diags(&items), "pending": false }));
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             }
-            return Ok(json!({ "items": [], "pending": true }));
+            // bd dmsm：空 pending 出口统一记账，禁无限 pending。
+            return Ok(self.register_empty_pending_exit(&key.root, &uri));
         }
 
         // push 等待：**version 精确比对** —— RA didChange 后会先重推旧快照再推新
@@ -1367,6 +1383,8 @@ impl Supervisor {
         }
         if let Some(items) = confirmed_items {
             tracing::debug!(uri = %uri, "tool_diagnostics confirmed: {} items", items.len());
+            // bd dmsm：确认结果清零连续空 pending 记账。
+            self.reset_pending_streak(&key.root, &uri);
             return Ok(json!({ "items": compact_diags(&items), "pending": false }));
         }
 
@@ -1402,7 +1420,37 @@ impl Supervisor {
         {
             items = pull;
         }
+        if items.is_empty() {
+            // bd dmsm：空 pending 出口统一记账——同文件连续 ≥3 轮且 ≥10s 仍空
+            // pending → 降级 pending:false + warning，禁无限 pending。
+            return Ok(self.register_empty_pending_exit(&key.root, &uri));
+        }
+        // items 非空（可能是陈旧快照）不是「LS 无诊断」信号：清零记账，行为不变。
+        self.reset_pending_streak(&key.root, &uri);
         Ok(json!({ "items": compact_diags(&items), "pending": true }))
+    }
+
+    /// bd dmsm：`tool_diagnostics` 的空 pending 出口统一记账。连续空 pending 轮数
+    /// 达标（≥3 轮且距首轮 ≥10s）→ 降级 `pending:false` + warning（该 LS 可能不
+    /// 支持此语言的诊断），此后清账重计；未达标 → 原 `pending:true` 形态不变。
+    fn register_empty_pending_exit(&self, root: &Path, uri: &str) -> serde_json::Value {
+        let k = (root.to_path_buf(), uri.to_ascii_lowercase());
+        let mut streak = self.diag_pending_streak.lock().unwrap();
+        let e = streak.entry(k.clone()).or_insert((0u32, std::time::Instant::now()));
+        e.0 += 1;
+        let out = pending_no_diag_response(e.0, e.1.elapsed());
+        if out.get("pending").and_then(serde_json::Value::as_bool) == Some(false) {
+            streak.remove(&k);
+        }
+        out
+    }
+
+    /// bd dmsm：非空/确认结果清零连续空 pending 记账（「连续」中断）。
+    fn reset_pending_streak(&self, root: &Path, uri: &str) {
+        self.diag_pending_streak
+            .lock()
+            .unwrap()
+            .remove(&(root.to_path_buf(), uri.to_ascii_lowercase()));
     }
 
     /// 从 LSP 3.17 `textDocument/diagnostic` 响应提取权威 items。
@@ -1431,6 +1479,25 @@ impl Supervisor {
 /// （与 read-file / 行级编辑基线一致）。message 内换行折叠为空格。
 fn compact_diags(items: &[serde_json::Value]) -> Vec<String> {
     items.iter().map(compact_one_diag).collect()
+}
+
+/// bd dmsm：空 pending 出口的降级判定（纯函数，测试钉死语义）。
+/// `count` = 含本轮的连续空 pending 轮数；`elapsed` = 距首轮的时长。
+/// 达标（≥3 轮且 ≥10s）→ `pending:false` + warning（不再暗示"再等等"）；
+/// 未达标 → 原 `pending:true` 形态逐字节不变。
+const PENDING_STREAK_MIN_ROUNDS: u32 = 3;
+const PENDING_STREAK_MIN_ELAPSED: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn pending_no_diag_response(count: u32, elapsed: std::time::Duration) -> serde_json::Value {
+    if count >= PENDING_STREAK_MIN_ROUNDS && elapsed >= PENDING_STREAK_MIN_ELAPSED {
+        serde_json::json!({
+            "items": [],
+            "pending": false,
+            "warning": "LS returned no diagnostics after 3 polls — it may not support diagnostics for this language"
+        })
+    } else {
+        serde_json::json!({ "items": [], "pending": true })
+    }
 }
 
 fn compact_one_diag(d: &serde_json::Value) -> String {
@@ -2375,7 +2442,7 @@ impl Supervisor {
     /// 即清该文件缓存"）。didChange 重放由 miss 路径既有的 `ensure_open` 承担
     /// （mtime/size 变 → 全量 didChange），不在此重复发。
     fn reconcile_symbol_cache_for_file(&self, root: &Path, file: &str) -> bool {
-        let stamp = doc_symbol_cache_key(root, file).2;
+        let stamp = doc_symbol_cache_key(root, file, None).2;
         let mut cache = self.symbol_cache.lock().unwrap();
         let stale = cache
             .keys()
@@ -2442,7 +2509,8 @@ impl Supervisor {
         lang_override: Option<&str>,
     ) -> ToolResult<Vec<SymbolHit>> {
         // Phase 3.1 缓存：同 (root, file, mtime) 二次调用免 LS 往返（命中 <1ms）。
-        let cache_key = doc_symbol_cache_key(root, file);
+        // bd 8ges：override 进键——不同路由平面的结果互不遮蔽。
+        let cache_key = doc_symbol_cache_key(root, file, lang_override);
         if let Some(cached) = self.symbol_cache_get(&cache_key) {
             return Ok(cached); // cache_hit
         }
@@ -2614,7 +2682,8 @@ impl Supervisor {
                         // 与 tool_overview 一致：纯缓存命中也可走，但 miss 路径无法走 LS，
                         // 这里走 cache-only 分支（与下方的 cache 分流合一）。
                         // 直接尝试读缓存（避免漏已有 cache 命中）：
-                        let cache_key = doc_symbol_cache_key(root, file);
+                        // bd 8ges：树扇出与无 override 平面共享键（历史行为，键=扩展名路由）。
+                        let cache_key = doc_symbol_cache_key(root, file, None);
                         let cached = cache_arc.lock().unwrap().get(&cache_key).cloned();
                         match cached {
                             Some(symbols) if !symbols.is_empty() => {
@@ -2655,7 +2724,7 @@ impl Supervisor {
                 let mut miss_indices: Vec<usize> = Vec::new();
                 for &idx in &bucket_indices {
                     let file = &files[idx];
-                    let cache_key = doc_symbol_cache_key(root, file);
+                    let cache_key = doc_symbol_cache_key(root, file, None);
                     let cached = cache_arc.lock().unwrap().get(&cache_key).cloned();
                     match cached {
                         Some(symbols) if !symbols.is_empty() => {
@@ -3641,7 +3710,7 @@ impl Supervisor {
         // 文本仍现读）。not-found 与 miss 路径同语义。Δ: find_symbol_range 对 Flat 形态返
         // None 而缓存列表含 Flat 平铺项 —— 仅理论差异（本仓库 adapter 均回 Nested，见
         // flatten_symbols 注）。
-        let cache_key = doc_symbol_cache_key(root, file);
+        let cache_key = doc_symbol_cache_key(root, file, lang_override);
         if let Some(cached) = self.symbol_cache_get(&cache_key) {
             return match cached.iter().find(|h| h.name == symbol) {
                 Some(h) => read_and_slice(&path, file, h.range).await,
@@ -3742,8 +3811,9 @@ impl Supervisor {
         lang_override: Option<&str>,
     ) -> ToolResult<serde_json::Value> {
         let body = self.tool_symbol_body(root, file, symbol, lang_override).await?;
-        let (s0, e0) = crate::edit_context::range_from_symbol_cache(self, root, file, symbol)
-            .unwrap_or((0, 0));
+        let (s0, e0) =
+            crate::edit_context::range_from_symbol_cache(self, root, file, symbol, lang_override)
+                .unwrap_or((0, 0));
         let text = tokio::fs::read_to_string(root.join(file))
             .await
             .map_err(|e| ToolError::Core(CoreError::Io(e)))?;
@@ -3914,10 +3984,7 @@ impl Supervisor {
         // undo 收口：快照旧内容 → 原子写 → 入当前事务。
         undo::recorded_write(path, &new_text)
             .await
-            .map_err(|e| ToolError::WriteConflict {
-                path: user_path(root, path),
-                reason: format!("atomic write failed: {e}"),
-            })?;
+            .map_err(|e| atomic_write_err(&user_path(root, path), e))?;
 
         // 4) 读回 diff 校验（C3 防线 ②③）—— 不符回滚 + 报冲突。
         // dry-run 干跑未落盘，readback 读到旧内容属预期，跳过比对。
@@ -4238,10 +4305,7 @@ impl Supervisor {
             // 聚合为单事务（契约设计第 2 条），undo 一次全部回滚。
             undo::recorded_write(&abs, &new_content)
                 .await
-                .map_err(|e| ToolError::WriteConflict {
-                    path: abs.display().to_string(),
-                    reason: format!("atomic write failed: {e}"),
-                })?;
+                .map_err(|e| atomic_write_err(&abs.display().to_string(), e))?;
 
             // 全量 didChange 让 LS 跟上 —— 走 ensure_open 的 mtime-检测路径，
             // 与 tool_replace_body / edit_tools 共享同一 content_version 单调递增
@@ -4347,6 +4411,7 @@ impl Supervisor {
                 deleted: false,
                 symbol: symbol.to_string(),
                 references: locations,
+                note: None,
             });
         }
 
@@ -4386,10 +4451,7 @@ impl Supervisor {
         // undo 收口：快照旧内容 → 原子写 → 入当前事务。
         undo::recorded_write(&path, &new_text)
             .await
-            .map_err(|e| ToolError::WriteConflict {
-                path: user_path(root, &path),
-                reason: format!("atomic write failed: {e}"),
-            })?;
+            .map_err(|e| atomic_write_err(&user_path(root, &path), e))?;
         let readback = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| ToolError::BadArgs {
@@ -4408,6 +4470,7 @@ impl Supervisor {
             deleted: true,
             symbol: symbol.to_string(),
             references: vec![],
+            note: new_text.is_empty().then(|| "file left empty (0 bytes)".into()),
         })
     }
 
@@ -4455,10 +4518,7 @@ impl Supervisor {
         }
         undo::recorded_write(&abs, content)
             .await
-            .map_err(|e| ToolError::WriteConflict {
-                path: abs.display().to_string(),
-                reason: format!("atomic write failed: {e}"),
-            })?;
+            .map_err(|e| atomic_write_err(&abs.display().to_string(), e))?;
         let mut warnings: Vec<String> = Vec::new();
         match resolve_lang_for_file(file, lang_override) {
             Ok(lang) => match self.session_for(root, lang.as_str()).await {
@@ -4469,7 +4529,9 @@ impl Supervisor {
                 }
                 Err(e) => warnings.push(format!("created but LS unavailable: {e}")),
             },
-            Err(e) => warnings.push(format!("created but no language adapter: {e}")),
+            // bd P2-8：纯文本创建成功不是 bad args——info 化措辞，不再用
+            // "unsupported extension ... pass --lang" 的 BAD_ARGS 文案误导。
+            Err(_) => warnings.push("created as plain text (no language adapter)".into()),
         }
         let mut value = serde_json::json!({ "created": true, "file": file });
         if !warnings.is_empty() {
@@ -4866,6 +4928,10 @@ pub struct SafeDeleteReport {
     pub symbol: String,
     /// deleted=false 时非空：引用位置（相对路径 + 1-based 行号，按 file+line 排序去重）。
     pub references: Vec<SafeDeleteRef>,
+    /// bd P2-7：符号删除把整文件清空时提示 0 字节残壳（否则消费者不知道文件
+    /// 被清空了）。其余场景省略键（wire 不变）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// 单条引用位置。
@@ -5111,7 +5177,9 @@ async fn overview_via_session(
     lang_override: Option<&str>,
 ) -> ToolResult<Vec<SymbolHit>> {
     // 缓存查：与 `Supervisor::symbol_cache_get` 等价（共享同一张表）。
-    let cache_key = doc_symbol_cache_key(&root, &file);
+    // bd 8ges：树扇出键固定 None 平面——lang_override 只用于本文件会话解析，
+    // 与 tool_overview(None) 的历史共享不碎片化。
+    let cache_key = doc_symbol_cache_key(&root, &file, None);
     if let Some(cached) = cache_arc.lock().unwrap().get(&cache_key).cloned() {
         return Ok(cached);
     }
@@ -6233,6 +6301,61 @@ fn truncate_envelope_list(value: &mut serde_json::Value, budget_bytes: usize) ->
     true
 }
 
+/// bd 2rxp：工具响应出站 uri 归一——递归遍历响应树，把 `uri`/`targetUri` 字符串
+/// 字段统一为 `file:///C:/...` 形态（盘符大写 + 驱动器冒号解码）。归一点在
+/// `execute_tool` 出口（公共序列化处），禁逐工具手补；`file:` 之外的 uri 形态原样。
+fn normalize_output_uris(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if (k == "uri" || k == "targetUri") && v.is_string() {
+                    if let Some(s) = v.as_str() {
+                        let normalized = normalize_file_uri(s);
+                        if normalized != s {
+                            *v = serde_json::Value::String(normalized);
+                        }
+                    }
+                } else {
+                    normalize_output_uris(v);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                normalize_output_uris(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 单个 uri 归一：`file:///` 后首个段形如 `c%3A` / `c:`（Windows 盘符）→
+/// 大写盘符 + 字面冒号。其余内容（路径段编码、query）不动。
+fn normalize_file_uri(uri: &str) -> String {
+    let Some(rest) = uri.strip_prefix("file:///") else {
+        return uri.to_string();
+    };
+    let bytes = rest.as_bytes();
+    // 形态一：`c%3A/...`；形态二：`c:/...`。
+    let drive = *bytes.first().unwrap_or(&b'\0');
+    if !drive.is_ascii_alphabetic() {
+        return uri.to_string();
+    }
+    let tail: Option<&str> = if rest[1..].starts_with("%3A") {
+        Some(&rest[1 + "%3A".len()..])
+    } else if rest[1..].starts_with(':') {
+        Some(&rest[2..])
+    } else {
+        None
+    };
+    let drive_upper = drive.to_ascii_uppercase() as char;
+    match tail {
+        // tail 自带 `/` 前缀（如 "/Users/x/a.py"）——盘符与路径间只补冒号。
+        Some(t) => format!("file:///{drive_upper}:{t}"),
+        None => uri.to_string(),
+    }
+}
+
 /// AI-token 特性 G（§10-G）：签名压缩——递归删除 `container` / `container_name` /
 /// `kind` 三个"二级"冗余字段（保留 name + 位置）。截断/压缩与 `_compact`/`_delta`
 /// 同套私有约定（sanitize 不清）。按需未来扩展字段名单。
@@ -6624,7 +6747,22 @@ impl Supervisor {
         let mut value: serde_json::Value = match tool {
             "overview" => {
                 let file = required_file(args)?;
-                let raw = self.tool_overview(root, &file, lang).await?;
+                // bd P2-1：LS 不支持 documentSymbol（-32601）→ 优雅降级 + 指路，
+                // 不再裸 RPC_ERROR rc=1（ct_verify format_skipped 同款显式降级先例）。
+                let raw = match self.tool_overview(root, &file, lang).await {
+                    Ok(v) => v,
+                    Err(ToolError::Core(CoreError::Rpc {
+                        code: -32601, ..
+                    })) => {
+                        return Ok(json!({
+                            "symbols": [],
+                            "overview_skipped":
+                                "LS does not support textDocument/documentSymbol for this language; \
+                                 use read-file / search to inspect the file structure",
+                        }));
+                    }
+                    Err(e) => return Err(e),
+                };
                 // bd kq6e：`summary:true` 升级为 {summary, symbols} 对象（头部一行概要
                 // + 符号数）；默认维持裸数组 wire 不变。
                 let value = if args
@@ -7775,6 +7913,10 @@ impl Supervisor {
         {
             apply_compress(&mut value);
         }
+        // bd 2rxp：出站 uri 统一形态（file:///C:/ 大写盘符、%3A 解码）——同一文件
+        // 跨工具两种 uri 字符串（overview file:///C:/ vs refs file:///c%3A/）会让
+        // 按 uri 分组/去重的 AI 消费者算重。入站方向（LS 推送小写盘符）不动。
+        normalize_output_uris(&mut value);
         Ok(value)
     }
 }
@@ -8126,6 +8268,29 @@ fn map_completion_kind(kind_num: i64) -> String {
     // 用 Debug 拿名字最稳（spec 表与常量名一一对应）。
     format!("{:?}", k).to_ascii_lowercase()
 }
+/// bd edpi：原子写 io 错误分类。NotFound（os error 2/3：文件/路径不存在，典型 =
+/// 父目录缺失）不是写冲突——冲突语义是「盘上内容与预期不符，重读重试」，按
+/// hint 重试永远失败（盲测 v4 实锤：create-text-file 到缺失目录报
+/// WRITE_CONFLICT + re-read 指引）。NotFound 归 BAD_ARGS 带创建指引；其余
+/// （权限/占用等真冲突候选）保持 WRITE_CONFLICT。各 `recorded_write` 写点共用。
+pub(crate) fn atomic_write_err(path: &str, e: std::io::Error) -> ToolError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| path.to_string());
+        return ToolError::BadArgs {
+            detail: format!(
+                "parent directory does not exist: {dir}; create it first (atomic write failed: {e})"
+            ),
+        };
+    }
+    ToolError::WriteConflict {
+        path: path.to_string(),
+        reason: format!("atomic write failed: {e}"),
+    }
+}
+
 /// 从文本中删除符号 range：默认整行删除（start 行首 → end 行含换行）；
 /// end 行符号之后还有非空白内容时只删到符号结尾，保留行尾余文。
 fn delete_symbol_text(text: &str, range: lsp_types::Range) -> ToolResult<String> {
@@ -8895,6 +9060,69 @@ mod pull_diagnostics_tests {
             "文件不存在 → 必须降级为空数组"
         );
     }
+
+    /// bd dmsm 纯函数锁：连续空 pending 的降级阈值（≥3 轮且 ≥10s）与报文形态。
+    #[test]
+    fn pending_no_diag_response_thresholds() {
+        use std::time::Duration;
+        let a = super::pending_no_diag_response(1, Duration::from_secs(0));
+        assert_eq!(a["pending"], serde_json::json!(true));
+        assert!(a.get("warning").is_none(), "未达标不带 warning: {a}");
+        let b = super::pending_no_diag_response(3, Duration::from_secs(9));
+        assert_eq!(
+            b["pending"],
+            serde_json::json!(true),
+            "轮数够但时长不够不降级: {b}"
+        );
+        let c = super::pending_no_diag_response(3, Duration::from_secs(10));
+        assert_eq!(c["pending"], serde_json::json!(false), "达标降级: {c}");
+        assert_eq!(
+            c["warning"],
+            serde_json::json!(
+                "LS returned no diagnostics after 3 polls — it may not support diagnostics for this language"
+            )
+        );
+        assert_eq!(
+            super::pending_no_diag_response(4, Duration::from_secs(60))["pending"],
+            serde_json::json!(false),
+            "≥3 语义"
+        );
+    }
+
+    /// bd dmsm 接线锁：register 计数、达标降级、降级后清账、reset 清账。
+    /// 回拨首轮时刻（Instant - 11s）免真实等待。
+    #[tokio::test]
+    async fn diag_pending_streak_counts_degrades_and_resets() {
+        let sup = Supervisor::direct().await.expect("supervisor");
+        let root = std::path::Path::new("Z:/no/such/dmsm_proj");
+        let uri = "file:///Z:/no/such/dmsm_proj/x.sql";
+        for _ in 0..2 {
+            let r = sup.register_empty_pending_exit(root, uri);
+            assert_eq!(r["pending"], serde_json::json!(true), "{r}");
+            assert!(r.get("warning").is_none(), "{r}");
+        }
+        let key = (root.to_path_buf(), uri.to_ascii_lowercase());
+        sup.diag_pending_streak.lock().unwrap().get_mut(&key).unwrap().1 =
+            std::time::Instant::now() - std::time::Duration::from_secs(11);
+        let r = sup.register_empty_pending_exit(root, uri);
+        assert_eq!(r["pending"], serde_json::json!(false), "第 3 轮达标降级: {r}");
+        assert!(
+            r["warning"]
+                .as_str()
+                .unwrap()
+                .contains("no diagnostics after 3 polls"),
+            "{r}"
+        );
+        // 降级即清账：下一轮从头计数 → pending:true。
+        let r = sup.register_empty_pending_exit(root, uri);
+        assert_eq!(r["pending"], serde_json::json!(true), "清账后重计: {r}");
+        // reset（确认/非空 items 路径）清零。
+        sup.reset_pending_streak(root, uri);
+        assert!(
+            sup.diag_pending_streak.lock().unwrap().get(&key).is_none(),
+            "reset 必须清账"
+        );
+    }
 }
 // ============================================================================
 // Phase 3.1 文档符号缓存（local/solidlsp-development-plan.md §3.1）
@@ -9408,11 +9636,11 @@ mod symbol_cache_tests {
         };
         // 前缀命中在 a.rs（字母序在前），精确命中在 b.rs —— 精确必须赢。
         sup.symbol_cache_put(
-            doc_symbol_cache_key(root, "a.rs"),
+            doc_symbol_cache_key(root, "a.rs", None),
             vec![mk("ensure_open_impl", "file:///x/a.rs", 0, 0)],
         );
         sup.symbol_cache_put(
-            doc_symbol_cache_key(root, "b.rs"),
+            doc_symbol_cache_key(root, "b.rs", None),
             vec![mk("ensure_open", "file:///x/b.rs", 4, 2)],
         );
         let (file, line, col, note) = sup
@@ -9424,7 +9652,7 @@ mod symbol_cache_tests {
 
         // 多命中：同名精确 ×2（前缀 ×1 落选不计）→ 取 (file, line, col) 序首者 + note 报总数。
         sup.symbol_cache_put(
-            doc_symbol_cache_key(root, "c.rs"),
+            doc_symbol_cache_key(root, "c.rs", None),
             vec![mk("ensure_open", "file:///x/c.rs", 1, 0)],
         );
         let (file, _l, _c, note) = sup
@@ -9488,7 +9716,7 @@ mod symbol_cache_tests {
         )
         .unwrap();
         sup.symbol_cache_put(
-            doc_symbol_cache_key(root, "m.py"),
+            doc_symbol_cache_key(root, "m.py", None),
             vec![SymbolHit {
                 name: "divide".into(),
                 kind: SymbolKindTag::Function,
@@ -9589,15 +9817,15 @@ mod symbol_cache_tests {
         let sup = Supervisor::direct().await.unwrap();
         let root = Path::new("Z:/no/such/project");
         let other = Path::new("Z:/no/such/other");
-        sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs"), vec![hit("main")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs", None), vec![hit("main")]);
         sup.symbol_cache_put(find_symbol_cache_key(root, "main", None), vec![hit("main")]);
-        sup.symbol_cache_put(doc_symbol_cache_key(other, "a.rs"), vec![hit("helper")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(other, "a.rs", None), vec![hit("helper")]);
 
         // 模拟 (root, lang) 会话换代（session_for 挂入新会话前的失效动作）。
         sup.invalidate_symbol_cache_for_root(root);
 
         assert!(
-            sup.symbol_cache_get(&doc_symbol_cache_key(root, "a.rs"))
+            sup.symbol_cache_get(&doc_symbol_cache_key(root, "a.rs", None))
                 .is_none(),
             "会话换代后同 root 文档符号缓存必须 miss"
         );
@@ -9607,7 +9835,7 @@ mod symbol_cache_tests {
             "会话换代后同 root workspace 级缓存必须 miss"
         );
         assert!(
-            sup.symbol_cache_get(&doc_symbol_cache_key(other, "a.rs"))
+            sup.symbol_cache_get(&doc_symbol_cache_key(other, "a.rs", None))
                 .is_some(),
             "其他 root 的缓存不受影响"
         );
@@ -9621,7 +9849,12 @@ mod symbol_cache_tests {
     async fn overview_cache_hit_returns_under_1ms() {
         let sup = Supervisor::direct().await.unwrap();
         let root = Path::new("Z:/no/such/project");
-        sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs"), vec![hit("main")]);
+        // bd 8ges：键含 override 维度——seed 与查询必须同平面（Some("rust")），
+        // 否则命中路径 miss 会尝试拉 LS（不存在 root → spawn 失败）。
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "a.rs", Some("rust")),
+            vec![hit("main")],
+        );
 
         // warmup：预热 LazyLock / 代码路径，排除首次抖动。
         let _ = sup.tool_overview(root, "a.rs", Some("rust")).await.unwrap();
@@ -9643,11 +9876,46 @@ mod symbol_cache_tests {
         let sup = Supervisor::direct().await.unwrap();
         let root = Path::new("Z:/no/such/project");
         sup.symbol_cache_put(
-            doc_symbol_cache_key(root, "x.unknownext"),
+            doc_symbol_cache_key(root, "x.unknownext", None),
             vec![hit("weird")],
         );
         let out = sup.tool_overview(root, "x.unknownext", None).await.unwrap();
         assert_eq!(out[0].name, "weird");
+    }
+
+    /// bd 8ges 锁：override 进键——同文件 None（扩展名路由）与 Some(lang) 是不同
+    /// 缓存平面，override 调用不被先前无 override 的结果遮蔽（Dockerfile
+    /// `--lang python` 曾静默返回 docker 符号），且 override 大小写归一。
+    #[tokio::test]
+    async fn override_lang_results_do_not_shadow_extension_route() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/project");
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "Dockerfile", None),
+            vec![hit("FROM")],
+        );
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "Dockerfile", Some("python")),
+            vec![hit("py_sym")],
+        );
+        assert_eq!(
+            sup.symbol_cache_get(&doc_symbol_cache_key(root, "Dockerfile", None))
+                .unwrap()[0]
+                .name,
+            "FROM",
+            "None 平面保持扩展名路由结果"
+        );
+        assert_eq!(
+            sup.symbol_cache_get(&doc_symbol_cache_key(
+                root,
+                "Dockerfile",
+                Some("PYTHON")
+            ))
+            .unwrap()[0]
+                .name,
+            "py_sym",
+            "override 平面独立且大小写归一"
+        );
     }
 
     /// cache miss：空 supervisor 必 miss；put 后 get 命中（首次调用写入 cache 的机制）。
@@ -9655,7 +9923,7 @@ mod symbol_cache_tests {
     async fn cache_miss_then_put_then_hit() {
         let sup = Supervisor::direct().await.unwrap();
         let root = Path::new("Z:/no/such/project");
-        let key = doc_symbol_cache_key(root, "a.rs");
+        let key = doc_symbol_cache_key(root, "a.rs", None);
         assert!(
             sup.symbol_cache_get(&key).is_none(),
             "fresh supervisor must miss"
@@ -9672,7 +9940,7 @@ mod symbol_cache_tests {
     async fn cache_hit_bumps_counter_for_daemon_diffing() {
         let sup = Supervisor::direct().await.unwrap();
         let root = Path::new("Z:/no/such/project");
-        let key = doc_symbol_cache_key(root, "a.rs");
+        let key = doc_symbol_cache_key(root, "a.rs", None);
         let before = sup.cache_hits_total();
         assert!(sup.symbol_cache_get(&key).is_none(), "miss");
         assert_eq!(sup.cache_hits_total(), before, "miss must not bump");
@@ -9690,7 +9958,7 @@ mod symbol_cache_tests {
         std::fs::write(&file, "fn f() {}\n").unwrap();
         let root = dir.path();
 
-        let key1 = doc_symbol_cache_key(root, "a.rs");
+        let key1 = doc_symbol_cache_key(root, "a.rs", None);
         sup.symbol_cache_put(key1.clone(), vec![hit("f")]);
         assert!(sup.symbol_cache_get(&key1).is_some());
 
@@ -9700,7 +9968,7 @@ mod symbol_cache_tests {
             .unwrap()
             .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(42))
             .unwrap();
-        let key2 = doc_symbol_cache_key(root, "a.rs");
+        let key2 = doc_symbol_cache_key(root, "a.rs", None);
         assert_ne!(key1, key2, "mtime change must produce a new cache key");
         assert!(
             sup.symbol_cache_get(&key2).is_none(),
@@ -9744,8 +10012,8 @@ mod symbol_cache_tests {
     async fn different_files_do_not_share_entries() {
         let sup = Supervisor::direct().await.unwrap();
         let root = Path::new("Z:/no/such/project");
-        let ka = doc_symbol_cache_key(root, "a.rs");
-        let kb = doc_symbol_cache_key(root, "b.rs");
+        let ka = doc_symbol_cache_key(root, "a.rs", None);
+        let kb = doc_symbol_cache_key(root, "b.rs", None);
         assert_ne!(ka, kb);
         sup.symbol_cache_put(ka.clone(), vec![hit("a_sym")]);
         assert!(sup.symbol_cache_get(&ka).is_some());
@@ -9808,8 +10076,8 @@ mod symbol_cache_tests {
         std::fs::write(nm.join("dep.rs"), "fn dep() {}\n").unwrap();
         let root = dir.path();
 
-        sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs"), vec![hit("sym_a")]);
-        sup.symbol_cache_put(doc_symbol_cache_key(root, "b.rs"), vec![hit("sym_b")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "a.rs", None), vec![hit("sym_a")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "b.rs", None), vec![hit("sym_b")]);
 
         let tree = sup
             .tool_symbol_tree(root, ".", Some("rust"), 200, false, None, None, false)
@@ -9845,7 +10113,7 @@ mod symbol_cache_tests {
         let root = dir.path();
         for i in 0..5 {
             sup.symbol_cache_put(
-                doc_symbol_cache_key(root, &format!("f{i}.rs")),
+                doc_symbol_cache_key(root, &format!("f{i}.rs"), None),
                 vec![hit("x")],
             );
         }
@@ -9877,7 +10145,7 @@ mod symbol_cache_tests {
         }
         let root = dir.path();
         for n in &names {
-            sup.symbol_cache_put(doc_symbol_cache_key(root, n), vec![hit("x")]);
+            sup.symbol_cache_put(doc_symbol_cache_key(root, n, None), vec![hit("x")]);
         }
 
         let tree = sup
@@ -9908,7 +10176,7 @@ mod symbol_cache_tests {
         }
         let root = dir.path();
         for n in &names {
-            sup.symbol_cache_put(doc_symbol_cache_key(root, n), vec![hit("x")]);
+            sup.symbol_cache_put(doc_symbol_cache_key(root, n, None), vec![hit("x")]);
         }
 
         let tree = sup
@@ -9935,7 +10203,7 @@ mod symbol_cache_tests {
         }
         let root = dir.path();
         for n in &names {
-            sup.symbol_cache_put(doc_symbol_cache_key(root, n), vec![hit("x")]);
+            sup.symbol_cache_put(doc_symbol_cache_key(root, n, None), vec![hit("x")]);
         }
 
         let tree = sup
@@ -9967,7 +10235,7 @@ mod symbol_cache_tests {
         // 预置 symbol cache（避免触发 session_for 拉 LS）
         for (idx, n) in files.iter().enumerate() {
             sup.symbol_cache_put(
-                doc_symbol_cache_key(root, n),
+                doc_symbol_cache_key(root, n, None),
                 vec![hit(&format!("sym_{idx}"))],
             );
         }
@@ -10143,7 +10411,7 @@ mod symbol_cache_tests {
         std::fs::write(&file, "fn f() {}\n").unwrap();
         let root = dir.path();
 
-        let key1 = doc_symbol_cache_key(root, "a.rs");
+        let key1 = doc_symbol_cache_key(root, "a.rs", None);
         sup.symbol_cache_put(key1.clone(), vec![hit("f")]);
         assert!(sup.symbol_cache_get(&key1).is_some(), "warm cache must hit");
 
@@ -10157,7 +10425,7 @@ mod symbol_cache_tests {
             .set_modified(m0)
             .unwrap();
 
-        let key2 = doc_symbol_cache_key(root, "a.rs");
+        let key2 = doc_symbol_cache_key(root, "a.rs", None);
         assert_ne!(key1, key2, "同 mtime 下 size 变化必须产生新 key（双因子）");
         assert!(sup.symbol_cache_get(&key2).is_none(), "size 变必须 miss");
         // 对账：检出不一致 → 清旧 stamp 残留；二次调用已一致 → false（幂等）。
@@ -10178,13 +10446,13 @@ mod symbol_cache_tests {
         std::fs::write(&other, "fn g() {}\n").unwrap();
         let root = dir.path();
 
-        let key = doc_symbol_cache_key(root, "a.rs");
-        let other_key = doc_symbol_cache_key(root, "b.rs");
+        let key = doc_symbol_cache_key(root, "a.rs", None);
+        let other_key = doc_symbol_cache_key(root, "b.rs", None);
         sup.symbol_cache_put(key.clone(), vec![hit("f")]);
         sup.symbol_cache_put(other_key.clone(), vec![hit("g")]);
 
         assert_eq!(
-            doc_symbol_cache_key(root, "a.rs"),
+            doc_symbol_cache_key(root, "a.rs", None),
             key,
             "无修改 key 必须稳定（fast path 前提）"
         );
@@ -10208,7 +10476,7 @@ mod symbol_cache_tests {
         // 灌满：put cap 次后 len == cap。
         for i in 0..cap {
             sup.symbol_cache_put(
-                doc_symbol_cache_key(root, &format!("f{i}.rs")),
+                doc_symbol_cache_key(root, &format!("f{i}.rs"), None),
                 vec![hit("x")],
             );
         }
@@ -10218,19 +10486,19 @@ mod symbol_cache_tests {
             "刚好达到上限时不清空（< 阈值）"
         );
         // 第 cap+1 次 → 触发闸门 → 全清后只剩本条。
-        sup.symbol_cache_put(doc_symbol_cache_key(root, "overflow.rs"), vec![hit("y")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "overflow.rs", None), vec![hit("y")]);
         assert_eq!(
             sup.symbol_cache_len(),
             1,
             "超上限触发全清后只剩新插入的 1 条"
         );
         assert!(
-            sup.symbol_cache_get(&doc_symbol_cache_key(root, "overflow.rs"))
+            sup.symbol_cache_get(&doc_symbol_cache_key(root, "overflow.rs", None))
                 .is_some(),
             "新写入的 key 必须可命中"
         );
         assert!(
-            sup.symbol_cache_get(&doc_symbol_cache_key(root, "f0.rs"))
+            sup.symbol_cache_get(&doc_symbol_cache_key(root, "f0.rs", None))
                 .is_none(),
             "旧 entry 被全清"
         );
@@ -10247,7 +10515,7 @@ mod symbol_cache_tests {
         let total = cap * 2 + 5;
         for i in 0..total {
             sup.symbol_cache_put(
-                doc_symbol_cache_key(root, &format!("g{i}.rs")),
+                doc_symbol_cache_key(root, &format!("g{i}.rs"), None),
                 vec![hit("x")],
             );
             let n = sup.symbol_cache_len();
@@ -10271,7 +10539,7 @@ mod symbol_cache_tests {
         let mut triggered = 0usize;
         for i in 0..total {
             sup.symbol_cache_put(
-                doc_symbol_cache_key(root, &format!("edit_{i}.rs")),
+                doc_symbol_cache_key(root, &format!("edit_{i}.rs"), None),
                 vec![hit("x")],
             );
             let cur = sup.symbol_cache_len();
@@ -10299,7 +10567,7 @@ mod symbol_cache_tests {
         let root = Path::new("Z:/no/such/project");
         for i in 0..256 {
             sup.symbol_cache_put(
-                doc_symbol_cache_key(root, &format!("f{i}.rs")),
+                doc_symbol_cache_key(root, &format!("f{i}.rs"), None),
                 vec![hit("x")],
             );
             assert_eq!(
@@ -10320,16 +10588,16 @@ mod symbol_cache_tests {
         let cap = SYMBOL_CACHE_MAX_ENTRIES;
         for i in 0..cap {
             sup.symbol_cache_put(
-                doc_symbol_cache_key(root, &format!("s{i}.rs")),
+                doc_symbol_cache_key(root, &format!("s{i}.rs"), None),
                 vec![hit("x")],
             );
         }
         // 触发全清
-        sup.symbol_cache_put(doc_symbol_cache_key(root, "trigger.rs"), vec![hit("y")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(root, "trigger.rs", None), vec![hit("y")]);
         let mut all_miss = true;
         for i in 0..cap {
             if sup
-                .symbol_cache_get(&doc_symbol_cache_key(root, &format!("s{i}.rs")))
+                .symbol_cache_get(&doc_symbol_cache_key(root, &format!("s{i}.rs"), None))
                 .is_some()
             {
                 all_miss = false;
@@ -10351,19 +10619,19 @@ mod symbol_cache_tests {
         // root_a 灌满 + root_b 灌 1 条
         for i in 0..cap {
             sup.symbol_cache_put(
-                doc_symbol_cache_key(root_a, &format!("a{i}.rs")),
+                doc_symbol_cache_key(root_a, &format!("a{i}.rs"), None),
                 vec![hit("a")],
             );
         }
-        sup.symbol_cache_put(doc_symbol_cache_key(root_b, "b0.rs"), vec![hit("b")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(root_b, "b0.rs", None), vec![hit("b")]);
         // 触发全清
-        sup.symbol_cache_put(doc_symbol_cache_key(root_a, "trigger.rs"), vec![hit("t")]);
+        sup.symbol_cache_put(doc_symbol_cache_key(root_a, "trigger.rs", None), vec![hit("t")]);
         // 全清后 root_a 只有 trigger.rs + root_b 的 b0.rs
         // invalidate root_a → 只剩 root_b 的 1 条
         sup.invalidate_symbol_cache_for_root(root_a);
         assert_eq!(sup.symbol_cache_len(), 1, "只 root_b 一条存活");
         assert!(
-            sup.symbol_cache_get(&doc_symbol_cache_key(root_b, "b0.rs"))
+            sup.symbol_cache_get(&doc_symbol_cache_key(root_b, "b0.rs", None))
                 .is_some()
         );
     }
@@ -12857,5 +13125,97 @@ mod sweep_a3a_unit_tests {
     fn symbol_containment_depth_excludes_identical_ranges() {
         let all = vec![sym_json("a", 1, 0, 2, 0), sym_json("b", 1, 0, 2, 0)];
         assert_eq!(symbol_containment_depth(&all[0], &all), 0, "并列不加深");
+    }
+}
+
+/// 盲测 v4 修复波的纯函数单测（bd edpi/2rxp/P2-2）。
+#[cfg(test)]
+mod blindv4_unit_tests {
+    use super::*;
+
+    // ---- bd edpi：原子写 NotFound → BAD_ARGS（父目录指引），其余保持 WRITE_CONFLICT ----
+
+    #[test]
+    fn atomic_write_not_found_maps_to_bad_args_with_parent_hint() {
+        // os error 3（Windows ERROR_PATH_NOT_FOUND）→ io::ErrorKind::NotFound。
+        let e = std::io::Error::from_raw_os_error(3);
+        let err = atomic_write_err("D:/tmp/proj/no_dir/sub/f.txt", e);
+        match err {
+            ToolError::BadArgs { detail } => {
+                assert!(
+                    detail.contains("parent directory does not exist: "),
+                    "hint 指到缺失的父目录: {detail}"
+                );
+                assert!(detail.contains("no_dir/sub"), "{detail}");
+                assert!(detail.contains("create it first"), "{detail}");
+            }
+            other => panic!("NotFound 必须归 BAD_ARGS，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn atomic_write_other_io_errors_stay_write_conflict() {
+        let e = std::io::Error::from_raw_os_error(5); // 拒绝访问——真冲突候选
+        let err = atomic_write_err("D:/tmp/proj/a.py", e);
+        assert!(
+            matches!(err, ToolError::WriteConflict { .. }),
+            "非 NotFound 保持 WRITE_CONFLICT: {err:?}"
+        );
+    }
+
+    // ---- bd 2rxp：出站 uri 归一 ----
+
+    #[test]
+    fn file_uri_drive_letter_normalized() {
+        assert_eq!(
+            normalize_file_uri("file:///c%3A/Users/x/a.py"),
+            "file:///C:/Users/x/a.py"
+        );
+        assert_eq!(
+            normalize_file_uri("file:///c:/Users/x/a.py"),
+            "file:///C:/Users/x/a.py"
+        );
+        // 已是目标形态：原样。
+        assert_eq!(
+            normalize_file_uri("file:///C:/Users/x/a.py"),
+            "file:///C:/Users/x/a.py"
+        );
+        // 非 file scheme / 非盘符段：原样。
+        assert_eq!(
+            normalize_file_uri("file:///home/u/a.py"),
+            "file:///home/u/a.py"
+        );
+        assert_eq!(
+            normalize_file_uri("https://example.com/x"),
+            "https://example.com/x"
+        );
+        // 路径段编码（%20）不动。
+        assert_eq!(
+            normalize_file_uri("file:///C:/My%20Docs/a.py"),
+            "file:///C:/My%20Docs/a.py"
+        );
+    }
+
+    #[test]
+    fn output_uri_walker_touches_only_uri_fields() {
+        let mut v = serde_json::json!({
+            "items": [
+                {"uri": "file:///c%3A/Users/x/a.py", "line": 1},
+                {"targetUri": "file:///d:/y/b.py"},
+            ],
+            "uri": "file:///e:/top.py",
+            "note": "file:///c%3A/not_a_uri_field.py",
+            "nested": {"deep": [{"uri": "file:///f%3A/z.py"}]},
+        });
+        normalize_output_uris(&mut v);
+        assert_eq!(v["items"][0]["uri"], "file:///C:/Users/x/a.py", "{v}");
+        assert_eq!(v["items"][1]["targetUri"], "file:///D:/y/b.py", "{v}");
+        assert_eq!(v["uri"], "file:///E:/top.py", "{v}");
+        assert_eq!(
+            v["note"],
+            "file:///c%3A/not_a_uri_field.py",
+            "非 uri 字段不动"
+        );
+        assert_eq!(v["nested"]["deep"][0]["uri"], "file:///F:/z.py", "{v}");
     }
 }

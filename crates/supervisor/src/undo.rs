@@ -19,13 +19,14 @@
 //!   —— kill 打中写提交窗只会留下「有记录无改动」（undo 侧幂等收口为 no-op），
 //!   绝不出现「有改动无记录」的永久脱账写入。
 //! - undo 冲突语义（bd serena-rust-3ux6 拍板：**自动跳过 + warning**，不做
-//!   `--force`）：盘面与事务后状态不符（外部编辑）的事务已不可干净回滚，undo
-//!   把它整事务改名 `discarded-{N}`（留档、不参与栈/prune 照常回收），附
-//!   warning 指明原因与下一可用事务，继续尝试更早事务 —— 楔死状态有出路，且
-//!   跳过不消耗 steps 名额（steps 只数真实回滚）。剩余 `WRITE_CONFLICT`
-//!   （IO 占用/存储损坏）仍整步报错。选自动跳过而非 `--force`：(a) 本战役禁改
-//!   cli crate，加不了 flag；(b) AI 操作者少一轮「先撞错再补 flag」往返，返回
-//!   报文自带完整交代。redo 侧对称（外部冲突链式 discarded 清栈）。
+//!   `--force`；bd e1f4 收紧：冲突即停）：盘面与事务后状态不符（外部编辑）的事务
+//!   已不可干净回滚，undo 把它整事务改名 `discarded-{N}`（留档、不参与栈/prune
+//!   照常回收），附 warning 指明原因，**并立即停止**——冲突证明时间线已被外部
+//!   编辑打乱，更老事务的 pre-image 不再可信，fall-through 会静默回滚无关改动
+//!   （盲测 v4 实锤）。响应带 `stopped_early`（CLI 据此置 rc=2）。torn（无
+//!   manifest 的崩溃窗残骸）仍跳过继续——那不是外部编辑，时间线未乱。剩余
+//!   `WRITE_CONFLICT`（IO 占用/存储损坏）仍整步报错。redo 侧对称（外部冲突
+//!   链式 discarded 清栈）。
 //! - redo 重放序（bd serena-rust-b5od）：按**事务时间序（N 升序）**重放，即最
 //!   后 undo 的先 redo —— undo 是 LIFO 弹栈，正放必须还原原始写入顺序，否则
 //!   深度 ≥2 时 pre-image 对账必然失配（F1 根因：曾取 N 最大 undone 项）。每次
@@ -979,9 +980,14 @@ pub(crate) async fn undo_at(store: &Path, steps: usize) -> Result<serde_json::Va
     let mut undone = Vec::new();
     let mut skipped = Vec::new();
     let mut done = 0usize;
+    // bd e1f4：sha 冲突 discard 后必须**立即停止**——冲突证明时间线已被外部编辑
+    // 打乱，更老事务的 pre-image 不再可信（fall-through 会静默回滚无关改动，
+    // 盲测 v4 实锤：txn3 冲突却撤掉了 txn2）。torn（无 manifest 的崩溃窗残骸）
+    // 仍按 3ux6 语义跳过继续——那不是外部编辑，时间线未乱。
+    let mut stopped_early: Option<serde_json::Value> = None;
     // steps 只数真实回滚；no-op 收口与外部冲突 discarded 跳过不占名额（栈单调
     // 收缩保证终止）。空栈 = no-op（IDE undo 语义）。
-    while done < steps {
+    while done < steps && stopped_early.is_none() {
         let n = match top_active(store).await {
             Ok(Some(n)) => n,
             _ => break,
@@ -1006,6 +1012,12 @@ pub(crate) async fn undo_at(store: &Path, steps: usize) -> Result<serde_json::Va
                     )
                 })?;
                 let next = top_active(store).await.ok().flatten();
+                stopped_early = Some(serde_json::json!({
+                    "txn_id": n,
+                    "reason": reason,
+                    "file": path,
+                    "note": "older transactions not rolled back: timeline broken by external edit",
+                }));
                 skipped.push(serde_json::json!({
                     "txn_id": n,
                     "state": "discarded",
@@ -1032,7 +1044,12 @@ pub(crate) async fn undo_at(store: &Path, steps: usize) -> Result<serde_json::Va
             Err(UndoFail::Transient(e)) => return Err(e),
         }
     }
-    Ok(serde_json::json!({"undone": undone, "skipped": skipped}))
+    let mut resp = serde_json::json!({"undone": undone, "skipped": skipped});
+    if let Some(stop) = stopped_early {
+        // CLI 据此置 rc=2：部分完成非完全成功（载荷已打印，agent 可解析）。
+        resp["stopped_early"] = stop;
+    }
+    Ok(resp)
 }
 
 /// `redo`：重放最近被 undo 的事务。

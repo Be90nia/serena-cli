@@ -202,6 +202,13 @@ pub(crate) async fn ct_verify(
     // 也不拖垮诊断段。
     let (format_ok, format_edits, format_skipped) = match sup.tool_format(root, file, None, None, None).await {
         Ok(edits) => (Some(edits.is_empty()), edits.len(), None),
+        // bd P2-9a：-32601 = LS 无 formatting 能力——原始 rpc jargon（"core error:
+        // rpc error -32601: Unhandled method ..."）换人话一行，写 recipe 每步可见。
+        Err(ToolError::Core(crate::CoreErrorWire::Rpc { code: -32601, .. })) => (
+            None,
+            0,
+            Some("format skipped: LS does not support formatting".to_string()),
+        ),
         Err(e) => (None, 0, Some(format!("format-check skipped: {e}"))),
     };
     let mut env = json!({
@@ -970,6 +977,19 @@ async fn smart_edit_extract(
 ) -> Result<Vec<(String, Value)>, ToolError> {
     let item = sup.tool_symbol_body(root, file, symbol, None).await?;
     let Some((name_off, _, _)) = locate_signature_name(&item, symbol) else {
+        // bd P2-6：本实现按 Rust 语法解析签名（fn 关键字 + 参数串重建）。非 rust
+        // 文件的 def 落到这里时，旧文案 "`x` is not a function item" 张冠李戴
+        // （python def 明明是函数）——真实原因 = 该重构仅实现了 Rust 源。
+        let lang = crate::resolve_lang_for_file(file, None)
+            .unwrap_or_else(|_| "unknown".to_string());
+        if lang != "rust" {
+            return Err(unsupported(
+                "extract",
+                format!(
+                    "extract transform supports Rust sources only; the {lang} LS does not provide this refactoring"
+                ),
+            ));
+        }
         return Err(unsupported(
             "extract",
             format!("`{symbol}` is not a function item"),

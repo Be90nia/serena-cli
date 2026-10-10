@@ -324,10 +324,12 @@ async fn undo_external_conflict_discards_txn_with_warning() {
     assert_eq!(committed_dirs(&store), vec!["txn-2".to_string()], "N not reused");
 }
 
-/// bd serena-rust-3ux6：跳过不占 steps 名额 —— 冲突顶事务 discarded 后，本次
-/// 调用继续回滚下一个可用事务，warning 指向它。
+/// bd e1f4 核心锁：sha 冲突 discard 后**立即停止**，不 fall-through 回滚更老事务。
+/// 旧语义（serena-rust-3ux6 的"跳过继续"）会静默撤掉无关改动（盲测 v4 实锤：
+/// txn2 是 safe-delete，txn3 冲突后 txn2 被 fall-through 回滚，dead_code 复活）。
+/// torn（无 manifest 崩溃窗残骸）仍跳过继续——时间线未乱，见 UndoFail::Torn 分支。
 #[tokio::test]
-async fn undo_skip_does_not_consume_step_budget() {
+async fn undo_conflict_stops_fall_through() {
     let work = tmpdir("skip_work");
     let store = tmpdir("skip_store");
     let a = work.join("a.txt");
@@ -338,19 +340,31 @@ async fn undo_skip_does_not_consume_step_budget() {
     txn_write(&store, &a, "v3", u2).await;
     commit_at(&store, u2).await.unwrap();
 
-    // 外部把顶事务（txn-2）的产物改成别的；txn-1 的预期盘面（v2）也被破坏 ——
-    // 两个都冲突 → 链式 discarded，栈清空。
+    // 外部把顶事务（txn-2）的产物改成别的；txn-1 的预期盘面（v2）同样不符。
     std::fs::write(&a, "hand-edit").unwrap();
     let r = undo_at(&store, 1).await.unwrap();
-    assert_eq!(r["skipped"].as_array().unwrap().len(), 2, "chained discard: {r}");
-    assert_eq!(
-        r["skipped"][0]["next_active_txn"], 1,
-        "warning points to next candidate"
+    let skipped = r["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "conflict stops the loop: {r}");
+    assert_eq!(skipped[0]["txn_id"], 2);
+    assert_eq!(skipped[0]["state"], "discarded");
+    // 停止标记：CLI 据此置 rc=2（部分完成非完全成功）。
+    assert_eq!(r["stopped_early"]["txn_id"], 2, "{r}");
+    assert!(
+        r["stopped_early"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("not rolled back"),
+        "{r}"
     );
     assert_eq!(
         committed_dirs(&store),
-        Vec::<String>::new(),
-        "stack fully unwound"
+        vec!["txn-1".to_string()],
+        "older txn stays on the stack (no fall-through)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "hand-edit",
+        "external edit untouched; older txn not reverted"
     );
 }
 

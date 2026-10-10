@@ -30,7 +30,7 @@ Diagnostics (3): `diagnostics` (with `--wait-gen N`) · pull diagnostics fallbac
 
 Editing (11): `rename-symbol` · `safe-delete-symbol` · `replace-body` · `replace-text-in-symbol` · `insert-text-before-symbol` · `insert-text-after-symbol` · `delete-text-in-symbol` · `insert-at-line` · `replace-lines` · `delete-lines` · `create-text-file`
 
-Undo / redo (2): `undo` (`--steps N`, `--list`) · `redo` — transactional snapshot stack: every successful write records the prior state; a multi-file edit (e.g. cross-file rename) is one transaction and rolls back as a whole. Files created by a transaction are deleted on undo. Conflict gate: if a file changed on disk after the transaction, undo refuses instead of overwriting. Stack lives in the user cache dir (survives restarts and upgrades), capped at 20 txns / 200 MB / 30 days.
+Undo / redo (2): `undo` (`--steps N`, `--list`) · `redo` — transactional snapshot stack: every successful write records the prior state; a multi-file edit (e.g. cross-file rename) is one transaction and rolls back as a whole. Files created by a transaction are deleted on undo. Conflict gate: if a file changed on disk after the transaction, that transaction is discarded and undo stops immediately (broken timeline — older transactions are not touched; response carries `stopped_early`, exit code 2). Stack lives in the user cache dir (survives restarts and upgrades), capped at 20 txns / 200 MB / 30 days.
 
 Test / diff / find-test (3): `test <target> [name]` (cargo/npm backends auto-selected; parses failures into a JSON list) · `diff [txn-id] [--patch]` (before/after of a write transaction; `--patch` emits a unified diff) · `find-test <sym>` (heuristic chain: tests/ mirrors → test dirs/naming → `mod tests` → LS refs)
 
@@ -48,9 +48,9 @@ Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `
 |---|---|---|
 | `fix-bug` | `<file> <sym> [--new-body T]` | context (tldr + callers + verify before) → replace-body → verify after; without `--new-body` runs the analysis chain only |
 | `add-feature` | `<name> [--target F]` | define-feature (report / stub text) → stub write; optional tests via `--tests-file` + `--tests` |
-| `rename` | `<file> <sym> --to N` | impact → single-file LSP rename (cross-file edits land in `skipped`) → verify |
-| `add-test` | `<sym> [--run]` | find-test → hit means tests exist (report only); miss appends a `mod tests` template at EOF (explicit skip if one exists) |
-| `refactor-extract` | `<file> <sym> --as N` | smart-edit extract (whole-symbol) → verify |
+| `rename` | `<file> <sym> --to N` | impact → LSP rename via the same internal path as `rename-symbol` (cross-file edits applied in one transaction, bd d1hs) → verify |
+| `add-test` | `<sym> [--run]` | find-test → hit means tests exist (report only); miss appends a `mod tests` template at EOF (explicit skip if one exists). `.rs` targets only |
+| `refactor-extract` | `<file> <sym> --as N` | smart-edit extract (whole-symbol; Rust sources only — other languages are rejected with the reason) → verify |
 | `refactor-rename` | `<sym> --to N` | impact → workspace rename → verify (definition file) |
 | `review-diff` | `[txn-id]` | diff + related tests + aggregated review report |
 | `explore` | `<path>` | tldr → repo-map → recent activity |

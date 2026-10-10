@@ -69,8 +69,11 @@ pub(crate) fn range_from_symbol_cache(
     root: &Path,
     file: &str,
     symbol: &str,
+    lang_override: Option<&str>,
 ) -> Option<(u32, u32)> {
-    let key = crate::doc_symbol_cache_key(root, file);
+    // bd 8ges：与 tool_symbol_body 同键维度（override 进键），否则 override 写入
+    // 的缓存这里读不到。
+    let key = crate::doc_symbol_cache_key(root, file, lang_override);
     let hits = sup.symbol_cache_get(&key)?;
     hits.iter()
         .find(|h| h.name == symbol)
@@ -131,7 +134,7 @@ pub async fn collect(
         }
         Err(e) => return Err(e),
     };
-    let (s0, e0) = range_from_symbol_cache(sup, root, file, symbol).unwrap_or((0, 0));
+    let (s0, e0) = range_from_symbol_cache(sup, root, file, symbol, lang).unwrap_or((0, 0));
     let body_line_0based = s0;
     report.body = Some(BodyRange {
         start_line: s0 + 1, // 1-based 输出给 AI
