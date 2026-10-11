@@ -6,9 +6,10 @@
 //!
 //! ## 防线与语义
 //!
-//! 1. **带根/绝对分量拒绝**：Windows `Path::join` 遇带根分量整体替换基路径
-//!    （`root.join("C:/x") == "C:/x"`、`root.join("/x") == "D:/x"`），盘符相对
-//!    `C:x` 同样换盘 —— Prefix/RootDir 分量一律拒。
+//! 1. **带根/绝对分量拒绝（Windows 语义）**：Windows `Path::join` 遇带根分量整体替换
+//!    基路径（`root.join("C:/x") == "C:/x"`、`root.join("/x") == "D:/x"`），盘符相对
+//!    `C:x` 同样换盘 —— Prefix/RootDir 分量在 Windows 一律拒。Unix 下 RootDir 是
+//!    绝对路径合法首分量，放行但防线 2/3 原样生效。
 //! 2. **词法归一**：`..` 逐级上卷、卷出 root 即拒（`root/../x`）；`.` 与混合
 //!    分隔符（`..\..\x`）由 `Path::components` 天然消解。此步不碰磁盘，确定性。
 //! 3. **canonical 校验（symlink 语义）**：对目标「最深已存在祖先」做
@@ -45,10 +46,18 @@ pub(crate) fn guarded_join(root: &Path, file: &str) -> Result<PathBuf, String> {
     // 放行：Drive Prefix + RootDir（`C:\foo` / `C:/foo`）→ 走阶段 3。
     let raw_comps: Vec<Component<'_>> = raw.components().collect();
     let mut drive_prefix_idx: Option<usize> = None;
+    // Unix 绝对路径（首分量 RootDir）→ 路由阶段 3。
+    let mut rooted_absolute = false;
     for (i, c) in raw_comps.iter().enumerate() {
         match c {
             Component::RootDir if drive_prefix_idx.is_none() => {
-                return Err(format!("path escapes project root: {file}"));
+                if cfg!(windows) {
+                    // Windows 专属危险：`/foo` 的 join 语义 = 换当前盘根。
+                    return Err(format!("path escapes project root: {file}"));
+                }
+                // Unix：RootDir 是绝对路径合法首分量 → 放行，但阶段 3 的
+                // 词法上卷 + canonical 终检原样生效（放行 ≠ 放弃防御）。
+                rooted_absolute = true;
             }
             Component::Prefix(p) => match p.kind() {
                 Prefix::Verbatim(_)
@@ -71,9 +80,9 @@ pub(crate) fn guarded_join(root: &Path, file: &str) -> Result<PathBuf, String> {
         }
     }
 
-    if drive_prefix_idx.is_some() {
-        // 阶段 3：drive-rooted 绝对路径。词法归一（.. 上卷至盘根停），再沿
-        // 祖先链 canonicalize，最后 starts_with(canon_root) 终检。
+    if drive_prefix_idx.is_some() || rooted_absolute {
+        // 阶段 3：绝对路径（drive-rooted / Unix 根锚定）。词法归一（.. 上卷
+        // 至根停），再沿祖先链 canonicalize，最后 starts_with(canon_root) 终检。
         return check_absolute_in_root(raw, &canon_root, file);
     }
 
@@ -118,8 +127,8 @@ pub(crate) fn guarded_join(root: &Path, file: &str) -> Result<PathBuf, String> {
     Ok(checked)
 }
 
-/// Drive-rooted 绝对路径校验：词法归一 .. / . 后，沿祖先链 canonicalize
-/// （解析 symlink + 处理不存在的尾部分量），再 starts_with(canon_root) 终检。
+/// 绝对路径校验（drive-rooted / Unix 根锚定）：词法归一 .. / . 后，沿祖先链
+/// canonicalize（解析 symlink + 处理不存在的尾部分量），再 starts_with(canon_root) 终检。
 fn check_absolute_in_root(
     raw: &Path,
     canon_root: &Path,
@@ -253,6 +262,25 @@ mod tests {
         // 混合分隔符穿越（%TEMP% 类拼接的实锚形态）。
         assert!(guarded_join(&root, r"..\..\evil.txt").is_err());
         assert!(guarded_join(&root, "../../evil.txt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_absolute_allowed_and_defenses_intact() {
+        let dir = scratch("uxabs");
+        let root = root_of(&dir, "uxabs");
+        // 1. 斜杠形式绝对路径放行（Linux 侧 19 处写工具的回归门）。
+        let inside = format!("{}/main.rs", root.display());
+        assert_eq!(guarded_join(&root, &inside).unwrap(), root.join("main.rs"));
+        // 2. 防御不松：绝对路径内 `..` 词法上卷出 root 仍拒。
+        let up = format!("{}/../outside.txt", root.display());
+        let err = guarded_join(&root, &up).unwrap_err();
+        assert!(err.contains("escapes project root"), "{up}: {err}");
+        // 3. 防御不松：root 内 symlink 指向 root 外 → canonical 终检仍拒。
+        std::os::unix::fs::symlink(dir.path(), root.join("sneaky")).unwrap();
+        let through = format!("{}/sneaky/outside.txt", root.display());
+        let err = guarded_join(&root, &through).unwrap_err();
+        assert!(err.contains("escapes project root"), "{through}: {err}");
     }
 
     #[test]
