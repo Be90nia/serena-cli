@@ -1058,10 +1058,12 @@ mod tests {
             if !declares {
                 continue;
             }
-            // 白名单：本批声明的 5 门。表内出现白名单外条目 = 意外通道声明，
+            // 白名单：本批声明的门（Wave 1 五门 + kotlin env + fsharp init_options，
+            // fix7 2026-10-11）。表内出现白名单外条目 = 意外通道声明，
             // 会改其它 LS 行为——必须人工过目。
             assert!(
-                ["yaml", "dart", "elixir", "kotlin", "julia", "nextflow"].contains(&id.as_str()),
+                ["yaml", "dart", "elixir", "kotlin", "julia", "nextflow", "fsharp"]
+                    .contains(&id.as_str()),
                 "[servers.{id}] 意外声明 Wave 1 通道"
             );
         }

@@ -632,60 +632,63 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 # 非单二进制下载形态，不入本表）。
 
 [servers.kotlin]
-# JetBrains managed Kotlin LSP（IntelliJ 平台 headless 形态；上游 kotlin_language_server.py
-# 7a296833 同源，sha 锚 = 其 downloaded_dependency_hashes.json）。包内捆绑 JBR，无需系统
-# JDK。env（上游 adopt W6）：↖ mirror kotlin_language_server.py@7a296833 L262-280
-# create_launch_command_env——JVM 默认堆 1/4 RAM，大仓 OOM/内存失控面，上游钉 -Xmx2G。
-# server→client 请求（workspace/*/refresh 等）未注册时 lsp-core 默认回 null 成功
-# ——KLS 对 MethodNotFound 是致命退出（上游注释实锤），本架构天然规避。
+# Kotlin LS = fwcd/kotlin-language-server GitHub release stable pin。2026-10-11 pin 变更
+# （fix7 残余波，blindtest v5.5 kotlin 归因收口）：JetBrains managed KLS EAP 263.4702.0
+# 到期（裸探针 stderr "This build of kotlin-server has expired" 启动即退 rc=7），且
+# JetBrains 侧无新版（release 页 latest MISSING、无 assets）→ 改 pin fwcd release 最新
+# stable（原 JetBrains 形态的替换上游，非同源升版）。fwcd 包 = 平台无关纯 JVM zip：
+# 五平台同 url/sha（matlab 同款全平台同条目先例）；启动即 stdio —— `--stdio` 不在其
+# 参数表（jcommander ParameterException 拒绝，2026-10-11 裸探实锤），exec 裸 {bin}。
+# 需系统 java 在 PATH（包内无 JBR——与 JetBrains 包的关键差异）。env：JVM 堆钉
+# -Xmx2G（上游 create_launch_command_env 同款取舍，JVM 默认堆 1/4 RAM 大仓 OOM 面，
+# 对任意 Kotlin JVM LS 成立）。server→client 请求（workspace/*/refresh 等）未注册时
+# lsp-core 默认回 null 成功——JetBrains KLS 对 MethodNotFound 致命退出（上游注释实锤），
+# fwcd 对未知请求容忍，同架构天然规避。
 languages = ["kotlin"]
 extensions = [".kt", ".kts"]
 install = "download"
-exec = ["{bin}", "--stdio", "--system-path", "{bin_dir}/system"]
-source_commit = "7a296833"
+exec = ["{bin}"]
 
 [servers.kotlin.env]
+# JVM 堆钉 -Xmx2G（上游 create_launch_command_env 同款取舍，JVM 默认堆 1/4 RAM 大仓
+# OOM 面，对任意 Kotlin JVM LS 成立）。
 JAVA_TOOL_OPTIONS = "-Xmx2G"
+# ⚠ JDK 版本约束：fwcd 1.3.13 捆绑的 IntelliJ JavaVersion.parse 不认 4 段版本串
+# （JDK 25.0.4.1 → IllegalArgumentException，处理 initialize 即退 rc=1，2026-10-11
+# 裸探实锤）——需 JAVA_HOME/PATH 命中 ≤23 的 JDK（21 LTS 实测通过）。仅装 JDK 25 的
+# 机器用 external-servers.toml 整条覆盖并在 env 钉 JAVA_HOME（本机即此形态，非仓库
+# 数据——机器路径不入内置表）。
 
 [servers.kotlin.download]
-version = "263.4702.0"
+version = "1.3.13"
 archive = "zip"
-bin_path = "bin/intellij-server.exe"
-allowed_hosts = ["download-cdn.jetbrains.com"]
+bin_path = "server/bin/kotlin-language-server.bat"
+allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
 
 [servers.kotlin.download.url_per_platform]
-"windows-x86_64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0.win.zip"
-"windows-aarch64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0-aarch64.win.zip"
-"linux-x86_64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0.tar.gz"
-"linux-aarch64" = "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0-aarch64.tar.gz"
+# 平台无关 zip：五组同 url / 同 sha（2026-10-11 本机下载实测锚，API assets[].size 逐字对上）。
+"windows-x86_64" = "https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip"
+"windows-aarch64" = "https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip"
+"linux-x86_64" = "https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip"
+"linux-aarch64" = "https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip"
+"macos-x86_64" = "https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip"
+"macos-aarch64" = "https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip"
 
 [servers.kotlin.download.sha256_per_platform]
-"windows-x86_64" = "a9b471b16025b1bfb3b0a097862580abb40e3c35406c44242c18b1d70f5d0e44"
-"windows-aarch64" = "3bf008d8c94fa70eb13fc998eaa42f29b9d13f368984d4cec46277808f94e1de"
-"linux-x86_64" = "1e11d2e5fefbf9ea215ad8dd6be95f2222897cd086e8cb7a661a52084a590405"
-"linux-aarch64" = "ec7cb254a6662a07fff9f10e4365226afab6c40008f8a974c10ac5e785d6510f"
+"windows-x86_64" = "4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2"
+"windows-aarch64" = "4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2"
+"linux-x86_64" = "4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2"
+"linux-aarch64" = "4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2"
+"macos-x86_64" = "4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2"
+"macos-aarch64" = "4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2"
 
-# 首个平台间压缩形态互异条目（win=zip / linux=tar.gz / macos=.sit 即 zip 格式）：
-# archive_per_platform 命中优先、miss 回退单值 archive（resolved_archive）。macos .sit
-# 走 zip 解压器待验证，暂不启用 M 组（sha 锚保留在注释）。
-[servers.kotlin.download.archive_per_platform]
-"linux-x86_64" = "tar.gz"
-"linux-aarch64" = "tar.gz"
-
+# zip 内双层目录：win 启动器 .bat 走单值 bin_path；unix 启动器 sh 脚本 per-platform 覆盖
+# （installer 对 unix 已对解析产物补 0o755）。
 [servers.kotlin.download.bin_path_per_platform]
-"linux-x86_64" = "kotlin-server-263.4702.0/bin/intellij-server"
-"linux-aarch64" = "kotlin-server-263.4702.0-aarch64/bin/intellij-server"
-# 包内路径/压缩形态随平台变化，单值字段仅容 win 组：
-#   macos-x86_64: kotlin-server-263.4702.0.sit（zip 格式）
-#     sha256 62ab735947b1c855b505f64f5db8fbd7ff0b52a35ab1897938c6dbfc7b24c8a3
-#     bin bin/intellij-server
-#   macos-aarch64: kotlin-server-263.4702.0-aarch64.sit
-#     sha256 95da3fc6d3b9092c7616345044a05edb85e5408dc648d081e4e433595c892bec
-#     bin bin/intellij-server
-# exec：{bin_dir} = {bin} 所在目录（config::expand_exec 占位符）；system-path 指向安装
-# 缓存内可写目录（上游语义 = per-project 索引存储，静态模板只能给共享目录 —— 并发多
-# 项目会话有索引争用风险，oraios/serena#1966 上游同款边界）。JetBrains CDN 无版本列表
-# 端点（latest MISSING）。
+"linux-x86_64" = "server/bin/kotlin-language-server"
+"linux-aarch64" = "server/bin/kotlin-language-server"
+"macos-x86_64" = "server/bin/kotlin-language-server"
+"macos-aarch64" = "server/bin/kotlin-language-server"
 
 [servers.lua]
 languages = ["lua"]
@@ -1480,6 +1483,15 @@ entrypoint = "fortls"
 languages = ["fsharp"]
 install = "dotnet"
 source_commit = "43ae0211"
+# init_options（fix7 残余波 2026-10-11，blindtest v5.5 P4 "fsharp 语义层 project-gate"
+# 根因收口）：FSAC 语义层（ov/hover）要 project load，裸 didOpen 恒 -32603 "Couldn't
+# find … in LoadedProjects"；自动工作区加载 = opt-in 声明（FSAC docs
+# communication-protocol.md InitializationOptions），通用 init 不声明即死——「机制存在
+# ≠接线生效」第三例的声明点形态。↖ mirror fsharp_language_server.py@43ae021
+# _create_initialize_params initializationOptions 首键 "automaticWorkspaceInit": True。
+# 裸探实锚（0.83.0）：声明后 projectLoading→project→workspaceLoad finished→
+# documentSymbol 有货；不声明 25s 全程零 workspace 通知。
+init_options = { automaticWorkspaceInit = true }
 [servers.fsharp.dotnet]
 # 上游 fsharp_language_server.py L145：--tool-path 自有目录（非 -g），L188 启动开关组。
 tool = "fsautocomplete"

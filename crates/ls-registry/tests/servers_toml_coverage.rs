@@ -145,12 +145,19 @@ fn new_download_entries_parse_with_complete_fields() {
             spec.exec.iter().any(|arg| arg.contains("{bin}")),
             "{id}: exec must reference {{bin}} placeholder"
         );
-        // 升版锚例外：kotlin 263.4702.0（上游 DEFAULT_KOTLIN_LSP_VERSION + sha 锚）取自
-        // 7a296833 kotlin_language_server.py 与同 commit 的 downloaded_dependency_hashes.json；
-        // cue 同批升锚（7a296833 才有 cue_language_server.py，W6 批对拍修正）；其余条目
-        // 数据源锚 43ae0211。
+        // 升版锚例外：cue（7a296833 才有 cue_language_server.py，W6 批对拍修正）；其余
+        // 条目数据源锚 43ae0211。kotlin 豁免：2026-10-11 改 pin fwcd/kotlin-language-server
+        // stable 1.3.13（JetBrains EAP 263.4702.0 到期且无新版——替换上游，非同源升版），
+        // 自有决策，source_commit 缺省。
+        if *id == "kotlin" {
+            assert!(
+                spec.source_commit.is_none(),
+                "kotlin: fwcd re-pin is a local decision, source_commit must stay unset"
+            );
+            continue;
+        }
         let anchor = match *id {
-            "kotlin" | "cue" => "7a296833",
+            "cue" => "7a296833",
             _ => "43ae0211",
         };
         assert_eq!(
@@ -553,12 +560,13 @@ fn html_css_entries_pins_match_research() {
     assert!(css.source_commit.is_none(), "Δ 自有设计条目无上游锚");
 }
 
-/// bd 56a 后续批：kotlin download 条目（JetBrains managed LSP 升版 263.4702.0）+ dart
-/// download 条目（整 SDK，windows 组）pin 锚，防数据漂移（astro 同款 spot-check 形态）。
-/// sha256 锚 = oraios/serena@7a296833 downloaded_dependency_hashes.json（kotlin）/
-/// dart_language_server.py DEFAULT_DART_SDK_SHA256_BY_PLATFORM（dart）。
+/// bd 56a 后续批：kotlin download 条目 + dart download 条目（整 SDK，windows 组）pin 锚，
+/// 防数据漂移（astro 同款 spot-check 形态）。dart sha256 锚 = oraios/serena@7a296833
+/// dart_language_server.py DEFAULT_DART_SDK_SHA256_BY_PLATFORM；kotlin 2026-10-11 起
+/// 改 pin fwcd/kotlin-language-server stable（JetBrains EAP 263.4702.0 到期且无新版——
+/// 替换上游非同源升版，sha = 本机下载实测，API assets[].size 逐字对上）。
 #[test]
-fn kotlin_dart_entries_pins_match_upstream_7a296833() {
+fn kotlin_dart_entries_pins_match_research() {
     let servers = parsed_servers();
 
     let kotlin = servers
@@ -567,38 +575,46 @@ fn kotlin_dart_entries_pins_match_upstream_7a296833() {
     assert_eq!(kotlin.install, "download");
     assert_eq!(kotlin.languages, vec!["kotlin"]);
     assert_eq!(kotlin.extensions, vec![".kt", ".kts"]);
-    assert_eq!(kotlin.source_commit.as_deref(), Some("7a296833"));
-    assert_eq!(
-        kotlin.exec,
-        vec![
-            "{bin}".to_string(),
-            "--stdio".to_string(),
-            "--system-path".to_string(),
-            "{bin_dir}/system".to_string(),
-        ]
-    );
+    assert_eq!(kotlin.source_commit.as_deref(), None);
+    // fwcd 启动即 stdio（--stdio 不在其参数表，jcommander 拒绝）。
+    assert_eq!(kotlin.exec, vec!["{bin}".to_string()]);
     let kdl = kotlin.download.as_ref().expect("kotlin: download table");
-    assert_eq!(kdl.version, "263.4702.0");
+    assert_eq!(kdl.version, "1.3.13");
     assert_eq!(kdl.archive, "zip");
-    assert_eq!(kdl.bin_path, "bin/intellij-server.exe");
+    assert_eq!(kdl.bin_path, "server/bin/kotlin-language-server.bat");
     assert_eq!(
         kdl.allowed_hosts,
-        vec!["download-cdn.jetbrains.com".to_string()]
+        vec![
+            "github.com".to_string(),
+            "release-assets.githubusercontent.com".to_string(),
+            "objects.githubusercontent.com".to_string(),
+        ]
     );
-    assert_eq!(
-        kdl.url_per_platform
-            .get("windows-x86_64")
-            .map(String::as_str),
-        Some(
-            "https://download-cdn.jetbrains.com/language-server/kotlin-server/263.4702.0/kotlin-server-263.4702.0.win.zip"
-        )
-    );
-    assert_eq!(
-        kdl.sha256_per_platform
-            .get("windows-x86_64")
-            .map(String::as_str),
-        Some("a9b471b16025b1bfb3b0a097862580abb40e3c35406c44242c18b1d70f5d0e44")
-    );
+    // 平台无关 zip：全平台同 url / 同 sha。
+    for plat in [
+        "windows-x86_64",
+        "windows-aarch64",
+        "linux-x86_64",
+        "linux-aarch64",
+        "macos-x86_64",
+        "macos-aarch64",
+    ] {
+        assert_eq!(
+            kdl.url_per_platform.get(plat).map(String::as_str),
+            Some("https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip")
+        );
+        assert_eq!(
+            kdl.sha256_per_platform.get(plat).map(String::as_str),
+            Some("4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2")
+        );
+    }
+    // unix 启动器 sh 脚本 per-platform 覆盖（win 走单值 .bat）。
+    for plat in ["linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64"] {
+        assert_eq!(
+            kdl.bin_path_per_platform.get(plat).map(String::as_str),
+            Some("server/bin/kotlin-language-server")
+        );
+    }
 
     let dart = servers
         .get("dart")
