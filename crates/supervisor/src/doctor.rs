@@ -404,7 +404,7 @@ fn check_local_ls() -> Vec<Check> {
     ));
     out.push(check_download_ls(
         "kotlin",
-        "Kotlin LSP (JetBrains managed intellij-server, bd 56a follow-up)",
+        "Kotlin LSP (fwcd/kotlin-language-server, 2026-10-11 re-pin from expired JetBrains EAP)",
         "run `serena-cli install kotlin`",
     ));
     out.push(check_download_ls(
