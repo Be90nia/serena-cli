@@ -74,10 +74,14 @@ serena-rust/
 │   │                           #   symbol_cache / diag_generation，§3.4 权威表）
 │   ├── ls-adapters/            # 适配器抽象 + T2 手写实现
 │   │   └── src/
-│   │       ├── lib.rs          # trait LanguageServerAdapter（§4）+ builtin_adapters() 注册表
-│   │       └── clangd.rs / pyright.rs / basedpyright_server.rs / jedi_server.rs / ty_server.rs /
-│   │           pyre_server.rs / typescript.rs / gopls.rs / csharp_ls.rs / jdtls.rs / rust_analyzer.rs
-│   │                           # T2 手写 ×11（上游 73 中已落地 11 个）；clangd 为 M0 首个，quirk 逐函数抄译
+│   │       ├── lib.rs          # trait LanguageServerAdapter（§4）；T2 singleton 注册表在 ls-registry/lib.rs（adapter_for 路由）
+│   │       └── clangd.rs / pyright.rs / typescript.rs / gopls.rs / csharp_ls.rs / jdtls.rs / rust_analyzer.rs /
+│   │           bash.rs / json.rs / powershell.rs / vue.rs / astro.rs / html.rs / css.rs / svelte.rs /
+│   │           deno.rs / sass.rs / vts.rs / nextflow.rs / scala.rs / angular.rs / pyrefly_server.rs
+│   │                           #   （以上 22 个注册 singleton，见 ls-registry/lib.rs）+ basedpyright_server.rs /
+│   │                           #   jedi_server.rs / ty_server.rs / pyre_server.rs（变体模块，不在 singleton 注册表）
+│   │                           #   + project_root.rs / symbol_quirks.rs（辅助）
+│   │                           # T2 手写 ×22 注册 singleton（上游 73 中已落地 22 个）；clangd 为 M0 首个，quirk 逐函数抄译
 │   │                           #   ↖ mirror: language_servers/clangd_language_server.py@43ae021
 │   ├── ls-registry/            # 配置驱动层
 │   │   └── src/
@@ -98,7 +102,8 @@ serena-rust/
 │   │       ├── ref_tools.rs    # 导航/引用类：refs / find-referencing-* / call·type-hierarchy / signature-help 等
 │   │       ├── fs_tools.rs     # 文件类：read-file / list-dir / find-file / search（不经 LS）
 │   │       ├── root_finder.rs  # LSP 项目根发现（marker 向上 / workspace 兜底）
-│   │       ├── doctor.rs       # `doctor` 环境体检：5 类检查（系统 runtime / PATH / 本机 LS / daemon / 网络），
+│   │       ├── doctor.rs       # `doctor` 环境体检：6 类检查（系统 runtime / PATH / 本机 LS / daemon / 网络
+│   │       │                   #   共 5 类在本模块 + workspace cargo metadata 1 类在 cli 层 main.rs），
 │   │       │                   #   OK·MISS·WARN 三态 + --json / --fix，exit 0 全绿 / 1 有 MISS
 │   │       └── tools/          # 早期拆分草稿（未挂入模块树，不参与编译）；实际工具语义 = lib.rs execute_tool
 │   │                           #   路由 + 上列模块   ↖ mirror（语义）: ls.py@43ae021 request_{definition,references,hover,document_symbols} + request_workspace_symbols
@@ -111,7 +116,7 @@ serena-rust/
 │   │       ├── lockfile.rs     # daemon 探测/lazy-spawn 协议（§2 分支 B）
 │   │       └── reaper.rs       # 全局空闲自杀（默认 15min，阈值可配 §6.4）；Δ 每 LS 实例空闲卸载在 supervisor（默认 10min）
 │   └── cli/                    # 唯一 bin：serena-cli
-│       └── src/main.rs         # clap 解析（59 子命令，2026-10-08 实测 Cmd enum；分类清单见 README「CLI commands」）→
+│       └── src/main.rs         # clap 解析（65 子命令，2026-10-12 实测 Cmd enum；分类清单见 README「CLI commands」）→
 │                               #   探测 daemon → 转发/拉起；--daemon 进 daemon 模式；--direct 开发模式；
 │                               #   doctor/install 直连 supervisor/ls-registry
 └── tests/                      # 集成测试：真实拉起 clangd 的冒烟（M0 验收），逐 T0 适配器冒烟（M2）
@@ -125,7 +130,7 @@ serena-rust/
 | `lsp-core` | 与单个 LS 进程的完整 LSP 会话：JSON-RPC 传输、握手、docsync、偏移换算、录制回放 | `ls.py` 核心 + `lsp_protocol_handler/` |
 | `ls-adapters` | 定义 `LanguageServerAdapter` trait，承载 T2 手写 quirk 模块 | `language_servers/*.py` 大户 |
 | `ls-registry` | 语言/文件 → adapter 的解析（EXT_TABLE + `file_detect` 三层探测）；T0 服务器 = `servers.toml` 一条记录，零 Rust 代码 | `ls_config.py` + 模板化适配器 |
-| `supervisor` | `(project_root, language)` 实例池、内存闸门（LRU/空闲卸载）、读并行写互斥、工具语义（execute_tool 路由 42 工具）、`doctor` 环境体检 | `project_server.py`（形态）+ serena 工具层（语义） |
+| `supervisor` | `(project_root, language)` 实例池、内存闸门（LRU/空闲卸载）、读并行写互斥、工具语义（execute_tool 路由 53 工具）、`doctor` 环境体检 | `project_server.py`（形态）+ serena 工具层（语义） |
 | `daemon` | HTTP 前端、lazy-spawn 探测协议、空闲自杀 | 无（本项目新增形态） |
 | `cli` | 单 exe 入口：解析、转发、拉起、渲染 | 无 |
 
@@ -152,7 +157,7 @@ sequenceDiagram
     else lock 缺失/端口死（分支 B：lazy-spawn）
         CLI->>CLI: 以 detached 方式 spawn 自身 `--daemon`
         CLI->>D: 轮询 GET /status（≤3s，100ms 间隔）
-        Note over D: daemon bind 7860（被占则+1）→ 写 lock file<br/>（pid+port+boot 时间戳）
+        Note over D: daemon bind 7860（bind 失败即退出，无端口回退）→ 写 lock file<br/>（pid+port+boot 时间戳）
         CLI->>D: POST /tools/find-symbol …
     end
     D->>SUP: tools::find_symbol(ctx)
@@ -171,12 +176,12 @@ sequenceDiagram
 
 **分支 B 竞态与残留处理**（Δ 全部为自有设计，落地于 `daemon/lockfile.rs`）：
 
-- lock file 位置：`%LOCALAPPDATA%/serena/daemon.lock`（内容 JSON：`{pid, port, boot_ms, token}`；token 由 `lockfile.rs::gen_token` 以时钟+pid+原子计数器派生 32 hex 字符——非加密安全，`Δ` 有意为之：校验目标是**本机防误连/防跨会话误投**，lock 文件本机可读者本可得 token，不作为抗恶意进程边界。CLI 从 lock 读取后每个请求带 `X-Serena-Token` 头，daemon 校验）。
+- lock file 位置：`%LOCALAPPDATA%/serena/daemon.lock`（内容 JSON：`{pid, port, boot_ms, token}`；token 由 `lockfile.rs::gen_token` 生成 32 hex 字符（128-bit）：`RandomState`（进程启动时 OS 熵播种的 SipHash 密钥）双实例散列 pid/时钟/计数器——等价 getrandom 语义、零新依赖，audit 竞锁 #11 换掉旧「时钟+pid+计数器」可预测拼接——非加密安全，`Δ` 有意为之：校验目标是**本机防误连/防跨会话误投**，lock 文件本机可读者本可得 token，不作为抗恶意进程边界。CLI 从 lock 读取后每个请求带 `X-Serena-Token` 头，daemon 校验）。
 - 探测判定 = lock 存在 ∧ 宽限 TCP 探活（连探 3 次 × 300ms 间隔，单次 connect 超时 500ms）——覆盖「daemon 启动中（lock 已建、bind 未完成）」与「draining 收尾（listener 已关、进程未退）」两个窗口，全部失败才判 stale 接管。不引入进程探活 API —— lock 内 `boot_ms` + token + TCP 三检已够。
 - 删除归属校验：daemon 收尾删 lock 必须走 `remove_owned`（pid + boot_ms 匹配才删）——drain 期间 lock 可能已被新 daemon 接管，无条件删除会制造「活着但无 lock」的孤儿。CLI 侧不删 lock（无归属凭据），stale 清理统一由 daemon 仲裁路径接管。
 - daemon 启动顺序 = bind 先于 lock 仲裁：端口的 OS 排他性是第一道仲裁，bind 输家直接退出、不触碰 lock；lock 只由 bind 赢家创建/接管。杜绝「动过 lock 却起不来」的进程留下错误归属。
 - CLI 403 自愈：daemon 换代后 CLI 缓存 token 过期（旧 token 打新 daemon）→ CLI 收到 403 重读 lock 刷新 token 重发一次，换代窗口内的瞬时 403 自愈，不产生持久 403。
-- 两个 CLI 同时冷启动：`create_new` 原子建 lock 只有一方成功（赢者 spawn daemon 并在 bind 成功后回填端口），败者轮询——正常路径不会双 daemon。唯一双实例路径：活 daemon 满载未 accept，探测窗口内被误判死 → 新 daemon bind 7860+1 并覆盖 lock，旧实例失去 lock 归属，15min 空闲自杀收敛（A6），无正确性影响。`ponytail: 竞态窗口容忍双 daemon 短暂并存，靠 idle 自杀收敛，不建分布式锁`
+- 两个 CLI 同时冷启动：`create_new` 原子建 lock 只有一方成功（赢者 spawn daemon 并在 bind 成功后回填端口），败者轮询——正常路径不会双 daemon。端口恒 7860：**bind 失败 = daemon 拒绝启动并报错**（OS 端口排他即仲裁，serve.rs；无 +1 端口回退）。极端竞态（活 daemon 被误判死 → lazy-spawn 新 daemon）不产生第二实例——新 daemon bind 失败即退，lock/port 归属不变；drain 收尾窗口若真有并存尾巴，由 idle 自杀/收尾退出收敛（A6），无正确性影响。`ponytail: 竞态窗口靠 bind 排他 + idle 自杀收敛，不建分布式锁`
 - `--direct` 开发模式：CLI 不经 HTTP，进程内直接构造 Supervisor 执行工具（M0 冒烟与单测路径，也覆盖 §5 状态机的直接驱动）。
 
 **时序预算**：CLI 进程冷启动 ≤10ms（纯 clap+reqwest::blocking，无自建 tokio runtime）+ 转发 ≤10ms；daemon 冷启动 ≤100ms（目标，见 DESIGN §1）；LS 冷启动（首查触发）秒级起步 —— 壳不承诺掩盖 LS 慢，只承诺壳自身不叠加可感延迟。CLI 就绪轮询窗口 3s（超时报错可重试；LS 冷启动等待由 per-LS 工具超时覆盖——普通 30s / 索引类 120s，见 §6.3——不占轮询窗口）。
@@ -300,51 +305,45 @@ flowchart TB
 ### 4.1 trait 定义（M0 定型；修订自 DESIGN §4 草稿）
 
 ```rust
-// ls-adapters/src/lib.rs —— 签名级定义，非实现
+// ls-adapters/src/lib.rs —— 签名级摘录（trait 现为 15 方法；权威以 crates/ls-adapters/src/lib.rs 为准）
 #[async_trait::async_trait]
 pub trait LanguageServerAdapter: Send + Sync {
-    /// 稳定标识，如 "clangd"（对应 servers.toml 的 key 与上游 LanguageServerId 值）
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &'static str;                                    // 稳定标识（= servers.toml key / 上游 LanguageServerId 值）
+    fn languages(&self) -> &'static [LanguageId];                    // 实例键 language 维度
 
-    /// 本 adapter 服务哪些语言（= 实例键中的 language 维度）
-    fn languages(&self) -> &'static [LanguageId];
-
-    /// 解析启动方式：PATH 查找 / 依赖下载 / 环境变量组装。可能很慢（下载），故 async + Result
-    /// ↖ mirror: dependency_provider.py@43ae021 create_launch_command(_env)
-    async fn launch_info(&self, ctx: &ProjectCtx) -> anyhow::Result<LaunchInfo>;
-
-    /// 基础 InitializeParams 补丁（capabilities 声明、初始化选项）
-    /// ↖ mirror: ls.py@43ae021 _create_base_initialize_params + initialize_params.py 构造器
-    fn initialize_patches(&self, base: &mut InitializeParamsBuilder) {}
-
-    /// LS 就绪后钩子：注册 notification handler、等待服务器特有就绪事件/索引完成
-    /// ↖ mirror: ls.py@43ae021 on_server_started/start 中的子类等待逻辑（如 jdtls 等服务就绪）
+    // ↖ mirror: dependency_provider.py@43ae021 create_launch_command(_env)
+    async fn launch_info(&self, ctx: &ProjectCtx) -> anyhow::Result<ls_runtime::process::LaunchInfo>;
+    // ↖ mirror: ls.py@43ae021 _create_base_initialize_params
+    fn initialize_patches(&self, base: &mut InitializeParams) {}
+    // ↖ mirror: ls.py@43ae021 on_server_started/start 中的子类等待逻辑（如 jdtls 等服务就绪）
     async fn on_server_ready(&self, session: &Session) -> anyhow::Result<()> { Ok(()) }
-
-    /// 写类工具（rename / replace-body）入口的索引等待：对被操作文件反复探针
-    /// documentSymbol 直到 LS 应答或 timeout；未确认就绪也放行（回退契约同 on_server_ready）。
-    /// Δ PLAN Phase 3.2：cold-start rename 超时 / replace-body range 错位的对症点
-    /// ↖ mirror: ls.py@43ae021 request_rename / replace_text_in_symbol（上游无此等待）
+    // Arc 变体：supervisor 统一调本方法，默认转发 on_server_ready（hybrid 伴生生命周期需 Weak<Session>）
+    async fn on_session_ready(&self, session: &Arc<Session>) -> anyhow::Result<()>;
+    // 就绪探针外层预算（bd 62z）：必须 ≥ adapter 内部探针预算（jdtls 90s / csharp-ls 60s 覆写）
+    fn ready_probe_budget(&self) -> Duration { Duration::from_secs(30) }
+    // hybrid 伴生语义会话（vue/astro/svelte：ts 语义路由到伴生 TypeScript LS）
+    fn semantic_session(&self, root: &Path) -> Option<Arc<Session>> { None }
+    // 写类工具（rename / replace-body）入口的索引等待（Δ PLAN Phase 3.2；未确认就绪也放行）
+    // ↖ mirror: ls.py@43ae021 request_rename / replace_text_in_symbol（上游无此等待）
     async fn wait_for_index(&self, session: &Session, file: &Path, timeout: Duration)
-        -> anyhow::Result<()> { … }
-
-    /// 记录项目 root，供 on_server_ready 选真实文件探针（触发 LS 项目索引）。默认空实现。
-    fn set_project_root(&self, root: &Path) {}
-
-    /// 请求改写钩子（quirk 用：改 params、注入额外通知）。默认无操作
+        -> anyhow::Result<()>;
+    fn set_project_root(&self, root: &Path) {}                       // 供 on_server_ready 选真实文件探针
     fn request_hooks(&self) -> RequestHooks { RequestHooks::default() }
-
-    /// 该服务器是否支持 textDocument/implementation（能力探测的静态先验）
-    /// ↖ mirror: ls_config.py@43ae021 supports_implementation_request
+    // ↖ mirror: ls_config.py@43ae021 supports_implementation_request
     fn supports_implementation(&self) -> bool { false }
+    // references 前 $/progress 索引等待
+    // （↖ mirror: _wait_for_cross_file_references_if_needed；cf54869a 修订：后继查询继续 drain 在飞 token）
+    async fn wait_for_cross_file_index(&self, session: &Session) {}
+    // references 前 LS 特异前置（如 nextflow 强制扫描 + documentSymbol 同步）
+    async fn pre_references(&self, session: &Session, file: &Path) {}
+    // per-file 会话重路由（angular 三服务器编排：.html 语义请求按方法分流）
+    fn session_for_file(&self, root: &Path, file: &Path, method: &str) -> Option<Arc<Session>> { None }
 }
 
-pub struct LaunchInfo {           // ↖ mirror: lsp_protocol_handler/server.py@43ae021 ProcessLaunchInfo
-    pub cmd: Vec<OsString>,       // 列表形式，杜绝引号拼接 quirk
-    pub cwd: PathBuf,
-    pub env: Vec<(String, String)>,
-    pub transport: TransportKind, // Stdio | Tcp(TCPConnectionInfo)   ↖ mirror: TCPLanguageServer 的 Godot 场景
-}
+// LaunchInfo 实际定义在 crates/ls-runtime/src/process.rs（ls-adapters 产出、ls-runtime 消费）
+//   ↖ mirror: lsp_protocol_handler/server.py@43ae021 ProcessLaunchInfo：
+// { cmd: Vec<OsString>（列表形式，杜绝引号拼接 quirk）, cwd: PathBuf, env: Vec<(String, String)>, transport: TransportKind }
+// TransportKind 现仅 Stdio——TCP（Godot 6008）未落地（§1 Δ / §9.1）。
 ```
 
 **对 DESIGN §4 草稿的修订记录**（`Δ`）：
@@ -353,7 +352,7 @@ pub struct LaunchInfo {           // ↖ mirror: lsp_protocol_handler/server.py@
 2. `pre_request(&mut Session, &mut Request)` 拆为 `request_hooks() -> RequestHooks`：不再交出 `&mut Session`（Session 无外部可变性，见 §3.1 非 actor 决策），hook 是值对象，可组合、可测试。
 3. 新增 `supports_implementation` 等静态能力先验，来自 ls_config.py 逐语言抄表。
 4. `on_server_ready` 给默认空实现：T0 模板无需写任何 quirk 代码。
-5. `Δ` SolidLSP Phase 3.2 增补 `wait_for_index`（写类工具索引等待）与 `set_project_root`（root 记录供就绪探针选择），trait 现为九方法；签名以 `crates/ls-adapters/src/lib.rs` 为准。
+5. `Δ` SolidLSP Phase 3.2 增补 `wait_for_index`（写类工具索引等待）与 `set_project_root`（root 记录供就绪探针选择）；此后多语言扩展轮陆续增补 `on_session_ready`（Arc 变体）/ `ready_probe_budget`（bd 62z）/ `semantic_session`（hybrid 路由）/ `wait_for_cross_file_index` / `pre_references` / `session_for_file`（angular 编排），trait 现为 **15 方法**；签名以 `crates/ls-adapters/src/lib.rs` 为准。
 
 ### 4.2 类图：T0 配置驱动如何生成默认实现
 
@@ -366,8 +365,16 @@ classDiagram
         +launch_info(ctx) Future~Result~LaunchInfo~~
         +initialize_patches(base)
         +on_server_ready(session) Future~Result~()~~
+        +on_session_ready(session) Future~Result~()~~
+        +ready_probe_budget() Duration
+        +semantic_session(root) Option~Arc~Session~~
+        +wait_for_index(session, file, timeout) Future~Result~()~~
+        +set_project_root(root)
         +request_hooks() RequestHooks
         +supports_implementation() bool
+        +wait_for_cross_file_index(session)
+        +pre_references(session, file)
+        +session_for_file(root, file, method) Option~Arc~Session~~
     }
     class ServerSpec {
         <<serde, from servers.toml>>
@@ -485,13 +492,12 @@ stateDiagram-v2
     [*] --> NotOpen
     NotOpen --> Synced : ensure_open→didOpen(version=v, 全文)  ↖ mirror: LSPFileBuffer._open_in_ls
     Synced --> Synced : 查询前对账：stat mtime ≠ 已同步 mtime → 全量 didChange(v+1)
-    Synced --> LocalDirty : replace-body 写盘后、didChange 发出前（写事务内瞬时态）
-    LocalDirty --> Synced : didChange(全量) + 诊断代际推进
+    Synced --> Synced : 写事务瞬时窗口：盘已写、didChange(全量)+诊断代际推进未完成（写门串行保证外部不可见，无独立状态符号）
     Synced --> NotOpen : didClose（ref_count 归零/实例卸载）
     NotOpen --> [*]
 ```
 
-`↖ mirror: ls.py@43ae021 LSPFileBuffer`（mtime 对账 `_read_file_modified_date(_passed_to_ls)`、`ref_count`、全量同步 —— 上游不做增量 range 同步，本项目同样只做全量，简单且规避位置映射错误）。`Δ` 新增 `LocalDirty` 显式命名写事务中的中间态，供 `WRITE_CONFLICT` 判定引用。
+`↖ mirror: ls.py@43ae021 LSPFileBuffer`（mtime 对账 `_read_file_modified_date(_passed_to_ls)`、`ref_count`、全量同步 —— 上游不做增量 range 同步，本项目同样只做全量，简单且规避位置映射错误）。`Δ` 写事务的「盘已写、didChange 未发」瞬时窗口不设独立状态符号（写门串行保证外部不可见，§3.3）；`WRITE_CONFLICT` 判据 = 写前 `content_hash` 对账（sha256 前 16 位，supervisor）+ docsync mtime/size 双因子记账。
 
 ---
 
@@ -557,6 +563,7 @@ flowchart LR
 | `RPC_ERROR` | LS 返回 JSON-RPC error | case | 1 |
 | `WRITE_CONFLICT` | 盘上内容与 LSP 状态不符（§3.3 防线）；wire 附 `hint`（重读后重试指引，bd serena-rust-i4j） | false（需重读） | 1 |
 | `INTERNAL` | daemon 内部 bug（anyhow 兜底，含 chain 摘要） | false | 3 |
+| `DAEMON_DRAINING` | daemon 排空关停中（ShutdownDraining 收尾窗口），拒绝新请求；仅出现在 503 body，不产生于 ToolError 映射（ADR-0008，bd xvs7）。CLI 客户端 ≤5s 窗口自愈、超窗 rc=3（bd serena-rust-g0m） | false | 3 |
 
 HTTP 层错误保留给传输语义：`404` 未知工具名、`503` daemon 关停中。**工具级失败走 200 + `{ok:false}`**，让 CLI 的分支只看 JSON，不看状态码二次判错。CLI exit：0 成功 / 1 工具失败（非 retryable）/ 2 用法错误 / 3 daemon 或传输故障（含 daemon 拉起失败）/ 4 `wait-ready` 超时（bd serena-rust-55m）/ 5 retryable 工具失败（瞬态可直接重试，bd 719——此前与 1 合桶，agent 需读 body 才知可重试）。转发路径对 `503 DAEMON_DRAINING`（stop-all 后 reaper 收尾窗口）做客户端侧自愈：≤5s 窗口内每 300ms 重试一次完整链路（重新探活 + lazy-spawn），超窗仍 draining 则原样报错 rc=3（bd serena-rust-g0m）。
 
@@ -583,7 +590,7 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 |---|---|---|
 | lsp-core `framing.rs` | `lsp_protocol_handler/server.py`（create_message/content_length/`_NO_PARAMS_METHODS`：shutdown/exit 无 params；只发 Content-Length 头，Godot 兼容；None params 补 `{}`，Delphi/FPC 兼容） | 逐 quirk 抄 |
 | lsp-core `transport/stdio.rs` | `ls_process.py` `StdioLanguageServer`（帧循环、read_exact、终止时 `_cancel_pending_requests`） | 结构抄译 |
-| lsp-core `transport/tcp.rs` | `ls_process.py` `TCPLanguageServer`（Godot 6008、连接重试 deadline、不发 shutdown/exit） | 结构抄译 |
+| lsp-core `transport/tcp.rs`（**未落地**——文件不存在，§1 Δ / §9.1 同话；transport/ 现仅 stdio.rs） | `ls_process.py` `TCPLanguageServer`（Godot 6008、连接重试 deadline、不发 shutdown/exit） | 上游对应物预登记，随 Godot 场景任务补 |
 | lsp-core `client.rs` | `ls_process.py` `LanguageServerInterface`（pending 表、handler 注册、ContentModified 重试、字符串 id 回退） | 结构抄译 |
 | lsp-core `session.rs` | `ls.py` `SolidLanguageServer.start` + `initialize_params.py`（握手、capabilities、staleRequestSupport 声明一致性） | 结构抄译 |
 | lsp-core `docsync.rs` | `ls.py` `LSPFileBuffer` + `open_file_buffers`（mtime 对账、全量同步、ref_count） | 逐行为抄 |
@@ -597,7 +604,7 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 | ls-registry `lib.rs` | `ls_config.py`（LanguageServerId 枚举/扩展名表/priority/experimental） | 抄表进 TOML |
 | ls-registry `servers.toml` | `language_servers/*.py` 中的 T0 模板（crystal 6KB 等） | 模板→配置 |
 | supervisor `lib.rs` | `project_server.py` per-root 加载锁（形态）；`Δ` 加 LRU/空闲卸载（上游 `_loaded_projects_by_root` 只进不出） | 形态借鉴+改进 |
-| supervisor `lib.rs execute_tool` + `edit_tools.rs`/`ref_tools.rs`/`fs_tools.rs`（42 工具） | `ls.py` `request_{definition,references,hover,document_symbols}` + `request_workspace_symbols` + `SymbolBody` 等 | 语义抄译 |
+| supervisor `lib.rs execute_tool` + `edit_tools.rs`/`ref_tools.rs`/`fs_tools.rs`（53 工具） | `ls.py` `request_{definition,references,hover,document_symbols}` + `request_workspace_symbols` + `SymbolBody` 等 | 语义抄译 |
 | supervisor 崩溃重启 | serena 工具层 "restart the LS and retry"（ls.py@43ae021 L1002 注释） | 语义前移到 supervisor |
 | writer task 单所有者 stdin | helix `helix-lsp/src/transport.rs`（send task/pending map/inject 通道/shutdown 期空响应 quirk） | Rust 先例参考 |
 
@@ -607,9 +614,9 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 
 | 依赖 | 用途与理由（一行） |
 |---|---|
-| `tokio`（features: rt-multi-thread, process, io-util, sync, time, fs, macros） | 唯一异步运行时：I/O 泵、超时、task 治理；axum/reqwest 的公共底盘 |
+| `tokio`（features: rt-multi-thread, process, io-util, io-std, sync, time, fs, macros） | 唯一异步运行时：I/O 泵、超时、task 治理；axum/reqwest 的公共底盘 |
 | `axum` | daemon HTTP：tokio 生态默认、extractor 精简路由；备选 actix-web 被否（自建 runtime，生态分裂） |
-| `reqwest`（default-features off + `blocking` + `rustls-tls`） | CLI 转发（blocking 路径免自建 runtime）与依赖下载共用一个客户端；rustls 免 OpenSSL 链接负担 |
+| `reqwest`（default-features off + `blocking` + `rustls-tls` + `json`） | CLI 转发（blocking 路径免自建 runtime）与依赖下载共用一个客户端；`json` 供请求/响应体 JSON 编解码；rustls 免 OpenSSL 链接负担 |
 | `clap`（derive） | CLI 解析与 `--help` 自动生成；单 exe 分发的标准答案 |
 | `serde` + `serde_json` | LSP/JSON-RPC/TOML/DTO 的序列化底座 |
 | `lsp-types` | LSP 3.17 官方类型（helix 同款）；适配器 seam 处一律可退化到 `serde_json::Value` 逃生舱以承接 quirk 字段 |
@@ -627,6 +634,9 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 | `bytes` | workspace 级 `BytesMut`：JSON-RPC 帧缓冲（framing/泵）与下载缓冲共用——PLAN §8 表未列，2026-09 补登记 |
 | `dunce` | Windows canonicalize 去 `\\?\` 前缀，实例键与 LSP URI 不被 UNC 污染 |
 | `windows-sys`（feature: Win32_System_Console） | CLI 启动即 `SetConsoleOutputCP(65001)`：中文 Windows 的 conhost/PowerShell/cmd 默认 GBK 码页，不设则 UTF-8 输出乱码 |
+| `libc` | Unix 侧进程治理原语（`cfg(unix)`：process_group/killpg + linux PR_SET_PDEATHSIG 父死兜底，§3.2 三平台发布引入）——PLAN §8 表未列，2026-10 补登记（bd xvs7 C-3） |
+| `percent-encoding` | lsp-core/ls-adapters 的 file URI 路径段百分号编解码（path_to_uri/uri_to_path）——PLAN §8 表未列，2026-10 补登记（bd xvs7 C-3） |
+| `tower`（dev） | daemon 测试经 `ServiceExt::oneshot` 直调 axum router——PLAN §8 表未列，2026-10 补登记（bd xvs7 C-3） |
 | **不引入**：`dashmap`/`parking_lot`（std Mutex 足够，§3.4 已核算临界区）、`async-lsp`（tower Service 面向服务器中间件场景；本项目的 quirk 注入点在裸传输层更贴近上游 1:1 抄译，自研泵 ~400 行，已在 §3.2 给出完整拓扑）、`tower-lsp`（方向相反：server 框架） |
 
 ---
@@ -657,9 +667,9 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 | 项目缓存加 LRU/空闲回收 | `crates/supervisor/src/lib.rs` | 上游 `_loaded_projects_by_root` 只进不出，长驻会累积 |
 | 每 LS 实例空闲卸载放 supervisor（默认 10min），daemon 只管全局空闲自杀（15min） | `crates/supervisor`；`crates/daemon/src/reaper.rs` | 实例卸载与进程自毁分层（阈值见 §6.4） |
 | 分支 B（daemon 探测/残留仲裁）全部自有设计 | `crates/daemon/src/lockfile.rs` | 覆盖「启动中」「draining 收尾」两个窗口，最少机制（TCP 探活 + `boot_ms` + token） |
-| `gen_token` 非加密安全，有意为之 | `crates/daemon/src/lockfile.rs` | 校验目标是本机防误连/防跨会话误投，不作抗恶意进程边界 |
+| `gen_token` 非加密安全，有意为之（现实现：`RandomState` OS 熵 SipHash 双实例派生，等价 getrandom 语义；audit 竞锁 #11 替换旧时钟+pid+计数器可预测拼接） | `crates/daemon/src/lockfile.rs` | 校验目标是本机防误连/防跨会话误投，不作抗恶意进程边界 |
 | 服务器→客户端请求未注册 handler 时默认回空成功响应 | `crates/lsp-core/src/client.rs`（泵内分发） | vscode-languageserver-node 系把 `registerCapability` 错误响应当致命（helix 同款 quirk） |
 | writer task 单所有者 stdin，等价替换上游 `_stdin_lock` | `crates/lsp-core/src/transport` | 多任务并写一把锁 ↔ 单任务顺序写，语义相同、无锁竞争 |
 | trait 增补 `wait_for_index` + `set_project_root`（SolidLSP Phase 3.2） | `crates/ls-adapters/src/lib.rs` | cold-start rename 超时 / replace-body range 错位的对症点（上游无此等待） |
-| docsync 新增 `LocalDirty` 显式命名写事务中间态 | `crates/lsp-core/src/docsync.rs` | 供 `WRITE_CONFLICT` 判定引用 |
+| docsync mtime+size 双因子对账（同 mtime 粒度窗口内的外部改写靠 size 检出） | `crates/lsp-core/src/docsync.rs` | `WRITE_CONFLICT` 判据之一（content-hash 对账外的事实源） |
 | `ToolError` 自 `Launch` 兜底拆出 `Serialize`/`Protocol` | `crates/supervisor` | 确定性失败与协议语义错不再被误标 retryable |

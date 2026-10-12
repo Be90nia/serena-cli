@@ -67,6 +67,26 @@ fn parse_handshake_secs(raw: Option<&str>) -> Duration {
 /// ↖ mirror: ls.py@43ae021 `_send_shutdown_in_thread` 的 2s join 上限。
 const SHUTDOWN_REQ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// bd 0pgr W1：从 initialize 响应的 `capabilities` 子对象解析协商位置编码。
+///
+/// `None`（LS 未声明，LSP 规范默认 utf-16）/ 无 `positionEncoding` 键 / 未知值
+/// 一律落 [`crate::offsets::OffsetEncoding::Utf16`]（`from_lsp_kind` 同语义：未知
+/// 值按 LSP 历史默认处理比硬报 unsupported 更友好）。纯函数供单测，无需真 session。
+fn offset_encoding_from_caps(caps: Option<&Value>) -> crate::offsets::OffsetEncoding {
+    let name = match caps {
+        Some(c) => c.get("positionEncoding").and_then(Value::as_str),
+        None => None,
+    };
+    // 已知值映射到 lsp-types 常量再统一走 `from_lsp_kind`（映射权威单一）；
+    // 常量的 `new(&'static str)` 是 const fn，运行时字符串无法直接构造。
+    let kind = match name {
+        Some("utf-8") => &lsp_types::PositionEncodingKind::UTF8,
+        Some("utf-32") => &lsp_types::PositionEncodingKind::UTF32,
+        _ => &lsp_types::PositionEncodingKind::UTF16,
+    };
+    crate::offsets::OffsetEncoding::from_lsp_kind(kind)
+}
+
 /// stdout EOF 等待上限（5s）。mock_ls shutdown+exit 通常 <100ms 退；真实 LS 需读 stdin EOF 才退。
 ///
 /// ↖ mirror: ls.py@43ae021 5s wait 上限（语义：本项目是 EOF 通知，不是 wait()）。
@@ -266,8 +286,12 @@ pub struct Session {
     outbound_tx: mpsc::Sender<OutboundItem>,
     /// 泵句柄集合。`shutdown` 终态 drop → Job 句柄关闭 → KILL_ON_JOB_CLOSE 灭树兜底。
     pumps: Mutex<Option<Pumps>>,
-    /// stdout EOF 通知：stdout 泵读到 EOF 时 `notify_waiters()`；`shutdown` 等此门确认进程退。
-    stdout_eof: Notify,
+    /// stdout EOF 通知门：与泵 on_eof 闭包**共享同一 `Arc` 实例**（bd g6yp Q1：
+    /// 曾在 start 末尾 `Arc::try_unwrap` 收编为裸 `Notify`，但闭包持 clone 令其恒
+    /// 失败 → `unwrap_or_else` 落全新 Notify → 泵 EOF 永远打不到本门 → shutdown
+    /// 恒等满 5s）。stdout 泵读到 EOF 时 `notify_waiters()`；`shutdown` 等此门确认
+    /// 进程退。
+    stdout_eof: Arc<Notify>,
     /// docsync 缓冲池：`ensure_open` / `FileGuard::drop` 用（PLAN Task 7，§3.4 锁表）。
     pub(crate) buffers:
         Mutex<std::collections::HashMap<lsp_types::Uri, crate::docsync::FileBuffer>>,
@@ -373,13 +397,31 @@ impl Session {
         };
         // stdout EOF：先调 Client::abort_all（drain pending），
         // 然后 notify_waiters 让 shutdown 等门知道进程已退。
+        // Q2①（bd g6yp）：EOF 同时把 session 置 Failed —— 泵 EOF = LS stdout 已断
+        // （进程退出/崩溃），若仍留 Ready，supervisor 的三道自愈门（session_for
+        // reuse 判定 / evict_failed_instances / with_session_retry）全看不见死
+        // session。闭包先于 session 构造创建、无法直接持引用 → 经 Weak 槽位延迟
+        // 绑定（Weak 不构成 Arc 环，不复刻 P2-y5u 的强引用泄漏）。
         let stdout_eof = Arc::new(Notify::new());
         let stdout_eof_for_pump = stdout_eof.clone();
+        let eof_state_slot: Arc<Mutex<Option<std::sync::Weak<Session>>>> = Arc::default();
+        let eof_state_slot_for_pump = eof_state_slot.clone();
         let on_eof: OnEof = {
             let c = client_for_pump.clone();
             Arc::new(move || {
                 c.abort_all();
                 stdout_eof_for_pump.notify_waiters();
+                if let Some(s) = eof_state_slot_for_pump
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                {
+                    let mut state = s.state.lock().unwrap();
+                    if matches!(*state, SessionState::Ready | SessionState::Initializing) {
+                        *state = SessionState::Failed("stdout eof: LS process exited".into());
+                    }
+                }
             })
         };
         let recorder = recorder_from_env();
@@ -397,8 +439,7 @@ impl Session {
                 )));
             }
         };
-        // stdout_eof 在闭包外独占
-        let stdout_eof = Arc::try_unwrap(stdout_eof).unwrap_or_else(|_| Notify::new());
+        // bd g6yp Q1：stdout_eof 保持 Arc 与泵闭包共享（同一实例），不再 try_unwrap。
 
         let session = Arc::new(Self {
             state: Mutex::new(SessionState::Initializing),
@@ -414,6 +455,10 @@ impl Session {
             language_by_ext: std::sync::Mutex::new(std::collections::HashMap::new()),
             index_progress: IndexProgressTracker::new(),
         });
+
+        // Q2①（bd g6yp）：延迟绑定完成 —— 此后泵 on_eof 触发时经 Weak 升级把
+        // session 置 Failed("stdout eof")，supervisor 自愈门即可见。
+        *eof_state_slot.lock().unwrap() = Some(Arc::downgrade(&session));
 
         // Phase 4 基建 Task 22c：注册唯一 `$/progress` handler。LS 触发进度时会发
         // 通知 params = {token: <val>, value: {kind: "begin"|"report"|"end", ...}}。
@@ -641,6 +686,13 @@ impl Session {
     /// 当前状态快照。
     pub fn state(&self) -> SessionState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// 握手协商的位置编码（bd 0pgr W1）。读 initialize 响应里的
+    /// `serverCapabilities.positionEncoding`；LS 未声明或声明未知值 → Utf16
+    /// （LSP 历史默认，`OffsetEncoding::from_lsp_kind` 同语义）。
+    pub fn offset_encoding(&self) -> crate::offsets::OffsetEncoding {
+        offset_encoding_from_caps(self.server_capabilities.lock().unwrap().as_ref())
     }
 
     // ---- 跨文件索引 $/progress 跟踪（cf54869a mirror；TS adapter 消费）----
@@ -928,6 +980,37 @@ pub(crate) fn resolve_language_id_for(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- bd 0pgr W1：positionEncoding 协商解析 ----
+
+    #[test]
+    fn offset_encoding_caps_negotiated_values() {
+        assert_eq!(
+            offset_encoding_from_caps(Some(&json!({"positionEncoding": "utf-8"}))),
+            crate::offsets::OffsetEncoding::Utf8
+        );
+        assert_eq!(
+            offset_encoding_from_caps(Some(&json!({"positionEncoding": "utf-16"}))),
+            crate::offsets::OffsetEncoding::Utf16
+        );
+    }
+
+    #[test]
+    fn offset_encoding_caps_defaults_to_utf16() {
+        // LSP 规范默认：capabilities 缺失 / 键缺失 / 未知值 → utf-16。
+        assert_eq!(
+            offset_encoding_from_caps(None),
+            crate::offsets::OffsetEncoding::Utf16
+        );
+        assert_eq!(
+            offset_encoding_from_caps(Some(&json!({}))),
+            crate::offsets::OffsetEncoding::Utf16
+        );
+        assert_eq!(
+            offset_encoding_from_caps(Some(&json!({"positionEncoding": "utf-7"}))),
+            crate::offsets::OffsetEncoding::Utf16
+        );
+    }
 
     /// bd xht：SERENA_REPLAY 是进程全局 env——本模块内用例共用一把锁串行化
     /// （ls-adapters lib.rs REPLAY_ENV 先例）。

@@ -354,11 +354,11 @@ enum Cmd {
     /// 超时返 partial:true（LS 已启动、索引未确认），不阻塞。
     Warm {
         /// 要预热的语言。缺省时按项目根清单探测（Cargo.toml/pyproject.toml/
-        /// tsconfig.json/package.json）；探测失败 rc=2。
+        /// tsconfig.json/package.json）；探测失败 rc=2。双形态：`warm rust` ≡
+        /// `warm --lang rust`（后者值经全局 --lang 归一，bd z260：位置参 arg id
+        /// 须与全局 --lang（id=lang）错开，否则 global 回灌致单来源计成双来源）。
+        #[arg(id = "warm_lang", value_name = "LANG")]
         lang: Option<String>,
-        /// 双形态：与位置参 LANG 等价（`warm --lang rust` ≡ `warm rust`）。
-        #[arg(long = "lang", value_name = "LANG")]
-        lang_flag: Option<String>,
         /// 就绪等待上限（秒）。
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
@@ -861,9 +861,10 @@ async fn cli_main() -> ExitCode {
     }
 
     // 批3 可发现性：warm 位置参双形态——`warm <LANG>` 与 `warm --lang <LANG>`
-    // 等价（三来源二选一归一，8cx5 同款契约）；皆缺才走下方项目清单探测。
-    if let Some(Cmd::Warm { lang, lang_flag, .. }) = cli.cmd.as_mut()
-        && let Err(detail) = warm_lang_forms(lang, lang_flag, cli.lang.as_deref())
+    // 等价（两来源二选一归一；子命令级 --lang 值由 global 回灌 cli.lang，bd z260）；
+    // 皆缺才走下方项目清单探测。
+    if let Some(Cmd::Warm { lang, .. }) = cli.cmd.as_mut()
+        && let Err(detail) = warm_lang_forms(lang, cli.lang.as_deref())
     {
         return bad_args_exit(&detail);
     }
@@ -4922,57 +4923,57 @@ mod discoverability_batch3_tests {
     // ==== warm 位置参双形态（`warm <LANG>` ≡ `warm --lang <LANG>`）====
 
     #[test]
-    fn warm_lang_forms_merges_flag_into_positional() {
+    fn warm_lang_forms_merges_global_into_positional() {
+        // `warm --lang rust` 值经 global 回灌 cli.lang（bd z260 两来源契约）。
         let mut pos = None;
-        let mut flag = Some("rust".into());
-        warm_lang_forms(&mut pos, &mut flag, None).unwrap();
+        warm_lang_forms(&mut pos, Some("rust")).unwrap();
         assert_eq!(pos.as_deref(), Some("rust"));
-        assert!(flag.is_none(), "flag 归一后清空");
 
-        // 前置全局 --lang（`--lang X warm`，global flag 不传播进子命令）第三来源。
+        // 前置全局形态（`--lang X warm`）同路可达。
         let mut pos = None;
-        warm_lang_forms(&mut pos, &mut None, Some("rust")).unwrap();
-        assert_eq!(pos.as_deref(), Some("rust"));
+        warm_lang_forms(&mut pos, Some("go")).unwrap();
+        assert_eq!(pos.as_deref(), Some("go"));
     }
 
     #[test]
     fn warm_lang_forms_keeps_positional_when_others_absent() {
         let mut pos = Some("python".into());
-        warm_lang_forms(&mut pos, &mut None, None).unwrap();
+        warm_lang_forms(&mut pos, None).unwrap();
         assert_eq!(pos.as_deref(), Some("python"));
     }
 
     #[test]
     fn warm_lang_forms_rejects_multiple_forms() {
         let mut pos = Some("python".into());
-        let mut flag = Some("rust".into());
-        let err = warm_lang_forms(&mut pos, &mut flag, None).unwrap_err();
-        assert!(err.contains("not multiple forms"), "{err}");
-
-        let mut pos = None;
-        let mut flag = Some("rust".into());
-        let err = warm_lang_forms(&mut pos, &mut flag, Some("go")).unwrap_err();
+        let err = warm_lang_forms(&mut pos, Some("rust")).unwrap_err();
         assert!(err.contains("not multiple forms"), "{err}");
     }
 
     #[test]
-    fn warm_flag_form_parses_via_subcommand_lang() {
+    fn warm_both_forms_parse_with_single_lang_source() {
         use clap::Parser as _;
-        // flag 形态：--lang 落子命令字段，位置参保持空（归一由 cli_main 接线完成）。
+        // flag 形态：`warm --lang rust` 值落全局 cli.lang，子命令位置参保持空
+        //（归一由 cli_main 接线完成；bd z260 后子命令无独立 --lang 声明）。
         let cli = Cli::try_parse_from(["serena-cli", "warm", "--lang", "rust"]).unwrap();
-        let Some(Cmd::Warm { lang, lang_flag, .. }) = cli.cmd else {
+        let Some(Cmd::Warm { lang, .. }) = cli.cmd else {
             panic!("expected warm");
         };
         assert!(lang.is_none(), "flag 形态不得占位置参");
-        assert_eq!(lang_flag.as_deref(), Some("rust"));
+        assert_eq!(cli.lang.as_deref(), Some("rust"), "--lang 值须可达 cli.lang");
         // 位置参形态（既有行为不破）。
         let cli = Cli::try_parse_from(["serena-cli", "warm", "rust"]).unwrap();
-        let Some(Cmd::Warm { lang, lang_flag, .. }) = cli.cmd else {
+        let Some(Cmd::Warm { lang, .. }) = cli.cmd else {
             panic!("expected warm");
         };
         assert_eq!(lang.as_deref(), Some("rust"));
-        assert!(lang_flag.is_none());
-        // 前置全局形态（既有行为不破，第三来源）。
+        // bd z260：位置参值不得被 global 机制回灌 cli.lang（曾因 Warm 位置参
+        // 与全局 --lang 撞 arg id，回灌成双来源直接 rc=2）。
+        assert!(
+            cli.lang.is_none(),
+            "位置参值不得回灌全局 --lang: {:?}",
+            cli.lang
+        );
+        // 前置全局形态（既有行为不破，同路可达）。
         let cli = Cli::try_parse_from(["serena-cli", "--lang", "python", "warm"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Warm { .. })));
         assert_eq!(cli.lang.as_deref(), Some("python"));
@@ -5644,23 +5645,19 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
     }
 }
 
-/// 批3 可发现性：warm 双形态归一——位置参 LANG 与子命令级 `--lang` 二选一，
-/// 统一落回位置参字段（wire args 键名不变，8cx5 同款契约）。global 是前置全局
-/// `--lang`（clap global flag 不传播进子命令，仅 `--lang X warm` 形态可达），
-/// 第三来源同判二选一。
-fn warm_lang_forms(
-    pos: &mut Option<String>,
-    flag: &mut Option<String>,
-    global: Option<&str>,
-) -> Result<(), String> {
-    let given = usize::from(pos.is_some()) + usize::from(flag.is_some()) + usize::from(global.is_some());
+/// 批3 可发现性：warm 双形态归一——位置参 LANG 与 `--lang` 二选一，统一落回
+/// 位置参字段（wire args 键名不变，8cx5 同款契约）。`warm --lang rust` 的值由
+/// clap global 机制回灌 `cli.lang`（子命令内无独立 --lang 声明，bd z260：曾因
+/// 位置参与全局 --lang 撞 arg id 致回灌污染、单来源计成双来源），故此处仅两来源。
+fn warm_lang_forms(pos: &mut Option<String>, global: Option<&str>) -> Result<(), String> {
+    let given = usize::from(pos.is_some()) + usize::from(global.is_some());
     if given > 1 {
         return Err(
             "provide the warm LANG positionally or via --lang (once), not multiple forms".into(),
         );
     }
     if pos.is_none() {
-        *pos = flag.take().or(global.map(str::to_string));
+        *pos = global.map(str::to_string);
     }
     Ok(())
 }

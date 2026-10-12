@@ -22,7 +22,7 @@
 
 ## 覆盖范围
 
-### CLI 命令（63 个）
+### CLI 命令（65 个）
 
 读取 / 导航（7 个）：`overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -32,15 +32,15 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 
 编辑（11 个）：`rename-symbol` · `safe-delete-symbol` · `replace-body` · `replace-text-in-symbol` · `insert-text-before-symbol` · `insert-text-after-symbol` · `delete-text-in-symbol` · `insert-at-line` · `replace-lines` · `delete-lines` · `create-text-file`
 
-撤销 / 重做（2 个）：`undo`（`--steps N`、`--list`）· `redo` —— 事务级快照栈：每次写成功前记录旧状态；跨文件操作（如 rename 改多文件）是一个事务、整体回滚。事务中新建的文件 undo 时删除。冲突门：事务之后文件在磁盘上被改动过，undo 拒绝执行而不是覆盖。快照栈存于用户缓存目录（重启/升级不丢），上限 20 事务 / 200 MB / 30 天。
+撤销 / 重做（2 个）：`undo`（`--steps N`、`--list`）· `redo` —— 事务级快照栈：每次写成功前记录旧状态；跨文件操作（如 rename 改多文件）是一个事务、整体回滚。事务中新建的文件 undo 时删除。冲突门：事务之后文件在磁盘上被改动过，该事务即被丢弃、undo 立即停止（时间线断裂——更旧的事务不予触碰；响应携带 `stopped_early`，退出码 2）。快照栈存于用户缓存目录（重启/升级不丢），上限 20 事务 / 200 MB / 30 天。
 
-测试 / 对照 / 找测试（3 个）：`test <target> [name]`（cargo/npm 后端按路径自动选，失败解析为 JSON 清单）· `diff [txn-id] [--patch]`（写事务写前写后对照；`--patch` 输出 unified diff）· `find-test <sym>`（启发式链：tests/ 镜像 → 测试目录/命名 → `mod tests` → LS refs）
+测试 / 对照 / 找测试（4 个）：`test <target> [name]`（cargo/npm 后端按路径自动选，失败解析为 JSON 清单）· `diff [txn-id] [--patch]`（写事务写前写后对照；`--patch` 输出 unified diff）· `find-test <sym>`（启发式链：tests/ 镜像 → 测试目录/命名 → `mod tests` → LS refs）· `change-history`（`git log --follow` 包装；`--symbol` 用 `-L :sym:` 做符号级追踪；非 repo 目录 → exit 3）
 
 补全（1 个）：`completion`（支持 `--limit` 与按文件后缀的 trigger 推断）
 
-管理（8 个）：`status` · `stop-all` · `install <lang>` · `uninstall <lang>` · `ls-use <lang或id> <path>` · `ls-list` · `ls-remove <id>` · `shell`（JSONL stdin/stdout 会话）
+管理（9 个）：`status` · `project-info`（project root + git branch/HEAD + daemon/LS 状态；纯探测语义，永不 lazy-spawn）· `stop-all` · `install <lang>` · `uninstall <lang>` · `ls-use <lang或id> <path>` · `ls-list` · `ls-remove <id>` · `shell`（JSONL stdin/stdout 会话）
 
-长尾（19 个）：`defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker`
+长尾（20 个）：`defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker` · `code-action`（列可用 codeActions；`--kind` 过滤）
 
 ### recipe 工作流（8 个）
 
@@ -50,16 +50,16 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 |---|---|---|
 | `fix-bug` | `<file> <sym> [--new-body T]` | 上下文（tldr + callers + verify 前）→ replace-body → verify 后；无 `--new-body` 只跑分析链 |
 | `add-feature` | `<name> [--target F]` | define-feature（报告 / stub 文本）→ stub 落盘；可选测试（`--tests-file` + `--tests`） |
-| `rename` | `<file> <sym> --to N` | impact → 单文件 LSP rename（跨文件 edits 计入 `skipped`）→ verify |
-| `add-test` | `<sym> [--run]` | find-test → 命中即报告（已有测试）；未命中在定义文件 EOF 追加 `mod tests` 模板（已存在则显式跳过） |
-| `refactor-extract` | `<file> <sym> --as N` | smart-edit 整符号抽取 → verify |
+| `rename` | `<file> <sym> --to N` | impact → LSP rename（与 `rename-symbol` 同一内部路径：索引等待 + 跨文件 edits 一个事务落地，bd d1hs）→ verify |
+| `add-test` | `<sym> [--run]` | find-test → 命中即报告（已有测试）；未命中在定义文件 EOF 追加 `mod tests` 模板（已存在则显式跳过）。仅 `.rs` 目标 |
+| `refactor-extract` | `<file> <sym> --as N` | smart-edit 整符号抽取（仅 Rust 源文件——其他语言拒绝并说明原因）→ verify |
 | `refactor-rename` | `<sym> --to N` | impact → workspace rename → verify（定义文件） |
 | `review-diff` | `[txn-id]` | diff + 关联测试 + 聚合 review 报告 |
 | `explore` | `<path>` | tldr → repo-map → 近期活动 |
 
 **位置基线约定**：接受 `line`/`col` 的命令（按位置寻址：`def`、`refs`、`hover`、`find-implementations`、`rename-symbol`、`find-referencing-*`、`containing-symbol`、`defining-symbol`、`signature-help`、`code-action`、`document-highlight`、`completion`、`format-range`、`inlay-hint`、`call-hierarchy prepare`、`type-hierarchy prepare`、`moniker`）在 CLI 表面为 **1-based** —— 内部转换为 LSP 的 0-based `Position`（`normalize_positions`，bd serena-rust-7xv）；传 `0` 属于用法错误。行范围与行编辑类命令（`read-file`、`insert-at-line`、`replace-lines`、`delete-lines`、`delete-text-in-symbol`）为 **1-based 含端点**。每条命令的 `--help` 中也各自注明了这一点。
 
-对比上游 oraios/serena：19/19 高 ROI wrapper 全部覆盖（agent 实际会用的每个工具），外加长尾（`documentHighlight`、`codeLens`、`documentLink`、`foldingRange`、`call/type hierarchy`、`moniker`、`semanticTokens`、`inlayHint`）—— 全部落地并于 2026-09-23 验证；`document-link`/`moniker` 在不支持该能力的 LS 上返回空结果（如 rust-analyzer stable）。
+对比上游 oraios/serena：19/19 高 ROI wrapper 全部覆盖（agent 实际会用的每个工具），外加长尾（`documentHighlight`、`codeLens`、`documentLink`、`foldingRange`、`call/type hierarchy`、`moniker`、`semanticTokens`、`inlayHint`）—— 全部落地并于 2026-09-23 验证；`document-link`/`moniker` 在不支持该能力的 LS 上（如 rust-analyzer stable）透传服务端的 `RPC_ERROR -32601`，而非返回空结果。
 
 ### Language server（上游目录 73 个中的 53 个，与 EN 表对齐）
 
@@ -78,7 +78,7 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 | Vue | @vue/language-server | ready（npm，hybrid） | 伴生 typescript-language-server 挂 `@vue/typescript-plugin`；语义 hover/路由已通，诊断走 tsserver 桥待接 |
 | Astro | @astrojs/language-server | ready（npm，hybrid） | 伴生 typescript-language-server 挂 `@astrojs/ts-plugin`（上游 `7a296833`）；ts/js refs 路由到伴生 LS，`.astro` 语义 hover 已通 |
 | Docker | docker-langserver | ready（npm） | `Dockerfile*`（含 `Dockerfile.dev` 变体）+ `*.dockerfile`；didOpen languageId 发 `dockerfile` |
-| SQL | sqls | ready（下载） | `*.sql`；无 config 文件时语法层 hover/def 可用 |
+| SQL | sqls | ready（下载） | `*.sql`；会话/语法层可用（formatting 可用），语义 hover/def 需 `sqls` config（DB 连接）；无 documentSymbol/references 能力 |
 | PostgreSQL | postgres-language-server（pgls） | ready（下载） | `--lang pgsql`（`.sql` 默认归 sql 条目）；无 DB 时语法诊断可用（libpg_query 本地 parser）；documentSymbol/schema hover 需 DB 连接 —— LS 能力边界 |
 | MySQL | sqls | ready（下载） | `--lang mysql`；与 sql 条目同一 sqls 二进制（独立缓存目录）；hover/诊断需 DB 连接（LS 警告 "no database connection"） |
 | HTML | vscode-html-language-server | ready（npm） | `*.html`/`*.htm`；文件内元素/id 符号 + mdn 驱动 hover/补全（`vscode-langservers-extracted`）；跨文件 refs/def 对 HTML 无意义（上游明示） |
@@ -105,7 +105,7 @@ Symbol（8 个）：`def` · `refs` · `find-symbol` · `symbol-body` · `find-i
 | Crystal | crystalline | wired（path_only）；CI 冒烟待跑 | `*.cr`；musl 静态单二进制（免 crystal 工具链）；documentSymbol 上游注释 "works reliably"；条目保持 path_only（legacy 锚 canary）——CI 门 curl 钉版 v0.20.0 release URL（sha 校验） |
 | Zig | zls | wired（下载）；CI 冒烟待跑 | `*.zig`/`*.zon`；条目 path_only → download 升级（六平台 pin，`assets[].digest` sha 校验，0.16.0）；zls 与同 minor zig 严格配对——门装 ziglang.org 0.16.0 工具链 tarball（官方 index.json sha 校验）并 symlink 入 PATH |
 | TOML | taplo | ready（下载） | `*.toml`；单文件 gzip 二进制（钉 `0.10.0`，sha 对上游内嵌校验和验证）；表/键 documentSymbols；存在 schema 关联时 schema 驱动 hover/诊断（taplo 特性） |
-| Terraform | terraform-ls | ready（下载） | `*.tf`/`*.tfvars`；块/资源 documentSymbols（钉 `0.36.5`，HashiCorp releases sha 校验；以 `terraform-ls serve` 启动）；上游要求 PATH 有 `terraform` CLI 才有模块特性—— |
+| Terraform | terraform-ls | ready（下载） | `*.tf`/`*.tfvars`；块/资源 documentSymbols（钉 `0.36.5`，HashiCorp releases sha 校验；以 `terraform-ls serve` 启动）；上游要求 PATH 有 `terraform` CLI 才有模块特性——documentSymbol 仅解析层，无 terraform CLI 也可用 |
 | Cue | `cue lsp`（cue CLI 内置） | ready（下载） | `*.cue`；cue CLI 把 LSP 藏在隐藏 `lsp` 子命令后（v0.16.1 实证）；字段/包 documentSymbols |
 | Nix | nixd | source build | `*.nix`；`git clone` + `nix build` 安装——需要 Nix 工具链（上游无预编译资产，与上游 adapter 同约束）；构建后 attribute documentSymbols |
 | Ansible | ansible-language-server | wired（npm）；CI 冒烟待跑 | `--lang ansible`（`.yaml`/`.yml` 归 YAML 门）；hover/补全/诊断可用；**无 documentSymbol**——上游拒绝（vscode-ansible#601 NOT_PLANNED），smoke 走 fallback |
@@ -133,6 +133,14 @@ cargo install --path crates/cli --locked
 serena-cli --help
 ```
 
+### 升级：先停旧 daemon
+
+`serena-cli` 懒启动一个常驻后台 daemon（LS 空闲 10 分钟回收 / daemon 空闲 15 分钟自退）。**升级前后各执行一次 `serena-cli stop-all`** —— 否则升级后的 CLI 会静默连到仍持有旧二进制的旧 daemon：新子命令报 "not found"、新 wire 字段"缺失"，行为"回退"，容易被误读为版本损坏。新版首个命令前用 `serena-cli status`（应无 daemon）验证。
+
+### 容器化部署
+
+不发布官方镜像（bd serena-rust-eo7c）。`x86_64-unknown-linux-musl` 的 release 资产是静态二进制——直接放进 scratch 或 alpine 基础镜像即可。`serena-cli` 拉起的一切都活在容器内：每个 language server 是独立进程树（含 node/python/JVM 运行时），镜像必须带上你打算服务的每个语言的运行时。推荐的沙箱化：以 rootless 运行容器（podman `--userns=keep-id`）和/或用 `bubblewrap` 包裹 LS 启动——language server 是按需下载并执行的第三方二进制，这是不可信代码边界，不只是本地工具。
+
 ### 首次运行的 language server 安装
 
 `serena-cli install <lang>` 依 `servers.toml` 逐项执行 —— 对每个受支持的语言按序尝试：
@@ -157,6 +165,17 @@ serena-cli ls-remove marksman                    # 只卸载 serena 托管缓存
 ```
 
 注册在 daemon 重启后生效（`serena-cli stop-all` 或等空闲超时）。条目是普通 TOML，可手改；`ls-use` 只重写自己的 `[servers.<id>]` 块。
+
+### 配置文件位置
+
+两个用户级 TOML 文件在同一目录（bd serena-rust-0z9/xwh）：
+
+| 文件 | Windows | Unix |
+|---|---|---|
+| `external-servers.toml`（用户 LS 注册表，覆盖内置） | `%APPDATA%\serena\external-servers.toml` | `~/.config/serena/external-servers.toml` |
+| `config.toml`（用户配置） | `%APPDATA%\serena\config.toml` | `~/.config/serena/config.toml` |
+
+`doctor` 不在输出中打印这些路径——当提示「通过 external-servers.toml / config.toml 配置」时，回到本表查询。
 
 ### 专有 LS 配置（MATLAB）
 
@@ -203,24 +222,29 @@ serena-cli safe-delete-symbol <file> <symbol>   # 有引用时拒绝删除
 
 ## 性能基线
 
-测量于 `feature/solidlsp-phase0-1`，2026-09-16，Windows 11 / i9-10900F，无竞争的 rust-analyzer：
+当前复测（2026-10-12，Windows 11 26200 x64，release `serena-cli` 0.3.0 build，温 daemon，workspace 外小 fixture；与 2026-10-12 DeepDocs 审计实测互证）：
+
+| 工作负载 | 延迟 |
+|---|---|
+| `overview` daemon 温热、首次命中 | ~19 ms 中位（16.8 – 20.5 ms，n=7，CLI 进程启动）/ ~1.3 ms 中位（1.13 – 1.86 ms，n=10，shell 模式） |
+
+历史基线（`feature/solidlsp-phase0-1` 分支，2026-09-16，Windows 11 / i9-10900F，无竞争的 rust-analyzer；此后未复测）：
 
 | 工作负载 | 延迟 |
 |---|---|
 | `find-symbol` daemon 温热、命中缓存 | < 1 ms |
-| `overview` daemon 温热、首次命中 | 65 – 108 ms（CLI 进程启动）/ 0.88 – 0.93 ms（shell 模式） |
 | `find-referencing-symbols` 温热 | ~70 ms |
 | `symbol-tree <dir>` 2 文件聚合 | 0.34 s |
 | `rename-symbol` 冷启动（rust fixture workspace） | 162 ms（修复前为 30s+） |
 | 冷 daemon 首次 overview（rust fixture，workspace 模式） | ~5 s（无 workspace 时为 89 s、有 VS Code 竞争时为 300 s+） |
 
-`cargo test --workspace`：49 个测试目标全绿，新增 30+ 单测。`cargo clippy --workspace --all-targets -- -D warnings`：0 错误。
+`cargo test --workspace`：58 个测试目标全绿（2026-10-12，`cargo metadata` 计数）。`cargo clippy --workspace --all-targets -- -D warnings`：0 错误（CI 门槛）。
 
 ## 30 秒看懂架构
 
 7-crate Cargo workspace：
 
-- `crates/lsp-core` —— JSON-RPC 帧封装，带 id 归一化的请求/响应 client，`ContentModified` 重试，托管 LSP 进程启动 + stdio/TCP 传输（3-pump 拓扑，上游 `ls_process.py` 的镜像）
+- `crates/lsp-core` —— JSON-RPC 帧封装，带 id 归一化的请求/响应 client，`ContentModified` 重试，托管 LSP 进程启动 + stdio 传输（TCP 未落地，Δ；3-pump 拓扑，上游 `ls_process.py` 的镜像）
 - `crates/ls-registry` —— `LanguageServerId` ↔ 文件扩展名映射表
 - `crates/ls-adapters` —— 各 LS 的启动参数 + 就绪探测（rust-analyzer / clangd / pyright / gopls / typescript / csharp-ls / jdtls）
 - `crates/supervisor` —— `Supervisor` trait + `DaemonSupervisor` 实现：per-key 负载门、session 缓存、工具分发、写门、symbol 缓存
@@ -234,6 +258,7 @@ serena-cli safe-delete-symbol <file> <symbol>   # 有引用时拒绝删除
 
 | 局限 | 影响 | 何时回头解决 |
 |---|---|---|
+| `doctor` 网络探活默认 `github.com:443` | 仅提示、非门禁：镜像/代理环境下 `net` 检查可能在 LS 安装源可达时仍报 MISS——设 `SERENA_NETWORK_PROBE_HOST=host:port` 把探活指向可达目标 | 已解决——覆盖项已实现（`doctor.rs::check_network`，bd serena-rust-5uf） |
 | 非 clangd LS 的 SHA-256 下载矩阵不完整 | `install` 对已校验条目可用；未校验条目回退到 PATH 探测 | 当 CI 需要封闭（hermetic）安装时 —— 从上游 SolidLSP 源码填充 `local/ls-download-matrix.md` |
 | 无 monorepo 多 root 支持 | 每次 `serena-cli` 调用只作用于一个 workspace root | 增加 `additionalWorkspaceFolders`（Phase 4 延伸项） |
 | 无 `$/progress` 通知缓冲 | 长时运行的工具阻塞直至完成 | 当 refactor 类工具跨过 30s 边界时 |

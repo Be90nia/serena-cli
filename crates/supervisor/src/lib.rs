@@ -3,9 +3,9 @@
 //! M0 最小版（Task 10）：
 //! - **单实例**：每个 `(root, lang)` 缓存**一份** `Arc<Session>`（无池/LRU，Task 13-15 接管）。
 //! - 工具入口：`tool_overview` / `tool_def` / `tool_refs` —— 直接 LSP 三个只读语义。
-//! - line/col 经 `lsp_core::offsets::OffsetEncoding::Utf16` 换算为 LSP `Position`。
-//!   M0 固定 utf-16：clangd 默认协商 + base init_params 声明 utf-16 优先；M1 改走
-//!   `Session` 协商结果。
+//! - line/col 换算为 LSP `Position` 用的编码走 `Session::offset_encoding()` 协商
+//!   结果（bd 0pgr W1：base init_params 声明 [utf-16, utf-8]；rust-analyzer 真机
+//!   协商 utf-8，硬编码 Utf16 会让中文行错位；LS 未声明落 LSP 默认 utf-16）。
 //!
 //! 错误模型（ARCH §6.1）：库层用 thiserror 具名类型 `ToolError`；adapters 是被编排末端
 //! 用 anyhow 内部传（`launch_info` 错误冒泡上来），包装成 `ToolError::NotInstalled` 等。
@@ -522,6 +522,15 @@ pub struct Supervisor {
     /// 命中（TTL 内）→ 后续调用不再重复 spawn/请求，快速失败带恢复指引——失败
     /// 语言错误重放占盲测 token 61%（al 四步 ×687B）。stop-all 杀 daemon 即清账。
     failure_memo: Mutex<HashMap<(PathBuf, String), FailureMemoEntry>>,
+    /// bd g6yp Q2②：同 key 连续 Timeout 计数。装死 LS（收请求不回包）在 Terminated
+    /// 自愈门外形成漏区 —— 每次调用烧满超时永不恢复。连续达
+    /// [`TIMEOUT_STREAK_EVICT_THRESHOLD`] 视为装死 → evict+respawn；任何非 Timeout
+    /// 结果（含成功 / Terminated 自愈重建）清零。
+    timeout_streak: Mutex<HashMap<Key, u32>>,
+    /// perf-P1-1（bd qq3a / ADR-0010）：写后异步诊断回查的自引用。daemon 在 Arc
+    /// 包装后经 [`Supervisor::attach_self_weak`] 回填；未回填（CLI direct / 测试）
+    /// → 回查优雅跳过（写响应已立返，仅少一条可观察日志）。
+    me: std::sync::OnceLock<std::sync::Weak<Supervisor>>,
 }
 
 /// memo 记账类别（重建同 wire 类错误用；NotInstalled 短 TTL——装上 LS 即可自愈，
@@ -723,6 +732,8 @@ impl Supervisor {
             ls_warmup: Mutex::new(HashMap::new()),
             warmup_budget_ms: AtomicU64::new(WARMUP_BUDGET_DEFAULT.as_millis() as u64),
             failure_memo: Mutex::new(HashMap::new()),
+            timeout_streak: Mutex::new(HashMap::new()),
+            me: std::sync::OnceLock::new(),
             #[cfg(test)]
             _idle_ttl_override: std::sync::Arc::new(Mutex::new(None)),
         })
@@ -864,6 +875,13 @@ impl Supervisor {
         self.last_used.lock().unwrap().remove(key);
         self.pull_diag_supported.lock().unwrap().remove(key);
         self.launch_exe.lock().unwrap().remove(key);
+        // bd g6yp Q2①：驱逐 = 显式重建决定，failure memo 的「同类失败别再试」账
+        // 必须同步清 —— 否则 session 转 Failed 后首次 respawn 会被刚记下的
+        // Terminated memo（TTL 300s）短路，自愈名存实亡。
+        self.failure_memo
+            .lock()
+            .unwrap()
+            .remove(&(key.root.clone(), key.lang.to_ascii_lowercase()));
         let evicted_root = key_root_identity(&key.root);
         self.version_seen
             .lock()
@@ -897,8 +915,17 @@ impl Supervisor {
         n
     }
 
+    /// bd g6yp Q2②：同 key 连续 Timeout 视为 LS 装死的阈值。2 次容忍窗给慢查询
+    /// （RA 冷启动首析 / 索引风暴单次长分析）留余量，防误杀活 session。
+    const TIMEOUT_STREAK_EVICT_THRESHOLD: u32 = 2;
+
     /// Self-heal 包装：调 `session_for` + 闭包；若闭包因 LS 终结返 `Core(Terminated)`，
     /// 驱逐该 (root, lang) 的旧 session（避免下次再拿到死 session）并重试一次。
+    ///
+    /// Q2②（bd g6yp）：`Core(Timeout)` 同样纳入自愈 —— 装死 LS（收请求不回包）
+    /// 不产生 Terminated，此前每次调用烧满超时且永不恢复。同 key **连续**达
+    /// [`Self::TIMEOUT_STREAK_EVICT_THRESHOLD`] 次才 evict+respawn（防误杀）；
+    /// 首次 Timeout 透传调用方。任何非 Timeout 结果清 streak。
     ///
     /// 重试上限 1 次 —— 再次 Terminated 透传原错误给 agent，避免无限重试掩盖真实故障。
     /// 写门内工具（replace-body / insert-*）的 LS 死亡根因是单写门后多次 write 的
@@ -918,9 +945,10 @@ impl Supervisor {
         Fut: Future<Output = ToolResult<T>>,
     {
         let session = sup.session_for(root, lang).await?;
+        let key = Supervisor::key(root, lang);
         match f(session.clone()).await {
             Err(ToolError::Core(CoreError::Terminated { .. })) => {
-                let key = Supervisor::key(root, lang);
+                sup.timeout_streak.lock().unwrap().remove(&key);
                 tracing::warn!(
                     ?key,
                     "session terminated mid-call; evicting and retrying once"
@@ -929,7 +957,29 @@ impl Supervisor {
                 let session2 = sup.session_for(root, lang).await?;
                 f(session2).await
             }
-            other => other,
+            Err(e @ ToolError::Core(CoreError::Timeout { .. })) => {
+                let streak = {
+                    let mut m = sup.timeout_streak.lock().unwrap();
+                    *m.entry(key.clone()).and_modify(|s| *s += 1).or_insert(1)
+                };
+                if streak < Self::TIMEOUT_STREAK_EVICT_THRESHOLD {
+                    // 防误杀：单次 Timeout 可能是慢查询（冷启动首析），透传不 evict。
+                    return Err(e);
+                }
+                sup.timeout_streak.lock().unwrap().remove(&key);
+                tracing::warn!(
+                    ?key,
+                    streak,
+                    "consecutive timeouts; evicting and retrying once"
+                );
+                let _ = sup.evict(&key).await;
+                let session2 = sup.session_for(root, lang).await?;
+                f(session2).await
+            }
+            other => {
+                sup.timeout_streak.lock().unwrap().remove(&key);
+                other
+            }
         }
     }
 
@@ -1327,18 +1377,22 @@ impl Supervisor {
         }
     }
 
-    /// 写工具收尾：拉一次 file-level 诊断快照；挂进写工具响应 `post_write_diagnostics`。
+    /// daemon Arc 包装后回填自引用（serve.rs 一次性调用；perf-P1-1）。
+    pub fn attach_self_weak(self: &Arc<Self>) {
+        let _ = self.me.set(Arc::downgrade(self));
+    }
+
+    /// 写工具收尾：写后诊断回查排后台，响应**立返** pending 快照。
     ///
-    /// F2 设计：写完后 AI 最常见的下一步是 `diagnostics <file>` 验证；本 helper 把这步
-    /// 折叠进写工具返回值。不阻塞主结果（写仍正常返回 applied=true）。
+    /// F2 设计（写响应折叠诊断）保留价值、剔除同步等待（bd qq3a / ADR-0010）：
+    /// 原实现在响应路径同步等 version 确认（上限 3s），replace-body p50=3029ms——
+    /// AI 每次写 ≥3s、/batch 32 写最坏 +96s。现在确认动作走既有 wait_gen 通道
+    /// （LS 推送照常进 diag_cache；AI 显式 `diagnostics --wait-gen` 查询不受影响），
+    /// 后台回查仅负责可观察性：完成 debug / 失败 warn（禁静默）。
     ///
-    /// pending 语义（2026-09-23 裸 RA 探针实锤）：rust-analyzer 语义诊断（didChange →
-    /// publishDiagnostics 推送）延迟 ~2.5s，pull（textDocument/diagnostic）更滞后。
-    /// `pending: true` = 等待窗口内 LS 没推新一代诊断，items 为空**不代表无错**——
-    /// AI 应回头显式查 `diagnostics` 复核；`pending: false` 且 items 空 = LS 确认无错。
-    ///
-    /// 锁纪律：与 tool_diagnostics 同样走 push 缓存 + 3s 兜底超时；不进诊断时不阻塞。
-    /// ponytail: 不为失败建新错误路径 —— 任何 err 都 `tracing::debug!` + pending 假快照。
+    /// 立返形态 = 既有「3s 超时降级」同一 JSON（`{items: [], pending: true}`，
+    /// slim 后压缩为 `"pending"` 字符串）：pending 语义 = 未确认、items 空 ≠ 无错、
+    /// AI 应回头复核——调用方契约零变化，无新形态。
     async fn post_diag_for_write(
         &self,
         root: &Path,
@@ -1350,24 +1404,42 @@ impl Supervisor {
         invalidate_write_derived_caches(root);
         self.invalidate_symbol_cache_for_root(root);
         self.mark_recent_write(root, file);
-        // 写入刚发生：记基线，等"下一次"推送（本次 didChange 引发的那代诊断）。
+        self.spawn_post_write_diag_check(root, file, lang);
+        serde_json::json!({ "items": [], "pending": true })
+    }
+
+    /// 写后诊断异步回查（fire-and-forget，perf-P1-1）。走 `tool_diagnostics` 的
+    /// wait_gen 语义等 didChange 引发的新一代诊断；结果不进响应（已发出），仅
+    /// tracing 留痕。无自引用（direct/测试）→ 跳过。
+    /// ponytail: 不为失败建新错误路径 —— 任何 err 都 `tracing::warn!`（禁静默），
+    /// 写响应恒 pending 快照。
+    fn spawn_post_write_diag_check(&self, root: &Path, file: &str, lang: Option<&str>) {
+        let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else {
+            tracing::debug!(file, "post-write diag check skipped: no self ref (direct/test)");
+            return;
+        };
         let before = self.diag_generation.load(Ordering::Relaxed);
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            self.tool_diagnostics(root, file, lang, Some(before + 1)),
-        )
-        .await
-        {
-            Ok(Ok(value)) => value,
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, file, "F2 post-write diag failed; degrading");
-                serde_json::json!({ "items": [], "pending": true })
+        let root = root.to_path_buf();
+        let file = file.to_string();
+        let lang = lang.map(str::to_string);
+        tokio::spawn(async move {
+            match me
+                .tool_diagnostics(&root, &file, lang.as_deref(), Some(before + 1))
+                .await
+            {
+                Ok(value) => {
+                    let pending = value.get("pending").and_then(|p| p.as_bool()).unwrap_or(true);
+                    tracing::debug!(file, pending, "post-write diag check resolved (async)");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        file,
+                        "post-write async diag check failed; re-check via `diagnostics --wait-gen`"
+                    );
+                }
             }
-            Err(_elapsed) => {
-                tracing::debug!(file, "F2 post-write diag timeout 3s; degrading");
-                serde_json::json!({ "items": [], "pending": true })
-            }
-        }
+        });
     }
 
     /// `textDocument/diagnostic` 诊断（PLAN Phase 2.5）。
@@ -3171,7 +3243,7 @@ impl Supervisor {
             return Ok(Some(Vec::new()));
         }
 
-        // 4) 读盘 → 切片 body（OffsetEncoding::Utf16 与 tool_symbol_body 一致）。
+        // 4) 读盘 → 切片 body（编码与 tool_symbol_body 一致，走 session 协商值）。
         let text =
             tokio::fs::read_to_string(&target_path)
                 .await
@@ -3194,7 +3266,7 @@ impl Supervisor {
                     line: hit.range.end.line,
                     character: hit.range.end.character,
                 };
-                let body = lsp_core::offsets::slice_at(&text, start, end, OffsetEncoding::Utf16)
+                let body = lsp_core::offsets::slice_at(&text, start, end, session.offset_encoding())
                     .unwrap_or_else(|e| {
                         // 切片失败（罕见：LS 给的 range 异常）→ 留空 + 不中断整体响应。
                         // 整调用返 None 会让上层误判「无定义」，代价更大。
@@ -3567,9 +3639,9 @@ impl Supervisor {
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
-        // offsets.rs 换算：M0 固定 utf-16（clangd 默认 + base init_params 首选 utf-16）。
-        // M1 走 Session 协商结果（`capabilities.positionEncoding`）。本任务不引入新 API。
-        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
+        // offsets.rs 换算：编码走 Session 协商结果（`capabilities.positionEncoding`，
+        // bd 0pgr W1）；LS 未声明落 LSP 默认 utf-16。
+        let pos = lsp_position_from_byte(&path, file, line, col, session.offset_encoding()).await?;
 
         let params = json!({
             "textDocument": { "uri": uri.clone() },
@@ -3603,7 +3675,7 @@ impl Supervisor {
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
-        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
+        let pos = lsp_position_from_byte(&path, file, line, col, session.offset_encoding()).await?;
 
         let params = json!({
             "textDocument": { "uri": uri.clone() },
@@ -3635,7 +3707,7 @@ impl Supervisor {
         let uri = path_to_uri_str(&path);
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
-        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
+        let pos = lsp_position_from_byte(&path, file, line, col, session.offset_encoding()).await?;
 
         let params = json!({
             "textDocument": { "uri": uri.clone() },
@@ -3674,7 +3746,7 @@ impl Supervisor {
         let _guard = session.ensure_open(&path).await.map_err(ToolError::Core)?;
 
         // 越界校验（同 tool_def）—— 防止上游传错位掩盖。
-        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
+        let pos = lsp_position_from_byte(&path, file, line, col, session.offset_encoding()).await?;
 
         // CompletionContext：trigger=Some → TriggerCharacter + triggerCharacter；
         //                None → Invoked（agent 显式请求）。
@@ -4022,8 +4094,21 @@ impl Supervisor {
         // flatten_symbols 注）。
         let cache_key = doc_symbol_cache_key(root, file, lang_override);
         if let Some(cached) = self.symbol_cache_get(&cache_key) {
+            // bd 0pgr W1：编码跟 session 协商值走。hit 分支刻意不 session_for
+            //（省 LS 往返）—— 从实例表直读；session 已被驱逐时落 LSP 默认 utf-16。
+            let enc = resolve_lang_for_file(file, lang_override)
+                .ok()
+                .and_then(|lang| {
+                    self.instances
+                        .lock()
+                        .unwrap()
+                        .get(&Supervisor::key(root, lang.as_str()))
+                        .cloned()
+                })
+                .map(|s| s.offset_encoding())
+                .unwrap_or(OffsetEncoding::Utf16);
             return match cached.iter().find(|h| h.name == symbol) {
-                Some(h) => read_and_slice(&path, file, h.range).await,
+                Some(h) => read_and_slice(&path, file, h.range, enc).await,
                 None => Err(ToolError::BadArgs {
                     detail: format!("symbol `{symbol}` not found in {file}"),
                 }),
@@ -4052,7 +4137,7 @@ impl Supervisor {
             find_symbol_range(resp.as_ref(), symbol, &lang).ok_or_else(|| ToolError::BadArgs {
                 detail: format!("symbol `{symbol}` not found in {file}"),
             })?;
-        let out = read_and_slice(&path, file, range).await?;
+        let out = read_and_slice(&path, file, range, session.offset_encoding()).await?;
         self.symbol_cache_put(cache_key, flatten_symbols(resp, &uri, &lang)); // cache_miss → 写入
         Ok(out)
     }
@@ -4275,15 +4360,15 @@ impl Supervisor {
             character: range.end.character,
         };
         let start_byte =
-            lsp_core::offsets::position_to_byte(&old_text, start, OffsetEncoding::Utf16).map_err(
-                |e| ToolError::BadArgs {
+            lsp_core::offsets::position_to_byte(&old_text, start, session.offset_encoding())
+                .map_err(|e| ToolError::BadArgs {
                     detail: format!("start position: {e}"),
-                },
-            )?;
-        let end_byte = lsp_core::offsets::position_to_byte(&old_text, end, OffsetEncoding::Utf16)
-            .map_err(|e| ToolError::BadArgs {
-            detail: format!("end position: {e}"),
-        })?;
+                })?;
+        let end_byte =
+            lsp_core::offsets::position_to_byte(&old_text, end, session.offset_encoding())
+                .map_err(|e| ToolError::BadArgs {
+                    detail: format!("end position: {e}"),
+                })?;
         let new_text = format!(
             "{}{}{}",
             &old_text[..start_byte],
@@ -4542,7 +4627,7 @@ impl Supervisor {
 
         let _gate = write_gate::acquire("rename-symbol").await?;
 
-        let pos = lsp_position_from_byte(&path, file, line, col, OffsetEncoding::Utf16).await?;
+        let pos = lsp_position_from_byte(&path, file, line, col, session.offset_encoding()).await?;
         let pos_params = json!({
             "textDocument": { "uri": uri_str },
             "position": { "line": pos.line, "character": pos.character },
@@ -4607,7 +4692,9 @@ impl Supervisor {
         for (uri, mut edits) in by_uri {
             edits.sort_by_key(|e| std::cmp::Reverse(e.0)); // 倒序
             let (abs, content, new_content) =
-                match prepare_rename_file(&root_canon, &uri, &edits).await {
+                match prepare_rename_file(&root_canon, &uri, &edits, session.offset_encoding())
+                    .await
+                {
                     Ok(v) => v,
                     Err(skip) => {
                         report.skipped.push(skip);
@@ -4765,7 +4852,7 @@ impl Supervisor {
             .map_err(|e| ToolError::BadArgs {
                 detail: format!("read {}: {e}", user_path(root, &path)),
             })?;
-        let new_text = delete_symbol_text(&old_text, range)?;
+        let new_text = delete_symbol_text(&old_text, range, session.offset_encoding())?;
         // undo 收口：快照旧内容 → 原子写 → 入当前事务。
         undo::recorded_write(&path, &new_text)
             .await
@@ -5177,6 +5264,7 @@ async fn prepare_rename_file(
     root_canon: &Path,
     uri: &str,
     edits: &[EditSpec],
+    enc: OffsetEncoding,
 ) -> Result<(std::path::PathBuf, String, String), RenameSkipped> {
     let abs = uri_to_path(uri).ok_or_else(|| RenameSkipped {
         file: uri.to_string(),
@@ -5203,26 +5291,25 @@ async fn prepare_rename_file(
         })?;
     let mut new_content = content.clone();
     for (i, (_key, range, new_text)) in edits.iter().enumerate() {
-        let start_byte =
-            lsp_core::offsets::position_to_byte(
-                &new_content,
-                lsp_core::offsets::Position {
-                    line: range.start.line,
-                    character: range.start.character,
-                },
-                OffsetEncoding::Utf16,
-            )
-            .map_err(|_| RenameSkipped {
-                file: rel(&abs),
-                reason: format!("edit {i} start position out of range"),
-            })?;
+        let start_byte = lsp_core::offsets::position_to_byte(
+            &new_content,
+            lsp_core::offsets::Position {
+                line: range.start.line,
+                character: range.start.character,
+            },
+            enc,
+        )
+        .map_err(|_| RenameSkipped {
+            file: rel(&abs),
+            reason: format!("edit {i} start position out of range"),
+        })?;
         let end_byte = lsp_core::offsets::position_to_byte(
             &new_content,
             lsp_core::offsets::Position {
                 line: range.end.line,
                 character: range.end.character,
             },
-            OffsetEncoding::Utf16,
+            enc,
         )
         .map_err(|_| RenameSkipped {
             file: rel(&abs),
@@ -8595,7 +8682,13 @@ fn find_symbol_range(
 }
 
 /// 读盘 + 按 LSP range 切符号体（tool_symbol_body 缓存命中/miss 两路共用）。
-async fn read_and_slice(path: &Path, file: &str, range: lsp_types::Range) -> ToolResult<String> {
+/// `enc` 来自 session 协商（bd 0pgr W1：硬编码 Utf16 令中文行在 utf-8 协商下错位）。
+async fn read_and_slice(
+    path: &Path,
+    file: &str,
+    range: lsp_types::Range,
+    enc: OffsetEncoding,
+) -> ToolResult<String> {
     let text = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| ToolError::BadArgs {
@@ -8610,7 +8703,7 @@ async fn read_and_slice(path: &Path, file: &str, range: lsp_types::Range) -> Too
         line: range.end.line,
         character: range.end.character,
     };
-    lsp_core::offsets::slice_at(&text, start, end, OffsetEncoding::Utf16).map_err(|e| {
+    lsp_core::offsets::slice_at(&text, start, end, enc).map_err(|e| {
         ToolError::BadArgs {
             detail: format!("slice {file}@{start:?}-{end:?}: {e}"),
         }
@@ -8850,12 +8943,13 @@ pub(crate) fn atomic_write_err(path: &str, e: std::io::Error) -> ToolError {
 
 /// 从文本中删除符号 range：默认整行删除（start 行首 → end 行含换行）；
 /// end 行符号之后还有非空白内容时只删到符号结尾，保留行尾余文。
-fn delete_symbol_text(text: &str, range: lsp_types::Range) -> ToolResult<String> {
+/// `enc` 来自 session 协商（bd 0pgr W1）。
+fn delete_symbol_text(text: &str, range: lsp_types::Range, enc: OffsetEncoding) -> ToolResult<String> {
     let line_start = |line: u32| {
         lsp_core::offsets::position_to_byte(
             text,
             LspPos { line, character: 0 },
-            OffsetEncoding::Utf16,
+            enc,
         )
         .map_err(|e| ToolError::BadArgs {
             detail: format!("position {line}:0: {e}"),
@@ -8868,7 +8962,7 @@ fn delete_symbol_text(text: &str, range: lsp_types::Range) -> ToolResult<String>
             line: range.end.line,
             character: range.end.character,
         },
-        OffsetEncoding::Utf16,
+        enc,
     )
     .map_err(|e| ToolError::BadArgs {
         detail: format!("end position: {e}"),
@@ -9033,19 +9127,19 @@ mod safe_delete_tests {
     fn delete_symbol_keeps_trailing_same_line_content() {
         // end 行符号后还有别的代码 → 只删符号本体。
         let text = "void f() {} void g() {}\n";
-        let out = delete_symbol_text(text, range(0, 0, 0, 11)).unwrap();
+        let out = delete_symbol_text(text, range(0, 0, 0, 11), OffsetEncoding::Utf16).unwrap();
         assert_eq!(out, " void g() {}\n");
     }
     #[test]
     fn delete_symbol_removes_whole_lines() {
         let text = "int a = 1;\nint orphan() { return 1; }\nint b = 2;\n";
-        let out = delete_symbol_text(text, range(1, 0, 1, 26)).unwrap();
+        let out = delete_symbol_text(text, range(1, 0, 1, 26), OffsetEncoding::Utf16).unwrap();
         assert_eq!(out, "int a = 1;\nint b = 2;\n");
     }
     #[test]
     fn delete_symbol_at_eof_without_trailing_newline() {
         let text = "int a;\nint orphan() { return 1; }";
-        let out = delete_symbol_text(text, range(1, 0, 1, 26)).unwrap();
+        let out = delete_symbol_text(text, range(1, 0, 1, 26), OffsetEncoding::Utf16).unwrap();
         assert_eq!(out, "int a;\n");
     }
 
@@ -9615,6 +9709,27 @@ mod pull_diagnostics_tests {
             c["items"],
             serde_json::json!([]),
             "文件不存在 → 必须降级为空数组"
+        );
+    }
+
+    /// perf-P1-1（bd qq3a）：写响应立返 —— post_diag_for_write 恒 pending 快照且
+    /// 不再同步等诊断确认（修复前真实 LS 下同步等待使 p50≈3s）。坏 root 排除 LS
+    /// 冷启动，纯测响应路径无同步等待；诊断回查经 spawn 排后台（direct 模式无
+    /// 自引用 → debug 跳过），不阻塞主返回。
+    #[tokio::test]
+    async fn post_diag_for_write_returns_immediately_without_diag_wait() {
+        let sup = Supervisor::direct().await.expect("supervisor");
+        let bad_root = std::path::PathBuf::from("Z:/nonexistent_for_test_xyz_42");
+        let t0 = std::time::Instant::now();
+        let v = sup
+            .post_diag_for_write(&bad_root, "x.rs", Some("rust"))
+            .await;
+        let elapsed = t0.elapsed();
+        assert_eq!(v["items"], serde_json::json!([]));
+        assert_eq!(v["pending"], serde_json::json!(true));
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "写响应必须立返（<500ms），实测 {elapsed:?}——超时说明诊断等待回流到了响应路径"
         );
     }
 
@@ -13538,7 +13653,7 @@ mod silent_failure_tests {
     #[tokio::test]
     async fn prepare_rename_reports_unparsable_uri() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let err = prepare_rename_file(tmp.path(), "not-a-uri", &[])
+        let err = prepare_rename_file(tmp.path(), "not-a-uri", &[], OffsetEncoding::Utf16)
             .await
             .unwrap_err();
         assert_eq!(err.file, "not-a-uri");
@@ -13554,7 +13669,7 @@ mod silent_failure_tests {
         let f = dunce::canonicalize(&f).unwrap();
         let root = dunce::canonicalize(tmp.path()).unwrap();
 
-        let err = prepare_rename_file(&root, &file_uri(&f), &[])
+        let err = prepare_rename_file(&root, &file_uri(&f), &[], OffsetEncoding::Utf16)
             .await
             .unwrap_err();
         assert!(err.reason.contains("outside workspace root"), "{}", err.reason);
@@ -13576,14 +13691,16 @@ mod silent_failure_tests {
         // 正常路径：edit 应用，内容与原内容都返回。
         let edits = vec![(0u64, rng(0, 3, 0, 4), "b".to_string())];
         let (abs, content, new_content) =
-            prepare_rename_file(&root, &file_uri(&f), &edits).await.unwrap();
+            prepare_rename_file(&root, &file_uri(&f), &edits, OffsetEncoding::Utf16)
+                .await
+                .unwrap();
         assert_eq!(abs, f);
         assert_eq!(content, "fn a() {}\nfn b() {}\n");
         assert_eq!(new_content, "fn b() {}\nfn b() {}\n");
 
         // 越界行 → 整文件跳过 + 原因可见（原 break 静默点）。
         let bad = vec![(9u64, rng(999, 0, 999, 1), "x".to_string())];
-        let err = prepare_rename_file(&root, &file_uri(&f), &bad)
+        let err = prepare_rename_file(&root, &file_uri(&f), &bad, OffsetEncoding::Utf16)
             .await
             .unwrap_err();
         assert!(err.reason.contains("position out of range"), "{}", err.reason);
@@ -14131,5 +14248,207 @@ mod blindv4_unit_tests {
             "非 uri 字段不动"
         );
         assert_eq!(v["nested"]["deep"][0]["uri"], "file:///F:/z.py", "{v}");
+    }
+}
+
+#[cfg(test)]
+mod self_heal_timeout_tests {
+    //! bd g6yp Q2② 回归锁（TG-H1）：装死 LS（收请求不回包）→ `with_session_retry`
+    //! 连续 Timeout 自愈链。
+    //!
+    //! 修复前：仅 `Terminated` 进自愈分支；装死 session 每次调用烧满超时、永不恢复。
+    //! 修复后：同 (root,lang) **连续 2 次** Timeout → evict + respawn → 新 session
+    //! 服务成功。单次 Timeout 透传不 evict（防误杀慢查询/冷启动长分析）。
+
+    use super::*;
+    use std::time::Duration;
+
+    /// 装死腿的请求超时：须短（两次共 ~4s）；respawn 腿走真 RA 的 documentSymbol
+    /// 对未注册文件立即返 null，不会烧满。
+    const REQ_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// respawn 腿依赖真 rust-analyzer：adapter 探测不到 launch（CI minimal profile
+    /// 无 RA 组件）→ skip，不构成 false failure（同 mock_ls 缺失即 skip 约定）。
+    async fn rust_adapter_ready() -> bool {
+        match ls_registry::adapter_for("rust") {
+            Some(a) => a
+                .launch_info(&ls_adapters::ProjectCtx {
+                    project_root: std::env::temp_dir(),
+                })
+                .await
+                .is_ok(),
+            None => false,
+        }
+    }
+
+    /// mock_ls 直连 session，对 documentSymbol 装死（MOCK_LS_SILENT_METHODS）。
+    async fn dead_mock_session() -> std::sync::Arc<lsp_core::session::Session> {
+        let exe = reclaim_idle_buffers_tests::find_mock_ls()
+            .expect("mock_ls 必须在（cargo test 自动 build）");
+        let child = ls_runtime::process::Child::spawn(ls_runtime::process::LaunchInfo {
+            cmd: vec![std::ffi::OsString::from(exe)],
+            cwd: std::env::temp_dir(),
+            env: vec![(
+                "MOCK_LS_SILENT_METHODS".to_string(),
+                "workspace/symbol".to_string(),
+            )],
+            transport: ls_runtime::process::TransportKind::Stdio,
+        })
+        .expect("spawn mock_ls(silent documentSymbol)");
+        lsp_core::session::Session::start(
+            Some(child),
+            lsp_core::init_params::base_initialize_params(),
+        )
+        .await
+        .expect("Session::start Ready")
+    }
+
+    #[tokio::test]
+    async fn consecutive_timeouts_evict_dead_session_and_recover() {
+        if !rust_adapter_ready().await {
+            println!("skipped: rust-analyzer adapter launch info unavailable");
+            return;
+        }
+        let sup = Supervisor::direct().await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let key = Supervisor::key(root, "rust");
+        let dead = dead_mock_session().await;
+        sup.instances
+            .lock()
+            .unwrap()
+            .insert(key.clone(), dead.clone());
+
+        // f 无捕获 → Copy，可被 FnMut 多次调用。workspace/symbol 是全局请求，
+        // 无需文档态：装死 session 上烧满超时；RA（respawn 后，空 workspace）与
+        // mock_ls（其余请求回 null）都立即成功。
+        let f = |session: std::sync::Arc<lsp_core::session::Session>| async move {
+            let _v: serde_json::Value = session
+                .request(
+                    "workspace/symbol",
+                    serde_json::json!({"query": ""}),
+                    REQ_TIMEOUT,
+                )
+                .await
+                .map_err(ToolError::Core)?;
+            Ok(())
+        };
+
+        // 调 1：单次 Timeout → 透传（streak=1，不 evict）。
+        let r1 = Supervisor::with_session_retry(&sup, root, "rust", f).await;
+        assert!(
+            matches!(&r1, Err(ToolError::Core(CoreError::Timeout { .. }))),
+            "首调 Timeout 必须透传且不误杀: {r1:?}"
+        );
+        assert!(
+            sup.instances.lock().unwrap().contains_key(&key),
+            "单次超时不得驱逐装死 session"
+        );
+
+        // 调 2：连续第 2 次 Timeout → evict + respawn（空 workspace RA）→ 成功。
+        let r2 = Supervisor::with_session_retry(&sup, root, "rust", f).await;
+        r2.expect("连续 2 次 Timeout 必须触发 evict+respawn，新 session 服务成功");
+        let cur = sup
+            .instances
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .expect("respawn 后 instances 必有 session");
+        assert!(
+            !std::sync::Arc::ptr_eq(&cur, &dead),
+            "后续调用必须拿到 respawn 的新 session，而非复用旧装死 session"
+        );
+    }
+}
+
+#[cfg(test)]
+mod offset_encoding_cjk_tests {
+    //! bd 0pgr W1 回归锁：位置编码协商（utf-8）下，中文行 range 切片必须按
+    //! utf-8 unit 计数。修复前 supervisor 全链硬编码 `OffsetEncoding::Utf16`，
+    //! 真机 rust-analyzer 协商出 utf-8 → 中文注释行的 hover/def/symbol-body
+    //! 位置错位（1 个中文字符 = 3 utf-8 字节 ≠ 1 utf-16 code unit）。
+    //!
+    //! 场景：mock_ls 协商 utf-8（`MOCK_LS_POSITION_ENCODING` 钩子）→ 注入
+    //! session → symbol-body 缓存 hit 路径对行首含中文注释的符号 range 切片。
+    //! line5 = `/* 中文 */ mock_helper`：
+    //! - utf-8 字节：`/* ` 3 + `中文` 6 + ` */` 3 = 12 → C0..C11 = `/* 中文 *`
+    //! - utf-16 unit：`/* ` 3 + 中 1 + 文 1 + ` */` 3 + ` ` 1 = 9 → C0..C11 多吞 `mo`
+    use super::*;
+
+    const LINE5: &str = "/* 中文 */ mock_helper";
+
+    async fn mock_session_utf8() -> std::sync::Arc<lsp_core::session::Session> {
+        let exe = reclaim_idle_buffers_tests::find_mock_ls()
+            .expect("mock_ls 必须在（cargo test 自动 build）");
+        let child = ls_runtime::process::Child::spawn(ls_runtime::process::LaunchInfo {
+            cmd: vec![std::ffi::OsString::from(exe)],
+            cwd: std::env::temp_dir(),
+            env: vec![(
+                "MOCK_LS_POSITION_ENCODING".to_string(),
+                "utf-8".to_string(),
+            )],
+            transport: ls_runtime::process::TransportKind::Stdio,
+        })
+        .expect("spawn mock_ls(utf-8)");
+        lsp_core::session::Session::start(
+            Some(child),
+            lsp_core::init_params::base_initialize_params(),
+        )
+        .await
+        .expect("Session::start Ready")
+    }
+
+    #[tokio::test]
+    async fn symbol_body_slice_follows_negotiated_utf8_on_cjk_line() {
+        let sup = Supervisor::direct().await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("main.rs"),
+            format!("// 顶部\n\nfn mock_main() {{}}\n\n\n{LINE5}\n"),
+        )
+        .unwrap();
+
+        // 注入 utf-8 协商 session（key 生成方式与 session_for 内部一致）。
+        let key = Supervisor::key(root, "rust");
+        let session = mock_session_utf8().await;
+        assert_eq!(
+            session.offset_encoding(),
+            lsp_core::offsets::OffsetEncoding::Utf8,
+            "mock_ls 已协商 utf-8，session 必须读到该协商结果"
+        );
+        sup.instances.lock().unwrap().insert(key, session);
+
+        // 暖 docsym 缓存（mock_ls FLAT 符号位形：mock_helper@L5 C0..C11），走
+        // tool_symbol_body 缓存 hit → read_and_slice 切片链。
+        let uri = path_to_uri_str(&root.join("main.rs"));
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "main.rs", None),
+            vec![SymbolHit {
+                name: "mock_helper".into(),
+                kind: SymbolKindTag::Function,
+                uri,
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: 5,
+                        character: 11,
+                    },
+                },
+                container: None,
+            }],
+        );
+        let body = sup
+            .tool_symbol_body(root, "main.rs", "mock_helper", None)
+            .await
+            .expect("symbol-body 必成功");
+        assert_eq!(
+            body, "/* 中文 *",
+            "utf-8 协商下 C0..C11 = 11 字节恰为注释段；拿到 {body:?} 说明切片仍按 Utf16 计数（W1 回归）"
+        );
     }
 }

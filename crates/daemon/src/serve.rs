@@ -96,6 +96,8 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     };
 
     let sup = Arc::new(Supervisor::direct().await?);
+    // perf-P1-1：写后异步诊断回查需要 Arc 自引用（fire-and-forget spawn）。
+    sup.attach_self_weak();
     let state = AppState {
         supervisor: sup.clone(),
         token: Arc::new(token),

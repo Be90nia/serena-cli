@@ -69,7 +69,7 @@ pub enum ToolResponse {
     },
 }
 
-/// 9 个错误码（ARCH §6.3 表）。
+/// 10 个错误码（ARCH §6.3 表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WireErrorCode {
@@ -82,6 +82,9 @@ pub enum WireErrorCode {
     RpcError,
     WriteConflict,
     Internal,
+    /// daemon 排空关停中（bd xvs7 A-3 / ADR-0008）：仅出现在 draining 503 body，
+    /// 不产生于 ToolError 映射；CLI 客户端对 503+此码做 ≤5s 自愈重试（g0m）。
+    DaemonDraining,
 }
 
 impl WireErrorCode {
@@ -254,6 +257,7 @@ pub fn wire_error_code_to_exit(code: WireErrorCode) -> u8 {
         WireErrorCode::BadArgs => 2,
         WireErrorCode::WriteConflict => 1,
         WireErrorCode::Internal => 3,
+        WireErrorCode::DaemonDraining => 3,
         other if other.retryable() => 5,
         _ => 1,
     }
@@ -275,6 +279,20 @@ mod tests {
         assert_eq!(wire_error_code_to_exit(WireErrorCode::LsTerminated), 5);
         assert_eq!(wire_error_code_to_exit(WireErrorCode::LsSpawnFailed), 5);
         assert_eq!(wire_error_code_to_exit(WireErrorCode::LsNotReady), 5);
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::DaemonDraining), 3);
+    }
+
+    /// bd xvs7 A-3：第 10 wire 码 wire 形态锁定（序列化串与既有线上字节一致 +
+    /// roundtrip + retryable=false）。
+    #[test]
+    fn daemon_draining_wire_code_contract() {
+        assert_eq!(
+            serde_json::to_string(&WireErrorCode::DaemonDraining).unwrap(),
+            "\"DAEMON_DRAINING\""
+        );
+        let back: WireErrorCode = serde_json::from_str("\"DAEMON_DRAINING\"").unwrap();
+        assert_eq!(back, WireErrorCode::DaemonDraining);
+        assert!(!WireErrorCode::DaemonDraining.retryable());
     }
 
     #[test]

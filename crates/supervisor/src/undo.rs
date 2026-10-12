@@ -197,6 +197,35 @@ fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// bd xvs7 B-P1-1：日志里的路径脱敏——user home 前缀折叠成 `~`，用户名等
+/// 凭据不进日志（daemon reaper.rs 有同款 helper；跨 crate 不共享，勿造全局机制）。
+fn redact_path(path: &Path) -> String {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    redact_path_with(path, home.as_deref())
+}
+
+fn redact_path_with(path: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return path.display().to_string();
+    };
+    if let Ok(rel) = path.strip_prefix(home) {
+        return format!("~{}{}", std::path::MAIN_SEPARATOR, rel.display());
+    }
+    // Windows 大小写漂移兜底：日志路径来源各异（客户端传参 vs env 值），
+    // strip_prefix 是精确匹配，前缀按大小写折叠比对后再剥一次（分隔符守卫
+    // 防 home `D:/pro` 误吃路径 `D:/proj`）。
+    let (p, h) = (path.to_string_lossy(), home.to_string_lossy());
+    if let (Some(prefix), Some(rest)) = (p.get(..h.len()), p.get(h.len()..))
+        && prefix.eq_ignore_ascii_case(&h)
+        && rest.starts_with(['/', '\\'])
+    {
+        return format!("~{rest}");
+    }
+    p.into_owned()
+}
+
 /// 项目根 → undo 存储目录：`default_cache_root()/undo/{project_hash}`。
 /// bd serena-rust-ej5：canonicalize 失败（挪盘瞬窗/目录权限变化）不再 BAD_ARGS
 /// 整栈孤儿——退回对原始路径串做 sha256（无 canonicalize 也有确定性键）；彻底
@@ -205,7 +234,7 @@ pub(crate) fn store_for(root: &Path) -> Result<PathBuf, ToolError> {
     let hash_source = match dunce::canonicalize(root) {
         Ok(canon) => canon.to_string_lossy().into_owned(),
         Err(e) if root.exists() => {
-            tracing::warn!(root = %root.display(), error = %e, "canonicalize failed; hashing raw path for undo store");
+            tracing::warn!(root = %redact_path(root), error = %e, "canonicalize failed; hashing raw path for undo store");
             root.to_string_lossy().into_owned()
         }
         Err(e) => {

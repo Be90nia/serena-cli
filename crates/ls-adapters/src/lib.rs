@@ -791,7 +791,7 @@ pub(crate) fn probe_uri_for_root(root: &Path, langs: &[LanguageId], fallback: &s
 
 /// 适配器 trait 签名（ARCHITECTURE §4.1 完整定稿）。
 ///
-/// 九个方法 —— 任何 `T0`（配置驱动）或 `T2`（手写）实现都覆盖。`set_project_root` /
+/// 十五个方法 —— 任何 `T0`（配置驱动）或 `T2`（手写）实现都覆盖。`set_project_root` /
 /// `on_server_ready` / `wait_for_index` / `supports_implementation` 给默认实现，
 /// 让 T0 模板零代码可用。
 #[async_trait]

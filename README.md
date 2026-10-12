@@ -20,7 +20,7 @@ Trade-off: you lose the "MCP auto-discovery" story. You gain `bash`-debuggabilit
 
 ## What it covers
 
-### CLI commands (63)
+### CLI commands (65)
 
 Read / navigate (7): `overview` · `symbol-tree` · `read-file` · `list-dir` · `find-file` · `search` · `hover`
 
@@ -32,13 +32,13 @@ Editing (11): `rename-symbol` · `safe-delete-symbol` · `replace-body` · `repl
 
 Undo / redo (2): `undo` (`--steps N`, `--list`) · `redo` — transactional snapshot stack: every successful write records the prior state; a multi-file edit (e.g. cross-file rename) is one transaction and rolls back as a whole. Files created by a transaction are deleted on undo. Conflict gate: if a file changed on disk after the transaction, that transaction is discarded and undo stops immediately (broken timeline — older transactions are not touched; response carries `stopped_early`, exit code 2). Stack lives in the user cache dir (survives restarts and upgrades), capped at 20 txns / 200 MB / 30 days.
 
-Test / diff / find-test (3): `test <target> [name]` (cargo/npm backends auto-selected; parses failures into a JSON list) · `diff [txn-id] [--patch]` (before/after of a write transaction; `--patch` emits a unified diff) · `find-test <sym>` (heuristic chain: tests/ mirrors → test dirs/naming → `mod tests` → LS refs)
+Test / diff / find-test (4): `test <target> [name]` (cargo/npm backends auto-selected; parses failures into a JSON list) · `diff [txn-id] [--patch]` (before/after of a write transaction; `--patch` emits a unified diff) · `find-test <sym>` (heuristic chain: tests/ mirrors → test dirs/naming → `mod tests` → LS refs) · `change-history` (`git log --follow` wrapper; `--symbol` uses `-L :sym:` for symbol-level tracking; non-repo → exit 3)
 
 Completion (1): `completion` (with `--limit` and per-file-suffix trigger inference)
 
-Admin (8): `status` · `stop-all` · `install <lang>` · `uninstall <lang>` · `ls-use <lang-or-id> <path>` · `ls-list` · `ls-remove <id>` · `shell` (JSONL stdin/stdout session)
+Admin (9): `status` · `project-info` (project root + git branch/HEAD + daemon/LS state; probe semantics, never lazy-spawns) · `stop-all` · `install <lang>` · `uninstall <lang>` · `ls-use <lang-or-id> <path>` · `ls-list` · `ls-remove <id>` · `shell` (JSONL stdin/stdout session)
 
-Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker`
+Long-tail (20): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `wait-ready` · `doctor` · `lint-shell` · `workspace-diagnostic` · `format` · `format-range` · `inlay-hint` · `document-highlight` · `folding-range` · `semantic-tokens` · `code-lens` · `document-link` · `call-hierarchy` · `type-hierarchy` · `moniker` · `code-action` (list available codeActions; `--kind` filter)
 
 ### Recipe workflows (8)
 
@@ -57,7 +57,7 @@ Long-tail (19): `defining-symbol` · `edit-context` · `repo-map` · `warm` · `
 
 **Position baseline convention**: commands taking `line`/`col` (position-addressed: `def`, `refs`, `hover`, `find-implementations`, `rename-symbol`, `find-referencing-*`, `containing-symbol`, `defining-symbol`, `signature-help`, `code-action`, `document-highlight`, `completion`, `format-range`, `inlay-hint`, `call-hierarchy prepare`, `type-hierarchy prepare`, `moniker`) are **1-based** on the CLI surface — converted to LSP's 0-based `Position` internally (`normalize_positions`, bd serena-rust-7xv); passing `0` is a usage error. Line-range and line-editing commands (`read-file`, `insert-at-line`, `replace-lines`, `delete-lines`, `delete-text-in-symbol`) are **1-based inclusive**. Every command also states this in its `--help`.
 
-vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses), plus the long tail (`documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint`) — all landed and verified 2026-09-23; `document-link`/`moniker` return empty on LS without the capability (e.g. rust-analyzer stable).
+vs. upstream oraios/serena: 19/19 high-ROI wrappers covered (every tool an agent realistically uses), plus the long tail (`documentHighlight`, `codeLens`, `documentLink`, `foldingRange`, `call/type hierarchy`, `moniker`, `semanticTokens`, `inlayHint`) — all landed and verified 2026-09-23; `document-link`/`moniker` surface the server's `RPC_ERROR -32601` on LS without the capability (e.g. rust-analyzer stable) rather than an empty result.
 
 ### Language servers (53 of 73 in upstream catalog)
 
@@ -245,24 +245,29 @@ Write-tool receipts slim the snapshot when it carries no items (bd tfa3): unconf
 
 ## Performance baseline
 
-Measured on `feature/solidlsp-phase0-1`, 2026-09-16, Windows 11 / i9-10900F, no competing rust-analyzer:
+Current re-measurement (2026-10-12, Windows 11 26200 x64, release `serena-cli` 0.3.0 build, warm daemon, small fixture outside the workspace; cross-checked by the 2026-10-12 deep-docs audit):
+
+| Workload | Latency |
+|---|---|
+| `overview` warm daemon, first hit | ~19 ms median (16.8 – 20.5 ms, n=7, CLI spawn) / ~1.3 ms median (1.13 – 1.86 ms, n=10, shell mode) |
+
+Historical baseline (`feature/solidlsp-phase0-1` branch, 2026-09-16, Windows 11 / i9-10900F, no competing rust-analyzer; not re-measured since):
 
 | Workload | Latency |
 |---|---|
 | `find-symbol` warm daemon, cached | < 1 ms |
-| `overview` warm daemon, first hit | 65 – 108 ms (CLI spawn) / 0.88 – 0.93 ms (shell mode) |
 | `find-referencing-symbols` warm | ~70 ms |
 | `symbol-tree <dir>` 2-file aggregate | 0.34 s |
 | `rename-symbol` cold start (rust fixture workspace) | 162 ms (was 30s+ pre-fix) |
 | Cold daemon first overview (rust fixture, workspace mode) | ~5 s (was 89 s with no workspace / 300 s+ with VS Code competing) |
 
-`cargo test --workspace`: 49 test targets green, 30+ new unit tests added. `cargo clippy --workspace --all-targets -- -D warnings`: 0 errors.
+`cargo test --workspace`: 58 test targets green (2026-10-12, `cargo metadata` count). `cargo clippy --workspace --all-targets -- -D warnings`: 0 errors (CI gate).
 
 ## Architecture in 30 seconds
 
 7-crate Cargo workspace:
 
-- `crates/lsp-core` — JSON-RPC framing, request/response client with id normalization, `ContentModified` retry, managed LSP process spawn + stdio/TCP transport (3-pump topology, mirror of upstream `ls_process.py`)
+- `crates/lsp-core` — JSON-RPC framing, request/response client with id normalization, `ContentModified` retry, managed LSP process spawn + stdio transport (TCP not landed, Δ; 3-pump topology, mirror of upstream `ls_process.py`)
 - `crates/ls-registry` — `LanguageServerId` ↔ file extension table
 - `crates/ls-adapters` — per-LS launch args + readiness probes (rust-analyzer / clangd / pyright / gopls / typescript / csharp-ls / jdtls)
 - `crates/supervisor` — `Supervisor` trait + `DaemonSupervisor` impl: per-key load gate, session cache, tool dispatch, write gate, symbol cache
@@ -276,7 +281,7 @@ The single source of architectural truth is [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
 | Limitation | Impact | When to revisit |
 |---|---|---|
-| `doctor` network probe hardcodes `github.com:443` | Behind a registry mirror/proxy the `net` check reports MISS even when LS install sources are reachable — it is advisory, not a gate (bd serena-rust-5uf; a `SERENA_NETWORK_PROBE_HOST` override is planned, not yet implemented) | When the probe host becomes configurable (fix wave A) |
+| `doctor` network probe defaults to `github.com:443` | Advisory only (not a gate): behind a registry mirror/proxy the `net` check can report MISS even when LS install sources are reachable — set `SERENA_NETWORK_PROBE_HOST=host:port` to point the probe at a reachable target | Resolved — override implemented (`doctor.rs::check_network`, bd serena-rust-5uf) |
 | SHA-256 download matrix for non-clangd LS is partial | `install` works for verified entries; unverified entries fall back to PATH probe | When CI needs hermetic installs — populate `local/ls-download-matrix.md` from upstream SolidLSP source |
 | No monorepo multi-root support | Each `serena-cli` invocation scopes to one workspace root | Add `additionalWorkspaceFolders` (Phase 4 stretch) |
 | No `$/progress` notification buffering | Long-running tools block until complete | When tools like refactor cross 30s boundaries |

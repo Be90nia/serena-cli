@@ -26,6 +26,7 @@ use crate::dto::{
     StatusRecentError, StatusResponse, ToolResponse, WireError, WireErrorCode,
     wire_error_code_to_exit, wire_error_from_tool_error,
 };
+use crate::reaper::redact_path;
 
 /// Daemon 状态。`token` 来自 lock 文件（Task 11）；draining 标志由 Reaper（Task 14）置。
 #[derive(Clone)]
@@ -508,7 +509,7 @@ pub(crate) fn rotate_invocation_log(path: &std::path::Path, keep: u32) {
             path
         );
     } else {
-        tracing::info!(path = %path.display(), keep, "invocation log rotated");
+        tracing::info!(path = %redact_path(path), keep, "invocation log rotated");
     }
 }
 
@@ -834,7 +835,11 @@ fn draining_response() -> Response {
         [("Retry-After", "10")],
         Json(json!({
             "ok": false,
-            "error": {"code": "DAEMON_DRAINING", "message": "daemon in ShutdownDraining; refusing new requests", "retryable": false}
+            "error": {
+                "code": WireErrorCode::DaemonDraining,
+                "message": "daemon in ShutdownDraining; refusing new requests",
+                "retryable": WireErrorCode::DaemonDraining.retryable()
+            }
         })),
     )
         .into_response()

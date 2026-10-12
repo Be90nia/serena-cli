@@ -44,7 +44,7 @@
 | `ls-registry` | lib | servers.toml 解析 + 语言路由（EXT_TABLE） |
 | `supervisor` | lib | 实例池 / LRU / 读写调度 / 工具语义 |
 | `daemon` | lib | axum HTTP / lock file / idle reaper |
-| `cli` | bin | 唯一可执行 `serena-cli.exe`（含 daemon） |
+| `serena-cli` | bin | 唯一可执行 `serena-cli.exe`（crate 目录 `crates/cli/`；含 daemon；二进制身份以更名战役定案为准） |
 
 新增 crate = 改本节 + `Cargo.toml` workspace.members + `ARCHITECTURE.md §0` 依赖图。
 
@@ -91,7 +91,7 @@
 | `ls-adapters` | `anyhow::Error`（末端编排） | 上游子类 raise |
 | `ls-registry` | `String` 消息（spec 解析） | — |
 | `supervisor` | `ToolError::{BadArgs, NotInstalled, Core, WriteConflict, Launch, Serialize, Protocol}` | — |
-| `daemon` / `cli` | `anyhow`（顶层装配与兜底） | — |
+| `daemon` / `serena-cli` | `anyhow`（顶层装配与兜底） | — |
 
 **边界规则**：
 - 库 crate 一律 `thiserror` 具名类型（按变体分类重试/上报）
@@ -150,34 +150,53 @@
 
 ## 5. 配置管理
 
-**权威**：`crates/ls-registry/src/spec.rs` · `servers.toml`（项目内 `include_str!` 内嵌）· `external-servers.toml`（用户目录覆盖）
+**权威**：`crates/ls-registry/src/spec.rs` · `servers.toml`（项目内 `include_str!` 内嵌）· `config.rs`（分层合并 + 用户 `config.toml`）· `external-servers.toml`（用户目录覆盖）
 
-### 5.1 配置分层
+### 5.1 配置分层（3 层，与 `config.rs` 实现一致）
 
-| 层 | 路径 | 优先级 |
-|---|---|---|
-| 1 | 项目内 `servers.toml`（编译期 `include_str!` 内嵌） | 最低（默认值） |
-| 2 | `%APPDATA%/serena/servers.toml`（Unix `~/.config/serena/servers.toml`） | 中（用户覆盖） |
-| 3 | `%APPDATA%/serena/external-servers.toml` | 最高（外部 LS 优先 + warn） |
-| 4 | 环境变量 `SERENA_*`（详见 `ARCHITECTURE.md §6.4`） | 平行（覆盖 TOML） |
+| 层 | 路径 | 粒度 | 优先级 |
+|---|---|---|---|
+| 1 | 项目内 `crates/ls-registry/src/servers.toml`（编译期 `include_str!` 内嵌） | 内置默认表 | 最低（默认值） |
+| 2 | 用户目录 `config.toml`（Windows `%APPDATA%\serena\`；Unix `~/.config/serena/`） | 字段级覆盖（`[ls.<id>]` 逐字段 → `LsOverride`） | 中 |
+| 3 | 用户目录 `external-servers.toml`（同目录，`ls-use` 管理） | 条目级整块替换（`[servers.<id>]`） | 最高（同 id/language 并列 external 胜出 + 加载时逐条 warn） |
 
-### 5.2 环境变量清单
+- **运行期合并优先级链**：CLI flag（`LsOverride`）> 用户 `config.toml` > `external-servers.toml` > 内置 `servers.toml`（`ls-registry/src/config.rs` `merged_spec_for`）。字段级与条目级覆盖并存不冲突。
+- **servers.toml 归属**：唯一内置 LS 注册表，只存在于仓库内、编译期内嵌（`spec.rs` 解析 + `config.rs::SERVERS`）；用户目录**没有**第二份 `servers.toml`——条目级用户注册/覆盖一律走 `external-servers.toml`（决策见 ADR-0009）。
+- **环境变量不在本分层内**：§5.2 的 `SERENA_*` 是运行时行为开关（超时/预算/诊断钩子），不参与 LS spec 解析，属平行维度，不设「第 4 层」。
+- **项目级配置不参与 cmd 构造**（防恶意仓库注入二进制；环境变量 override 禁止——`config.rs` 头注）。
 
-| 变量 | 默认 | 语义 |
-|---|---|---|
-| `SERENA_IDLE_TIMEOUT_SECS` | `900` | 全局 idle 自杀阈值；`0` = 永不自杀 |
-| `SERENA_LS_IDLE_EVICTION_SECS` | `600` | 单 LS 空闲驱逐阈值；`0` = 永不驱逐 |
-| `SERENA_NO_TOKEN_ESTIMATE` | 未设 | `1` = 工具成功响应不附 `~tokens` 估算 |
-| `SERENA_RECORD` | 未设 | frame 录制到 `<path>` |
-| `SERENA_SKIP_LS_E2E` | 未设 | 真 LS e2e 跳过（CI 用） |
+### 5.2 环境变量清单（生产路径全集）
+
+| 变量 | 默认 | 语义 | 注册点（grep 锚） |
+|---|---|---|---|
+| `SERENA_IDLE_TIMEOUT_SECS` | `900` | daemon 全局 idle 自杀阈值；`0` = 永不自杀 | `daemon/src/reaper.rs` `intervals_from_env` |
+| `SERENA_LS_IDLE_EVICTION_SECS` | `600` | 单 LS 空闲驱逐阈值；`0` = 永不驱逐 | `daemon/src/reaper.rs` `intervals_from_env` |
+| `SERENA_MAX_LOADED_LS` | `6` | LRU 驱逐线；`0` 非法（持续驱逐）回默认 | `daemon/src/reaper.rs` `parse_count` |
+| `SERENA_NO_TOKEN_ESTIMATE` | 未设 | `1` = 工具成功响应不附 `~tokens` 估算 | `daemon/src/serve.rs` |
+| `SERENA_DAEMON_LOG` | 未设 | daemon stderr 落盘路径（append；排障/smoke per-door 归属） | `cli/src/main.rs` `daemon_log_file` |
+| `SERENA_RECORD` | 未设 | LSP 帧录制到 `<path>` | `lsp-core/src/session.rs` `ENV_RECORD` |
+| `SERENA_REPLAY` | 未设 | 帧回放驱动（不接真 LS；失败复现/回归） | `lsp-core/src/session.rs` `recorder_from_env` |
+| `SERENA_HANDSHAKE_TIMEOUT_SECS` | `30` | LS 握手段超时；`0`/非法回默认（0 = 永不超时禁用） | `lsp-core/src/session.rs` `handshake_timeout` |
+| `SERENA_WAIT_READY_TIMEOUT_SECS` | `120` | `wait-ready` 就绪等待上限；显式 `--timeout` 优先 | `cli/src/main.rs` `wait_ready_timeout_secs` |
+| `SERENA_JDTLS_SNAPSHOT` | 未设 | `1` = jdtls 切 snapshot 发行版 + 系统 JDK 模式 | `ls-adapters/src/jdtls.rs` `snapshot_mode` |
+| `SERENA_SKIP_LLVM_FALLBACK` | 未设 | `1` = 禁 clangd Windows LLVM 兜底探测（验证 not-installed 路径） | `ls-adapters/src/lib.rs` `var_os` |
+| `SERENA_NETWORK_PROBE_HOST` | `github.com:443` | `doctor` 网络探活目标覆盖（镜像环境） | `supervisor/src/doctor.rs` `check_network` |
+| `SERENA_DEBUG_RAW` | 未设 | `1` = 静默空结果附 `raw_lsp_response` 200B 快照 | `supervisor/src/lib.rs` `debug_raw_enabled` |
+| `SERENA_WARMUP_TIMEOUT_MS` | `15000` | 语义渐进首答预热预算；CLI `--warmup-timeout` / `args._warmup_ms` 优先 | `supervisor/src/lib.rs` `parse_warmup_env` |
+| `SERENA_DEFAULT_MAX_TOKENS` | 未设 | 未显式 `_max_tokens` 时的响应 token 预算 | `supervisor/src/lib.rs` `execute_tool` |
+| `SERENA_DEFAULT_MAX_ITEMS` | 未设 | list 类工具未显式条数旗时的默认条数 | `supervisor/src/lib.rs` `arg_limit` |
+| `SERENA_WRITE_GATE_TIMEOUT_SECS` | `60` | 写门等待超时（超时 → `LS_TIMEOUT` retryable）；`0` 视同非法 | `supervisor/src/write_gate.rs` `gate_timeout_secs` |
+| `SERENA_SKIP_LS_E2E` | 未设 | `1` = 真 LS e2e 全跳过（CI 门禁，§6.2） | `supervisor/src/ct/tests.rs` `skip_ls_e2e` 等 |
 
 非法值（负数 / 非数字）warn 后用默认，**配置错误不致命**。
+
+**边界（不入本表）**：测试/脚本门控 env（`SERENA_TEST_DOWNLOAD`、`SERENA_CI_ONLY_INCL`、`SERENA_MOCK_NF_CHILD`、`SERENA_EXTRA_ENV`、`SERENA_FXDIR`）、示例二进制 env（`SERENA_DAEMON_LOCK` / `SERENA_DAEMON_PORT`，仅 `daemon/examples/`）、日志门控 `RUST_LOG`（§4.1）。新增生产 env = 改本表。
 
 ### 5.3 Secret 与凭据
 
 - **绝不**入库：用户 token、绝对路径（home/~/Project/）、SHA-256 期望值之外的网络资产 URL
 - 期望值入 `servers.toml` 是公开事实（脱敏后即失效）
-- 用户目录覆盖文件自动 gitignore（`servers.local.toml` / `external-servers.local.toml`）
+- 用户目录覆盖文件（`config.toml` / `external-servers.toml`，位于 `%APPDATA%\serena\` 或 `~/.config/serena/`，仓库外）天然不入库；仓库内本地运行形态 `.config/serena/` 由 `.gitignore` 覆盖。不存在 `.local.toml` 后缀文件。
 
 ## 6. 测试策略
 
@@ -191,7 +210,7 @@
 | 集成 | `cargo test --workspace` 同上 + `crates/*/tests/*.rs` | **CI 红线** |
 | 真 LS 冒烟 | `scripts/smoke_one.sh` + `scripts/smoke_langs.toml` | 本地（CI gate: `SERENA_SKIP_LS_E2E=1` 跳过） |
 | 真 LS 压测 | `scripts/stress_loop.sh` + `scripts/stress_churn.sh` | nightly + 本机 |
-| 端到端 | `scripts/accept_*.py`（PM 亲验） | 收口（每里程碑） |
+| 端到端 | `local/accept_*.py`（PM 亲验，gitignore PM 工作材料） | 收口（每里程碑） |
 
 ### 6.2 真 LS e2e 不进 CI 门禁
 
@@ -217,25 +236,85 @@ cargo tree -p lsp-core && cargo tree -p supervisor   # 分层铁律
 
 ## 7. 并发与内存管理
 
-**权威**：`ARCHITECTURE.md §3.4` 锁表（全项目唯一权威）· `rules/rust-concurrency` · `rules/rust-pitfalls`
+**权威**：本节 §7.1 全量登记表 · `ARCHITECTURE.md §3.4`（锁序与临界区约定权威）· `rules/rust-concurrency` · `rules/rust-pitfalls`
 
-### 7.1 锁与同步原语（10 项全项目唯一权威表）
+### 7.1 锁与同步原语（生产代码全量登记表）
 
-| 原语 | 位置 | 保护对象 | 临界区 |
+**权威**：本表（全项目生产代码全量登记）· `ARCHITECTURE.md §3.4`（语义性原语的临界区约定与锁序叙事；与本表重叠行内容一致）
+
+**登记范围与豁免判据**（机械可判，三条**全部满足**才豁免登记）：
+
+1. 不在测试范围：声明处非 `#[cfg(test)]`、不在 `tests/`、不在 `tests/bin/` 测试夹具；
+2. 非 static、非 struct 字段：函数体内 `let` 创建且函数返回前 drop；
+3. 叶锁：临界区内无 `.await` 且不获取第二把锁。
+
+任一条不满足 → **必须入本表**。补充口径：`LazyLock`/`OnceLock` 一次性初始化容器本身不算原语，其内层 `Mutex`/`Atomic` 单独登记；函数内 `static`（如 id 计数器）因第 2 条**入表**。
+
+**锁序总纲**：全局写门 `WRITE_GATE` = 全项目最外层，所有写类工具入口先取门再触其他锁（16 处 `write_gate::acquire` 调用点一致）；`load_gates` 外层 map 锁取 `Arc` 后立即释放，跨 await 等待只发生在内层 per-key tokio Mutex 上；其余 std `Mutex`/`Atomic` 一律叶锁（微秒临界区、无 await、锁内不获第二把锁）。
+
+| 原语 | 位置 | 保护对象 | 纪律 |
 |---|---|---|---|
-| `AtomicI64` | `lsp-core client.rs` | 请求 id 分配 | 无锁 |
-| `Mutex<HashMap<Id, oneshot::Sender>>` | `lsp-core client.rs` | pending 表 | 微秒，无 await |
-| `Mutex<HashMap<Uri, FileBuffer>>` | `lsp-core docsync.rs` | 打开文件表 | 微秒，无 await |
-| `IndexProgressTracker`（Mutex + watch） | `lsp-core session.rs` | `$/progress` token | 微秒，无 await |
-| `DiagCache` + `diag_generation: AtomicU64` | `supervisor lib.rs` | 诊断缓存 | 微秒；wait_gen 100ms 探询 |
-| `symbol_cache` | `supervisor lib.rs` | 文件指纹→符号 | 微秒 |
-| `tokio::sync::Mutex` ×N（per-key） | `supervisor lib.rs` | LS 冷启动去重 | 跨 await |
-| `tokio::sync::Mutex<()>` ×1（全局） | `supervisor write_gate.rs` | 写事务串行化 | 跨 await |
-| `Mutex<HashMap<Key, Entry>>` | `supervisor lib.rs` | 实例表 | 微秒，无 await |
-| `mpsc`（cap 64）×1/Session | `lsp-core transport` | client→LS 出站 | — |
+| `next_id: AtomicI64` | `lsp-core client.rs` | 请求 id 分配 | 叶·无锁 |
+| `pending: Mutex<HashMap<Id, oneshot::Sender>>` | `lsp-core client.rs` | pending 响应表 | 叶 |
+| `notification_handlers: Mutex<HashMap<String, NotificationHandler>>` | `lsp-core client.rs` | 通知 handler 表（未注册即丢弃） | 叶 |
+| `server_request_handlers: Mutex<HashMap<String, ServerRequestHandler>>` | `lsp-core client.rs` | server→client 请求 handler 表 | 叶 |
+| `content_modified_retry_methods: Mutex<HashSet<String>>` | `lsp-core client.rs` | `-32801` 重试白名单 | 叶 |
+| `TokenBucket.state: Mutex<TokenState>` | `lsp-core client.rs` | Background 帧令牌桶 | 叶 |
 | `oneshot` ×1/请求 | `lsp-core client.rs` | 响应完成 | — |
+| `state: Mutex<SessionState>` | `lsp-core session.rs` | 状态机 Uninitialized→Initializing→Ready/Failed | 叶 |
+| `pumps: Mutex<Option<Pumps>>` | `lsp-core session.rs` | 泵句柄集合（shutdown 终态 drop → Job 句柄回收） | 叶 |
+| `server_capabilities: Arc<Mutex<Option<Value>>>` | `lsp-core session.rs` | initialize 响应 capabilities 原值 | 叶 |
+| `progress: Mutex<ProgressRegistry>` | `lsp-core session.rs` | `$/progress` waiter + 早到通知合并登记（两步原子防通知丢失） | 叶 |
+| `language_id: Mutex<Box<str>>` | `lsp-core session.rs` | didOpen languageId | 叶 |
+| `language_by_ext: Mutex<HashMap<Box<str>, Box<str>>>` | `lsp-core session.rs` | per-file languageId 覆盖表（astro/vue 双服务器） | 叶 |
+| `buffers: Mutex<HashMap<Uri, FileBuffer>>` | `lsp-core session.rs`（docsync 语义归属） | 打开文件表；盘上 IO 全在锁外 | 叶 |
+| `IndexProgressTracker`（`active: Mutex<HashSet>` + `count_tx: watch` + `first_query_done: AtomicBool`） | `lsp-core session.rs` | 跨文件索引 `$/progress` 在飞 token | 叶 |
+| `mpsc` 出站 cap 64 + reply cap 8 ×1/Session | `lsp-core session.rs` | client→LS 出站三路路由 / server→client 请求回程 | — |
+| `Recorder.inner: Arc<Mutex<RecorderInner>>` | `lsp-core recording.rs` | 录制文件写者 / 回放队列 | 叶 |
+| `Queues: Arc<tokio::sync::Mutex<Queues>>` | `lsp-core transport/stdio.rs` | 出站优先级三队列 high/normal/bg | 跨 await（pump task） |
+| `instances: Mutex<HashMap<Key, Arc<Session>>>` | `supervisor lib.rs` | 实例表 | 叶 |
+| `load_gates: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>` | `supervisor lib.rs` | LS 冷启动去重（外层 map 锁即取即释；内层 per-key 跨 await） | 外层叶 / 内层跨 await |
+| `last_used: Mutex<HashMap<Key, Instant>>` | `supervisor lib.rs` | reaper LRU 时间戳 | 叶 |
+| `launch_exe: Mutex<HashMap<Key, PathBuf>>` | `supervisor lib.rs` | LS exe 登记（复用前复验在盘） | 叶 |
+| `diag_cache`（`Arc<Mutex<HashMap>>`） | `supervisor lib.rs` | publishDiagnostics 缓存 | 叶 |
+| `diag_generation: Arc<AtomicU64>` | `supervisor lib.rs` | 诊断代计数（wait_gen 探询） | 叶 |
+| `pull_diag_supported: Arc<Mutex<HashMap<Key, bool>>>` | `supervisor lib.rs` | per-key pull 诊断支持标记 | 叶 |
+| `version_seen: Arc<Mutex<HashMap<(PathBuf, String), bool>>>` | `supervisor lib.rs` | per-uri version 纪律标记 | 叶 |
+| `diag_pending_streak: Mutex<HashMap<…>>` | `supervisor lib.rs` | 连续空 pending 降级记账 | 叶 |
+| `recent_writes: Mutex<HashMap<(PathBuf, String), Instant>>` | `supervisor lib.rs` | 写后一致性窗口 | 叶 |
+| `workspace_errors: Arc<Mutex<HashMap<String, String>>>` | `supervisor lib.rs` | workspace 加载失败记录 | 叶 |
+| `symbol_cache`（`Arc<Mutex<HashMap>>`） | `supervisor lib.rs` | 文件指纹→符号缓存 | 叶 |
+| `delta_cache: Arc<Mutex<HashMap<String, Value>>>` | `supervisor lib.rs` | 文档符号缓存 | 叶 |
+| `idle_buffers_reclaim_counter: AtomicU64` | `supervisor lib.rs` | 缓冲回收节流计数 | 叶 |
+| `cache_hit_counter: AtomicU64` | `supervisor lib.rs` | 符号缓存命中计数（invocation 差分） | 叶 |
+| `ls_warmup: Mutex<HashMap<String, LsWarmup>>` | `supervisor lib.rs` | per-root 预热窗口 | 叶 |
+| `warmup_budget_ms: AtomicU64` | `supervisor lib.rs` | 预热预算（跨请求覆盖竞态无害） | 叶 |
+| `failure_memo: Mutex<HashMap<(PathBuf, String), FailureMemoEntry>>` | `supervisor lib.rs` | LS 失败 memo（TTL 短路） | 叶 |
+| `timeout_streak: Mutex<HashMap<Key, u32>>` | `supervisor lib.rs` | 连续 Timeout 计数（Q2 evict+respawn 自愈链） | 叶 |
+| `ROOT_SIGNAL_CACHE: LazyLock<Mutex<HashMap<PathBuf, RootSignalEntry>>>` | `supervisor lib.rs` | root 信号 TTL 缓存（static） | 叶 |
+| `WRITE_GATE: tokio::sync::Mutex<()>` | `supervisor write_gate.rs` | 写事务全局串行化 | 最外层·跨 await |
+| `WAITERS: AtomicUsize` | `supervisor write_gate.rs` | 排队取门请求数 | 叶 |
+| `HOLDER: StdMutex<Option<&'static str>>` | `supervisor write_gate.rs` | 当前持门者标签 | 叶 |
+| `OPEN_TXNS: StdMutex<Vec<(u64, PathBuf)>>` | `supervisor undo.rs` | 在飞 undo 事务登记（static） | 叶 |
+| `NEXT_UID: AtomicU64` | `supervisor undo.rs` | 事务 uid 分配（static） | 叶 |
+| `TOUCHED: StdMutex<Vec<(u64, TouchedFile)>>` | `supervisor undo.rs` | 恢复写文件登记（static，LS 态同步桥） | 叶 |
+| `WAL_INIT: tokio::sync::Mutex<()>` | `supervisor undo.rs` | WAL 初始化串行化（static） | 跨 await |
+| `TxnGuard.settled: AtomicBool` | `supervisor undo.rs` | 事务 settle 标记 | 叶 |
+| `GLOBAL_LAST_ACTIVITY: LazyLock<Mutex<Instant>>` | `daemon reaper.rs` | 全局活跃时钟（idle 自杀判据） | 叶 |
+| `COUNTER: AtomicU64`（fn-local static） | `daemon lockfile.rs gen_token` | lock token 计数 | 叶 |
+| `loaded_ls / draining / active_project / switch_reported / in_flight`（`Arc<Mutex/_Atomic>` 字段组） | `daemon http.rs AppState` | 观测与 drain 状态（`in_flight` 由 `InFlightGuard` drop 维护，同一 Arc） | 叶 |
+| `shutdown_notify: Arc<tokio::sync::Notify>` | `daemon http.rs AppState` | `/shutdown` 优雅停机门 | — |
+| `invocation_count / recent_errors / recent_agents / seen / log_lines`（`Arc<Mutex/_Atomic>` 字段组） | `daemon http.rs ObsState` | invocation 观测面 | 叶 |
+| `COUNTER: AtomicU64`（fn-local static） | `daemon http.rs new_invocation_id` | invocation id 计数 | 叶 |
+| `RecipeProgressRelay.stop: Arc<AtomicBool>` | `serena-cli main.rs` | recipe 进度中继停止旗 | 叶 |
+| `NG_COMPANION` / `HTML_COMPANION`（static `Mutex<Option<…>>`） | `ls-adapters angular.rs` | angular 伴生会话槽 | 叶 |
+| `COMPANION`（static `Mutex<Option<…>>`） | `ls-adapters astro.rs` / `svelte.rs` / `vue.rs` | 伴生会话槽（各文件一枚） | 叶 |
+| `PYTHON_PATH_CACHE: Mutex<Vec<(ProjectKey, String)>>` | `ls-adapters pyrefly_server.rs` | pythonPath 缓存（static） | 叶 |
+| `ProjectRootSlot.inner: Mutex<SlotInner>` | `ls-adapters project_root.rs` | 会话级项目 root 槽 | 叶 |
+| `SEQ: AtomicU64`（fn-local static） | `ls-adapters powershell.rs pses_session_files` | 会话文件序号 | 叶 |
+| `COUNTER: AtomicU64`（fn-local static） | `ls-runtime deps.rs sha256_hex` | 临时文件序号 | 叶 |
 
-**新增/修改锁 = 改 §3.4 表 + 加 ADR**。
+**新增/修改锁 = 改本表**（涉语义行同步 `ARCHITECTURE.md §3.4`）**+ 加 ADR**（§9.4）。
 
 ### 7.2 内存管理
 
@@ -314,7 +393,7 @@ cargo tree -p lsp-core && cargo tree -p supervisor   # 分层铁律
 | wire 错误码增/改 | `ARCHITECTURE.md §6.3` + 新增 ADR + CHANGELOG Unreleased |
 | 架构决策 | 新增 ADR + `ARCHITECTURE.md §9` 表追加指针 |
 | 依赖增/改 | `Cargo.toml` + `ARCHITECTURE.md §8` + CHANGELOG Unreleased |
-| 锁/原语增/改 | `ARCHITECTURE.md §3.4` + 新增 ADR |
+| 锁/原语增/改 | `constitution §7.1` 全量表 + `ARCHITECTURE.md §3.4`（涉语义行）+ 新增 ADR |
 
 ---
 
@@ -323,3 +402,4 @@ cargo tree -p lsp-core && cargo tree -p supervisor   # 分层铁律
 | 日期 | bead | 摘要 |
 |---|---|---|
 | 2026-10-12 | `serena-rust-j0hf` | 一次性补建：CLAUDE.md + 九件 + contract + 首批 7 条 ADR + plans/ 落地子计划 + CHANGELOG Unreleased 段 |
+| 2026-10-12 | `li4x`/`qt1u`/`o8ab`/`xvs7` | §5.1 配置分层收敛 3 层实况（ADR-0009）；§5.2 env 清单扩为生产全集（18 条 + 注册点列）；§7.1 锁表重写为生产代码全量登记（豁免判据 + 锁序总纲，计数矛盾归零）；§1.2/§3.1 crate 名对齐 Cargo.toml（`serena-cli`） |

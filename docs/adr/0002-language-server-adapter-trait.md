@@ -11,7 +11,7 @@ DESIGN §4 草稿的 trait 是同步签名 + 必实现全部方法。复刻时�
 
 ## 决策
 
-`LanguageServerAdapter` trait 修订为九方法签名级定义（非实现），关键改动：
+`LanguageServerAdapter` trait 修订为方法级签名定义（非实现；初始九方法，随 T2 适配器演进扩至十五方法，2026-10-12 更新计数），关键改动：
 
 1. `launch_info` 改 `async + anyhow::Result<LaunchInfo>`（下载慢 IO 不阻塞）
 2. `pre_request(&mut Session, &mut Request)` 拆为 `request_hooks() -> RequestHooks`（值对象、可组合、可测试）

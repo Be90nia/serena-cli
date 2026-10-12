@@ -227,7 +227,14 @@ pub async fn replace_text_in_symbol(
     let _guard = session.ensure_open(file).await?;
     let range = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
-    let (lo, hi) = locate_in_range(file, &content, range, symbol, old_text, OffsetEncoding::Utf16)?;
+    let (lo, hi) = locate_in_range(
+        file,
+        &content,
+        range,
+        symbol,
+        old_text,
+        session.offset_encoding(),
+    )?;
     let mut new_content = String::with_capacity(content.len() + new_text.len());
     new_content.push_str(&content[..lo]);
     new_content.push_str(new_text);
@@ -260,7 +267,7 @@ pub async fn insert_text_after_symbol(
         &content,
         range.end.line,
         range.end.character,
-        OffsetEncoding::Utf16,
+        session.offset_encoding(),
     )?;
     let new_content = format!("{}{}{}", &content[..end_byte], text, &content[end_byte..]);
     let (end_line, end_col) = end_line_col(&new_content, end_byte + text.len());
@@ -292,7 +299,7 @@ pub async fn insert_text_before_symbol(
         &content,
         range.start.line,
         range.start.character,
-        OffsetEncoding::Utf16,
+        session.offset_encoding(),
     )?;
     let new_content = format!(
         "{}{}{}",
@@ -386,13 +393,13 @@ pub async fn apply_format_edits(
             &new_content,
             e.range.start.line,
             e.range.start.character,
-            OffsetEncoding::Utf16,
+            session.offset_encoding(),
         )?;
         let hi = pos_to_byte(
             &new_content,
             e.range.end.line,
             e.range.end.character,
-            OffsetEncoding::Utf16,
+            session.offset_encoding(),
         )?;
         if lo > hi || hi > new_content.len() {
             return Err(EditError::BadArgs {

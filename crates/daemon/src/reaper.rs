@@ -24,6 +24,35 @@ use supervisor::Supervisor;
 use crate::http::AppState;
 use crate::lockfile;
 
+/// bd xvs7 B-P1-1：日志里的路径脱敏——user home 前缀折叠成 `~`，用户名等
+/// 凭据不进日志。home 之外（或 HOME/USERPROFILE 均未设）原样返回。
+pub(crate) fn redact_path(path: &std::path::Path) -> String {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    redact_path_with(path, home.as_deref())
+}
+
+fn redact_path_with(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    let Some(home) = home else {
+        return path.display().to_string();
+    };
+    if let Ok(rel) = path.strip_prefix(home) {
+        return format!("~{}{}", std::path::MAIN_SEPARATOR, rel.display());
+    }
+    // Windows 大小写漂移兜底：日志路径来源各异（客户端传参 vs env 值），
+    // strip_prefix 是精确匹配，前缀按大小写折叠比对后再剥一次（分隔符守卫
+    // 防 home `D:/pro` 误吃路径 `D:/proj`）。
+    let (p, h) = (path.to_string_lossy(), home.to_string_lossy());
+    if let (Some(prefix), Some(rest)) = (p.get(..h.len()), p.get(h.len()..))
+        && prefix.eq_ignore_ascii_case(&h)
+        && rest.starts_with(['/', '\\'])
+    {
+        return format!("~{rest}");
+    }
+    p.into_owned()
+}
+
 /// 巡检参数（生产值；测试调小到 100ms 级）。
 #[derive(Debug, Clone, Copy)]
 pub struct ReaperIntervals {
@@ -193,7 +222,7 @@ async fn reaper_loop(
         // 2) 单 LS 空闲卸载；0 = 永不驱逐（bd j8b）。
         for (key, last) in &entries {
             if !iv.ls_idle.is_zero() && now.duration_since(*last) >= iv.ls_idle {
-                tracing::info!(root = %key.root.display(), lang = %key.lang, "evict idle LS");
+                tracing::info!(root = %redact_path(&key.root), lang = %key.lang, "evict idle LS");
                 let _ = sup.evict(key).await;
             }
         }
@@ -205,7 +234,7 @@ async fn reaper_loop(
             by_age.sort_by_key(|(_, t)| *t);
             let excess = by_age.len() - iv.max_loaded_ls;
             for (key, _) in by_age.into_iter().take(excess) {
-                tracing::info!(root = %key.root.display(), lang = %key.lang, "LRU evict");
+                tracing::info!(root = %redact_path(&key.root), lang = %key.lang, "LRU evict");
                 let _ = sup.evict(&key).await;
             }
         }
@@ -256,6 +285,48 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use supervisor::SupervisorTrait;
+
+    /// bd xvs7 B-P1-1：脱敏 helper——home 前缀折叠、组件边界守卫、无 home 原样。
+    #[test]
+    fn redact_path_folds_home_prefix() {
+        let home = if cfg!(windows) {
+            std::path::Path::new("C:/Users/alice")
+        } else {
+            std::path::Path::new("/home/alice")
+        };
+        let p = home.join("proj/src");
+        let out = redact_path_with(&p, Some(home));
+        assert!(out.starts_with('~'), "{out}");
+        assert!(!out.contains("alice"), "{out}");
+        assert!(out.ends_with("proj/src") || out.ends_with("proj\\src"), "{out}");
+    }
+
+    #[test]
+    fn redact_path_without_home_returns_as_is() {
+        let out = redact_path_with(std::path::Path::new("D:/proj/src"), None);
+        assert_eq!(out, "D:/proj/src");
+    }
+
+    /// 前缀组件边界不齐（home `D:/pro` vs 路径 `D:/proj`）不得折叠。
+    #[test]
+    fn redact_path_rejects_partial_component_prefix() {
+        let out = redact_path_with(
+            std::path::Path::new("D:/proj/src"),
+            Some(std::path::Path::new("D:/pro")),
+        );
+        assert_eq!(out, "D:/proj/src");
+    }
+
+    /// Windows 路径来源大小写漂移（客户端传小写盘符/用户名）仍折叠。
+    #[test]
+    #[cfg(windows)]
+    fn redact_path_case_insensitive_prefix() {
+        let out = redact_path_with(
+            std::path::Path::new("c:/users/ALICE/proj"),
+            Some(std::path::Path::new("C:/Users/alice")),
+        );
+        assert_eq!(out, "~/proj");
+    }
 
     /// 空 supervisor mock（不做真 spawn）。
     struct NoopSup;

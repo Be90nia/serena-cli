@@ -799,3 +799,39 @@ async fn batch3_deep_six_fixture_e2e() {
         "caller 检索报告缺失: {exists}"
     );
 }
+
+// ============ TG-H5：first_lines 越界拒收（bd rewn 回归锁）============
+
+/// first_lines 传 root 外路径必须 BadArgs 拒收，不得泄文件内容（bd rewn：
+/// 裸 `root.join(file)` 让绝对路径整体替换基路径 → 任意文件首 10 行外泄）。
+#[tokio::test]
+async fn first_lines_rejects_paths_outside_root() {
+    let dir = tmpdir("path_guard");
+    let root = dir.join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    let secret = dir.join("secret.txt");
+    std::fs::write(&secret, "TOPSECRET-LINE-1\nTOPSECRET-LINE-2\n").unwrap();
+
+    // root 外绝对路径（补丁前会整体替换基路径直读盘面）。
+    let err = first_lines(&root, &secret.to_string_lossy(), 10)
+        .await
+        .unwrap_err();
+    match err {
+        crate::ToolError::BadArgs { detail } => {
+            assert!(detail.contains("escapes project root"), "{detail}");
+            assert!(!detail.contains("TOPSECRET"), "不得泄文件内容: {detail}");
+        }
+        other => panic!("expected BadArgs, got: {other:?}"),
+    }
+
+    // 相对路径 `..` 穿越（同一洞的第二形态）。
+    let err = first_lines(&root, "../secret.txt", 10).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ToolError::BadArgs { ref detail }
+                if detail.contains("escapes project root")
+        ),
+        "{err:?}"
+    );
+}

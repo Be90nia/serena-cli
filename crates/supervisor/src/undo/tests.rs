@@ -928,3 +928,28 @@ fn txn_guard_settled_drop_is_noop() {
     assert!(dir.exists(), "settled drop must not delete WAL dir");
     abort(u); // 清场，不给其他用例留垃圾
 }
+
+/// bd xvs7 B-P1-1：脱敏 helper——home 前缀折叠、组件边界守卫、无 home 原样。
+#[test]
+fn redact_path_folds_home_prefix() {
+    let home = if cfg!(windows) {
+        std::path::Path::new("C:/Users/alice")
+    } else {
+        std::path::Path::new("/home/alice")
+    };
+    let p = home.join("proj/src");
+    let out = redact_path_with(&p, Some(home));
+    assert!(out.starts_with('~'), "{out}");
+    assert!(!out.contains("alice"), "{out}");
+    assert!(out.ends_with("proj/src") || out.ends_with("proj\\src"), "{out}");
+}
+
+/// 前缀组件边界不齐（home `D:/pro` vs 路径 `D:/proj`）不得折叠。
+#[test]
+fn redact_path_rejects_partial_component_prefix() {
+    let out = redact_path_with(
+        std::path::Path::new("D:/proj/src"),
+        Some(std::path::Path::new("D:/pro")),
+    );
+    assert_eq!(out, "D:/proj/src");
+}

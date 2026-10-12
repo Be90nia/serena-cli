@@ -463,22 +463,34 @@ impl Client {
         }
 
         let msg = JsonRpc::request(id_num, method, params);
-        if let Err(e) = self
+        // 预算覆盖发送段（bd qq3a perf-P1-2）：LS writer 卡死时 outbound 积压会让
+        // send().await 无界阻塞——发送与响应等待共享同一预算，超时清 pending 表。
+        let secs = timeout.as_secs();
+        let send = self
             .inner
             .outbound
-            .send(OutboundItem { msg, priority })
-            .await
-        {
-            // outbound 关 → pending 也要清，否则 zombie oneshot
-            let mut pending = self.inner.pending.lock().unwrap();
-            pending.remove(&id);
-            return Err(CoreError::Terminated {
-                ls: self.inner.ls_name.clone(),
-                cause: format!("outbound send failed: {e}"),
-            });
+            .send(OutboundItem { msg, priority });
+        match tokio::time::timeout(timeout, send).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // outbound 关 → pending 也要清，否则 zombie oneshot
+                let mut pending = self.inner.pending.lock().unwrap();
+                pending.remove(&id);
+                return Err(CoreError::Terminated {
+                    ls: self.inner.ls_name.clone(),
+                    cause: format!("outbound send failed: {e}"),
+                });
+            }
+            Err(_elapsed) => {
+                let mut pending = self.inner.pending.lock().unwrap();
+                pending.remove(&id);
+                return Err(CoreError::Timeout {
+                    method: method.to_string(),
+                    secs,
+                });
+            }
         }
 
-        let secs = timeout.as_secs();
         match time::timeout(timeout, rx).await {
             Ok(Ok(Ok(reply))) => Ok(reply),
             Ok(Ok(Err(e))) => Err(e),

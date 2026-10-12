@@ -164,7 +164,11 @@ fn shrink_nested_hits(env: &mut Value, budget: usize) {
 
 /// 文件首 n 行（读失败 → BadArgs：tldr 目标必须存在）。
 async fn first_lines(root: &Path, file: &str, n: usize) -> Result<String, ToolError> {
-    let body = tokio::fs::read_to_string(root.join(file))
+    // bd rewn：裸 root.join(file) 会把绝对路径整体替换基路径 → 任意文件读。
+    let abs = crate::path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs {
+        detail,
+    })?;
+    let body = tokio::fs::read_to_string(&abs)
         .await
         .map_err(|e| ToolError::BadArgs {
             detail: format!("cannot read {file}: {e}"),

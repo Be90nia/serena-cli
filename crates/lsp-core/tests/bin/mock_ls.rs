@@ -13,6 +13,9 @@
 //! - `MOCK_LS_SEND_SERVER_REQUESTS=1` → 初始化后发 `client/registerCapability` 请求。
 //! - `MOCK_LS_CONTENTMODIFIED_METHODS=documentSymbol` → 这些方法头 N 次回 -32801。
 //! - `MOCK_LS_CONTENTMODIFIED_FAILS=2` → 配合上一项：前 N 次回 -32801，第 N+1 次成功。
+//! - `MOCK_LS_DIAGNOSTIC_UNSUPPORTED=1` → `textDocument/diagnostic` 回 -32601。
+//! - `MOCK_LS_POSITION_ENCODING=utf-8` → capabilities.positionEncoding 协商值
+//!   （缺省 utf-16；W1 bd 0pgr 位置编码测试钩子）。
 //! - `MOCK_LS_TRACK_FILE_EVENTS=/path/to/track.log` → 把收到的
 //!   `textDocument/didOpen` / `didChange` / `didClose` 通知按收到顺序追加写一行
 //!   JSON：`{"event":"didOpen|didChange|didClose","uri":"...","version":N}`（Task 7）。
@@ -52,6 +55,9 @@ struct Config {
     diagnostic_provider: bool,
     /// 开启后 `textDocument/diagnostic` 返 -32601 MethodNotFound（fallback 路径测试用）。
     diagnostic_unsupported: bool,
+    /// capabilities.positionEncoding 的协商值（bd 0pgr W1 测试钩子）。
+    /// 缺省 "utf-16"（既有行为）。设 "utf-8" 模拟 rust-analyzer 真机协商结果。
+    position_encoding: Option<String>,
     /// Phase 4 Task 22a：把收到的 `initialize` params 写到该路径（一行 JSON）。
     /// supervisor monorepo 接线测试断言 workspaceFolders 数组。
     log_initialize: Option<std::path::PathBuf>,
@@ -94,6 +100,7 @@ fn load_config() -> Config {
         diagnostic_unsupported: std::env::var("MOCK_LS_DIAGNOSTIC_UNSUPPORTED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
+        position_encoding: std::env::var("MOCK_LS_POSITION_ENCODING").ok(),
         log_initialize: std::env::var("MOCK_LS_LOG_INITIALIZE")
             .ok()
             .map(std::path::PathBuf::from),
@@ -349,7 +356,7 @@ async fn main() {
 
 fn capabilities(config: &Config) -> Value {
     let mut caps = json!({
-        "positionEncoding": "utf-16",
+        "positionEncoding": config.position_encoding.as_deref().unwrap_or("utf-16"),
         "textDocumentSync": 1,
         "documentSymbolProvider": true
     });

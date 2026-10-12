@@ -36,5 +36,5 @@ DESIGN §3.1 提出"互斥队列"语义：写类工具（rename / replace-body /
 
 ## 关联
 
-- 写事务中间态命名 `LocalDirty`（Δ 自 lsp-core docsync.rs），详见 §9.1
-- `WRITE_CONFLICT` 错误码（wire 错误码 9 个之一）依赖本决策的串行语义做判定
+- 写事务的「盘已写、didChange 未发」瞬时中间窗口由本决策的串行语义保证外部不可见（代码无独立状态符号；判据 = 写前 content-hash 对账 + docsync mtime/size 双因子记账），详见 ARCHITECTURE §5/§9.1
+- `WRITE_CONFLICT` 错误码（wire 错误码 10 个之一）依赖本决策的串行语义做判定
