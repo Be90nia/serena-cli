@@ -132,16 +132,7 @@ fn register_proc_exit(kq: i32, pid: u32) -> bool {
     }; 1];
     // SAFETY: kq 为调用方刚创建的有效 kqueue；changelist/eventlist 均为有效
     // 栈指针，数组长度与传入计数一致；kevent 仅读写这两个栈数组。
-    let n = unsafe {
-        libc::kevent(
-            kq,
-            &change,
-            1,
-            receipt.as_mut_ptr(),
-            1,
-            std::ptr::null(),
-        )
-    };
+    let n = unsafe { libc::kevent(kq, &change, 1, receipt.as_mut_ptr(), 1, std::ptr::null()) };
     n == 1 && receipt[0].flags & libc::EV_ERROR == 0
 }
 
