@@ -152,6 +152,12 @@ impl LanguageServerAdapter for TypescriptLanguageServerAdapter {
         true
     }
 
+    /// bd serena-rust-yxr：tsserver 闲置冷启动单文件 documentSymbol 秒级，给 15s
+    /// 与默认 30s 拉开档次、避免纯闲置小项目被 default budget 拖到 30s 才报错。
+    fn write_probe_budget(&self) -> Duration {
+        Duration::from_secs(15)
+    }
+
     /// 跨文件引用查询前的索引等待。
     ///
     /// ↖ mirror: typescript_language_server.py@43ae021

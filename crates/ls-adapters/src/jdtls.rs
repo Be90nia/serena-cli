@@ -453,6 +453,12 @@ impl LanguageServerAdapter for JdtlsAdapter {
         READY_PROBE_TIMEOUT
     }
 
+    // bd serena-rust-yxr：写门 documentSymbol 沿用 jdtls 90s 探针预算，避免
+    // 大 gradle/maven 项目闲置冷启动首写撞 30s 默认硬截断。
+    fn write_probe_budget(&self) -> Duration {
+        READY_PROBE_TIMEOUT
+    }
+
     fn languages(&self) -> &'static [LanguageId] {
         const LANGS: &[LanguageId] = &[LanguageId::Java];
         LANGS

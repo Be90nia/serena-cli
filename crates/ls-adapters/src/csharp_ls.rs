@@ -59,6 +59,12 @@ impl LanguageServerAdapter for CsharpLsAdapter {
         READY_PROBE_TIMEOUT
     }
 
+    // bd serena-rust-yxr：写门 documentSymbol 沿用 csharp_ls 60s 探针预算，避免
+    // 大 sln 闲置冷启动首写撞 30s 默认硬截断。
+    fn write_probe_budget(&self) -> Duration {
+        READY_PROBE_TIMEOUT
+    }
+
     fn languages(&self) -> &'static [LanguageId] {
         const LANGS: &[LanguageId] = &[LanguageId::CSharp];
         LANGS

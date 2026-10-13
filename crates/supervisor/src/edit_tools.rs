@@ -47,12 +47,14 @@ async fn locate_symbol(
 ) -> EditResult<lsp_types::Range> {
     let uri = path_to_uri_str(file);
     let params = json!({ "textDocument": { "uri": uri } });
+    // bd serena-rust-yxr：写门入口 timeout 改按 adapter 自定（默认 30s；RA 60s /
+    // jdtls 90s / csharp-ls 60s / TS/Go 15s），避免 RA 大仓首查 30-90s 撞 30s
+    // 硬截断。adapter 缺失回落默认 30s 与历史行为一致。
+    let timeout = ls_registry::adapter_for(&session.language_id())
+        .map(|a| a.write_probe_budget())
+        .unwrap_or(std::time::Duration::from_secs(30));
     let resp: Option<DocumentSymbolResponse> = session
-        .request(
-            "textDocument/documentSymbol",
-            params,
-            std::time::Duration::from_secs(30),
-        )
+        .request("textDocument/documentSymbol", params, timeout)
         .await?;
     let range = find_first(resp.as_ref(), symbol_name).ok_or_else(|| EditError::BadArgs {
         detail: format!("symbol `{symbol_name}` not found"),

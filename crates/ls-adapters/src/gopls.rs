@@ -116,6 +116,12 @@ impl LanguageServerAdapter for GoplsAdapter {
         // gopls 支持 `textDocument/implementation`（interface → struct 方法跳转）。
         true
     }
+
+    /// bd serena-rust-yxr：gopls 闲置冷启动单文件 documentSymbol 秒级，给 15s
+    /// 与默认 30s 拉开档次。gopls 模块解析比单文件慢一点但仍远小于 RA。
+    fn write_probe_budget(&self) -> Duration {
+        Duration::from_secs(15)
+    }
 }
 
 impl GoplsAdapter {

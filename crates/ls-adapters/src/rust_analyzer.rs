@@ -106,10 +106,18 @@ impl LanguageServerAdapter for RustAnalyzerAdapter {
         Ok(())
     }
 
-    /// bd serena-rust-62z：外层包裹预算必须 ≥ 内部最坏路径（Indexing 等待 T + 兜底
-    /// 探针 30s），5s 余量保证内部先超时 —— 否则长预算被外层默认 30s 截断（jdtls 同款）。
+    /// bd serena-rust-62z：外层包裹预算必须 ≥ 内部最坏路径（Indexing 等待 T +
+    /// 兜底探针 30s），5s 余量保证内部先超时 —— 否则长预算被外层默认 30s 截断（jdtls 同款）。
     fn ready_probe_budget(&self) -> Duration {
         Self::indexing_wait_for_root() + READY_PROBE_TIMEOUT + Duration::from_secs(5)
+    }
+
+    /// bd serena-rust-yxr：写门 `documentSymbol` 闲置冷启动 RA 大仓首查 30-90s
+    /// 撞默认 30s 硬截断 —— 给 60s 覆盖最坏档（<500 crates 60s indexing）与
+    /// 后续 documentSymbol 自身开销。>=2000 crates 走 on_server_ready 路径，
+    /// 写门不再二次等全量索引。
+    fn write_probe_budget(&self) -> Duration {
+        Duration::from_secs(60)
     }
 
     fn request_hooks(&self) -> RequestHooks {
@@ -380,5 +388,14 @@ mod tests {
             adapter.ready_probe_budget() > t + READY_PROBE_TIMEOUT,
             "外层预算必须严格大于内部最坏路径"
         );
+    }
+
+    /// yxr 契约：写门 documentSymbol 预算独立覆写 60s，给大仓首查 +30s 余量；与
+    /// ready_probe_budget 解耦（后者已涵盖 indexing wait，文档内"≥2000 crates 走
+    /// on_server_ready 路径"豁免写门再等全量索引）。
+    #[test]
+    fn write_probe_budget_is_60s_for_ra() {
+        let adapter = RustAnalyzerAdapter;
+        assert_eq!(adapter.write_probe_budget(), Duration::from_secs(60));
     }
 }

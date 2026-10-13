@@ -841,6 +841,16 @@ pub trait LanguageServerAdapter: Send + Sync {
         Duration::from_secs(30)
     }
 
+    /// 写门 `textDocument/documentSymbol` 的外层包裹预算（bd serena-rust-yxr
+    /// supervisor 侧）：supervisor 对写工具入口的 `documentSymbol` 请求 timeout
+    /// 取本值。闲置冷启动后 RA 大仓首查 30-90s 撞默认 30s 硬截断即此链路。
+    /// 默认 30s 与 [`Self::ready_probe_budget`] 相同语义——慢索引 / 短启动
+    /// 的 adapter 按需覆写。readonly 侧（tool_overview / tool_containing_symbol）
+    /// 仍走 `effective_tool_timeout` 不变。
+    fn write_probe_budget(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+
     /// hybrid 语言的语义会话：`.vue` 的 script 类型语义（hover/诊断等）由伴生
     /// TypeScript LS（tsserver + `@vue/typescript-plugin`）承载，主 Vue LS 只承载
     /// SFC 结构与模板语义（↖ mirror 上游双 server 分工：Vue LS 处理 .vue 结构、
