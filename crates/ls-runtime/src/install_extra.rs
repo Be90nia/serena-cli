@@ -526,13 +526,18 @@ mod tests {
     /// ——cargo test step 内 PATH/sandbox 差异，v0.3.0 gnu 剥出 0vj3）。
     #[test]
     fn source_installer_clones_local_repo_and_builds() {
-        // git 可执行性守卫：spawn 失败（ENOENT）→ 跳过本测试
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("SKIP: git not available on this machine");
+        // git 可执行性守卫：用真实 `git init` 试水（不用 --version——ubuntu CI
+        // 表现为同进程内 --version 成功 init ENOENT，单纯 --version 探不出一致性）。
+        let probe_dir = tempfile::tempdir().unwrap();
+        let probe = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(probe_dir.path())
+            .output();
+        if probe.is_err() || !probe.as_ref().is_ok_and(|o| o.status.success()) {
+            eprintln!(
+                "SKIP: git init probe failed ({:?})",
+                probe.as_ref().err().map(|e| e.kind())
+            );
             return;
         }
         let src_repo = tempfile::tempdir().unwrap();
