@@ -114,7 +114,7 @@ impl Drop for ProcessTreeGuard {
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
 fn register_proc_exit(kq: i32, pid: u32) -> bool {
-    let mut change = libc::kevent {
+    let change = libc::kevent {
         ident: pid as usize,
         filter: libc::EVFILT_PROC,
         flags: libc::EV_ADD | libc::EV_RECEIPT,
@@ -135,7 +135,7 @@ fn register_proc_exit(kq: i32, pid: u32) -> bool {
     let n = unsafe {
         libc::kevent(
             kq,
-            &mut change,
+            &change,
             1,
             receipt.as_mut_ptr(),
             1,
