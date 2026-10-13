@@ -4385,6 +4385,9 @@ fn listener_pid_on_port(port: u16) -> Option<u32> {
 
 /// `netstat -ano -p TCP` 输出按端口反查 LISTENING PID（纯函数，跨平台单测锚）。
 /// 行形态：`  TCP    127.0.0.1:7860    0.0.0.0:0    LISTENING    4092`。
+/// 仅 Windows 分支调用（Unix 走 lsof 分支）；无门控时 Linux bin target 报 dead_code
+/// （v0.3.0 M0 ubuntu clippy 首跑剥出）。
+#[cfg(windows)]
 fn parse_netstat_listeners(output: &str, port: u16) -> Option<u32> {
     let suffix = format!(":{port}");
     output.lines().find_map(|line| {
@@ -6654,12 +6657,14 @@ mod residual_reap_tests {
 
     /// 中文 Windows netstat 表头 + 同端口非 LISTENING 行必须跳过。
     #[test]
+    #[cfg(windows)]
     fn netstat_parse_hits_listen_row_skips_established_and_headers() {
         let out = "\r\n 活动连接\r\n\r\n  Proto  本地地址          远程地址        状态           PID\r\n  TCP    127.0.0.1:7860    5.6.7.8:443           ESTABLISHED     999\r\n  TCP    127.0.0.1:7860    0.0.0.0:0              LISTENING       4092\r\n  TCP    [::]:7860         [::]:0                 LISTENING       111\r\n  UDP    127.0.0.1:7860    *:*                                    333\r\n";
         assert_eq!(parse_netstat_listeners(out, 7860), Some(4092));
     }
 
     #[test]
+    #[cfg(windows)]
     fn netstat_parse_ignores_other_ports_and_port_number_suffixes() {
         // :17860 不得因 ends_with 误命中 :7860
         let out = "  TCP    0.0.0.0:17860     0.0.0.0:0              LISTENING       111\r\n  TCP    0.0.0.0:7861      0.0.0.0:0              LISTENING       222\r\n";

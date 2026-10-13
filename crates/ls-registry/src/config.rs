@@ -2008,6 +2008,12 @@ install_hint = \"y\"
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = dir.path().join("fake_ls.exe");
         std::fs::write(&fake, b"not really an exe").unwrap();
+        #[cfg(unix)]
+        {
+            // unix 上 which() 走 X_OK，0644 会被判不可执行（v0.3.0 arm runner 剥出）。
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let got = validate_user_binary(&fake).expect("fake exe 应通过校验");
         let got = got.display().to_string();
         assert!(!got.contains(r"\\?\"), "UNC 前缀必须剥离: {got}");
