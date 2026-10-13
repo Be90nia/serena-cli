@@ -136,6 +136,7 @@ pub(crate) fn root_uri_to_path(uri: Option<&lsp_types::Uri>) -> Option<PathBuf> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::collections::HashSet;
 
     #[test]
