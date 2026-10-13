@@ -155,8 +155,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn key_identity_is_case_and_separator_insensitive() {
         // 大小写/分隔符差异命中同键（canonical 失败的 raw 路径走归一层）。
+        // Windows 专有语义：盘符小写归一 + \ / 等价（v0.3.0 ubuntu-24.04-arm 首跑剥出缺门控）。
         let k1 = ProjectKey::new(Path::new("D:/Proj/X"));
         let k2 = ProjectKey::new(Path::new("d:\\proj\\x"));
         assert_eq!(k1, k2);
@@ -165,6 +167,20 @@ mod tests {
         assert!(set.contains(&k1));
         // 真实大小写保留：as_path 不做小写化（磁盘/显示语义不变）。
         assert_eq!(k1.as_path(), Path::new("D:/Proj/X"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn key_identity_is_literal_on_unix() {
+        // Unix 无盘符概念：大小写与反斜杠都是字面差异，必须不同键（防误归一回归）。
+        let k1 = ProjectKey::new(Path::new("D:/Proj/X"));
+        let k2 = ProjectKey::new(Path::new("d:\\proj\\x"));
+        assert_ne!(k1, k2);
+        // 同字面路径恒同键。
+        assert_eq!(
+            ProjectKey::new(Path::new("D:/Proj/X")),
+            ProjectKey::new(Path::new("D:/Proj/X"))
+        );
     }
 
     #[test]
