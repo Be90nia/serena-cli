@@ -212,14 +212,14 @@ mod tests {
 
         let (entry, skipped) = find_entry_file(&dir, "python");
         let entry = entry.expect("good.py must be picked");
+        // 核心契约：entry 必是 good.py（证明二进制未被错选作 entry）。
+        // 注：skipped 集合的"必须包含 bin.py"不可强求——find_entry_file 采用
+        // "命中即返"语义（性能 vs 全扫），walker 顺序跨平台差异（ignore crate
+        // inode/dirent 序）让 arm 上可能 good.py 在前直接命中、bin.py 未遍历即
+        // skipped=[]（v0.3.0 arm-gnu 两轮剥出 0vj1+0vj2 形态）。`all_binary`
+        // 测试覆盖 skipped 非空分支（无命中即返场景）。此测试只验 entry 正确。
         assert_eq!(entry.file_name().unwrap(), "good.py");
-        // walker 顺序跨平台差异（ignore crate inode/dirent 序）：x86_64 先 bin 后 good、
-        // aarch64 可能反过来。entry 命中即返早，未遍历到的文件不进 skipped——断言改
-        // contains（v0.3.0 arm-gnu 剥出）。
-        assert!(
-            skipped.iter().any(|s| s == "bin.py"),
-            "bin.py 必须被跳过报告: {skipped:?}"
-        );
+        let _ = skipped; // 占位：未来若 find_entry_file 改为全扫再恢复断言
         let _ = std::fs::remove_dir_all(&dir);
     }
 
