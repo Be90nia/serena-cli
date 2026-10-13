@@ -59,7 +59,7 @@ const BEFORE_HELP_GUIDE: &str = "\
   warm <LANG>                                 预热 LS+索引，开工先发（或 --lang <LANG>）
   find-symbol <QUERY>                         按名找符号（精确名；宽查询加 --lang/--limit）
   symbol-body <FILE> <SYMBOL>                 按名取符号体（读类最省）
-  replace-body <FILE> <SYMBOL> --with <NEW>   换符号体（先 --dry-run 看 patch 预览）
+  replace-body <FILE> <SYMBOL> --with <NEW>   替换符号整个定义块（含签名；先 --dry-run 预览）
   undo                                        回滚上一步写操作（事务级，一次全回）
 ";
 
@@ -385,11 +385,12 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = WaitStage::Semantic)]
         stage: WaitStage,
     },
-    /// 替换符号体（写门 + hash 对账 + 原子写）。
+    /// 替换符号整个定义块（含 doc/属性/签名行，非仅函数体；写门 + hash 对账 + 原子写）。
     ReplaceBody {
         file: String,
         symbol: String,
-        /// 新符号体完整文本（`--new-body` 同义别名，与 recipe fix-bug 互通）。
+        /// 新定义块完整文本（起点=符号定义行，old 全文可先 `symbol-body` 取回改完传回；
+        /// `--new-body` 同义别名，与 recipe fix-bug 互通）。
         #[arg(long = "with", visible_alias = "new-body")]
         new_body: String,
     },
