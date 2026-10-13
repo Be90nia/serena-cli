@@ -117,7 +117,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         loaded_ls: Arc::new(Mutex::new(vec![])),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         active_project: Arc::new(std::sync::Mutex::new(None)),
-        switch_reported: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        switch_reported: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         // envelope 日志（d3a）：生产路径写 daemon.lock 同目录 invocations.jsonl。

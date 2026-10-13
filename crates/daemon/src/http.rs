@@ -8,7 +8,7 @@
 //! 工具级失败走 200 + `{ok:false}`（A5），transport 错误才用 4xx/5xx。
 //! 503 用于 ShutdownDraining 拒绝新请求（I8）。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use axum::{
@@ -38,9 +38,13 @@ pub struct AppState {
     pub draining: Arc<std::sync::atomic::AtomicBool>,
     /// 最近一次工具请求的 project_root（status 观察 + 重启定位用）。
     pub active_project: Arc<std::sync::Mutex<Option<String>>>,
-    /// bd ts9d：已报过 switched warning 的 (from, to) 对。daemon 生命周期内
-    /// 同对只报一次，多 fixture 轮换不逐响应刷 warning；重启后自然重报。
-    pub switch_reported: Arc<std::sync::Mutex<HashSet<(String, String)>>>,
+    /// bd vzrx.5（fdmj-F8 真修）：project 切次数计数（transition-id 模式）。
+    /// daemon 生命周期内**整个会话只报一次** switch warning——pair-based
+    /// (ts9d) 漏掉 prev/req 不同路径写法（D715d15 教训：Windows 大小写/正反
+    /// 斜杠双重身份 = 同 project 也当新对 -> 反复刷 warning）和轮换交替
+    /// (A→B→A→B 仍会触发首报以外的回环)。改 fetch_add 计数器：0→1 首报，
+    /// 1→N 全静默；重启/stop-all 计数器归零重新首报。
+    pub switch_reported: Arc<std::sync::atomic::AtomicU64>,
     /// /shutdown 触发：axum::serve.with_graceful_shutdown 等此 Notify。
     /// 一拍即过（notify_waiters 一次性广播）。
     pub shutdown_notify: Arc<tokio::sync::Notify>,
@@ -325,12 +329,15 @@ async fn tools_post(
     match result {
         Ok(mut data) => {
             if let Some(prev) = prev_project.filter(|p| *p != req.project_root) {
-                // bd ts9d：insert 返回 false = 该 (from,to) 对已报过 → 静默跳过。
-                let first_report = state
+                // bd vzrx.5（fdmj-F8 真修）：fetch_add 返回 = 切之前的次数。
+                // 0 → 1 是首报（first_report=true），1→N 全静默。pair-based
+                // (ts9d) 因 prev/req 路径归一化未做被 Windows 大小写双重身份
+                // 和反向斜杠绕过，counts 免疫此层（即使同一项目写两次法，
+                // 计数器只关心频率，路径格式不参与去重）。
+                let prev_count = state
                     .switch_reported
-                    .lock()
-                    .unwrap()
-                    .insert((prev.clone(), req.project_root.clone()));
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let first_report = prev_count == 0;
                 if first_report {
                     let switch = format!("project switched: {prev} -> {}", req.project_root);
                     // 工具自身的 warning（如 we0/xzb 就绪标记）不覆盖，拼接保序。
@@ -879,7 +886,7 @@ mod tests {
         /// `bad_*` → Err(BadArgs)，其余 Ok(tool)。并发下完成序 ≠ 请求序。
         echo: bool,
         /// v5 P2-E：可重复 Ok(value)——switch 场景断言需同一 AppState 内多调
-        /// （active_project/switch_reported 在 state 里，换 state 即丢记忆）。
+        /// （active_project/switch_reported 计数器在 state 里，换 state 即丢记忆）。
         always: Option<serde_json::Value>,
         result: tokio::sync::Mutex<
             Option<Box<dyn FnOnce() -> Result<serde_json::Value, supervisor::ToolError> + Send>>,
@@ -997,7 +1004,7 @@ mod tests {
             loaded_ls: Arc::new(std::sync::Mutex::new(vec!["clangd".into()])),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_project: Arc::new(std::sync::Mutex::new(None)),
-            switch_reported: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            switch_reported: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drain_window: std::time::Duration::from_millis(100),
@@ -1223,8 +1230,11 @@ mod tests {
         );
     }
 
-    /// bd ts9d：同 (from,to) 对 daemon 生命周期内只报一次——A→B 二次调用
-    /// 不再附 warning；反向 (B,A) 是新对，首次仍报。
+    /// bd vzrx.5（fdmj-F8 真修）：transition-id 模式——daemon 生命周期内
+    /// 整个会话**只首报一次** switch warning（A→B 首次报；B→A 反向 / 同
+    /// project 重复 / A→B 折返 = 全静默）。比 ts9d pair-based 更彻底：
+    /// 路径归一化未做也无所谓（Windows 大小写双重身份 D715d15 变体 + 反
+    /// 向斜杠变体都是同一对 path 字符串，counts 免疫）。
     #[tokio::test]
     async fn switch_warning_deduped_per_direction_pair() {
         let st = state("secret", MockSupervisor::echo_by_tool());
@@ -1239,9 +1249,10 @@ mod tests {
         let warning_of =
             |body: serde_json::Value| body["data"]["warning"].as_str().map(str::to_owned);
 
-        // 首调：零噪音。A→B：首次报。
+        // 首调：零噪音（active_project 尚为 None，无 prev 比较）。
         let (_, body) = oneshot_json(router.clone(), call("D:/proj-a")).await;
         assert_eq!(warning_of(body.expect("json body")), None, "首调零噪音");
+        // A→B：transition-id 计数 0→1，首报。
         let (_, body) = oneshot_json(router.clone(), call("D:/proj-b")).await;
         assert!(
             warning_of(body.expect("json body")).is_some(),
@@ -1256,24 +1267,27 @@ mod tests {
             "同 project 不报"
         );
 
-        // 反向 B→A：新对，首次报；B→A 二次：同对去重不报。
+        // 反向 B→A：transition-id 已首报过（计数 1→2），静默。
         let (_, body) = oneshot_json(router.clone(), call("D:/proj-a")).await;
-        assert!(
-            warning_of(body.expect("json body")).is_some(),
-            "反向 B→A 是新对，首次报"
+        assert_eq!(
+            warning_of(body.expect("json body")),
+            None,
+            "反向 B→A：transition-id 已首报过，静默"
         );
+        // A→A：同 project，不报；wire 零变化。
         let (_, body) = oneshot_json(router, call("D:/proj-a")).await;
         let body = body.expect("json body");
         assert_eq!(
             warning_of(body.clone()),
             None,
-            "(B,A) 同对第二次不报（会话级去重）"
+            "同 project 紧接不报"
         );
         assert_eq!(body["data"], json!("overview"), "去重路径 wire 零变化");
     }
 
-    /// bd ts9d：去重按 (from,to) 对记账且跨切换持续——A→B 报过一次后，经
-    /// B→A→B→A 折返，两个方向各至多一条，折返不再重报。
+    /// bd vzrx.5（fdmj-F8 真修）：transition-id 模式，会话单例——A→B 首
+    /// 报一次后，B→A→B→A 折返**全部静默**（不限次数、不限方向、不限
+    /// 项目数）。daemon 重启/stop-all 计数归零，重新首报。
     #[tokio::test]
     async fn switch_warning_dedup_persists_across_alternating_switches() {
         let st = state("secret", MockSupervisor::echo_by_tool());
@@ -1287,14 +1301,19 @@ mod tests {
         };
         let has_warning = |body: serde_json::Value| body["data"].get("warning").is_some();
 
-        // 首调 + A→B 首报 + B→A 首报。
+        // 首调（零噪音）+ A→B 首报（计数 0→1）。
         let _ = oneshot_json(router.clone(), call("D:/proj-a")).await;
         let (_, body) = oneshot_json(router.clone(), call("D:/proj-b")).await;
         assert!(has_warning(body.expect("json body")), "A→B 首报");
-        let (_, body) = oneshot_json(router.clone(), call("D:/proj-a")).await;
-        assert!(has_warning(body.expect("json body")), "B→A 首报");
 
-        // 折返 A→B / B→A：两对均已记账，全部静默。
+        // B→A 折返：transition-id 已报过，静默（计数 1→2）。
+        let (_, body) = oneshot_json(router.clone(), call("D:/proj-a")).await;
+        assert!(
+            !has_warning(body.expect("json body")),
+            "B→A：transition-id 已首报过，静默"
+        );
+
+        // 折返 A→B / A→A：均静默。
         let (_, body) = oneshot_json(router.clone(), call("D:/proj-b")).await;
         assert!(
             !has_warning(body.expect("json body")),
@@ -1303,7 +1322,7 @@ mod tests {
         let (_, body) = oneshot_json(router, call("D:/proj-a")).await;
         assert!(
             !has_warning(body.expect("json body")),
-            "(B,A) 已报过，折返不重报"
+            "后续任意切/同 project 都不重报"
         );
     }
 
