@@ -294,6 +294,13 @@ mod tests {
     #[test]
     fn current_platform_has_release() {
         let release = clangd_release_for(Os::current(), Arch::current());
+        // Linux-Aarch64 等上游无官方资产的平台矩阵显式 None（本文件头设计）——
+        // 原生 arm runner 跑到这里必须跳过而非失败（v0.3.0 CI arm-gnu 剥出）。
+        if release.is_none() {
+            assert_eq!(Os::current(), Os::Linux, "仅 Linux-Aarch64 允许无资产");
+            assert_eq!(Arch::current(), Arch::Aarch64);
+            return;
+        }
         assert!(release.is_some(), "current platform must have release");
         if let Some(r) = release {
             assert!(r.url.starts_with("https://"));

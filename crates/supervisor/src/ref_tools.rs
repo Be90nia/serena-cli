@@ -638,7 +638,15 @@ mod tests {
             loc("file:///D:/proj/a.rs", 7, 0), // 同文件别处 → 留
             loc("file:///D:/proj/b.rs", 3, 4), // 异文件同行 → 留
         ];
-        let out = drop_self_reference(refs, Path::new("D:/proj/a.rs"), 3);
+        // query 须与 uri_to_path 派生结果一致：Windows file:///D:/x → D:/x；
+        // Unix → /D:/x。裸 "D:/proj/a.rs" 在 Unix 是相对路径恒失配 → 过滤器
+        // 静默 no-op（v0.3.0 CI gnu 剥出）。
+        let query = if cfg!(windows) {
+            "D:/proj/a.rs"
+        } else {
+            "/D:/proj/a.rs"
+        };
+        let out = drop_self_reference(refs, Path::new(query), 3);
         let keys: Vec<(String, u32)> = out
             .iter()
             .map(|l| (l.uri.as_str().to_string(), l.range.start.line))

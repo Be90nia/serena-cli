@@ -10659,14 +10659,15 @@ mod symbol_cache_tests {
         );
         // 无过滤时直查扫描会把 "ws?divide" 当文件候选，且按文件名序 "ws?divide" <
         // "x/a.py" 排前当选 → Ok("ws?divide")；过滤后只能经 fallback 从 URI 派生
-        // 真相对路径 → Ok("x/a.py")。
+        // 真路径 → Windows（无盘符）相对 x/a.py、Unix 绝对 /x/a.py。
+        let expected = if cfg!(windows) { "x/a.py" } else { "/x/a.py" };
         let (file, line, col, _note) = sup
             .resolve_symbol_position(root, "divide", None)
             .await
             .unwrap();
         assert_eq!(
             (file.as_str(), line, col),
-            ("x/a.py", 3, 0),
+            (expected, 3, 0),
             "ws? 伪文件名不得当选，必须用 URI 派生路径"
         );
     }
@@ -14274,8 +14275,9 @@ mod blindv4_unit_tests {
 
     #[test]
     fn atomic_write_not_found_maps_to_bad_args_with_parent_hint() {
-        // os error 3（Windows ERROR_PATH_NOT_FOUND）→ io::ErrorKind::NotFound。
-        let e = std::io::Error::from_raw_os_error(3);
+        // 直接按 kind 构造：raw errno 3 跨平台语义不同（Windows=PATH_NOT_FOUND，
+        // Linux=ESRCH），kind 才是 atomic_write_err 的映射判据（v0.3.0 CI gnu 剥出）。
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
         let err = atomic_write_err("D:/tmp/proj/no_dir/sub/f.txt", e);
         match err {
             ToolError::BadArgs { detail } => {
@@ -14410,6 +14412,15 @@ mod self_heal_timeout_tests {
 
     #[tokio::test]
     async fn consecutive_timeouts_evict_dead_session_and_recover() {
+        // respawn 恢复腿拉真 rust-analyzer 做恢复验证——属真 LS e2e（CI 上 RA
+        // stdout pump EOF 不稳，v0.3.0 gnu 剥出），同全局 SKIP_LS_E2E 门禁。
+        if std::env::var_os("SERENA_SKIP_LS_E2E")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            println!("skipped: SERENA_SKIP_LS_E2E=1");
+            return;
+        }
         if !rust_adapter_ready().await {
             println!("skipped: rust-analyzer adapter launch info unavailable");
             return;

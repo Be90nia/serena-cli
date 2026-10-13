@@ -390,6 +390,13 @@ mod tests {
     /// rc=0 静默失败）；嵌套名（含 `.`/`::`）额外带短名提示，短名查询不带。
     #[tokio::test]
     async fn edit_context_unknown_symbol_errors_like_symbol_body() {
+        if std::env::var_os("SERENA_SKIP_LS_E2E")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            eprintln!("skipped: SERENA_SKIP_LS_E2E=1");
+            return;
+        }
         if !rust_analyzer_available() {
             eprintln!("skipped: rust-analyzer not on PATH");
             return;
