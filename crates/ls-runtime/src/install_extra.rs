@@ -521,9 +521,20 @@ mod tests {
     }
 
     /// SourceInstaller 全链路（无网络）：本地 git 仓库作 clone 源 + 幂等"build"
-    /// 命令落 bin_rel 产物。git 不在场 → MissingRuntime（不算失败）。
+    /// 命令落 bin_rel 产物。git 不在场 → skip（不算失败；CI runner 偶发
+    /// Command::new("git") ENOENT 虽 actions/checkout 步骤 /usr/bin/git 在场
+    /// ——cargo test step 内 PATH/sandbox 差异，v0.3.0 gnu 剥出 0vj3）。
     #[test]
     fn source_installer_clones_local_repo_and_builds() {
+        // git 可执行性守卫：spawn 失败（ENOENT）→ 跳过本测试
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: git not available on this machine");
+            return;
+        }
         let src_repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             let status = std::process::Command::new("git")
