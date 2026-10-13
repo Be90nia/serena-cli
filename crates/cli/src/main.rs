@@ -877,7 +877,9 @@ async fn cli_main() -> ExitCode {
         let root = resolve_project_root(cli.project.clone());
         match detect_project_lang(&root) {
             Some(detected) => {
-                eprintln!("[hint] warm: no --lang given; detected `{detected}` from project manifests");
+                eprintln!(
+                    "[hint] warm: no --lang given; detected `{detected}` from project manifests"
+                );
                 *lang = Some(detected.to_string());
             }
             None => {
@@ -935,11 +937,7 @@ async fn cli_main() -> ExitCode {
         // 对齐；项目根不参与 daemon 报告内容（cmd_status 忽略 _project）。
         Some(Cmd::Status { project: _ }) => return cmd_status(&lock_path).await,
         // change-history：纯本地 git log 包装（不碰 daemon/LS）。
-        Some(Cmd::ChangeHistory {
-            file,
-            symbol,
-            max,
-        }) => {
+        Some(Cmd::ChangeHistory { file, symbol, max }) => {
             let project_root = resolve_project_root(cli.project.clone());
             return cmd_change_history(&project_root, file, symbol.as_deref(), *max);
         }
@@ -1190,7 +1188,10 @@ where
                 if Instant::now() >= deadline {
                     return Err(format!("daemon transport error {status}: {payload}"));
                 }
-                tracing::warn!(status = status.as_u16(), "daemon draining; retrying within window");
+                tracing::warn!(
+                    status = status.as_u16(),
+                    "daemon draining; retrying within window"
+                );
                 tokio::time::sleep(backoff).await;
             }
         }
@@ -1309,7 +1310,10 @@ fn name_column_in_line(line_text: &str, name: &str) -> Option<u32> {
         let before = line_text[..start].chars().next_back().is_some_and(is_ident);
         let after = line_text[end..].chars().next().is_some_and(is_ident);
         if !before && !after {
-            let col = line_text[..start].chars().map(char::len_utf16).sum::<usize>();
+            let col = line_text[..start]
+                .chars()
+                .map(char::len_utf16)
+                .sum::<usize>();
             return Some(col as u32);
         }
         from = end;
@@ -1753,13 +1757,7 @@ async fn cmd_wait_ready(
                 )
                 .await
                 {
-                    Ok(data)
-                        if data
-                            .get("raw_count")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0)
-                            > 0 =>
-                    {
+                    Ok(data) if data.get("raw_count").and_then(|v| v.as_u64()).unwrap_or(0) > 0 => {
                         eprintln!(
                             "ready (symbol, find-symbol `{stem}`) in {}s",
                             started.elapsed().as_secs()
@@ -1785,7 +1783,9 @@ async fn cmd_wait_ready(
             eprintln!("wait-ready: not ready within {timeout_secs}s; last probe: {progress}");
             // bd serena-rust-y3c1：探针可能比实际工作负载更严（documentSymbol 层
             // 与语义解析层就绪节奏因 LS 而异）——超时不封死开工路，给降级指引。
-            eprintln!("hint: documentSymbol-layer tools (overview / find-referencing-code-snippets / symbol-body) may already work; if a semantic tool returns empty, its warning field carries degraded-mode guidance");
+            eprintln!(
+                "hint: documentSymbol-layer tools (overview / find-referencing-code-snippets / symbol-body) may already work; if a semantic tool returns empty, its warning field carries degraded-mode guidance"
+            );
             return ExitCode::from(4);
         }
         // bd fdmj-F5：进度行带累计等待秒数，与超时预算对照可见，盲等变可估。
@@ -1821,7 +1821,8 @@ fn wait_ready_progress(stage: WaitStage, symbol_up: bool, probe_count: usize, re
 
 /// 转发模式：探活 → 转发；死 lock → lazy-spawn --daemon → 轮询就绪 → 转发。
 async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<u8, ForwardFailure> {
-    let entry = daemon::lockfile::read_stale_tolerant(lock_path).map_err(|e| format!("read lock: {e}"))?;
+    let entry =
+        daemon::lockfile::read_stale_tolerant(lock_path).map_err(|e| format!("read lock: {e}"))?;
     let base = match entry {
         Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
             // bd fakewait：与 ensure_daemon 同一判定——drain 窗口内老 daemon
@@ -1833,11 +1834,9 @@ async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<u8, ForwardFail
                     .map_err(ForwardFailure::from)?
                 {
                     DrainOutcome::Attach(e2) => format!("http://127.0.0.1:{}", e2.port),
-                    DrainOutcome::ReadyToSpawn => {
-                        spawn_and_adopt(lock_path)
-                            .await
-                            .map_err(ForwardFailure::from)?
-                    }
+                    DrainOutcome::ReadyToSpawn => spawn_and_adopt(lock_path)
+                        .await
+                        .map_err(ForwardFailure::from)?,
                 }
             } else {
                 format!("http://127.0.0.1:{}", e.port)
@@ -2286,9 +2285,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
         ),
         Some(Cmd::RepoMap { top_n }) => ("repo-map", json!({"top_n": top_n})),
         Some(Cmd::Warm {
-            lang,
-            timeout_secs,
-            ..
+            lang, timeout_secs, ..
         }) => ("warm", json!({"lang": lang, "timeout_secs": timeout_secs})),
         Some(Cmd::ReplaceBody {
             file,
@@ -2307,12 +2304,16 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             "replace-text-in-symbol",
             json!({"file": file, "symbol": symbol, "old_text": old_text, "new_text": new_text}),
         ),
-        Some(Cmd::InsertTextBeforeSymbol { file, symbol, text, .. }) => (
+        Some(Cmd::InsertTextBeforeSymbol {
+            file, symbol, text, ..
+        }) => (
             "insert-text-before-symbol",
             // --with 别名已由 resolve_with_alias 落回 text（cli_main 必经）。
             json!({"file": file, "symbol": symbol, "text": text.as_deref().expect("resolved by resolve_with_alias")}),
         ),
-        Some(Cmd::InsertTextAfterSymbol { file, symbol, text, .. }) => (
+        Some(Cmd::InsertTextAfterSymbol {
+            file, symbol, text, ..
+        }) => (
             "insert-text-after-symbol",
             json!({"file": file, "symbol": symbol, "text": text.as_deref().expect("resolved by resolve_with_alias")}),
         ),
@@ -2559,15 +2560,39 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             "find-test",
             json!({"symbol": symbol.as_deref().expect("resolved by resolve_with_alias")}),
         ),
-        Some(Cmd::Recipe { name, args, new_body, to, as_name, target, tests_file, tests, run }) => {
+        Some(Cmd::Recipe {
+            name,
+            args,
+            new_body,
+            to,
+            as_name,
+            target,
+            tests_file,
+            tests,
+            run,
+        }) => {
             let mut a = json!({ "name": name, "pos": args });
-            if let Some(v) = new_body { a["new_body"] = json!(v); }
-            if let Some(v) = to { a["to"] = json!(v); }
-            if let Some(v) = as_name { a["as"] = json!(v); }
-            if let Some(v) = target { a["target"] = json!(v); }
-            if let Some(v) = tests_file { a["tests_file"] = json!(v); }
-            if let Some(v) = tests { a["tests"] = json!(v); }
-            if *run { a["run"] = json!(true); }
+            if let Some(v) = new_body {
+                a["new_body"] = json!(v);
+            }
+            if let Some(v) = to {
+                a["to"] = json!(v);
+            }
+            if let Some(v) = as_name {
+                a["as"] = json!(v);
+            }
+            if let Some(v) = target {
+                a["target"] = json!(v);
+            }
+            if let Some(v) = tests_file {
+                a["tests_file"] = json!(v);
+            }
+            if let Some(v) = tests {
+                a["tests"] = json!(v);
+            }
+            if *run {
+                a["run"] = json!(true);
+            }
             ("recipe", a)
         }
         Some(Cmd::Status { .. })
@@ -2592,7 +2617,12 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
 /// `_compact` envelope（§10-H）、`_max_tokens`/`_compress` 末尾后处理（§10-G）。
 /// 两条路径同一注入 = 同一输出契约（kns）。
 fn inject_private_args(args: &mut serde_json::Value, cli: &Cli) {
-    inject_timeout_args(args, cli.request_timeout, cli.index_timeout, cli.warmup_timeout);
+    inject_timeout_args(
+        args,
+        cli.request_timeout,
+        cli.index_timeout,
+        cli.warmup_timeout,
+    );
     if cmd_requests_delta(&cli.cmd)
         && let Some(obj) = args.as_object_mut()
     {
@@ -2665,8 +2695,8 @@ async fn forward(
     lang: Option<&str>,
 ) -> Result<u8, ForwardFailure> {
     let client = http_client();
-    let (tool, mut args) = tool_request(&cli.cmd)
-        .expect("handled earlier: local commands returned before forward");
+    let (tool, mut args) =
+        tool_request(&cli.cmd).expect("handled earlier: local commands returned before forward");
     let project_root = resolve_project_root(cli.project.clone());
     inject_private_args(&mut args, cli);
     // d3a：编排 envelope——invocation_id 来源 --invocation-id 覆写 > 自动生成
@@ -2778,8 +2808,7 @@ async fn forward(
             // bd e1f4：undo 遇 sha 冲突 discard 后立即停止（时间线乱，禁
             // fall-through）——载荷仍是成功形态（undone/skipped 可解析），但
             // 部分完成非完全成功 → rc=2。其余工具成功恒 rc=0。
-            let exit = if tool == "undo"
-                && data.get("stopped_early").is_some_and(|v| !v.is_null())
+            let exit = if tool == "undo" && data.get("stopped_early").is_some_and(|v| !v.is_null())
             {
                 2u8
             } else {
@@ -2849,15 +2878,13 @@ impl RecipeProgressRelay {
     /// 自停；Drop 兜底 abort，无需 join——CLI 进程存活远长于 100ms）。
     async fn finish(&self) {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        self.stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 impl Drop for RecipeProgressRelay {
     fn drop(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.handle.abort();
     }
 }
@@ -3185,7 +3212,9 @@ fn cmd_ls_use(
         .iter()
         .any(|(bid, _)| bid.eq_ignore_ascii_case(lang_or_id));
     let mut matched_by: Option<String> = None;
-    let (id, languages, extensions, exec, is_override) = match ls_registry::config::builtin_spec_for(lang_or_id) {
+    let (id, languages, extensions, exec, is_override) = match ls_registry::config::builtin_spec_for(
+        lang_or_id,
+    ) {
         Some((id, spec)) if explicit_id => (
             id.to_string(),
             spec.languages.clone(),
@@ -3213,7 +3242,11 @@ fn cmd_ls_use(
                     ));
                     let mut langs = vec![lang_or_id.to_string()];
                     langs.extend(
-                        hspec.languages.iter().filter(|l| !l.eq_ignore_ascii_case(lang_or_id)).cloned(),
+                        hspec
+                            .languages
+                            .iter()
+                            .filter(|l| !l.eq_ignore_ascii_case(lang_or_id))
+                            .cloned(),
                     );
                     (
                         hit.to_string(),
@@ -3228,7 +3261,9 @@ fn cmd_ls_use(
                     let servers: Vec<&str> = ls_registry::config::builtin_entries()
                         .into_iter()
                         .filter(|(_, s)| {
-                            s.languages.iter().any(|l| l.eq_ignore_ascii_case(lang_or_id))
+                            s.languages
+                                .iter()
+                                .any(|l| l.eq_ignore_ascii_case(lang_or_id))
                         })
                         .map(|(bid, _)| bid)
                         .collect();
@@ -3493,7 +3528,10 @@ fn cmd_ls_list(table: bool) -> ExitCode {
         // pyright] 却显示 ["pyright"]），注册时并上的请求语言在清单里蒸发
         // （NitpickAI F1 step4，与运行时行为相悖）。
         let languages: Vec<String> = if overridden {
-            external.get(*id).map(|s| s.languages.clone()).unwrap_or_else(|| spec.languages.clone())
+            external
+                .get(*id)
+                .map(|s| s.languages.clone())
+                .unwrap_or_else(|| spec.languages.clone())
         } else {
             spec.languages.clone()
         };
@@ -3527,7 +3565,9 @@ fn cmd_ls_list(table: bool) -> ExitCode {
         }
         if let Some(m) = missing {
             entry["missing"] = json!([m]);
-            entry["hint"] = json!(format!("entry incomplete — run `serena-cli install {id}` to repair"));
+            entry["hint"] = json!(format!(
+                "entry incomplete — run `serena-cli install {id}` to repair"
+            ));
         }
         if !versions.is_empty() {
             installed_count += 1;
@@ -3859,8 +3899,7 @@ fn apply_external_registrations(report: &mut supervisor::doctor::DoctorReport) {
             }
             if on_disk {
                 c.status = supervisor::doctor::Status::Ok;
-                c.detail =
-                    format!("registered via external-servers.toml: {}", po.binary_name);
+                c.detail = format!("registered via external-servers.toml: {}", po.binary_name);
                 c.hint = None;
             } else {
                 c.detail = format!(
@@ -3948,7 +3987,10 @@ async fn cmd_doctor(json: bool, fix: bool, lock_path: &Path, project_root: &Path
         // bd serena-rust-0z9 / xwh：用户可写配置路径就地可见（与 README
         // "Config file locations" 同源；--json 模式不加行，保持可解析）。
         if let Some(p) = ls_registry::config::external_servers_path() {
-            println!("config: external servers (ls-use registry) — {}", p.display());
+            println!(
+                "config: external servers (ls-use registry) — {}",
+                p.display()
+            );
         }
         if let Some(p) = ls_registry::config::user_config_path() {
             println!("config: user overrides (config.toml) — {}", p.display());
@@ -3965,16 +4007,14 @@ mod doctor_workspace_tests {
 
     #[test]
     fn workspace_check_reports_non_cargo_manifests_without_running_cargo() {
-        let tmp =
-            std::env::temp_dir().join(format!("serena-doctor-ws-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("serena-doctor-ws-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("package.json"), "{}").unwrap();
         let c = check_cargo_metadata(&tmp);
         assert_eq!(c.status, supervisor::doctor::Status::Ok);
         assert!(c.detail.contains("npm/node"), "{}", c.detail);
 
-        let py = std::env::temp_dir()
-            .join(format!("serena-doctor-ws-py-{}", std::process::id()));
+        let py = std::env::temp_dir().join(format!("serena-doctor-ws-py-{}", std::process::id()));
         std::fs::create_dir_all(&py).unwrap();
         std::fs::write(py.join("pyproject.toml"), "[project]").unwrap();
         let c = check_cargo_metadata(&py);
@@ -4014,7 +4054,9 @@ async fn cmd_status(lock_path: &Path) -> ExitCode {
                         Ok(_) => match daemon::lockfile::read(lock_path) {
                             Ok(Some(e2)) => e2,
                             other => {
-                                eprintln!("status: daemon did not come up after drain takeover: {other:?}");
+                                eprintln!(
+                                    "status: daemon did not come up after drain takeover: {other:?}"
+                                );
                                 return ExitCode::from(3);
                             }
                         },
@@ -4148,7 +4190,11 @@ async fn cmd_project_info(lock_path: &Path, project: Option<PathBuf>) -> ExitCod
 /// 超时 → exit 3 + stderr 原因，不静默。
 fn cmd_change_history(root: &Path, file: &str, symbol: Option<&str>, max: usize) -> ExitCode {
     let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(root).arg("log").arg("-n").arg(max.to_string());
+    cmd.arg("-C")
+        .arg(root)
+        .arg("log")
+        .arg("-n")
+        .arg(max.to_string());
     match symbol {
         Some(sym) => {
             // arg 分开传："-L :sym:file" 合成单 argv 会让 git 把值解析成
@@ -4177,7 +4223,10 @@ fn cmd_change_history(root: &Path, file: &str, symbol: Option<&str>, max: usize)
         }
     };
     if !out.status.success() {
-        eprintln!("git log failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        eprintln!(
+            "git log failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
         return ExitCode::from(3);
     }
     // -L 模式 format 行后附 patch 体；\x01 切分天然只取记录头，patch 忽略。
@@ -4621,7 +4670,8 @@ async fn wait_drain_outcome(
 
 /// 探活 + lazy-spawn，返回 (base_url, token)。
 async fn ensure_daemon(lock_path: &Path) -> Result<(String, String), String> {
-    let entry = daemon::lockfile::read_stale_tolerant(lock_path).map_err(|e| format!("read lock: {e}"))?;
+    let entry =
+        daemon::lockfile::read_stale_tolerant(lock_path).map_err(|e| format!("read lock: {e}"))?;
     let base = match entry {
         Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
             // bd fakewait：drain 窗口内老 daemon TCP 探活必中但请求必 503——
@@ -4775,9 +4825,9 @@ where
         // connect 类错误（退避耗尽仍连不上）重跑 ensure_daemon lazy-spawn 新
         // daemon，换新 (base, token) 重发一次；与转发模式 draining 自愈（g0m）同源。
         Err(e) if e.is_connect() || e.is_request() => {
-            let (base, token) = reensure().await.map_err(|he| {
-                format!("forward {tool}: {e}; reconnect self-heal failed: {he}")
-            })?;
+            let (base, token) = reensure()
+                .await
+                .map_err(|he| format!("forward {tool}: {e}; reconnect self-heal failed: {he}"))?;
             *base_token = (base, token);
             send_tool(&base_token.0, &base_token.1)
                 .await
@@ -4884,15 +4934,9 @@ mod discoverability_batch3_tests {
     fn replace_body_accepts_new_body_alias_and_canonical_with() {
         use clap::Parser as _;
         for flag in ["--new-body", "--with"] {
-            let cli = Cli::try_parse_from([
-                "serena-cli",
-                "replace-body",
-                "a.py",
-                "sym",
-                flag,
-                "NEW",
-            ])
-            .unwrap_or_else(|e| panic!("{flag}: {e}"));
+            let cli =
+                Cli::try_parse_from(["serena-cli", "replace-body", "a.py", "sym", flag, "NEW"])
+                    .unwrap_or_else(|e| panic!("{flag}: {e}"));
             let Some(Cmd::ReplaceBody { new_body, .. }) = cli.cmd else {
                 panic!("expected replace-body ({flag})");
             };
@@ -4960,7 +5004,11 @@ mod discoverability_batch3_tests {
             panic!("expected warm");
         };
         assert!(lang.is_none(), "flag 形态不得占位置参");
-        assert_eq!(cli.lang.as_deref(), Some("rust"), "--lang 值须可达 cli.lang");
+        assert_eq!(
+            cli.lang.as_deref(),
+            Some("rust"),
+            "--lang 值须可达 cli.lang"
+        );
         // 位置参形态（既有行为不破）。
         let cli = Cli::try_parse_from(["serena-cli", "warm", "rust"]).unwrap();
         let Some(Cmd::Warm { lang, .. }) = cli.cmd else {
@@ -5120,8 +5168,8 @@ mod with_alias_tests {
     #[test]
     fn clap_parses_sweep_a3a_flags() {
         use clap::Parser as _;
-        let cli = Cli::try_parse_from(["serena-cli", "find-symbol", "x", "--format", "brief"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["serena-cli", "find-symbol", "x", "--format", "brief"]).unwrap();
         let Some(Cmd::FindSymbol { format, .. }) = cli.cmd else {
             panic!("expected find-symbol");
         };
@@ -5448,12 +5496,8 @@ mod shorthand_tests {
 
     #[test]
     fn global_value_flag_value_is_skipped() {
-        let out = rewrite_shorthand_argv(vec![
-            "--project".into(),
-            ".".into(),
-            "?x".into(),
-        ])
-        .unwrap();
+        let out =
+            rewrite_shorthand_argv(vec!["--project".into(), ".".into(), "?x".into()]).unwrap();
         assert_eq!(
             out,
             vec![
@@ -5470,7 +5514,11 @@ mod shorthand_tests {
         let out = rewrite_shorthand_argv(vec!["--json".into(), "?q".into()]).unwrap();
         assert_eq!(
             out,
-            vec!["--json".to_string(), "find-symbol".to_string(), "q".to_string()]
+            vec![
+                "--json".to_string(),
+                "find-symbol".to_string(),
+                "q".to_string()
+            ]
         );
     }
 
@@ -5544,10 +5592,12 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
                 *pos = Some(t);
                 Ok(())
             }
-            (Some(_), Some(_)) => {
-                Err(format!("provide the {label} positionally or via --{flag}, not both"))
-            }
-            (None, None) => Err(format!("missing {label}: pass it positionally or via --{flag}")),
+            (Some(_), Some(_)) => Err(format!(
+                "provide the {label} positionally or via --{flag}, not both"
+            )),
+            (None, None) => Err(format!(
+                "missing {label}: pass it positionally or via --{flag}"
+            )),
         }
     }
     // 杠精 cqns：read-file 行别名（u32 形态的 merge；别名 = 同语义旗标对，二选一）。
@@ -5562,7 +5612,9 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
                 *long = Some(t);
                 Ok(())
             }
-            (Some(_), Some(_)) => Err(format!("provide only one of --{long_flag} / --{alias_flag}")),
+            (Some(_), Some(_)) => Err(format!(
+                "provide only one of --{long_flag} / --{alias_flag}"
+            )),
             (None, None) => Ok(()),
         }
     }
@@ -5610,8 +5662,7 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
         } => {
             let from_file = match content_file.take() {
                 Some(p) => Some(
-                    std::fs::read_to_string(&p)
-                        .map_err(|e| format!("--content-file {p}: {e}"))?,
+                    std::fs::read_to_string(&p).map_err(|e| format!("--content-file {p}: {e}"))?,
                 ),
                 None => None,
             };
@@ -5623,8 +5674,7 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
             } else {
                 None
             };
-            let sources: [Option<String>; 4] =
-                [content.take(), with.take(), from_stdin, from_file];
+            let sources: [Option<String>; 4] = [content.take(), with.take(), from_stdin, from_file];
             let picked: Vec<String> = sources.into_iter().flatten().collect();
             match picked.len() {
                 1 => {
@@ -6544,9 +6594,7 @@ mod net_retry_tests {
         // 大小写不敏感（与 hover_ready 的 contains 一致）。
         assert!(warning_suggests_index_warming("Type Analysis NOT READY"));
         // 项目切换 / not installed 等无关 warning → 误报护栏。
-        assert!(!warning_suggests_index_warming(
-            "project switched: A -> B"
-        ));
+        assert!(!warning_suggests_index_warming("project switched: A -> B"));
         assert!(!warning_suggests_index_warming(
             "python: language server for `python` not installed"
         ));
@@ -6732,7 +6780,8 @@ mod shell_selfheal_tests {
                 payload.len(),
                 payload
             );
-            sock.write_all(resp.as_bytes()).expect("mock daemon writes resp");
+            sock.write_all(resp.as_bytes())
+                .expect("mock daemon writes resp");
         });
 
         let client = http_client();
@@ -6805,16 +6854,21 @@ mod status_tests {
 
     #[tokio::test]
     async fn status_absent_daemon_never_spawns() {
-        let lock = std::env::temp_dir().join(format!(
-            "serena-status-nospawn-{}.lock",
-            std::process::id()
-        ));
+        let lock =
+            std::env::temp_dir().join(format!("serena-status-nospawn-{}.lock", std::process::id()));
         let _ = std::fs::remove_file(&lock);
 
         let code = cmd_status(&lock).await;
 
-        assert_eq!(code, ExitCode::from(1), "daemon 不在 = not-running (exit 1)");
-        assert!(!lock.exists(), "status 不得 lazy-spawn（lock 出现 = 有 daemon 被拉起）");
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "daemon 不在 = not-running (exit 1)"
+        );
+        assert!(
+            !lock.exists(),
+            "status 不得 lazy-spawn（lock 出现 = 有 daemon 被拉起）"
+        );
     }
 
     /// 死 lock（文件在、端口无 listener）同契约：不 spawn、报 not-running。
@@ -6844,7 +6898,11 @@ mod status_tests {
 
         let code = cmd_project_info(&lock, None).await;
 
-        assert_eq!(code, ExitCode::SUCCESS, "daemon 不在也输出 meta（git + 空加载态）");
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "daemon 不在也输出 meta（git + 空加载态）"
+        );
         assert!(!lock.exists(), "project-info 不得 lazy-spawn");
     }
 
@@ -6909,8 +6967,8 @@ mod status_tests {
         assert!(sha.starts_with("31bf612"), "got: {sha}");
 
         // ③ detached HEAD。
-        let sha =
-            resolve_git_head_sha(&dotgit, "e327fa5000000000000000000000000000000000").expect("detached");
+        let sha = resolve_git_head_sha(&dotgit, "e327fa5000000000000000000000000000000000")
+            .expect("detached");
         assert!(sha.starts_with("e327fa5"), "got: {sha}");
         let _ = std::fs::remove_dir_all(&dotgit);
     }
@@ -6943,7 +7001,9 @@ mod blindfix_b_tests {
         let hit = json!({"code":"BAD_ARGS","message":"unknown tool: recipe"});
         assert_eq!(
             unknown_tool_hint(&hit),
-            Some("daemon may have been started by an older binary; run `serena-cli stop-all` and retry")
+            Some(
+                "daemon may have been started by an older binary; run `serena-cli stop-all` and retry"
+            )
         );
         // 同文案但非 BAD_ARGS → 不 hint。
         let internal = json!({"code":"INTERNAL","message":"unknown tool: recipe"});
@@ -7014,10 +7074,7 @@ mod dbx1_concurrent_lazy_spawn_tests {
         write_lock_with_pid(&lock, 9999);
         let r = own_child_won(&lock, 4242);
         let _ = std::fs::remove_file(&lock);
-        assert!(
-            !r,
-            "lock.pid != spawned PID → 败家走 attach"
-        );
+        assert!(!r, "lock.pid != spawned PID → 败家走 attach");
     }
 
     #[test]
@@ -7096,7 +7153,8 @@ mod clap_exit_json_tests {
 
     #[test]
     fn version_request_returns_success_without_json() {
-        let err = Cli::try_parse_from(["serena-cli", "--version"]).expect_err("--version = DisplayVersion");
+        let err = Cli::try_parse_from(["serena-cli", "--version"])
+            .expect_err("--version = DisplayVersion");
         assert!(!err.use_stderr());
         let code = clap_exit_to_json(err);
         assert_eq!(code, ExitCode::SUCCESS);
@@ -7112,7 +7170,10 @@ mod clap_exit_json_tests {
             help.contains("\"query\":\"foo\""),
             "shell help 协议示例必须用 query 字段: {help}"
         );
-        assert!(!help.contains("name_path"), "name_path 是已废弃错字段: {help}");
+        assert!(
+            !help.contains("name_path"),
+            "name_path 是已废弃错字段: {help}"
+        );
     }
 
     // ---- bd serena-rust-mfht F7：status 接受 --project（与 project-info 形状对齐）----
@@ -7143,7 +7204,10 @@ mod wait_ready_progress_tests {
     fn semantic_stage_drops_symbol_ok_prefix() {
         let p = wait_ready_progress(WaitStage::Semantic, true, 3, "lib.rs");
         assert_eq!(p, "hover-pending");
-        assert!(!p.contains("symbol-ok"), "symbol-ok 对 semantic 等待者是噪音");
+        assert!(
+            !p.contains("symbol-ok"),
+            "symbol-ok 对 semantic 等待者是噪音"
+        );
     }
 
     #[test]
@@ -7246,18 +7310,27 @@ mod drain_takeover_tests {
     #[tokio::test]
     async fn alive_but_draining_true_only_on_explicit_flag() {
         let port = spawn_status_mock(OK_200, json!({"draining": true}));
-        assert!(alive_but_draining(&test_entry(port)).await, "draining:true 必须识别");
+        assert!(
+            alive_but_draining(&test_entry(port)).await,
+            "draining:true 必须识别"
+        );
     }
 
     #[tokio::test]
     async fn alive_but_draining_false_on_live_and_on_unreachable() {
         let port = spawn_status_mock(OK_200, json!({"draining": false}));
-        assert!(!alive_but_draining(&test_entry(port)).await, "活 daemon 不误杀");
+        assert!(
+            !alive_but_draining(&test_entry(port)).await,
+            "活 daemon 不误杀"
+        );
         // 连不上 = 拿不到明确标志 → 保守判活（保持既有探活语义）。
         let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dead_port = dead.local_addr().unwrap().port();
         drop(dead);
-        assert!(!alive_but_draining(&test_entry(dead_port)).await, "无响应保守判活");
+        assert!(
+            !alive_but_draining(&test_entry(dead_port)).await,
+            "无响应保守判活"
+        );
     }
 
     #[tokio::test]
@@ -7265,7 +7338,9 @@ mod drain_takeover_tests {
         // draining:true 的 200 不算就绪 → 短窗耗尽必 Err。
         let drain_port = spawn_status_mock(OK_200, json!({"draining": true}));
         assert!(
-            wait_ready(drain_port, Duration::from_millis(1200)).await.is_err(),
+            wait_ready(drain_port, Duration::from_millis(1200))
+                .await
+                .is_err(),
             "draining /status 200 不得判就绪"
         );
         // draining:false → 首轮即 Ok。

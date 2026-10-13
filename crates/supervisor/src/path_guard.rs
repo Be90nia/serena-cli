@@ -129,11 +129,7 @@ pub(crate) fn guarded_join(root: &Path, file: &str) -> Result<PathBuf, String> {
 
 /// 绝对路径校验（drive-rooted / Unix 根锚定）：词法归一 .. / . 后，沿祖先链
 /// canonicalize（解析 symlink + 处理不存在的尾部分量），再 starts_with(canon_root) 终检。
-fn check_absolute_in_root(
-    raw: &Path,
-    canon_root: &Path,
-    file: &str,
-) -> Result<PathBuf, String> {
+fn check_absolute_in_root(raw: &Path, canon_root: &Path, file: &str) -> Result<PathBuf, String> {
     // 词法归一 .. / . ：.. 在自身前缀层级上卷，盘根处不再 pop。
     let mut drive: Option<OsString> = None;
     let mut has_root = false;
@@ -224,14 +220,21 @@ mod tests {
         let got = guarded_join(&root, "sub/a.txt").unwrap();
         assert_eq!(got, root.join("sub").join("a.txt"));
         // `.` 与 `sub/../` 词法消解后仍在 root 内。
-        assert_eq!(guarded_join(&root, "./sub/../main.rs").unwrap(), root.join("main.rs"));
+        assert_eq!(
+            guarded_join(&root, "./sub/../main.rs").unwrap(),
+            root.join("main.rs")
+        );
     }
 
     #[test]
     fn parent_escape_rejected() {
         let dir = scratch("esc");
         let root = root_of(&dir, "esc");
-        for f in ["../outside.txt", "../../outside.txt", "sub/../../outside.txt"] {
+        for f in [
+            "../outside.txt",
+            "../../outside.txt",
+            "sub/../../outside.txt",
+        ] {
             let err = guarded_join(&root, f).unwrap_err();
             assert!(err.contains("escapes project root"), "{f}: {err}");
         }

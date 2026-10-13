@@ -134,10 +134,12 @@ pub(crate) async fn warm(
     });
     // bd serena-rust-sgc0：解码失败被跳过的文件显式带出——可见的降级，不静默。
     if !skipped.is_empty() {
-        out["warnings"] = json!(skipped
-            .iter()
-            .map(|f| format!("{f}: not readable as UTF-8 text (binary content?); skipped"))
-            .collect::<Vec<_>>());
+        out["warnings"] = json!(
+            skipped
+                .iter()
+                .map(|f| format!("{f}: not readable as UTF-8 text (binary content?); skipped"))
+                .collect::<Vec<_>>()
+        );
     }
     Ok(out)
 }

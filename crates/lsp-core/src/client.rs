@@ -477,10 +477,7 @@ impl Client {
         // 预算覆盖发送段（bd qq3a perf-P1-2）：LS writer 卡死时 outbound 积压会让
         // send().await 无界阻塞——发送与响应等待共享同一预算，超时清 pending 表。
         let secs = timeout.as_secs();
-        let send = self
-            .inner
-            .outbound
-            .send(OutboundItem { msg, priority });
+        let send = self.inner.outbound.send(OutboundItem { msg, priority });
         match tokio::time::timeout(timeout, send).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {

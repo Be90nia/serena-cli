@@ -6,7 +6,9 @@ use super::*;
 
 async fn sup_direct() -> crate::Supervisor {
     // --direct 同款空 supervisor：分派校验不触 LS（错误在入口先于 session 拉起）。
-    crate::Supervisor::direct().await.expect("direct supervisor")
+    crate::Supervisor::direct()
+        .await
+        .expect("direct supervisor")
 }
 
 fn skip_ls_e2e() -> bool {
@@ -19,9 +21,8 @@ fn rust_analyzer_available() -> bool {
     } else {
         "rust-analyzer"
     };
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file()))
 }
 
 // ============ 入口分派（确定性 BAD_ARGS，不触 LS） ============
@@ -62,10 +63,22 @@ async fn missing_name_is_bad_args() {
 #[tokio::test]
 async fn missing_positional_args_are_bad_args() {
     let sup = sup_direct().await;
-    for name in ["fix-bug", "rename", "add-feature", "add-test", "refactor-extract", "refactor-rename", "explore"] {
-        let err = run(&sup, &std::env::temp_dir(), &json!({"name": name, "pos": []}))
-            .await
-            .expect_err("missing pos must fail");
+    for name in [
+        "fix-bug",
+        "rename",
+        "add-feature",
+        "add-test",
+        "refactor-extract",
+        "refactor-rename",
+        "explore",
+    ] {
+        let err = run(
+            &sup,
+            &std::env::temp_dir(),
+            &json!({"name": name, "pos": []}),
+        )
+        .await
+        .expect_err("missing pos must fail");
         let crate::ToolError::BadArgs { detail } = err else {
             panic!("{name}: expect BadArgs, got {err:?}");
         };
@@ -79,9 +92,13 @@ async fn rename_without_to_flag_is_bad_args() {
     let dir = std::env::temp_dir().join("recipe_b4_no_to");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("tmpdir");
-    let err = run(&sup, &dir, &json!({"name": "rename", "pos": ["a.rs", "sym"]}))
-        .await
-        .expect_err("missing --to must fail");
+    let err = run(
+        &sup,
+        &dir,
+        &json!({"name": "rename", "pos": ["a.rs", "sym"]}),
+    )
+    .await
+    .expect_err("missing --to must fail");
     let crate::ToolError::BadArgs { detail } = err else {
         panic!("expect BadArgs, got {err:?}");
     };
@@ -101,14 +118,19 @@ fn fail_report_is_single_layer_message_with_required_facts() {
         ],
         vec![7, 9],
         vec![json!({"txn_id": 9, "undone_files": 1})],
-        &crate::ToolError::BadArgs { detail: "injected".into() },
+        &crate::ToolError::BadArgs {
+            detail: "injected".into(),
+        },
     );
     let crate::ToolError::Protocol { tool, reason } = err else {
         panic!("expect Protocol");
     };
     assert_eq!(tool, "recipe:add-feature");
     // 杠精 07u5-6：reason 必须是单层人话（非 JSON 字符串），失败步/原因/回滚账目齐备。
-    assert!(reason.contains("failed at step write-stub: bad args: injected"), "{reason}");
+    assert!(
+        reason.contains("failed at step write-stub: bad args: injected"),
+        "{reason}"
+    );
     assert!(
         reason.contains("completed steps: [define_feature, write-stub]"),
         "{reason}"

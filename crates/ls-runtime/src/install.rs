@@ -980,10 +980,12 @@ mod tests {
     fn download_hop_rejects_non_https_even_when_host_allowed() {
         let allowed = vec!["github.com".to_string()];
         let https: reqwest::Url = "https://github.com/x/y.zip".parse().unwrap();
-        assert!(check_download_hop(&https, &allowed).is_ok(), "https+白名单放行");
+        assert!(
+            check_download_hop(&https, &allowed).is_ok(),
+            "https+白名单放行"
+        );
         let http: reqwest::Url = "http://github.com/x/y.zip".parse().unwrap();
-        let err =
-            check_download_hop(&http, &allowed).expect_err("http 降级必须被拒（SEC-3）");
+        let err = check_download_hop(&http, &allowed).expect_err("http 降级必须被拒（SEC-3）");
         assert!(err.contains("https"), "错误须指明 scheme 要求: {err}");
         // host 门不松：白名单外照旧拒（原 §5.1 语义）。
         let evil: reqwest::Url = "https://evil.io/x".parse().unwrap();
@@ -1010,8 +1012,7 @@ mod tests {
         });
         let allowed = vec!["127.0.0.1".to_string()];
         let client = build_download_client(&allowed).expect("client");
-        let err =
-            download(&client, &format!("http://{addr}/payload"), &allowed).unwrap_err();
+        let err = download(&client, &format!("http://{addr}/payload"), &allowed).unwrap_err();
         assert!(
             err.to_string().contains("https"),
             "http 首跳必须被 scheme 门拒: {err}"

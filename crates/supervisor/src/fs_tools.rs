@@ -506,12 +506,21 @@ mod binary_read_tests {
         std::fs::write(dir.path().join("crlf.py"), "a = 1\r\nb = 2\r\n").expect("crlf fixture");
         std::fs::write(dir.path().join("lf.py"), "a = 1\nb = 2\n").expect("lf fixture");
         std::fs::write(dir.path().join("mixed.py"), "a = 1\r\nb = 2\n").expect("mixed fixture");
-        let crlf = read_file(dir.path(), "crlf.py", None, None, true, None).await.expect("crlf");
+        let crlf = read_file(dir.path(), "crlf.py", None, None, true, None)
+            .await
+            .expect("crlf");
         assert_eq!(crlf.line_endings, "crlf");
-        assert_eq!(crlf.content, "a = 1\nb = 2", "content 保持 LF 归一（既有契约）");
-        let lf = read_file(dir.path(), "lf.py", None, None, true, None).await.expect("lf");
+        assert_eq!(
+            crlf.content, "a = 1\nb = 2",
+            "content 保持 LF 归一（既有契约）"
+        );
+        let lf = read_file(dir.path(), "lf.py", None, None, true, None)
+            .await
+            .expect("lf");
         assert_eq!(lf.line_endings, "lf");
-        let mixed = read_file(dir.path(), "mixed.py", None, None, true, None).await.expect("mixed");
+        let mixed = read_file(dir.path(), "mixed.py", None, None, true, None)
+            .await
+            .expect("mixed");
         assert_eq!(mixed.line_endings, "mixed");
     }
 
@@ -703,11 +712,13 @@ mod max_tokens_tests {
         let got_lines = r.content.split('\n').filter(|s| !s.is_empty()).count();
         assert!(got_lines < 200, "截后行数 < 全量: {got_lines}");
         assert_eq!(
-            r.end_line as usize,
-            got_lines,
+            r.end_line as usize, got_lines,
             "end_line = 截后末行（契约：content 行数 = end_line - start_line + 1）"
         );
-        assert!(r.total_tokens.is_some(), "max_tokens 给 = total_tokens Some");
+        assert!(
+            r.total_tokens.is_some(),
+            "max_tokens 给 = total_tokens Some"
+        );
     }
 
     /// 单大行 max_tokens=1：整行超预算被整行丢（留半行砍），content 串=""
@@ -744,8 +755,7 @@ mod max_tokens_tests {
             .join("\n")
             + "\n";
         std::fs::write(dir.path().join("f.txt"), &full).expect("fixture");
-        let unrestricted =
-            crate::content_hash(&full);
+        let unrestricted = crate::content_hash(&full);
         let r = read_file(dir.path(), "f.txt", Some(1), Some(50), true, Some(80))
             .await
             .expect("read ok");

@@ -135,10 +135,7 @@ fn try_become_daemon_impl(lock_path: &Path, candidate_port: u16) -> Result<Outco
 
     // 原子创建：create_new(true) → 已存在则返回 AlreadyExists，胜者独占。
     // 0600：lock 含 token，其他本地用户不可读（bd w2l）。
-    let create_result = secure_open()
-        .write(true)
-        .create_new(true)
-        .open(lock_path);
+    let create_result = secure_open().write(true).create_new(true).open(lock_path);
 
     match create_result {
         Ok(mut file) => {
@@ -391,14 +388,19 @@ mod tests {
     fn read_stale_tolerant_maps_corrupt_to_none() {
         let (_dir, path) = fresh_lock();
         std::fs::write(&path, b"{oops").expect("write corrupt lock");
-        assert!(matches!(
-            read_stale_tolerant(&path),
-            Ok(None)
-        ), "corrupt lock must read as Ok(None) for the CLI probe");
+        assert!(
+            matches!(read_stale_tolerant(&path), Ok(None)),
+            "corrupt lock must read as Ok(None) for the CLI probe"
+        );
         // 健康 lock 照常读出；真 IO 错误（lock 路径是目录）保持上抛语义。
         write_final(
             &path,
-            &LockEntry { pid: 1, port: 1, boot_ms: 1, token: "t".into() },
+            &LockEntry {
+                pid: 1,
+                port: 1,
+                boot_ms: 1,
+                token: "t".into(),
+            },
         )
         .expect("write valid lock");
         assert!(read_stale_tolerant(&path).unwrap().is_some());
@@ -417,14 +419,23 @@ mod tests {
     fn corrupt_lock_is_taken_over() {
         let (_dir, path) = fresh_lock();
         std::fs::write(&path, b"{oops").expect("write corrupt lock");
-        assert!(read(&path).is_err(), "corrupt lock content must read as Err");
+        assert!(
+            read(&path).is_err(),
+            "corrupt lock content must read as Err"
+        );
         match try_become_daemon(&path, 7860) {
             Ok(Outcome::Won { port, .. }) => assert_eq!(port, 7860),
             other => panic!("corrupt lock must be taken over; got {other:?}"),
         }
         // 接管后 lock 内容恢复为有效的新归属。
-        let fresh = read(&path).expect("read after takeover").expect("lock exists");
-        assert_eq!(fresh.pid, std::process::id(), "lock must be owned by us now");
+        let fresh = read(&path)
+            .expect("read after takeover")
+            .expect("lock exists");
+        assert_eq!(
+            fresh.pid,
+            std::process::id(),
+            "lock must be owned by us now"
+        );
     }
 
     #[test]
@@ -495,13 +506,21 @@ mod tests {
         let (_dir, path) = fresh_lock();
         let _ = try_become_daemon(&path, 7860).expect("win");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "daemon.lock 必须 0600（实测 {mode:o}）");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "daemon.lock 必须 0600（实测 {mode:o}）"
+        );
 
         // write_final 重建路径（tmp → rename）也不得把 0644 带回来。
         let entry = read(&path).unwrap().unwrap();
         write_final(&path, &entry).expect("write_final");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "write_final 后仍须 0600（实测 {mode:o}）");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "write_final 后仍须 0600（实测 {mode:o}）"
+        );
 
         let log = _dir.path().join("invocations.jsonl");
         secure_open()
@@ -511,6 +530,10 @@ mod tests {
             .and_then(|mut f| std::io::Write::write_all(&mut f, b"{}\n"))
             .expect("append");
         let mode = std::fs::metadata(&log).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "invocations.jsonl 必须 0600（实测 {mode:o}）");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "invocations.jsonl 必须 0600（实测 {mode:o}）"
+        );
     }
 }

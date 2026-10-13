@@ -99,10 +99,7 @@ impl LanguageServerAdapter for BasedpyrightServerAdapter {
         // 探针逻辑同 pyright：根下真实 .py 文件 URI 触发项目解析。失败返回 Ok 放行。
         use serde_json::json;
         let uri = crate::probe_uri_for_root(
-            PROBE_ROOT
-                .get_last()
-                .as_deref()
-                .unwrap_or(Path::new(".")),
+            PROBE_ROOT.get_last().as_deref().unwrap_or(Path::new(".")),
             self.languages(),
             "file:///__basedpyright_ready_probe__",
         );

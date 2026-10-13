@@ -555,14 +555,19 @@ mod tests {
     /// （INTERNAL），但 message 人类可读且两条处置路径（重读 vs 重启）可分辨。
     #[test]
     fn io_and_framing_core_errors_get_distinct_readable_messages() {
-        let io = supervisor::ToolError::Core(supervisor::CoreErrorWire::Io(
-            std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
-        ));
+        let io = supervisor::ToolError::Core(supervisor::CoreErrorWire::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "gone",
+        )));
         let w = wire_error_from_tool_error(&io);
         assert_eq!(w.code, WireErrorCode::Internal);
         assert!(!w.retryable);
         assert!(w.message.starts_with("io error: "), "got: {}", w.message);
-        assert!(w.message.contains("gone"), "cause must survive: {}", w.message);
+        assert!(
+            w.message.contains("gone"),
+            "cause must survive: {}",
+            w.message
+        );
 
         let fr = supervisor::ToolError::Core(supervisor::CoreErrorWire::Framing {
             detail: "missing CONTENT_LENGTH".into(),
@@ -603,10 +608,9 @@ mod tests {
     /// bd 7tk：旧 daemon 响应（只有 5 个旧字段）→ 新客户端 default 兜底反序列化。
     #[test]
     fn status_legacy_response_without_obs_fields_deserializes() {
-        let resp: StatusResponse = serde_json::from_str(
-            r#"{"uptime_secs":9,"pid":42,"loaded_ls":[],"draining":false}"#,
-        )
-        .unwrap();
+        let resp: StatusResponse =
+            serde_json::from_str(r#"{"uptime_secs":9,"pid":42,"loaded_ls":[],"draining":false}"#)
+                .unwrap();
         assert_eq!(resp.in_flight, 0);
         assert_eq!(resp.invocation_count, 0);
         assert!(resp.recent_errors.is_empty());
@@ -619,7 +623,10 @@ mod tests {
         let resp = StatusResponse {
             uptime_secs: 3,
             pid: 4,
-            loaded_ls: vec![crate::dto::LoadedLs { lang: "rust".into(), sessions: 3 }],
+            loaded_ls: vec![crate::dto::LoadedLs {
+                lang: "rust".into(),
+                sessions: 3,
+            }],
             draining: false,
             active_project: Some("D:/proj".into()),
             in_flight: 2,

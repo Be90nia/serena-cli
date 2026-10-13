@@ -332,8 +332,7 @@ async fn tools_post(
                     .unwrap()
                     .insert((prev.clone(), req.project_root.clone()));
                 if first_report {
-                    let switch =
-                        format!("project switched: {prev} -> {}", req.project_root);
+                    let switch = format!("project switched: {prev} -> {}", req.project_root);
                     // 工具自身的 warning（如 we0/xzb 就绪标记）不覆盖，拼接保序。
                     let combined = match data.get("warning").and_then(|w| w.as_str()) {
                         Some(existing) => format!("{existing}; {switch}"),
@@ -521,7 +520,9 @@ pub(crate) fn rotate_invocation_log_if_oversized(
     max_bytes: u64,
     keep: u32,
 ) -> bool {
-    let oversized = std::fs::metadata(path).map(|m| m.len() >= max_bytes).unwrap_or(false);
+    let oversized = std::fs::metadata(path)
+        .map(|m| m.len() >= max_bytes)
+        .unwrap_or(false);
     if oversized {
         rotate_invocation_log(path, keep);
     }
@@ -547,7 +548,11 @@ fn log_invocation(state: &AppState, rec: InvocationRecord<'_>) {
     }
     // bd xwi：封顶轮转。代内行数达节流窗倍数才探测一次；大小或条数任一
     // 越限即轮转（本代行数计数随之清零）。
-    let lines = state.obs.log_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let lines = state
+        .obs
+        .log_lines
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
     if lines % INVOCATION_LOG_CHECK_EVERY == 0 {
         let oversized = std::fs::metadata(&state.invocation_log_path)
             .map(|m| m.len() >= INVOCATION_LOG_MAX_BYTES)
@@ -923,9 +928,7 @@ mod tests {
             }
         }
         /// bd wy1：慢写任务 + 完成信号 —— 断连 detach 测试用。
-        fn detached_write_probe(
-            tx: tokio::sync::mpsc::Sender<&'static str>,
-        ) -> Self {
+        fn detached_write_probe(tx: tokio::sync::mpsc::Sender<&'static str>) -> Self {
             Self {
                 delay: Some(std::time::Duration::from_millis(150)),
                 echo: false,
@@ -1282,8 +1285,7 @@ mod tests {
                 json!({ "project_root": root, "args": {} }),
             )
         };
-        let has_warning =
-            |body: serde_json::Value| body["data"].get("warning").is_some();
+        let has_warning = |body: serde_json::Value| body["data"].get("warning").is_some();
 
         // 首调 + A→B 首报 + B→A 首报。
         let _ = oneshot_json(router.clone(), call("D:/proj-a")).await;
@@ -1831,7 +1833,12 @@ mod tests {
         );
         st1.obs = st2.obs.clone();
         let mk = |body| {
-            req_post_invocation("/tools/tool_diagnostics", Some("secret"), "agent-x-1234", body)
+            req_post_invocation(
+                "/tools/tool_diagnostics",
+                Some("secret"),
+                "agent-x-1234",
+                body,
+            )
         };
         oneshot_json(
             router(st1),
@@ -1941,7 +1948,9 @@ mod tests {
         );
         assert!(!log.exists());
         assert_eq!(
-            std::fs::read_to_string(invocation_log_gen(&log, 1)).unwrap().len(),
+            std::fs::read_to_string(invocation_log_gen(&log, 1))
+                .unwrap()
+                .len(),
             64
         );
     }
@@ -1979,11 +1988,7 @@ mod tests {
             "越限轮转：旧当前代整体进 .1"
         );
         let cur = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(
-            cur.lines().count(),
-            1,
-            "轮转后新当前代只有本次请求一条"
-        );
+        assert_eq!(cur.lines().count(), 1, "轮转后新当前代只有本次请求一条");
         assert!(
             cur.contains("\"invocation_id\""),
             "新当前代是合法 JSONL 记录"

@@ -768,7 +768,10 @@ mod tests {
             "1\r\n3\r\n"
         );
         // 删到 EOF：余下前缀字节原样保留。
-        assert_eq!(apply_delete_lines("1\r\n2\r\n3\r\n", 2, 3).unwrap(), "1\r\n");
+        assert_eq!(
+            apply_delete_lines("1\r\n2\r\n3\r\n", 2, 3).unwrap(),
+            "1\r\n"
+        );
     }
 
     #[test]
@@ -794,9 +797,8 @@ mod tests {
             start: Position::new(0, 0),
             end: Position::new(2, 16),
         };
-        let err =
-            locate_in_range(path, text, range, "divide", "x - y", OffsetEncoding::Utf16)
-                .unwrap_err();
+        let err = locate_in_range(path, text, range, "divide", "x - y", OffsetEncoding::Utf16)
+            .unwrap_err();
         let EditError::BadArgs { detail } = &err else {
             panic!("多命中必须 BadArgs 拒改: {err:?}")
         };
@@ -807,13 +809,26 @@ mod tests {
             start: Position::new(0, 0),
             end: Position::new(1, 16),
         };
-        let (lo, hi) =
-            locate_in_range(path, text1, range1, "divide", "x - y", OffsetEncoding::Utf16)
-                .unwrap();
+        let (lo, hi) = locate_in_range(
+            path,
+            text1,
+            range1,
+            "divide",
+            "x - y",
+            OffsetEncoding::Utf16,
+        )
+        .unwrap();
         assert_eq!(&text1[lo..hi], "x - y");
 
-        let err0 = locate_in_range(path, text1, range1, "divide", "x * y", OffsetEncoding::Utf16)
-            .unwrap_err();
+        let err0 = locate_in_range(
+            path,
+            text1,
+            range1,
+            "divide",
+            "x * y",
+            OffsetEncoding::Utf16,
+        )
+        .unwrap_err();
         assert!(
             matches!(err0, EditError::WriteConflict { .. }),
             "零命中语义不变: {err0:?}"
@@ -831,9 +846,8 @@ mod tests {
             start: Position::new(0, 1),
             end: Position::new(1, 16),
         };
-        let err =
-            locate_in_range(path, text, range, "helper", "a - 1", OffsetEncoding::Utf16)
-                .unwrap_err();
+        let err = locate_in_range(path, text, range, "helper", "a - 1", OffsetEncoding::Utf16)
+            .unwrap_err();
         let EditError::BadArgs { detail } = &err else {
             panic!("行尾注释中的第二处命中必须计入: {err:?}")
         };
@@ -842,8 +856,7 @@ mod tests {
         // 对照：唯一命中在语句内（注释无同词）→ 单命中照旧返回语句内切片。
         let text1 = "def helper(a):\n    return a - 1  # halve it\n";
         let (lo, hi) =
-            locate_in_range(path, text1, range, "helper", "a - 1", OffsetEncoding::Utf16)
-                .unwrap();
+            locate_in_range(path, text1, range, "helper", "a - 1", OffsetEncoding::Utf16).unwrap();
         assert_eq!(&text1[lo..hi], "a - 1");
     }
 }

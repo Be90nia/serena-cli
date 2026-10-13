@@ -1060,7 +1060,11 @@ mod tests {
             "CI workflow 安装的 rust-analyzer 必须被 doctor 探到"
         );
         for id in ["cargo", "rustup", "python"] {
-            assert_eq!(status_of(id), Status::Ok, "{id} 必须在 CI runner PATH 可解析");
+            assert_eq!(
+                status_of(id),
+                Status::Ok,
+                "{id} 必须在 CI runner PATH 可解析"
+            );
         }
         assert_eq!(
             status_of("PATH"),

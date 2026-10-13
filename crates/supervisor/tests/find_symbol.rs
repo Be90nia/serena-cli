@@ -198,7 +198,10 @@ async fn find_symbol_degrades_to_semantic_pending_when_budget_expires() {
     );
     assert_eq!(v["warmup"]["stage"], "indexing", "warmup marker: {v}");
     assert_eq!(v["warmup"]["retry_after_warm"], true, "warmup marker: {v}");
-    let warning = v.get("warning").and_then(|x| x.as_str()).unwrap_or_default();
+    let warning = v
+        .get("warning")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default();
     assert!(
         warning.contains("warming") || warning.contains("incomplete"),
         "人话 warning 必须在场（超时 warming / 请求失败 / 暖机窗口任一形态）: {warning}"

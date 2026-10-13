@@ -318,7 +318,10 @@ mod tests {
         let out = redact_path_with(&p, Some(home));
         assert!(out.starts_with('~'), "{out}");
         assert!(!out.contains("alice"), "{out}");
-        assert!(out.ends_with("proj/src") || out.ends_with("proj\\src"), "{out}");
+        assert!(
+            out.ends_with("proj/src") || out.ends_with("proj\\src"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -465,7 +468,11 @@ mod tests {
         }
         handle.abort();
         let evicted = sup.evicted.lock().unwrap();
-        assert_eq!(evicted.len(), 2, "恰好驱逐超出 cap 的 2 条；got {evicted:?}");
+        assert_eq!(
+            evicted.len(),
+            2,
+            "恰好驱逐超出 cap 的 2 条；got {evicted:?}"
+        );
         assert!(
             evicted.contains(&fake_key(0)) && evicted.contains(&fake_key(1)),
             "最旧两条必须先卸；got {evicted:?}"
@@ -485,10 +492,7 @@ mod tests {
         let handle = spawn_reaper(sup.clone(), test_state(), lru_only_intervals(), None);
         tokio::time::sleep(Duration::from_millis(250)).await; // ≥2 个 scan tick
         handle.abort();
-        assert!(
-            sup.evicted.lock().unwrap().is_empty(),
-            "cap 内不得驱逐"
-        );
+        assert!(sup.evicted.lock().unwrap().is_empty(), "cap 内不得驱逐");
         assert_eq!(sup.entries.lock().unwrap().len(), 3);
     }
 

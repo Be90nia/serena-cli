@@ -126,7 +126,11 @@ impl RustAnalyzerAdapter {
     /// Indexing 等待预算：root 的 Cargo.lock 包数分档（0vj1 契约）。包数含全部
     /// 依赖（含 dev/build），是 RA 全量索引规模的廉价代理 —— 偏大取档更安全。
     fn indexing_wait_for_root() -> Duration {
-        indexing_wait(PROBE_ROOT.get_last().and_then(|root| cargo_lock_crates(&root)))
+        indexing_wait(
+            PROBE_ROOT
+                .get_last()
+                .and_then(|root| cargo_lock_crates(&root)),
+        )
     }
 
     /// Indexing begin→end 等待主体。切片等待（200ms）间轮询会话态：RA 进程死亡
@@ -141,7 +145,11 @@ impl RustAnalyzerAdapter {
             let Some(slice) = Self::alive_slice(session, deadline, ALIVE_POLL) else {
                 return false;
             };
-            if session.wait_for_progress(INDEXING_TOKEN, slice).await.is_ok() {
+            if session
+                .wait_for_progress(INDEXING_TOKEN, slice)
+                .await
+                .is_ok()
+            {
                 break;
             }
         }
@@ -260,7 +268,11 @@ fn indexing_wait(crates: Option<usize>) -> Duration {
 /// → None（回默认档）。
 fn cargo_lock_crates(root: &Path) -> Option<usize> {
     let text = std::fs::read_to_string(root.join("Cargo.lock")).ok()?;
-    Some(text.lines().filter(|l| l.starts_with("[[package]]")).count())
+    Some(
+        text.lines()
+            .filter(|l| l.starts_with("[[package]]"))
+            .count(),
+    )
 }
 
 /// Windows 隐藏子进程窗口（CREATE_NO_WINDOW）；非 Windows 无操作。

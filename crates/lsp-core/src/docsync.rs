@@ -248,7 +248,12 @@ impl Session {
                         )
                     }
                     (
-                        Snap::Present { mtime: sm, size: ss, version: sv, resync: sr },
+                        Snap::Present {
+                            mtime: sm,
+                            size: ss,
+                            version: sv,
+                            resync: sr,
+                        },
                         Some(buf),
                     ) if buf.mtime == sm
                         && buf.size == ss
@@ -291,8 +296,7 @@ impl Session {
                         // Q11 的 outbound 满拥塞）时回滚记账，否则新插条目变孤儿
                         // （ref_count=1 无人 drop）且记账让后续 ensure_open 走复用
                         // 分支永不补发——该文件语义请求全部拿空/旧结果。
-                        let mut map =
-                            self.buffers.lock().expect("docsync buffers mutex poisoned");
+                        let mut map = self.buffers.lock().expect("docsync buffers mutex poisoned");
                         match map.get_mut(&uri) {
                             // ref_count==1：唯一持有者就是本次失败的调用方，条目记账
                             // （mtime/version）已不可信，直接移表让下次冷启动重新 didOpen。
@@ -562,7 +566,10 @@ pub fn uri_in_root(uri: &str, root: &Path) -> bool {
         return false;
     };
     let root_canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    contains_norm(&lexically_normalize(&path), &lexically_normalize(&root_canon))
+    contains_norm(
+        &lexically_normalize(&path),
+        &lexically_normalize(&root_canon),
+    )
 }
 
 /// 前缀包含比对：分隔符统一 `/`，Windows 不分大小写（盘符/路径双重身份），
@@ -570,11 +577,7 @@ pub fn uri_in_root(uri: &str, root: &Path) -> bool {
 fn contains_norm(path: &Path, root: &Path) -> bool {
     let norm = |p: &Path| {
         let s = p.to_string_lossy().replace('\\', "/");
-        if cfg!(windows) {
-            s.to_lowercase()
-        } else {
-            s
-        }
+        if cfg!(windows) { s.to_lowercase() } else { s }
     };
     let (p, r) = (norm(path), norm(root));
     if p == r {
@@ -709,8 +712,7 @@ mod tests {
         );
 
         // `..` 穿越且目标不存在（canonicalize 失效 → 词法归一兜底拒收）。
-        let escape_uri =
-            path_to_uri_str(&root_dir.join("../../serena_avw_escape/x"));
+        let escape_uri = path_to_uri_str(&root_dir.join("../../serena_avw_escape/x"));
         assert!(
             !uri_in_root(&escape_uri, &root_dir),
             "穿越路径归一后落在 root 外必须拒: {escape_uri}"

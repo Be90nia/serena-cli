@@ -52,7 +52,11 @@ const HANDSHAKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
 /// 解析握手段预算（bd 62z）：`SERENA_HANDSHAKE_TIMEOUT_SECS`（纯函数供单测；
 /// 非数字/空串/0 → 回默认 30s——0 会让握手永不超时，挂死无界）。
 fn handshake_timeout() -> Duration {
-    parse_handshake_secs(std::env::var("SERENA_HANDSHAKE_TIMEOUT_SECS").ok().as_deref())
+    parse_handshake_secs(
+        std::env::var("SERENA_HANDSHAKE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn parse_handshake_secs(raw: Option<&str>) -> Duration {
@@ -1040,18 +1044,16 @@ mod tests {
         let replay = write_replay(dir.path());
         // SAFETY: REPLAY_ENV 保证本进程内独占访问 SERENA_REPLAY，用完即清。
         unsafe { std::env::set_var(ENV_REPLAY, &replay) };
-        let session = Session::start(
-            None,
-            crate::init_params::base_initialize_params(),
-        )
-        .await
-        .expect("replay session Ready");
+        let session = Session::start(None, crate::init_params::base_initialize_params())
+            .await
+            .expect("replay session Ready");
         unsafe { std::env::remove_var(ENV_REPLAY) };
         let got = session.client.retry_methods_for_test();
-        let expected: std::collections::HashSet<String> = crate::init_params::RETRY_ON_CONTENT_MODIFIED
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        let expected: std::collections::HashSet<String> =
+            crate::init_params::RETRY_ON_CONTENT_MODIFIED
+                .into_iter()
+                .map(Into::into)
+                .collect();
         assert!(
             !expected.is_empty(),
             "生产白名单常量不得为空（防御性：常量被清空时注册测也无意义）"
@@ -1282,7 +1284,8 @@ mod tests {
 
         let s2 = session.clone();
         let waiter = tokio::spawn(async move {
-            s2.wait_for_progress("q10-tok", Duration::from_secs(2)).await
+            s2.wait_for_progress("q10-tok", Duration::from_secs(2))
+                .await
         });
         // 轮询到 waiter 已注册（waiters 表出现 token），立刻在同一临界区内
         // notify_waiters —— 与 `$/progress` handler 的真实形态完全一致。
@@ -1322,8 +1325,9 @@ mod tests {
         *session.state.lock().unwrap() = SessionState::Initializing;
         let s2 = session.clone();
         let r = tokio::spawn(async move {
-            let res: Result<Value> =
-                s2.request("textDocument/q10", json!({}), Duration::from_millis(300)).await;
+            let res: Result<Value> = s2
+                .request("textDocument/q10", json!({}), Duration::from_millis(300))
+                .await;
             res
         });
         // 让 request 跑过 check1/check2、notified future 已创建、挂到门上。

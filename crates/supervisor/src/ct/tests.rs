@@ -25,10 +25,7 @@ fn tmpdir(label: &str) -> std::path::PathBuf {
 fn make_txn(store: &std::path::Path, n: u64, ts: u64, paths: &[&str]) {
     let dir = store.join(format!("txn-{n}"));
     std::fs::create_dir_all(&dir).expect("txn dir");
-    let files: Vec<Value> = paths
-        .iter()
-        .map(|p| json!({ "path": p }))
-        .collect();
+    let files: Vec<Value> = paths.iter().map(|p| json!({ "path": p })).collect();
     std::fs::write(
         dir.join("manifest.json"),
         json!({ "txn_id": n, "timestamp": ts, "files": files }).to_string(),
@@ -46,9 +43,8 @@ fn rust_analyzer_available() -> bool {
     } else {
         "rust-analyzer"
     };
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file()))
 }
 
 /// 本仓库根（crates/supervisor 上两级）。
@@ -69,9 +65,7 @@ fn tldr_budget_trims_head_then_hits() {
         .collect::<Vec<_>>()
         .join("\n");
     let fat_hits: Vec<Value> = (0..80)
-        .map(|i| {
-            json!({"file": format!("tests/t{i}.rs"), "line": 1, "col": 1, "source": "mirror"})
-        })
+        .map(|i| json!({"file": format!("tests/t{i}.rs"), "line": 1, "col": 1, "source": "mirror"}))
         .collect();
     let mut env = json!({
         "file": "lib.rs",
@@ -201,7 +195,9 @@ async fn recent_activity_counts_corrupt_manifests() {
 #[tokio::test]
 async fn recent_activity_store_missing_is_empty() {
     let dir = tmpdir("activity_empty");
-    let env = ct_recent_activity_at(&dir.join("no_store"), &dir, 10).await.unwrap();
+    let env = ct_recent_activity_at(&dir.join("no_store"), &dir, 10)
+        .await
+        .unwrap();
     assert!(env["last_edited"].as_array().unwrap().is_empty());
     assert!(env.get("manifest_skipped").is_none());
 }
@@ -248,11 +244,17 @@ async fn verify_and_impact_fixture_e2e() {
         .await
         .expect("verify broken");
     for _ in 0..30 {
-        if !broken["diagnostics"].as_array().unwrap_or(&Vec::new()).is_empty() {
+        if !broken["diagnostics"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .is_empty()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
-        broken = ct_verify(&sup, &root, "broken.rs", None).await.expect("verify broken");
+        broken = ct_verify(&sup, &root, "broken.rs", None)
+            .await
+            .expect("verify broken");
     }
     assert!(
         !broken["diagnostics"].as_array().unwrap().is_empty(),
@@ -261,7 +263,9 @@ async fn verify_and_impact_fixture_e2e() {
 
     // AC② 干净文件：诊断空 + format_ok:true（rustfmt 缺席环境显式 skip，
     // format_ok 缺席不冒充断言）。
-    let clean = ct_verify(&sup, &root, "lib.rs", None).await.expect("verify clean");
+    let clean = ct_verify(&sup, &root, "lib.rs", None)
+        .await
+        .expect("verify clean");
     assert!(
         clean["diagnostics"].as_array().unwrap().is_empty(),
         "干净文件诊断应为空: {clean}"
@@ -271,13 +275,17 @@ async fn verify_and_impact_fixture_e2e() {
     }
 
     // AC③ guarded_join refs 非空（声明 + render 内调用）。
-    let mut impact = ct_impact(&sup, &root, "guarded_join").await.expect("impact");
+    let mut impact = ct_impact(&sup, &root, "guarded_join")
+        .await
+        .expect("impact");
     for _ in 0..30 {
         if impact["refs_count"].as_u64().unwrap_or(0) >= 2 {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
-        impact = ct_impact(&sup, &root, "guarded_join").await.expect("impact");
+        impact = ct_impact(&sup, &root, "guarded_join")
+            .await
+            .expect("impact");
     }
     assert!(
         impact["refs_count"].as_u64().unwrap_or(0) >= 2,
@@ -295,7 +303,10 @@ async fn verify_and_impact_fixture_e2e() {
         TLDR_BUDGET_TOKENS * 4
     );
     assert!(tldr["symbol_count"].as_u64().unwrap() >= 1, "{tldr}");
-    assert!(tldr["head"].as_str().unwrap().lines().count() >= 1, "{tldr}");
+    assert!(
+        tldr["head"].as_str().unwrap().lines().count() >= 1,
+        "{tldr}"
+    );
 }
 
 /// AC① 真仓库口径：path_guard.rs 实测 ≤ 800 tok。重型（RA 冷启动 + 全仓
@@ -367,7 +378,11 @@ fn locate_signature_name_finds_keyword_position() {
     // 文档注释先出现名字 → 跳过，命中签名。
     let doc = "/// uses fn guarded_join internally.\npub fn guarded_join() {}\n";
     let (off, line, col) = locate_signature_name(doc, "guarded_join").expect("sig hit");
-    assert_eq!((line, col), (1, 7), "signature line, not doc line: off={off}");
+    assert_eq!(
+        (line, col),
+        (1, 7),
+        "signature line, not doc line: off={off}"
+    );
     // 属性行提及 → 跳过。
     let attr = "#[doc = \"see guarded_join\"]\nfn guarded_join() {}\n";
     let (off, line, _) = locate_signature_name(attr, "guarded_join").expect("sig hit");
@@ -379,9 +394,15 @@ fn locate_signature_name_finds_keyword_position() {
     let nested = "fn dup() {\n    fn dup() {}\n}\n";
     assert_eq!(locate_signature_name(nested, "dup"), Some((3, 0, 3)));
     // 非 fn item → None。
-    assert_eq!(locate_signature_name("pub struct Widget;\n", "Widget"), None);
+    assert_eq!(
+        locate_signature_name("pub struct Widget;\n", "Widget"),
+        None
+    );
     // 名字是更长标识符的子串 → 不命中。
-    assert_eq!(locate_signature_name("fn guarded_join2() {}\n", "guarded_join"), None);
+    assert_eq!(
+        locate_signature_name("fn guarded_join2() {}\n", "guarded_join"),
+        None
+    );
 }
 
 #[test]
@@ -397,7 +418,10 @@ fn split_fn_params_body_variants() {
     // tuple struct：名字后无 `(` → None。
     assert_eq!(split_fn_params_body("struct W(u8);\n", 7), None);
     // trait 声明无 body → None（name_off 指向 `fn f();` 的 `f`）。
-    assert_eq!(split_fn_params_body("trait T {\n    fn f();\n}\n", 17), None);
+    assert_eq!(
+        split_fn_params_body("trait T {\n    fn f();\n}\n", 17),
+        None
+    );
 }
 
 #[test]
@@ -428,8 +452,14 @@ fn param_bindings_rebuilds_call_args() {
 
 #[test]
 fn build_call_expr_self_and_free() {
-    assert_eq!(build_call_expr("impl_f", &["root".into(), "file".into()]), "impl_f(root, file)");
-    assert_eq!(build_call_expr("m", &["self".into(), "x".into()]), "self.m(x)");
+    assert_eq!(
+        build_call_expr("impl_f", &["root".into(), "file".into()]),
+        "impl_f(root, file)"
+    );
+    assert_eq!(
+        build_call_expr("m", &["self".into(), "x".into()]),
+        "self.m(x)"
+    );
     assert_eq!(build_call_expr("z", &[]), "z()");
 }
 
@@ -454,7 +484,10 @@ fn unsupported_error_contract_shape() {
     let e = unsupported("extract", "`x` is not a function item".into());
     match e {
         ToolError::BadArgs { detail } => {
-            assert!(detail.starts_with("language server does not support extract"), "{detail}");
+            assert!(
+                detail.starts_with("language server does not support extract"),
+                "{detail}"
+            );
         }
         other => panic!("expected BadArgs, got {other:?}"),
     }
@@ -527,16 +560,20 @@ async fn batch3_deep_six_fixture_e2e() {
 
     // AC③ pick "lang name resolve" → 候选含 resolve_lang_name 且得分最高
     // （3 token 全命中；resolve_lang/lang_name_hint 各 2）。轮询 workspace/symbol 索引。
-    let mut pick = ct_pick(&sup, &root, "lang name resolve").await.expect("pick");
+    let mut pick = ct_pick(&sup, &root, "lang name resolve")
+        .await
+        .expect("pick");
     for _ in 0..30 {
-        let has = pick["candidates"].as_array().is_some_and(|c| {
-            c.iter().any(|x| x["name"] == json!("resolve_lang_name"))
-        });
+        let has = pick["candidates"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|x| x["name"] == json!("resolve_lang_name")));
         if has {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
-        pick = ct_pick(&sup, &root, "lang name resolve").await.expect("pick");
+        pick = ct_pick(&sup, &root, "lang name resolve")
+            .await
+            .expect("pick");
     }
     let cands = pick["candidates"].as_array().expect("candidates");
     let top = cands
@@ -559,7 +596,9 @@ async fn batch3_deep_six_fixture_e2e() {
         Ok(env) => env,
         Err(_) => {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            ct_goto_callers(&sup, &root, "guarded_join").await.expect("goto_callers")
+            ct_goto_callers(&sup, &root, "guarded_join")
+                .await
+                .expect("goto_callers")
         }
     };
     for _ in 0..30 {
@@ -569,9 +608,15 @@ async fn batch3_deep_six_fixture_e2e() {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
-        callers_env = ct_goto_callers(&sup, &root, "guarded_join").await.expect("goto_callers");
+        callers_env = ct_goto_callers(&sup, &root, "guarded_join")
+            .await
+            .expect("goto_callers");
     }
-    assert_eq!(callers_env["definition"]["file"], json!("lib.rs"), "{callers_env}");
+    assert_eq!(
+        callers_env["definition"]["file"],
+        json!("lib.rs"),
+        "{callers_env}"
+    );
     // callers = render（同文件调用）+ extracted_and_renamed_still_work（集成测试
     // 调用）；定义点自身回显与 use 顶层导入（container 空）不算 caller。
     let mut got_callers: Vec<String> = callers_env["callers"]
@@ -595,7 +640,14 @@ async fn batch3_deep_six_fixture_e2e() {
     let mut direct_set: Vec<(String, u32, u32, String)> = direct
         .iter()
         // RefSymbolHit 原始 0-based → 信封 1-based 同基线对拍。
-        .map(|r| (r.file.clone(), r.line + 1, r.col + 1, r.container_name.clone()))
+        .map(|r| {
+            (
+                r.file.clone(),
+                r.line + 1,
+                r.col + 1,
+                r.container_name.clone(),
+            )
+        })
         .collect();
     direct_set.sort();
     let mut env_set: Vec<(String, u32, u32, String)> = callers_env["refs"]
@@ -612,20 +664,46 @@ async fn batch3_deep_six_fixture_e2e() {
         })
         .collect();
     env_set.sort();
-    assert_eq!(env_set, direct_set, "AC① 交叉对拍失败: env={callers_env} direct={direct:?}");
+    assert_eq!(
+        env_set, direct_set,
+        "AC① 交叉对拍失败: env={callers_env} direct={direct:?}"
+    );
 
     // AC② rename：真机 TEMP fixture → 符号+refs 同步。
-    let renamed = ct_smart_edit(&sup, &root, "lib.rs", "lang_name_hint", "rename", "hint_name")
-        .await
-        .expect("rename");
+    let renamed = ct_smart_edit(
+        &sup,
+        &root,
+        "lib.rs",
+        "lang_name_hint",
+        "rename",
+        "hint_name",
+    )
+    .await
+    .expect("rename");
     assert_eq!(renamed["transform"], json!("rename"), "{renamed}");
-    assert!(renamed["files_modified"].as_u64().unwrap() >= 1, "{renamed}");
-    assert_eq!(renamed["skipped"].as_array().map(Vec::len), Some(0), "{renamed}");
+    assert!(
+        renamed["files_modified"].as_u64().unwrap() >= 1,
+        "{renamed}"
+    );
+    assert_eq!(
+        renamed["skipped"].as_array().map(Vec::len),
+        Some(0),
+        "{renamed}"
+    );
     let lib_text = std::fs::read_to_string(root.join("lib.rs")).unwrap();
-    assert!(lib_text.contains("pub fn hint_name(id: &str)"), "{lib_text}");
+    assert!(
+        lib_text.contains("pub fn hint_name(id: &str)"),
+        "{lib_text}"
+    );
     assert!(!lib_text.contains("lang_name_hint"), "{lib_text}");
-    let overview = sup.tool_overview(&root, "lib.rs", None).await.expect("overview");
-    assert!(overview.iter().any(|h| h.name == "hint_name"), "refs 未同步: {overview:?}");
+    let overview = sup
+        .tool_overview(&root, "lib.rs", None)
+        .await
+        .expect("overview");
+    assert!(
+        overview.iter().any(|h| h.name == "hint_name"),
+        "refs 未同步: {overview:?}"
+    );
 
     // AC② extract：guarded_join 整符号抽取 → 新 fn + 原位调用。
     let extracted = ct_smart_edit(
@@ -648,7 +726,10 @@ async fn batch3_deep_six_fixture_e2e() {
         lib_text.contains("guarded_join_impl(root, file)"),
         "原位调用缺失: {lib_text}"
     );
-    assert!(lib_text.contains("pub fn guarded_join(root: &str, file: &str) -> String"), "{lib_text}");
+    assert!(
+        lib_text.contains("pub fn guarded_join(root: &str, file: &str) -> String"),
+        "{lib_text}"
+    );
 
     // AC② 错误路径（R1）：能力外操作 → 确定性 BadArgs（码 + detail 形态）。
     let bad_transform = ct_smart_edit(&sup, &root, "lib.rs", "render", "refactor", "x")
@@ -670,7 +751,9 @@ async fn batch3_deep_six_fixture_e2e() {
     }
 
     // AC② test 后端过：rename+extract 后 fixture 编译且行为不变。
-    let test = crate::recipe::run_test(&root, "tests/extract.rs", None).await.expect("run test");
+    let test = crate::recipe::run_test(&root, "tests/extract.rs", None)
+        .await
+        .expect("run test");
     assert_eq!(test["raw_exit"], json!(0), "{test}");
     assert!(test["passed"].as_u64().unwrap() >= 1, "{test}");
 
@@ -708,7 +791,9 @@ async fn batch3_deep_six_fixture_e2e() {
     assert_eq!(good["test"]["raw_exit"], json!(0), "{good}");
     assert!(good["test"]["passed"].as_u64().unwrap() >= 1, "{good}");
     let t1 = good["txn_id"].as_u64().expect("txn_id");
-    let snap1 = crate::undo::read_txn(&root2, Some(t1)).await.expect("txn snapshot");
+    let snap1 = crate::undo::read_txn(&root2, Some(t1))
+        .await
+        .expect("txn snapshot");
     let mut paths: Vec<String> = snap1
         .files
         .iter()
@@ -718,10 +803,15 @@ async fn batch3_deep_six_fixture_e2e() {
     assert_eq!(paths, ["lib.rs", "tests/add.rs"], "txn 只含写步: {paths:?}");
 
     // AC⑥ review_diff(None) = 最近事务（good 写事务）→ diff + 关联 test + 跑测。
-    let review = ct_review_diff(&sup, &root2, None).await.expect("review_diff none");
+    let review = ct_review_diff(&sup, &root2, None)
+        .await
+        .expect("review_diff none");
     assert_eq!(review["txn_id"], json!(t1), "{review}");
     assert_eq!(review["files"].as_array().unwrap().len(), 2, "{review}");
-    assert!(review["test_skipped"].is_null() || review.get("test_skipped").is_none(), "{review}");
+    assert!(
+        review["test_skipped"].is_null() || review.get("test_skipped").is_none(),
+        "{review}"
+    );
     assert!(review["test"]["passed"].as_u64().unwrap() >= 1, "{review}");
     assert!(
         review["related_tests"]
@@ -746,25 +836,42 @@ async fn batch3_deep_six_fixture_e2e() {
     .expect("write_with_tests broken");
     assert!(bad["test"]["failed"].as_u64().unwrap() >= 1, "{bad}");
     assert!(
-        !bad["test"]["failures"].as_array().expect("failures").is_empty(),
+        !bad["test"]["failures"]
+            .as_array()
+            .expect("failures")
+            .is_empty(),
         "失败清单缺失: {bad}"
     );
     let t2 = bad["txn_id"].as_u64().expect("txn_id2");
-    let snap2 = crate::undo::read_txn(&root2, Some(t2)).await.expect("txn snapshot2");
+    let snap2 = crate::undo::read_txn(&root2, Some(t2))
+        .await
+        .expect("txn snapshot2");
     let mut paths2: Vec<String> = snap2
         .files
         .iter()
         .map(|f| crate::recipe::rel_forward(&root2, &f.path))
         .collect();
     paths2.sort();
-    assert_eq!(paths2, ["lib.rs", "tests/broken.rs"], "坏 test txn 只含写步: {paths2:?}");
+    assert_eq!(
+        paths2,
+        ["lib.rs", "tests/broken.rs"],
+        "坏 test txn 只含写步: {paths2:?}"
+    );
 
     // AC⑥ review_diff(Some(坏事务)) → diff + 失败清单聚合。
-    let review_bad = ct_review_diff(&sup, &root2, Some(t2)).await.expect("review_diff some");
+    let review_bad = ct_review_diff(&sup, &root2, Some(t2))
+        .await
+        .expect("review_diff some");
     assert_eq!(review_bad["txn_id"], json!(t2), "{review_bad}");
-    assert!(review_bad["test"]["failed"].as_u64().unwrap() >= 1, "{review_bad}");
     assert!(
-        !review_bad["test"]["failures"].as_array().expect("failures").is_empty(),
+        review_bad["test"]["failed"].as_u64().unwrap() >= 1,
+        "{review_bad}"
+    );
+    assert!(
+        !review_bad["test"]["failures"]
+            .as_array()
+            .expect("failures")
+            .is_empty(),
         "{review_bad}"
     );
 

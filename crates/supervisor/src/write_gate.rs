@@ -18,8 +18,8 @@
 //!
 //! ponytail: 全局单写门；若未来证明同文件高频并发写是热点，再按 project_root 分键。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lsp_core::error::CoreError;

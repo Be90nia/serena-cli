@@ -31,11 +31,7 @@ async fn request_times_out_when_outbound_backpressured() {
     // 外层 5s 只是防测试自身挂死；断言的是 request 自身在预算量级内返回。
     let res = tokio::time::timeout(Duration::from_secs(5), async {
         client
-            .request::<serde_json::Value>(
-                "textDocument/hover",
-                serde_json::json!({}),
-                budget,
-            )
+            .request::<serde_json::Value>("textDocument/hover", serde_json::json!({}), budget)
             .await
     })
     .await

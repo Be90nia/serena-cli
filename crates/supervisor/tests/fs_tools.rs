@@ -21,7 +21,9 @@ async fn read_file_full_returns_all_lines() {
     let d = dir("full");
     let p = d.join("a.txt");
     fs::write(&p, "l1\nl2\nl3\nl4\nl5\n").unwrap();
-    let r = fs_tools::read_file(&d, "a.txt", None, None, true, None).await.unwrap();
+    let r = fs_tools::read_file(&d, "a.txt", None, None, true, None)
+        .await
+        .unwrap();
     assert_eq!(r.content, "l1\nl2\nl3\nl4\nl5");
     assert_eq!(r.total_lines, 5);
     assert_eq!(r.start_line, 1);
@@ -145,7 +147,11 @@ async fn find_file_glob_matches_names() {
     // bd 75k3：含通配符的 pattern 按相对路径匹配 —— `*.rs` 不跨目录，src/ 下的
     // 文件不命中。
     let hits = fs_tools::find_file(&d, "*.rs", None, 100).unwrap();
-    assert_eq!(hits.len(), 0, "top-level glob must not cross dirs: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        0,
+        "top-level glob must not cross dirs: {hits:?}"
+    );
     // `**/*.rs` 递归任意深度。
     let hits = fs_tools::find_file(&d, "**/*.rs", None, 100).unwrap();
     assert_eq!(hits.len(), 2, "got {hits:?}");

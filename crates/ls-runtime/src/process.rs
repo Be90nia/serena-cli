@@ -122,12 +122,25 @@ fn register_proc_exit(kq: i32, pid: u32) -> bool {
         data: 0,
         udata: std::ptr::null_mut(),
     };
-    let mut receipt =
-        [libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: std::ptr::null_mut() }; 1];
+    let mut receipt = [libc::kevent {
+        ident: 0,
+        filter: 0,
+        flags: 0,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    }; 1];
     // SAFETY: kq 为调用方刚创建的有效 kqueue；changelist/eventlist 均为有效
     // 栈指针，数组长度与传入计数一致；kevent 仅读写这两个栈数组。
     let n = unsafe {
-        libc::kevent(kq, &mut change, 1, receipt.as_mut_ptr(), 1, std::ptr::null())
+        libc::kevent(
+            kq,
+            &mut change,
+            1,
+            receipt.as_mut_ptr(),
+            1,
+            std::ptr::null(),
+        )
     };
     n == 1 && receipt[0].flags & libc::EV_ERROR == 0
 }
@@ -152,9 +165,7 @@ fn run_parent_death_watchdog(child_pid: u32) -> ! {
     let mut event: libc::kevent = unsafe { std::mem::zeroed() };
     loop {
         // SAFETY: kq 有效；event 为有效栈指针；NULL 超时 = 阻塞等宿主退出事件。
-        let n = unsafe {
-            libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null())
-        };
+        let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null()) };
         if n == 1 {
             break;
         }
@@ -370,11 +381,12 @@ mod tests {
             sleeper.wait().expect("reap sleep child");
 
             let mut event: libc::kevent = unsafe { std::mem::zeroed() };
-            let timeout = libc::timespec { tv_sec: 5, tv_nsec: 0 };
-            // SAFETY: kq 有效；event/timeout 为有效栈指针；kevent 至多 5s 返回。
-            let n = unsafe {
-                libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &timeout)
+            let timeout = libc::timespec {
+                tv_sec: 5,
+                tv_nsec: 0,
             };
+            // SAFETY: kq 有效；event/timeout 为有效栈指针；kevent 至多 5s 返回。
+            let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &timeout) };
             assert_eq!(
                 n, 1,
                 "NOTE_EXIT|NOTE_REAP event must be delivered after reap"
@@ -382,11 +394,7 @@ mod tests {
             // libc kevent 在部分 target 是 packed：assert_eq! 会创建字段引用
             // 触发 E0793，必须按 unaligned 读拷出值再断言。
             let event_ident = unsafe { std::ptr::addr_of!(event.ident).read_unaligned() };
-            assert_eq!(
-                event_ident,
-                pid as usize,
-                "event ident must be child pid"
-            );
+            assert_eq!(event_ident, pid as usize, "event ident must be child pid");
         }
     }
 

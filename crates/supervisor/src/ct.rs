@@ -165,9 +165,8 @@ fn shrink_nested_hits(env: &mut Value, budget: usize) {
 /// 文件首 n 行（读失败 → BadArgs：tldr 目标必须存在）。
 async fn first_lines(root: &Path, file: &str, n: usize) -> Result<String, ToolError> {
     // bd rewn：裸 root.join(file) 会把绝对路径整体替换基路径 → 任意文件读。
-    let abs = crate::path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs {
-        detail,
-    })?;
+    let abs = crate::path_guard::guarded_join(root, file)
+        .map_err(|detail| ToolError::BadArgs { detail })?;
     let body = tokio::fs::read_to_string(&abs)
         .await
         .map_err(|e| ToolError::BadArgs {
@@ -204,17 +203,18 @@ pub(crate) async fn ct_verify(
     // format-check best-effort：诊断是主信号。LS 后端缺格式化器（如 toolchain
     // 未装 rustfmt）→ 显式记 format_skipped，format_ok 缺席 = 未知，不冒充布尔
     // 也不拖垮诊断段。
-    let (format_ok, format_edits, format_skipped) = match sup.tool_format(root, file, None, None, None).await {
-        Ok(edits) => (Some(edits.is_empty()), edits.len(), None),
-        // bd P2-9a：-32601 = LS 无 formatting 能力——原始 rpc jargon（"core error:
-        // rpc error -32601: Unhandled method ..."）换人话一行，写 recipe 每步可见。
-        Err(ToolError::Core(crate::CoreErrorWire::Rpc { code: -32601, .. })) => (
-            None,
-            0,
-            Some("format skipped: LS does not support formatting".to_string()),
-        ),
-        Err(e) => (None, 0, Some(format!("format-check skipped: {e}"))),
-    };
+    let (format_ok, format_edits, format_skipped) =
+        match sup.tool_format(root, file, None, None, None).await {
+            Ok(edits) => (Some(edits.is_empty()), edits.len(), None),
+            // bd P2-9a：-32601 = LS 无 formatting 能力——原始 rpc jargon（"core error:
+            // rpc error -32601: Unhandled method ..."）换人话一行，写 recipe 每步可见。
+            Err(ToolError::Core(crate::CoreErrorWire::Rpc { code: -32601, .. })) => (
+                None,
+                0,
+                Some("format skipped: LS does not support formatting".to_string()),
+            ),
+            Err(e) => (None, 0, Some(format!("format-check skipped: {e}"))),
+        };
     let mut env = json!({
         "file": file,
         "diagnostics": diag.get("items").cloned().unwrap_or_else(|| json!([])),
@@ -323,8 +323,12 @@ fn clamp_json_strings(v: &mut Value, max_chars: usize) {
                 *s = clamped;
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(|i| clamp_json_strings(i, max_chars)),
-        Value::Object(map) => map.values_mut().for_each(|x| clamp_json_strings(x, max_chars)),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|i| clamp_json_strings(i, max_chars)),
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|x| clamp_json_strings(x, max_chars)),
         _ => {}
     }
 }
@@ -437,7 +441,7 @@ async fn git_log_recent(root: &Path, n: usize) -> (Vec<Value>, Option<String>) {
             return (
                 Vec::new(),
                 Some(format!("git log timed out after {GIT_TIMEOUT_SECS}s")),
-            )
+            );
         }
         Ok(res) => res,
     };
@@ -589,7 +593,10 @@ pub(crate) async fn name_position(
         .tool_symbol_body(root, &def.file, symbol, None)
         .await
         .ok();
-    match item.as_deref().and_then(|t| locate_signature_name(t, symbol)) {
+    match item
+        .as_deref()
+        .and_then(|t| locate_signature_name(t, symbol))
+    {
         Some((_, line_off, col)) => (
             def.line0 + line_off as u32 + 1,
             if line_off == 0 {
@@ -618,7 +625,11 @@ fn locate_signature_name(item: &str, symbol: &str) -> Option<(usize, usize, usiz
         let line_start = item[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
         let line_head = item[line_start..off].trim_start();
         let keyword = item[..off].trim_end().ends_with("fn");
-        if before_ok && after_ok && keyword && !line_head.starts_with("//") && !line_head.starts_with('#')
+        if before_ok
+            && after_ok
+            && keyword
+            && !line_head.starts_with("//")
+            && !line_head.starts_with('#')
         {
             let line_off = item[..off].matches('\n').count();
             return Some((off, line_off, off - line_start));
@@ -984,8 +995,8 @@ async fn smart_edit_extract(
         // bd P2-6：本实现按 Rust 语法解析签名（fn 关键字 + 参数串重建）。非 rust
         // 文件的 def 落到这里时，旧文案 "`x` is not a function item" 张冠李戴
         // （python def 明明是函数）——真实原因 = 该重构仅实现了 Rust 源。
-        let lang = crate::resolve_lang_for_file(file, None)
-            .unwrap_or_else(|_| "unknown".to_string());
+        let lang =
+            crate::resolve_lang_for_file(file, None).unwrap_or_else(|_| "unknown".to_string());
         if lang != "rust" {
             return Err(unsupported(
                 "extract",
@@ -1021,13 +1032,11 @@ async fn smart_edit_extract(
     // 原 fn = 原签名 + body 换为调用（缩进沿用 body 首行风格）。
     let call = build_call_expr(new_name, &bindings);
     let indent = body_indent(&item, body_open);
-    let original = format!(
-        "{}{{\n{indent}{call}\n}}",
-        &item[..body_open],
-    );
+    let original = format!("{}{{\n{indent}{call}\n}}", &item[..body_open],);
     sup.tool_edit_insert_after_symbol(root, file, symbol, &format!("\n\n{new_fn}"), false, None)
         .await?;
-    sup.tool_replace_body(root, file, symbol, &original, None).await?;
+    sup.tool_replace_body(root, file, symbol, &original, None)
+        .await?;
     Ok(vec![
         (
             "new_fn".into(),
@@ -1146,12 +1155,13 @@ pub(crate) async fn write_via_tool(
     file: &str,
     content: &str,
 ) -> Result<(), ToolError> {
-    let abs =
-        crate::path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs {
-            detail,
-        })?;
+    let abs = crate::path_guard::guarded_join(root, file)
+        .map_err(|detail| ToolError::BadArgs { detail })?;
     if !abs.exists() {
-        return sup.tool_create_text_file(root, file, content, None).await.map(|_| ());
+        return sup
+            .tool_create_text_file(root, file, content, None)
+            .await
+            .map(|_| ());
     }
     let total = tokio::fs::read_to_string(&abs)
         .await
@@ -1317,11 +1327,12 @@ pub(crate) async fn ct_define_feature(
             .map_err(|detail| ToolError::BadArgs { detail })?;
         if abs.exists() {
             // 追加 EOF：insert-at-line(total+1)；结尾无换行先补分隔。
-            let existing = tokio::fs::read_to_string(&abs)
-                .await
-                .map_err(|e| ToolError::BadArgs {
-                    detail: format!("read {target}: {e}"),
-                })?;
+            let existing =
+                tokio::fs::read_to_string(&abs)
+                    .await
+                    .map_err(|e| ToolError::BadArgs {
+                        detail: format!("read {target}: {e}"),
+                    })?;
             let sep = if existing.ends_with('\n') { "" } else { "\n" };
             let lines = existing.lines().count() as u32;
             sup.tool_insert_at_line(root, target, lines + 1, &format!("{sep}{stub}"), None, None)

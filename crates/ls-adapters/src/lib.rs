@@ -1245,7 +1245,10 @@ mod tests {
             macos_cargo_fallback("rust-analyzer", Some(dir.path().as_os_str())),
             Some(cargo_bin.join("rust-analyzer"))
         );
-        assert_eq!(macos_cargo_fallback("absent", Some(dir.path().as_os_str())), None);
+        assert_eq!(
+            macos_cargo_fallback("absent", Some(dir.path().as_os_str())),
+            None
+        );
         assert_eq!(macos_cargo_fallback("rust-analyzer", None), None);
     }
 }

@@ -505,11 +505,18 @@ mod tests {
             !name.contains(&std::process::id().to_string()),
             "SEC-4: 文件名不得含可预测 pid（CWE-377）: {name}"
         );
-        assert!(!name.starts_with("serena_sha256_"), "不得用可预测前缀: {name}");
+        assert!(
+            !name.starts_with("serena_sha256_"),
+            "不得用可预测前缀: {name}"
+        );
         // drop 即删，无残留。
         let gone = f.path().to_path_buf();
         drop(f);
-        assert!(!gone.exists(), "NamedTempFile drop 应删除临时文件: {}", gone.display());
+        assert!(
+            !gone.exists(),
+            "NamedTempFile drop 应删除临时文件: {}",
+            gone.display()
+        );
     }
 
     /// sha256_hex 端到端锚：临时文件 → 系统工具 → 已知向量（NamedTempFile 与

@@ -1036,7 +1036,10 @@ mod tests {
         assert!(entry_routable("csharp_ls", &langs("csharp_ls")));
         assert!(entry_routable("omnisharp", &langs("omnisharp")));
         assert!(entry_routable("typescript_ls", &langs("typescript_ls")));
-        assert!(entry_routable("crystalline_source", &langs("crystalline_source")));
+        assert!(entry_routable(
+            "crystalline_source",
+            &langs("crystalline_source")
+        ));
         // 语言门直通的条目（languages 即真语言）。
         assert!(entry_routable("kotlin", &langs("kotlin")));
         assert!(entry_routable("ada", &langs("ada")));
@@ -1048,8 +1051,14 @@ mod tests {
         // blindtest v5.2 P2-D：.rb 入 EXT_TABLE 后 ruby 家族翻可路由。ruby_lsp 的
         // languages 本就是真语言 ["ruby"]（非变体）→ languages 门直通；solargraph
         // 才是变体条目（languages 占位同 id，经家族折算）。
-        assert!(entry_routable("ruby_lsp", &langs("ruby")), "ruby_lsp: languages 直通");
-        assert!(entry_routable("solargraph", &langs("solargraph")), "solargraph: 家族折算");
+        assert!(
+            entry_routable("ruby_lsp", &langs("ruby")),
+            "ruby_lsp: languages 直通"
+        );
+        assert!(
+            entry_routable("solargraph", &langs("solargraph")),
+            "solargraph: 家族折算"
+        );
         assert!(!entry_routable("matlab", &langs("matlab")));
         // 未知条目。
         assert!(!entry_routable("zz_entry_xx", &langs("zz_entry_xx")));

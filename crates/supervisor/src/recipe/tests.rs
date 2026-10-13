@@ -172,10 +172,7 @@ fn unified_diff_modified_file_exact_format() {
 #[test]
 fn unified_diff_created_file_uses_dev_null() {
     let d = unified_diff("new.txt", "", "a\nb\n", true);
-    assert_eq!(
-        d,
-        "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+a\n+b\n"
-    );
+    assert_eq!(d, "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+a\n+b\n");
 }
 
 #[test]
@@ -274,8 +271,18 @@ fn make_txn_dir(store: &Path, name: &str, n: u64, files: &str) {
 #[tokio::test]
 async fn read_txn_default_picks_top_active() {
     let store = tmpstore("top");
-    make_txn_dir(&store, "txn-3", 3, r#"[{"path":"D:/w/a.rs","created":false,"before":"old","after":"new","after_sha256":"x"}]"#);
-    make_txn_dir(&store, "txn-1", 1, r#"[{"path":"D:/w/b.rs","created":true,"before":null,"after":"n","after_sha256":"y"}]"#);
+    make_txn_dir(
+        &store,
+        "txn-3",
+        3,
+        r#"[{"path":"D:/w/a.rs","created":false,"before":"old","after":"new","after_sha256":"x"}]"#,
+    );
+    make_txn_dir(
+        &store,
+        "txn-1",
+        1,
+        r#"[{"path":"D:/w/b.rs","created":true,"before":null,"after":"n","after_sha256":"y"}]"#,
+    );
     let snap = crate::undo::read_txn_at(&store, None).await.unwrap();
     assert_eq!(snap.txn_id, 3, "缺省 = N 最大的活跃事务");
     assert_eq!(snap.files[0].before.as_deref(), Some("old"));
@@ -284,10 +291,20 @@ async fn read_txn_default_picks_top_active() {
 #[tokio::test]
 async fn read_txn_explicit_id_reads_undone_and_side_files() {
     let store = tmpstore("undone");
-    make_txn_dir(&store, "txn-2", 2, r#"[{"path":"D:/w/a.rs","created":false,"before":null,"after":"new","after_sha256":"x","before_file":"before/0"}]"#);
+    make_txn_dir(
+        &store,
+        "txn-2",
+        2,
+        r#"[{"path":"D:/w/a.rs","created":false,"before":null,"after":"new","after_sha256":"x","before_file":"before/0"}]"#,
+    );
     std::fs::create_dir_all(store.join("txn-2/before")).unwrap();
     std::fs::write(store.join("txn-2/before/0"), "old-from-side").unwrap();
-    make_txn_dir(&store, "undone-1", 1, r#"[{"path":"D:/w/c.rs","created":true,"before":null,"after":"n","after_sha256":"z"}]"#);
+    make_txn_dir(
+        &store,
+        "undone-1",
+        1,
+        r#"[{"path":"D:/w/c.rs","created":true,"before":null,"after":"n","after_sha256":"z"}]"#,
+    );
     // 显式 id 可读 undone-*（复盘已回滚事务）。
     let snap = crate::undo::read_txn_at(&store, Some(1)).await.unwrap();
     assert!(snap.files[0].created);
@@ -318,7 +335,11 @@ fn resolve_target_dir_and_file_forms() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
     std::fs::create_dir_all(dir.path().join("crates/sub/tests")).unwrap();
-    std::fs::write(dir.path().join("crates/sub/tests/it.rs"), "#[test]\nfn t() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("crates/sub/tests/it.rs"),
+        "#[test]\nfn t() {}\n",
+    )
+    .unwrap();
 
     // 目录 → cargo test
     let t = resolve_target(dir.path(), ".", None).unwrap();

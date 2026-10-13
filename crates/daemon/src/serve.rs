@@ -47,7 +47,10 @@ pub fn default_lock_path() -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        unix_lock_path(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), std::env::var("HOME").ok().as_deref())
+        unix_lock_path(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
     }
 }
 
@@ -57,7 +60,9 @@ fn unix_lock_path(runtime_dir: Option<&std::ffi::OsStr>, home: Option<&str>) -> 
     if let Some(runtime) = runtime_dir {
         return PathBuf::from(runtime).join("serena").join("daemon.lock");
     }
-    PathBuf::from(home.unwrap_or(".")).join(".serena").join("daemon.lock")
+    PathBuf::from(home.unwrap_or("."))
+        .join(".serena")
+        .join("daemon.lock")
 }
 
 /// `default_lock_path` 的 Windows 分支纯函数（参数注入供单测，不碰进程 env）。

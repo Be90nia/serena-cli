@@ -601,7 +601,9 @@ fn kotlin_dart_entries_pins_match_research() {
     ] {
         assert_eq!(
             kdl.url_per_platform.get(plat).map(String::as_str),
-            Some("https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip")
+            Some(
+                "https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip"
+            )
         );
         assert_eq!(
             kdl.sha256_per_platform.get(plat).map(String::as_str),
@@ -609,7 +611,12 @@ fn kotlin_dart_entries_pins_match_research() {
         );
     }
     // unix 启动器 sh 脚本 per-platform 覆盖（win 走单值 .bat）。
-    for plat in ["linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64"] {
+    for plat in [
+        "linux-x86_64",
+        "linux-aarch64",
+        "macos-x86_64",
+        "macos-aarch64",
+    ] {
         assert_eq!(
             kdl.bin_path_per_platform.get(plat).map(String::as_str),
             Some("server/bin/kotlin-language-server")
@@ -1890,7 +1897,10 @@ fn w3b_pyrefly_angular_doors_wired() {
 #[test]
 fn al_install_hint_is_actionable_not_dev_digest() {
     let servers = parsed_servers();
-    let po = servers["al"].path_only.as_ref().expect("al: path_only table");
+    let po = servers["al"]
+        .path_only
+        .as_ref()
+        .expect("al: path_only table");
     let windows_hint = po.install_hint_windows.as_deref().unwrap_or("");
     assert!(!windows_hint.is_empty(), "windows 平台化指引必须在");
     for banned in [

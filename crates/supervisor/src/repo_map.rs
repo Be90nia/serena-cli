@@ -77,7 +77,16 @@ pub async fn build(
     // 1) LS documentSymbol 全库树（3.1 缓存兜底）。Err 不再整工具失败——降级路径
     //    接管（fj17：`session_for().await?` 曾把 LS 失败传播成全空响应）。
     let tree = sup
-        .tool_symbol_tree(root, ".", lang, CANDIDATE_SCAN_LIMIT, false, None, None, false)
+        .tool_symbol_tree(
+            root,
+            ".",
+            lang,
+            CANDIDATE_SCAN_LIMIT,
+            false,
+            None,
+            None,
+            false,
+        )
         .await
         .ok();
     let mut top = flatten_symbols(tree);
@@ -133,7 +142,10 @@ fn flatten_symbols(tree: Option<serde_json::Value>) -> Vec<RepoMapEntry> {
             }
             out.push(RepoMapEntry {
                 name: name.to_string(),
-                container: s.get("container").and_then(|v| v.as_str()).map(String::from),
+                container: s
+                    .get("container")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 file: file.to_string(),
                 kind,
             });
@@ -151,8 +163,16 @@ fn top_level_def(line: &str) -> Option<(&'static str, String)> {
     }
     // 带括号形态必须排在裸词前（否则 "pub" 先剥掉 "pub(crate)" 的前缀）。
     const MODIFIERS: [&str; 10] = [
-        "pub(crate)", "pub(super)", "pub", "export", "default", "public", "private",
-        "protected", "async", "abstract",
+        "pub(crate)",
+        "pub(super)",
+        "pub",
+        "export",
+        "default",
+        "public",
+        "private",
+        "protected",
+        "async",
+        "abstract",
     ];
     let mut rest = rest;
     while let Some(r) = MODIFIERS
@@ -330,17 +350,17 @@ mod tests {
             assert!(names.contains(&expected), "缺 {expected}，实际 {names:?}");
         }
         assert!(!names.contains(&"nested"), "缩进嵌套不算顶层: {names:?}");
-        assert!(
-            !names.contains(&"documented"),
-            "注释行不算定义: {names:?}"
-        );
+        assert!(!names.contains(&"documented"), "注释行不算定义: {names:?}");
         assert!(
             !names.contains(&"not_source"),
             "非源码扩展名不入扫: {names:?}"
         );
         assert!(out.iter().all(|e| e.container.is_none()));
         let alpha = out.iter().find(|e| e.name == "alpha").unwrap();
-        assert_eq!((alpha.file.as_str(), alpha.kind.as_str()), ("a.rs", "function"));
+        assert_eq!(
+            (alpha.file.as_str(), alpha.kind.as_str()),
+            ("a.rs", "function")
+        );
     }
 
     /// flatten：entries[].symbols[] 拉平、空名剔除、tree=None 空；批1-D 非真符号
@@ -377,13 +397,37 @@ mod tests {
     /// 批1-D：真符号 kind 词表覆盖 wire 首字母大写与 text_scan 小写两侧形态。
     #[test]
     fn real_symbol_kind_accepts_api_surface_only() {
-        for k in ["Function", "Method", "Class", "Struct", "Module", "Interface", "Enum"] {
+        for k in [
+            "Function",
+            "Method",
+            "Class",
+            "Struct",
+            "Module",
+            "Interface",
+            "Enum",
+        ] {
             assert!(is_real_symbol_kind(k), "API 面 kind 应放行: {k}");
         }
-        for k in ["function", "trait", "impl", "enummember", "constant", "type"] {
+        for k in [
+            "function",
+            "trait",
+            "impl",
+            "enummember",
+            "constant",
+            "type",
+        ] {
             assert!(is_real_symbol_kind(k), "text_scan 小写 kind 应放行: {k}");
         }
-        for k in ["Variable", "variable", "Parameter", "File", "String", "", "Other(99)", "unknown"] {
+        for k in [
+            "Variable",
+            "variable",
+            "Parameter",
+            "File",
+            "String",
+            "",
+            "Other(99)",
+            "unknown",
+        ] {
             assert!(!is_real_symbol_kind(k), "噪音 kind 应排除: {k:?}");
         }
     }

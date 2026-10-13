@@ -47,8 +47,14 @@ const FIND_TEST_SEARCH_LIMIT: usize = 500;
 /// 选定的测试后端与调用参数。
 #[derive(Debug)]
 enum TestTarget {
-    Cargo { dir: std::path::PathBuf, args: Vec<String> },
-    Npm { dir: std::path::PathBuf, args: Vec<String> },
+    Cargo {
+        dir: std::path::PathBuf,
+        args: Vec<String>,
+    },
+    Npm {
+        dir: std::path::PathBuf,
+        args: Vec<String>,
+    },
 }
 
 impl TestTarget {
@@ -97,10 +103,16 @@ fn resolve_target(root: &Path, file: &str, name: Option<&str>) -> Result<TestTar
             return Ok(TestTarget::Cargo { dir: p, args });
         }
         if p.join("package.json").is_file() {
-            return Ok(TestTarget::Npm { dir: p, args: npm_args(Vec::new(), name_args) });
+            return Ok(TestTarget::Npm {
+                dir: p,
+                args: npm_args(Vec::new(), name_args),
+            });
         }
         return Err(ToolError::BadArgs {
-            detail: format!("directory has no Cargo.toml or package.json: {}", p.display()),
+            detail: format!(
+                "directory has no Cargo.toml or package.json: {}",
+                p.display()
+            ),
         });
     }
     let ext = p
@@ -126,7 +138,10 @@ fn resolve_target(root: &Path, file: &str, name: Option<&str>) -> Result<TestTar
         Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") => {
             let dir = ancestor_with(&p, "package.json")?;
             let extra = vec![p.to_string_lossy().replace('\\', "/")];
-            Ok(TestTarget::Npm { dir, args: npm_args(extra, name_args) })
+            Ok(TestTarget::Npm {
+                dir,
+                args: npm_args(extra, name_args),
+            })
         }
         other => Err(ToolError::BadArgs {
             detail: format!(
@@ -180,10 +195,12 @@ async fn run_backend(t: &TestTarget) -> Result<(String, i32), ToolError> {
         .kill_on_drop(true);
     let out = tokio::time::timeout(Duration::from_secs(TEST_TIMEOUT_SECS), cmd.output())
         .await
-        .map_err(|_| ToolError::Core(lsp_core::error::CoreError::Timeout {
-            method: "test".into(),
-            secs: TEST_TIMEOUT_SECS,
-        }))?
+        .map_err(|_| {
+            ToolError::Core(lsp_core::error::CoreError::Timeout {
+                method: "test".into(),
+                secs: TEST_TIMEOUT_SECS,
+            })
+        })?
         .map_err(|e| ToolError::Core(lsp_core::error::CoreError::Io(e)))?;
     let text = format!(
         "{}{}",
@@ -255,7 +272,9 @@ fn parse_rust_output(text: &str) -> Parsed {
             && let Some(at) = rest.find("panicked at ")
         {
             let thread = rest[1..].split('\'').next().unwrap_or("?");
-            let loc = rest[at + "panicked at ".len()..].trim().trim_end_matches(':');
+            let loc = rest[at + "panicked at ".len()..]
+                .trim()
+                .trim_end_matches(':');
             if let Some((f, l, c)) = parse_rustc_loc(loc) {
                 failures.push(json!({
                     "file": f, "line": l, "col": c,
@@ -279,7 +298,9 @@ fn parse_npm_output(text: &str) -> Parsed {
             current_fail = Some(strip_duration(rest.trim()));
             continue;
         }
-        if t.starts_with("at ") && let Some(name) = current_fail.clone() {
+        if t.starts_with("at ")
+            && let Some(name) = current_fail.clone()
+        {
             if let Some((f, l, c)) = parse_stack_frame(t)
                 && !f.contains("node_modules")
             {
@@ -358,11 +379,7 @@ fn clamp_msg(s: &str) -> String {
 
 /// `diff [txn-id] [--patch]`：读 undo store 单事务快照，输出逐文件增删统计；
 /// `--patch` 附 unified diff（patch -p1 / git apply 可消费）。
-pub async fn diff_txn(
-    root: &Path,
-    txn_id: Option<u64>,
-    patch: bool,
-) -> Result<Value, ToolError> {
+pub async fn diff_txn(root: &Path, txn_id: Option<u64>, patch: bool) -> Result<Value, ToolError> {
     let snap = crate::undo::read_txn(root, txn_id).await?;
     let mut files = Vec::with_capacity(snap.files.len());
     let mut patch_buf = String::new();
@@ -393,7 +410,8 @@ pub async fn diff_txn(
         if patch_buf.len() > budget {
             let total = patch_buf.lines().count();
             let keep = max_fit_lines(&patch_buf, budget);
-            resp["patch"] = Value::String(patch_buf.lines().take(keep).collect::<Vec<_>>().join("\n"));
+            resp["patch"] =
+                Value::String(patch_buf.lines().take(keep).collect::<Vec<_>>().join("\n"));
             resp["truncated"] = json!(true);
             resp["original_count"] = json!(total);
         }
@@ -615,7 +633,11 @@ fn emit_hunks(out: &mut String, a: &[&str], a_nl: bool, b: &[&str], b_nl: bool, 
 /// `find-test <sym>`：H1 tests/ 镜像探针（fs，免 LS）→ H2/H3 文本搜索过滤测试
 /// 路径与 `super::` 单测惯例（免 LS）→ H4 LS refs 兜底（仅 H1-H3 全空时跑，
 /// best-effort：失败显式记 `ls_refs_skipped`，不静默）。
-pub async fn find_test(sup: &crate::Supervisor, root: &Path, symbol: &str) -> Result<Value, ToolError> {
+pub async fn find_test(
+    sup: &crate::Supervisor,
+    root: &Path,
+    symbol: &str,
+) -> Result<Value, ToolError> {
     if symbol.is_empty() {
         return Err(ToolError::BadArgs {
             detail: "symbol must not be empty".into(),
@@ -627,7 +649,16 @@ pub async fn find_test(sup: &crate::Supervisor, root: &Path, symbol: &str) -> Re
         push_hit(&mut hits, &rel, 1, 1, "mirror");
     }
     // H2/H3：全仓单词匹配 → 测试路径 / 命名约定 / super:: 单测惯例。
-    let resp = sup.tool_search_for_pattern(root, &format!(r"\b{}\b", regex::escape(symbol)), None, FIND_TEST_SEARCH_LIMIT, true, &[], false)
+    let resp = sup
+        .tool_search_for_pattern(
+            root,
+            &format!(r"\b{}\b", regex::escape(symbol)),
+            None,
+            FIND_TEST_SEARCH_LIMIT,
+            true,
+            &[],
+            false,
+        )
         .await?;
     let sym_lower = symbol.to_ascii_lowercase();
     for h in &resp.hits {
@@ -659,7 +690,9 @@ pub async fn find_test(sup: &crate::Supervisor, root: &Path, symbol: &str) -> Re
                 if let Some(hit) = items.iter().find(|i| i.name == symbol) {
                     ls_refs_skipped = refs_to_test_hits(sup, root, hit, &mut hits).await;
                 } else {
-                    ls_refs_skipped = Some(format!("ls_refs: symbol `{symbol}` not found by workspace/symbol"));
+                    ls_refs_skipped = Some(format!(
+                        "ls_refs: symbol `{symbol}` not found by workspace/symbol"
+                    ));
                 }
             }
             Err(e) => ls_refs_skipped = Some(format!("ls_refs skipped: {e}")),
@@ -770,12 +803,8 @@ fn is_test_path(file: &str) -> bool {
             return true;
         }
     }
-    file.split('/').any(|seg| {
-        matches!(
-            seg,
-            "tests" | "test" | "__tests__" | "spec" | "__specs__"
-        )
-    })
+    file.split('/')
+        .any(|seg| matches!(seg, "tests" | "test" | "__tests__" | "spec" | "__specs__"))
 }
 
 /// 按文件去重的命中追加（首个来源优先）。

@@ -126,7 +126,9 @@ pub async fn collect(
             let nested = symbol.contains('.') || symbol.contains("::");
             return Err(ToolError::BadArgs {
                 detail: if nested {
-                    format!("{detail}; nested names are searched flat — retry with the short name (part after the last `.`)")
+                    format!(
+                        "{detail}; nested names are searched flat — retry with the short name (part after the last `.`)"
+                    )
                 } else {
                     detail
                 },

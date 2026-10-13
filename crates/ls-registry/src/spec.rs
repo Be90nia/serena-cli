@@ -313,8 +313,8 @@ pub fn parse(toml_str: &str) -> Result<ServersToml, String> {
 /// 构建/包管理工具（不含任何 shell），防用户目录被投放恶意 toml 后拉起任意命令。
 const BUILD_CMD_ALLOWLIST: &[&str] = &[
     "cargo", "rustc", "make", "cmake", "meson", "ninja", "nix", "npm", "pnpm", "yarn", "node",
-    "go", "zig", "bazel", "python", "python3", "pip", "pip3", "dotnet", "cabal", "stack",
-    "shards", "crystal", "dub", "haxe", "gradle", "mvn",
+    "go", "zig", "bazel", "python", "python3", "pip", "pip3", "dotnet", "cabal", "stack", "shards",
+    "crystal", "dub", "haxe", "gradle", "mvn",
 ];
 
 /// 必填字段交叉校验（design §2：install 类别决定子表存在性）。

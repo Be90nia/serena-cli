@@ -68,9 +68,16 @@ async fn insert_text_before_symbol_adds_prefix() {
         .await
         .expect("overview");
 
-    sup.tool_edit_insert_before_symbol(&root, "demo.cpp", "main", "// header comment\n", true, None)
-        .await
-        .expect("insert before");
+    sup.tool_edit_insert_before_symbol(
+        &root,
+        "demo.cpp",
+        "main",
+        "// header comment\n",
+        true,
+        None,
+    )
+    .await
+    .expect("insert before");
 
     let content = std::fs::read_to_string(&file).unwrap();
     assert!(

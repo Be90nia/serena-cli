@@ -331,8 +331,7 @@ fn drop_self_reference(refs: Vec<Location>, abs_file: &Path, line: u32) -> Vec<L
     let self_path = norm(abs_file);
     refs.into_iter()
         .filter(|loc| {
-            let same_file =
-                uri_to_path(loc.uri.as_str()).is_some_and(|p| norm(&p) == self_path);
+            let same_file = uri_to_path(loc.uri.as_str()).is_some_and(|p| norm(&p) == self_path);
             !(same_file && loc.range.start.line == line)
         })
         .collect()
@@ -646,7 +645,10 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            vec![("file:///D:/proj/a.rs".into(), 7), ("file:///D:/proj/b.rs".into(), 3)]
+            vec![
+                ("file:///D:/proj/a.rs".into(), 7),
+                ("file:///D:/proj/b.rs".into(), 3)
+            ]
         );
     }
 

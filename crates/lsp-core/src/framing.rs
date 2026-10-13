@@ -396,8 +396,11 @@ mod tests {
     #[test]
     fn duplicate_content_length_last_one_wins() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#;
-        let mut wire =
-            format!("Content-Length: 100\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        let mut wire = format!(
+            "Content-Length: 100\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
         wire.extend_from_slice(body);
         let mut dec = Decoder::default();
         let mut buf = BytesMut::from(&wire[..]);

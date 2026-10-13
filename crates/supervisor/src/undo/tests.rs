@@ -107,10 +107,13 @@ async fn wal_manifest_persisted_before_target_write() {
         .unwrap();
     // 记账提交点已在盘，目标文件未动 = 「有记录无改动」崩溃态。
     let m: Manifest =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
-            .unwrap();
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(m.files.len(), 1, "manifest has the record");
-    assert_eq!(std::fs::read_to_string(&a).unwrap(), "old", "target untouched");
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "old",
+        "target untouched"
+    );
 }
 
 /// 「有记录无改动」崩溃态可恢复不楔死（bd serena-rust-15jb 验收）：undo 幂等
@@ -143,12 +146,20 @@ async fn undo_recovering_record_without_change_is_noop() {
         "no-op note present: {}",
         entries[0]
     );
-    assert_eq!(std::fs::read_to_string(&a).unwrap(), "old", "file untouched");
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "old",
+        "file untouched"
+    );
     assert_eq!(committed_dirs(&store), vec!["undone-1".to_string()]);
     // 收口后栈仍健康：redo 可重放（盘面 == before，正放通过）。
     let r = redo_at(&store).await.unwrap();
     assert_eq!(r["redone"][0]["txn_id"], 1);
-    assert_eq!(std::fs::read_to_string(&a).unwrap(), "new", "redo reapplies");
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "new",
+        "redo reapplies"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -211,7 +222,11 @@ async fn redo_replays_full_chain_in_time_order() {
         commit_at(&store, u).await.unwrap();
     }
     undo_at(&store, 3).await.unwrap();
-    assert_eq!(std::fs::read_to_string(&a).unwrap(), "v1", "back to baseline");
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "v1",
+        "back to baseline"
+    );
     assert_eq!(
         committed_dirs(&store),
         vec![
@@ -223,21 +238,16 @@ async fn redo_replays_full_chain_in_time_order() {
 
     // 重放序 = 事务时间序：txn-1 → txn-2 → txn-3；已重放的翻回 txn-*。
     for (expect_dirs, expect_content) in [
-        (
-            vec!["txn-1", "undone-2", "undone-3"],
-            "v2",
-        ),
-        (
-            vec!["txn-1", "txn-2", "undone-3"],
-            "v3",
-        ),
-        (
-            vec!["txn-1", "txn-2", "txn-3"],
-            "v4",
-        ),
+        (vec!["txn-1", "undone-2", "undone-3"], "v2"),
+        (vec!["txn-1", "txn-2", "undone-3"], "v3"),
+        (vec!["txn-1", "txn-2", "txn-3"], "v4"),
     ] {
         let r = redo_at(&store).await.unwrap();
-        assert_eq!(r["redone"].as_array().unwrap().len(), 1, "replay {expect_content}");
+        assert_eq!(
+            r["redone"].as_array().unwrap().len(),
+            1,
+            "replay {expect_content}"
+        );
         assert_eq!(
             std::fs::read_to_string(&a).unwrap(),
             expect_content,
@@ -290,7 +300,10 @@ async fn undo_external_conflict_discards_txn_with_warning() {
     // 外部只改 b：整事务不可干净回滚 → discarded，a 也不得被回滚。
     std::fs::write(&b, "external-edit").unwrap();
     let r = undo_at(&store, 1).await.unwrap();
-    assert!(r["undone"].as_array().unwrap().is_empty(), "nothing reverted");
+    assert!(
+        r["undone"].as_array().unwrap().is_empty(),
+        "nothing reverted"
+    );
     let skipped = r["skipped"].as_array().unwrap();
     assert_eq!(skipped.len(), 1, "one discard warning: {r}");
     assert_eq!(skipped[0]["txn_id"], 1);
@@ -321,7 +334,11 @@ async fn undo_external_conflict_discards_txn_with_warning() {
     let u2 = uid();
     txn_write(&store, &a, "newer-a", u2).await;
     commit_at(&store, u2).await.unwrap();
-    assert_eq!(committed_dirs(&store), vec!["txn-2".to_string()], "N not reused");
+    assert_eq!(
+        committed_dirs(&store),
+        vec!["txn-2".to_string()],
+        "N not reused"
+    );
 }
 
 /// bd e1f4 核心锁：sha 冲突 discard 后**立即停止**，不 fall-through 回滚更老事务。
@@ -411,7 +428,11 @@ async fn redo_noop_when_change_already_on_disk() {
         r["redone"][0]["note"].as_str().unwrap().contains("no-op"),
         "no-op note: {r}"
     );
-    assert_eq!(committed_dirs(&store), vec!["txn-1".to_string()], "flip done");
+    assert_eq!(
+        committed_dirs(&store),
+        vec!["txn-1".to_string()],
+        "flip done"
+    );
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "v2");
 }
 
@@ -430,7 +451,10 @@ async fn redo_external_conflict_discards_txn() {
     std::fs::write(&a, "hand-edited").unwrap();
 
     let r = redo_at(&store).await.unwrap();
-    assert!(r["redone"].as_array().unwrap().is_empty(), "nothing replayed");
+    assert!(
+        r["redone"].as_array().unwrap().is_empty(),
+        "nothing replayed"
+    );
     let skipped = r["skipped"].as_array().unwrap();
     assert_eq!(skipped.len(), 1, "discard warning: {r}");
     assert_eq!(skipped[0]["txn_id"], 1);
@@ -735,7 +759,10 @@ async fn list_summary_carries_line_diff_for_selection() {
     commit_at(&store, u2).await.unwrap();
     let r = list_at(&store).await.unwrap();
     let txns = r["txns"].as_array().unwrap();
-    let newest = txns.iter().max_by_key(|t| t["txn_id"].as_u64().unwrap()).unwrap();
+    let newest = txns
+        .iter()
+        .max_by_key(|t| t["txn_id"].as_u64().unwrap())
+        .unwrap();
     assert_eq!(
         newest["summary"].as_str().unwrap(),
         "new.rs created (+3 lines)"
@@ -880,10 +907,7 @@ fn txn_guard_drop_without_settle_cleans_open_and_touched() {
     let dir = store.join("txn-999");
     std::fs::create_dir_all(&dir).unwrap();
     let u = uid();
-    OPEN_TXNS
-        .lock()
-        .expect("open")
-        .push((u, dir.clone()));
+    OPEN_TXNS.lock().expect("open").push((u, dir.clone()));
     TOUCHED.lock().expect("touched").push((
         u,
         TouchedFile {
@@ -941,7 +965,10 @@ fn redact_path_folds_home_prefix() {
     let out = redact_path_with(&p, Some(home));
     assert!(out.starts_with('~'), "{out}");
     assert!(!out.contains("alice"), "{out}");
-    assert!(out.ends_with("proj/src") || out.ends_with("proj\\src"), "{out}");
+    assert!(
+        out.ends_with("proj/src") || out.ends_with("proj\\src"),
+        "{out}"
+    );
 }
 
 /// 前缀组件边界不齐（home `D:/pro` vs 路径 `D:/proj`）不得折叠。

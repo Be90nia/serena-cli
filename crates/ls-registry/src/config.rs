@@ -1062,8 +1062,10 @@ mod tests {
             // fix7 2026-10-11）。表内出现白名单外条目 = 意外通道声明，
             // 会改其它 LS 行为——必须人工过目。
             assert!(
-                ["yaml", "dart", "elixir", "kotlin", "julia", "nextflow", "fsharp"]
-                    .contains(&id.as_str()),
+                [
+                    "yaml", "dart", "elixir", "kotlin", "julia", "nextflow", "fsharp"
+                ]
+                .contains(&id.as_str()),
                 "[servers.{id}] 意外声明 Wave 1 通道"
             );
         }
@@ -1622,7 +1624,10 @@ package = "@vue/language-server"
                 b.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
                 b
             }),
-            ("utf16le-bomless", text.encode_utf16().flat_map(u16::to_le_bytes).collect()),
+            (
+                "utf16le-bomless",
+                text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            ),
             ("utf16be-bom", {
                 let mut b = vec![0xFE, 0xFF];
                 b.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
@@ -1632,7 +1637,11 @@ package = "@vue/language-server"
             let p = dir.path().join(format!("external-{label}.toml"));
             std::fs::write(&p, bytes).unwrap_or_else(|e| panic!("write {label}: {e}"));
             let loaded = load_external(&p).unwrap_or_else(|| panic!("{label} 必须是合法空配置"));
-            assert!(loaded.servers.is_empty(), "{label}: {:?}", loaded.servers.keys());
+            assert!(
+                loaded.servers.is_empty(),
+                "{label}: {:?}",
+                loaded.servers.keys()
+            );
         }
     }
 

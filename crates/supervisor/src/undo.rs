@@ -165,11 +165,14 @@ pub(crate) async fn scope_dry_run<F: Future>(fut: F) -> (F::Output, Vec<(String,
     DRY_RUN
         .scope(
             true,
-            PREVIEW.scope(std::cell::RefCell::new(Vec::new()), Box::pin(async move {
-                let out = fut.await;
-                let preview = PREVIEW.with(|p| p.borrow_mut().drain(..).collect());
-                (out, preview)
-            })),
+            PREVIEW.scope(
+                std::cell::RefCell::new(Vec::new()),
+                Box::pin(async move {
+                    let out = fut.await;
+                    let preview = PREVIEW.with(|p| p.borrow_mut().drain(..).collect());
+                    (out, preview)
+                }),
+            ),
         )
         .await
 }
@@ -292,9 +295,9 @@ pub(crate) async fn recorded_write(path: &Path, new_content: &str) -> std::io::R
     if uid == 0 {
         return crate::atomic_write(path, new_content).await;
     }
-    let store = TXN_STORE
-        .try_with(|s| s.clone())
-        .map_err(|_| std::io::Error::other("undo txn store not in scope (missing TXN_STORE wiring)"))?;
+    let store = TXN_STORE.try_with(|s| s.clone()).map_err(|_| {
+        std::io::Error::other("undo txn store not in scope (missing TXN_STORE wiring)")
+    })?;
     // 快照必须在写盘前取（契约设计第 2 条：成功写盘前把旧状态快照入栈）。
     let (before, created) = match tokio::fs::read_to_string(path).await {
         Ok(c) => (Some(c), false),
@@ -555,7 +558,10 @@ pub(crate) async fn commit_at(store: &Path, uid: u64) -> std::io::Result<()> {
         .map(|m| !m.files.is_empty())
         .unwrap_or(false);
     if has_files {
-        let store = dir.parent().map(Path::to_path_buf).unwrap_or_else(|| store.to_path_buf());
+        let store = dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| store.to_path_buf());
         remove_all_undone(&store).await;
     }
     Ok(())
@@ -646,7 +652,10 @@ enum UndoOne {
 
 /// undo/redo 单步失败：外部编辑冲突（可安全丢弃整事务）vs 瞬态错误（原样上抛）。
 enum UndoFail {
-    External { path: String, reason: String },
+    External {
+        path: String,
+        reason: String,
+    },
     /// WAL 开账撕裂（bd serena-rust-15jb）：manifest.json 缺失 = 崩溃打中
     /// mkdir 与首次 manifest 原子写之间的窗口 —— 零记录零影响，安全丢弃。
     Torn,
@@ -701,9 +710,9 @@ async fn undo_one_classified(store: &Path, n: u64) -> Result<UndoOne, UndoFail> 
         states.push(classify_for_undo(&dir, f).await?);
     }
     if states.iter().all(|s| *s == FileState::BeforeState) {
-        mark_undone(store, n, &dir)
-            .await
-            .map_err(|e| UndoFail::Transient(io_conflict(&dir, "undo: mark txn undone failed", e)))?;
+        mark_undone(store, n, &dir).await.map_err(|e| {
+            UndoFail::Transient(io_conflict(&dir, "undo: mark txn undone failed", e))
+        })?;
         return Ok(UndoOne::NothingToRevert);
     }
     // 恢复写（幂等：BeforeState 文件重写同内容；AfterState 正常恢复）。
@@ -793,7 +802,11 @@ async fn redo_one_classified(store: &Path, n: u64) -> Result<RedoOne, UndoFail> 
     let manifest = match read_manifest(&dir).await {
         Ok(m) => m,
         // 同 undo_one_classified：无 manifest = 撕裂账安全丢弃（防御对称）。
-        Err(_) if tokio::fs::metadata(dir.join("manifest.json")).await.is_err() => {
+        Err(_)
+            if tokio::fs::metadata(dir.join("manifest.json"))
+                .await
+                .is_err() =>
+        {
             return Err(UndoFail::Torn);
         }
         Err(e) => return Err(UndoFail::Transient(e)),
@@ -803,9 +816,9 @@ async fn redo_one_classified(store: &Path, n: u64) -> Result<RedoOne, UndoFail> 
         states.push(classify_for_redo(&dir, f).await?);
     }
     if states.iter().all(|s| *s == FileState::AfterState) {
-        mark_active(store, n, &dir)
-            .await
-            .map_err(|e| UndoFail::Transient(io_conflict(&dir, "redo: mark txn active failed", e)))?;
+        mark_active(store, n, &dir).await.map_err(|e| {
+            UndoFail::Transient(io_conflict(&dir, "redo: mark txn active failed", e))
+        })?;
         return Ok(RedoOne::NothingToReplay);
     }
     // 正放/补完：逐文件写回 after（幂等，AfterState 文件重写同内容）。
@@ -1373,8 +1386,11 @@ async fn bump_evicted_count(store: &Path, evicted: usize) {
         return;
     }
     let prev = evicted_count(store).await;
-    let _ = tokio::fs::write(store.join("evicted-count"), (prev + evicted as u64).to_string())
-        .await;
+    let _ = tokio::fs::write(
+        store.join("evicted-count"),
+        (prev + evicted as u64).to_string(),
+    )
+    .await;
 }
 
 async fn evicted_count(store: &Path) -> u64 {

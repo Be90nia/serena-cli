@@ -57,7 +57,12 @@ impl RecipeCtx {
         let n = self.begin_step(name);
         let started = std::time::Instant::now();
         let v = run_step_with_warn(name, fut).await?;
-        emit_recipe_line(&format_step_done(n, self.total_steps, name, started.elapsed()));
+        emit_recipe_line(&format_step_done(
+            n,
+            self.total_steps,
+            name,
+            started.elapsed(),
+        ));
         self.findings.push((name.to_string(), v.clone()));
         Ok(v)
     }
@@ -79,8 +84,14 @@ impl RecipeCtx {
         let n = self.begin_step(name);
         let started = std::time::Instant::now();
         let fut = Box::pin(fut);
-        let (mut v, txn_id) = crate::ct::ct_txn(root, async { run_step_with_warn(name, fut).await }).await?;
-        emit_recipe_line(&format_step_done(n, self.total_steps, name, started.elapsed()));
+        let (mut v, txn_id) =
+            crate::ct::ct_txn(root, async { run_step_with_warn(name, fut).await }).await?;
+        emit_recipe_line(&format_step_done(
+            n,
+            self.total_steps,
+            name,
+            started.elapsed(),
+        ));
         self.txn_ids.push(txn_id);
         if let Some(o) = v.as_object_mut() {
             o.insert("txn_id".into(), json!(txn_id));
@@ -92,11 +103,7 @@ impl RecipeCtx {
     /// 批2-F：步开始记账 + stderr 进度行（`[recipe] step N/M: label...`）。
     fn begin_step(&mut self, name: &str) -> usize {
         self.done_steps += 1;
-        emit_recipe_line(&format_step_start(
-            self.done_steps,
-            self.total_steps,
-            name,
-        ));
+        emit_recipe_line(&format_step_start(self.done_steps, self.total_steps, name));
         self.done_steps
     }
 
@@ -113,19 +120,21 @@ impl RecipeCtx {
         if !self.txn_ids.is_empty() {
             // 与写工具串行化：恢复写期间不得有并发写改盘（undo_at 同款）。
             match crate::write_gate::acquire("recipe-undo").await {
-                Ok(_gate) => match crate::undo::store_for(root) {
-                    Ok(store) => {
-                        for id in self.txn_ids.iter().rev() {
-                            match crate::undo::undo_one(&store, *id).await {
-                                Ok(files) => undo_results
-                                    .push(json!({"txn_id": id, "undone_files": files})),
-                                Err(e) => undo_results
-                                    .push(json!({"txn_id": id, "error": e.to_string()})),
+                Ok(_gate) => {
+                    match crate::undo::store_for(root) {
+                        Ok(store) => {
+                            for id in self.txn_ids.iter().rev() {
+                                match crate::undo::undo_one(&store, *id).await {
+                                    Ok(files) => undo_results
+                                        .push(json!({"txn_id": id, "undone_files": files})),
+                                    Err(e) => undo_results
+                                        .push(json!({"txn_id": id, "error": e.to_string()})),
+                                }
                             }
                         }
+                        Err(_) => undo_results.push(json!({"error": "undo store unavailable"})),
                     }
-                    Err(_) => undo_results.push(json!({"error": "undo store unavailable"})),
-                },
+                }
                 Err(e) => undo_results.push(json!({"error": format!("write gate: {e}")})),
             }
         }
@@ -163,17 +172,15 @@ fn protocol_fail(
         let undo_failures: Vec<String> = undo_results
             .iter()
             .filter_map(|u| {
-                u.get("error")
-                    .and_then(Value::as_str)
-                    .map(|e| {
-                        format!(
-                            "txn {}: {e}",
-                            u.get("txn_id")
-                                .and_then(Value::as_u64)
-                                .map(|n| n.to_string())
-                                .unwrap_or_else(|| "?".into())
-                        )
-                    })
+                u.get("error").and_then(Value::as_str).map(|e| {
+                    format!(
+                        "txn {}: {e}",
+                        u.get("txn_id")
+                            .and_then(Value::as_u64)
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "?".into())
+                    )
+                })
             })
             .collect();
         if undo_failures.is_empty() {
@@ -211,10 +218,7 @@ const STEP_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 执行单步 fut，每 [`STEP_WARN_EVERY`] 打一次警告（fut Box::pin 堆上，timeout
 /// 轮询不丢 poll 状态——同 [`RecipeCtx::write_step`] 的栈溢出约束）。
-async fn run_step_with_warn<F>(
-    label: &str,
-    fut: F,
-) -> Result<Value, crate::ToolError>
+async fn run_step_with_warn<F>(label: &str, fut: F) -> Result<Value, crate::ToolError>
 where
     F: Future<Output = Result<Value, crate::ToolError>>,
 {
@@ -237,7 +241,11 @@ where
 fn emit_recipe_line(line: &str) {
     eprintln!("{line}");
     let path = std::env::temp_dir().join(crate::RECIPE_PROGRESS_FILE);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         use std::io::Write as _;
         let _ = writeln!(f, "{line}");
     }
@@ -324,7 +332,14 @@ pub(crate) async fn run(
         }
         "add-feature" => {
             let nm = one_pos(&pos, name, "name")?;
-            add_feature(sup, root, &nm, args.get("target").and_then(Value::as_str), args).await
+            add_feature(
+                sup,
+                root,
+                &nm,
+                args.get("target").and_then(Value::as_str),
+                args,
+            )
+            .await
         }
         "rename" => {
             let (file, sym) = two_pos(&pos, name, ("file", "sym"))?;
@@ -332,7 +347,13 @@ pub(crate) async fn run(
         }
         "add-test" => {
             let sym = one_pos(&pos, name, "sym")?;
-            add_test(sup, root, &sym, args.get("run").and_then(Value::as_bool).unwrap_or(false)).await
+            add_test(
+                sup,
+                root,
+                &sym,
+                args.get("run").and_then(Value::as_bool).unwrap_or(false),
+            )
+            .await
         }
         "refactor-extract" => {
             let (file, sym) = two_pos(&pos, name, ("file", "sym"))?;
@@ -359,9 +380,11 @@ pub(crate) async fn run(
 }
 
 fn one_pos(pos: &[String], name: &str, what: &str) -> Result<String, crate::ToolError> {
-    pos.first().cloned().ok_or_else(|| crate::ToolError::BadArgs {
-        detail: format!("recipe {name}: missing positional arg <{what}>"),
-    })
+    pos.first()
+        .cloned()
+        .ok_or_else(|| crate::ToolError::BadArgs {
+            detail: format!("recipe {name}: missing positional arg <{what}>"),
+        })
 }
 
 fn two_pos(
@@ -371,7 +394,10 @@ fn two_pos(
 ) -> Result<(String, String), crate::ToolError> {
     if pos.len() < 2 {
         return Err(crate::ToolError::BadArgs {
-            detail: format!("recipe {name}: expected positional args <{a}> <{b}>, got {}", pos.len()),
+            detail: format!(
+                "recipe {name}: expected positional args <{a}> <{b}>, got {}",
+                pos.len()
+            ),
         });
     }
     Ok((pos[0].clone(), pos[1].clone()))
@@ -379,7 +405,11 @@ fn two_pos(
 
 /// --to（rename/refactor-rename）与 --as（refactor-extract）按 recipe 取新名。
 fn flag_new_name(args: &Value, name: &str) -> Result<String, crate::ToolError> {
-    let key = if name == "refactor-extract" { "as" } else { "to" };
+    let key = if name == "refactor-extract" {
+        "as"
+    } else {
+        "to"
+    };
     args.get(key)
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -401,7 +431,11 @@ async fn fix_bug(
     sym: &str,
     new_body: Option<&str>,
 ) -> Result<Value, crate::ToolError> {
-    let total = if new_body.map(|b| !b.is_empty()).unwrap_or(false) { 5 } else { 3 };
+    let total = if new_body.map(|b| !b.is_empty()).unwrap_or(false) {
+        5
+    } else {
+        3
+    };
     let mut ctx = RecipeCtx::new(Some(file.into()), Some(sym.into()), total);
     let file_s = ctx.file.clone().expect("constructor sets file");
     let sym_s = ctx.sym.clone().expect("constructor sets sym");
@@ -412,13 +446,19 @@ async fn fix_bug(
         return Err(ctx.fail("fix-bug", root, "ct_tldr", e).await);
     }
     if let Err(e) = ctx
-        .read_step("ct_goto_callers", crate::ct::ct_goto_callers(sup, root, &sym_s))
+        .read_step(
+            "ct_goto_callers",
+            crate::ct::ct_goto_callers(sup, root, &sym_s),
+        )
         .await
     {
         return Err(ctx.fail("fix-bug", root, "ct_goto_callers", e).await);
     }
     if let Err(e) = ctx
-        .read_step("ct_verify_before", crate::ct::ct_verify(sup, root, &file_s, None))
+        .read_step(
+            "ct_verify_before",
+            crate::ct::ct_verify(sup, root, &file_s, None),
+        )
         .await
     {
         return Err(ctx.fail("fix-bug", root, "ct_verify_before", e).await);
@@ -445,7 +485,10 @@ async fn fix_bug(
     }
     let txn = ctx.txn_ids.last().copied();
     let after = match ctx
-        .read_step("ct_verify_after", crate::ct::ct_verify(sup, root, &file_s, txn))
+        .read_step(
+            "ct_verify_after",
+            crate::ct::ct_verify(sup, root, &file_s, txn),
+        )
         .await
     {
         Ok(v) => v,
@@ -479,12 +522,22 @@ async fn add_feature(
     let total = 1
         + usize::from(target.map(|t| !t.is_empty()).unwrap_or(false))
         + usize::from(
-            args.get("tests_file").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
-                && args.get("tests").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false),
+            args.get("tests_file")
+                .and_then(Value::as_str)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+                && args
+                    .get("tests")
+                    .and_then(Value::as_str)
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
         );
     let mut ctx = RecipeCtx::new(target.map(str::to_string), None, total);
     let defined = match ctx
-        .read_step("ct_define_feature", crate::ct::ct_define_feature(sup, root, name, None))
+        .read_step(
+            "ct_define_feature",
+            crate::ct::ct_define_feature(sup, root, name, None),
+        )
         .await
     {
         Ok(v) => v,
@@ -541,7 +594,11 @@ async fn add_feature(
                 .await
             {
                 Ok(v) => Some(v),
-                Err(e) => return Err(ctx.fail("add-feature", root, "ct_write_with_tests", e).await),
+                Err(e) => {
+                    return Err(ctx
+                        .fail("add-feature", root, "ct_write_with_tests", e)
+                        .await);
+                }
             }
         }
         _ => None,
@@ -603,7 +660,10 @@ async fn rename(
     }
     let txn = ctx.txn_ids.last().copied();
     let after = match ctx
-        .read_step("ct_verify_after", crate::ct::ct_verify(sup, root, &def.file, txn))
+        .read_step(
+            "ct_verify_after",
+            crate::ct::ct_verify(sup, root, &def.file, txn),
+        )
         .await
     {
         Ok(v) => v,
@@ -665,11 +725,12 @@ async fn add_test(
     }
     let abs = crate::path_guard::guarded_join(root, &def.file)
         .map_err(|detail| crate::ToolError::BadArgs { detail })?;
-    let existing = tokio::fs::read_to_string(&abs)
-        .await
-        .map_err(|e| crate::ToolError::BadArgs {
-            detail: format!("read {}: {e}", def.file),
-        })?;
+    let existing =
+        tokio::fs::read_to_string(&abs)
+            .await
+            .map_err(|e| crate::ToolError::BadArgs {
+                detail: format!("read {}: {e}", def.file),
+            })?;
     if existing.contains("mod tests") {
         return Ok(json!({
             "recipe": "add-test",
@@ -740,7 +801,11 @@ async fn refactor_extract(
         .await
     {
         Ok(v) => v,
-        Err(e) => return Err(ctx.fail("refactor-extract", root, "ct_smart_edit_extract", e).await),
+        Err(e) => {
+            return Err(ctx
+                .fail("refactor-extract", root, "ct_smart_edit_extract", e)
+                .await);
+        }
     };
     let txn = ctx.txn_ids.last().copied();
     let vf = ctx.file.clone().expect("constructor sets file");
@@ -749,10 +814,16 @@ async fn refactor_extract(
         .await
     {
         Ok(v) => v,
-        Err(e) => return Err(ctx.fail("refactor-extract", root, "ct_verify_after", e).await),
+        Err(e) => {
+            return Err(ctx
+                .fail("refactor-extract", root, "ct_verify_after", e)
+                .await);
+        }
     };
     if let Some(e) = verify_errors_of(&after) {
-        return Err(ctx.fail("refactor-extract", root, "ct_verify_after", e).await);
+        return Err(ctx
+            .fail("refactor-extract", root, "ct_verify_after", e)
+            .await);
     }
     Ok(json!({
         "recipe": "refactor-extract",
@@ -794,18 +865,29 @@ async fn refactor_rename(
         })
         .await
     {
-        return Err(ctx.fail("refactor-rename", root, "rename-workspace", e).await);
+        return Err(ctx
+            .fail("refactor-rename", root, "rename-workspace", e)
+            .await);
     }
     let txn = ctx.txn_ids.last().copied();
     let after = match ctx
-        .read_step("ct_verify_after", crate::ct::ct_verify(sup, root, &def.file, txn))
+        .read_step(
+            "ct_verify_after",
+            crate::ct::ct_verify(sup, root, &def.file, txn),
+        )
         .await
     {
         Ok(v) => v,
-        Err(e) => return Err(ctx.fail("refactor-rename", root, "ct_verify_after", e).await),
+        Err(e) => {
+            return Err(ctx
+                .fail("refactor-rename", root, "ct_verify_after", e)
+                .await);
+        }
     };
     if let Some(e) = verify_errors_of(&after) {
-        return Err(ctx.fail("refactor-rename", root, "ct_verify_after", e).await);
+        return Err(ctx
+            .fail("refactor-rename", root, "ct_verify_after", e)
+            .await);
     }
     Ok(json!({
         "recipe": "refactor-rename",
@@ -827,7 +909,10 @@ async fn review_diff(
 ) -> Result<Value, crate::ToolError> {
     let mut ctx = RecipeCtx::new(None, None, 1);
     let report = match ctx
-        .read_step("ct_review_diff", crate::ct::ct_review_diff(sup, root, txn_id))
+        .read_step(
+            "ct_review_diff",
+            crate::ct::ct_review_diff(sup, root, txn_id),
+        )
         .await
     {
         Ok(v) => v,
@@ -885,7 +970,10 @@ async fn explore(
         Err(e) => return Err(ctx.fail("explore", root, "repo-map", e).await),
     };
     let recent = match ctx
-        .read_step("ct_recent_activity", crate::ct::ct_recent_activity(root, 10))
+        .read_step(
+            "ct_recent_activity",
+            crate::ct::ct_recent_activity(root, 10),
+        )
         .await
     {
         Ok(v) => v,
@@ -920,23 +1008,33 @@ async fn append_or_create(
     let abs = crate::path_guard::guarded_join(root, file)
         .map_err(|detail| crate::ToolError::BadArgs { detail })?;
     if abs.exists() {
-        let existing = tokio::fs::read_to_string(&abs)
-            .await
-            .map_err(|e| crate::ToolError::BadArgs {
-                detail: format!("read {file}: {e}"),
-            })?;
+        let existing =
+            tokio::fs::read_to_string(&abs)
+                .await
+                .map_err(|e| crate::ToolError::BadArgs {
+                    detail: format!("read {file}: {e}"),
+                })?;
         let sep = if existing.ends_with('\n') { "" } else { "\n" };
         let lines = existing.lines().count() as u32;
-        sup.tool_insert_at_line(root, file, lines + 1, &format!("{sep}{content}"), None, None)
-            .await
-            .map(|_| ())
+        sup.tool_insert_at_line(
+            root,
+            file,
+            lines + 1,
+            &format!("{sep}{content}"),
+            None,
+            None,
+        )
+        .await
+        .map(|_| ())
     } else {
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| crate::ToolError::BadArgs {
                 detail: format!("mkdir {}: {e}", parent.display()),
             })?;
         }
-        sup.tool_create_text_file(root, file, content, None).await.map(|_| ())
+        sup.tool_create_text_file(root, file, content, None)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -949,16 +1047,24 @@ async fn append_at_eof(
 ) -> Result<(), crate::ToolError> {
     let abs = crate::path_guard::guarded_join(root, file)
         .map_err(|detail| crate::ToolError::BadArgs { detail })?;
-    let existing = tokio::fs::read_to_string(&abs)
-        .await
-        .map_err(|e| crate::ToolError::BadArgs {
-            detail: format!("read {file}: {e}"),
-        })?;
+    let existing =
+        tokio::fs::read_to_string(&abs)
+            .await
+            .map_err(|e| crate::ToolError::BadArgs {
+                detail: format!("read {file}: {e}"),
+            })?;
     let sep = if existing.ends_with('\n') { "" } else { "\n" };
     let lines = existing.lines().count() as u32;
-    sup.tool_insert_at_line(root, file, lines + 1, &format!("{sep}{content}"), None, None)
-        .await
-        .map(|_| ())
+    sup.tool_insert_at_line(
+        root,
+        file,
+        lines + 1,
+        &format!("{sep}{content}"),
+        None,
+        None,
+    )
+    .await
+    .map(|_| ())
 }
 
 fn into_steps(ctx: &RecipeCtx) -> Value {

@@ -45,8 +45,11 @@ fn scratch_project() -> PathBuf {
         "[package]\nname = \"bp24_empty_cache\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .expect("write Cargo.toml");
-    std::fs::write(dir.join("src/lib.rs"), "pub fn bp24_marker_fn() -> u32 { 7 }\n")
-        .expect("write lib.rs");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn bp24_marker_fn() -> u32 { 7 }\n",
+    )
+    .expect("write lib.rs");
     dir
 }
 
@@ -84,7 +87,10 @@ async fn empty_ready_window_result_does_not_shadow_post_ready_symbols() {
         let _ = std::fs::remove_dir_all(&root);
         return;
     }
-    let probe = report["probe_file"].as_str().expect("probe_file").to_string();
+    let probe = report["probe_file"]
+        .as_str()
+        .expect("probe_file")
+        .to_string();
 
     // 3) 同 key 复查：必须拿到真符号。空集若曾入缓存，命中路径先于 LS ⇒
     //    此处恒空 ⇒ FAIL（回归的确定性红）。
