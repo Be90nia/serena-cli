@@ -213,7 +213,13 @@ mod tests {
         let (entry, skipped) = find_entry_file(&dir, "python");
         let entry = entry.expect("good.py must be picked");
         assert_eq!(entry.file_name().unwrap(), "good.py");
-        assert_eq!(skipped, vec!["bin.py".to_string()]);
+        // walker 顺序跨平台差异（ignore crate inode/dirent 序）：x86_64 先 bin 后 good、
+        // aarch64 可能反过来。entry 命中即返早，未遍历到的文件不进 skipped——断言改
+        // contains（v0.3.0 arm-gnu 剥出）。
+        assert!(
+            skipped.iter().any(|s| s == "bin.py"),
+            "bin.py 必须被跳过报告: {skipped:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
