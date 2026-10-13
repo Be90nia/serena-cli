@@ -2750,6 +2750,17 @@ impl Supervisor {
         ws
     }
 
+    /// bd serena-rust-vzrx.7：引用类空结果的降级标记判定（与监督工具链协议统一）。
+    /// 仅「空结果且语义未证就绪」标 SemanticPending——degraded/warmup 双字段由
+    /// attach_degraded 落 wire；语义已证后的空 = 真·无 caller，不标（真空 ≠ 未就绪）。
+    fn referencing_degraded(&self, root: &Path, empty: bool) -> Option<Degraded> {
+        if empty && !self.semantic_ok(root) {
+            Some(Degraded::SemanticPending)
+        } else {
+            None
+        }
+    }
+
     /// 写工具收尾标记（bd serena-rust-0em）：file 进入写后一致性窗口。
     fn mark_recent_write(&self, root: &Path, file: &str) {
         self.recent_writes.lock().unwrap().insert(
@@ -8204,6 +8215,11 @@ impl Supervisor {
                     Vec::new()
                 };
                 attach_warning(&mut value, &ws);
+                // bd serena-rust-vzrx.7：语义未就绪的空结果 → degraded/warmup 双字段
+                // （与监督工具链协议统一）；语义已证的真空不标。
+                if let Some(d) = self.referencing_degraded(root, empty) {
+                    attach_degraded(&mut value, d);
+                }
                 Ok(value)
             }
             "find-referencing-code-snippets" => {
@@ -8261,6 +8277,11 @@ impl Supervisor {
                     ws.push(note);
                 }
                 attach_warning(&mut value, &ws);
+                // bd serena-rust-vzrx.7：语义未就绪的空结果 → degraded/warmup 双字段
+                // （与监督工具链协议统一）；语义已证的真空不标。
+                if let Some(d) = self.referencing_degraded(root, empty) {
+                    attach_degraded(&mut value, d);
+                }
                 Ok(value)
             }
             "replace-text-in-symbol" => {
@@ -10438,18 +10459,51 @@ mod symbol_cache_tests {
         assert!(sup.referencing_empty_warnings(root).is_empty());
     }
 
-    /// bd serena-rust-e0hi：空 refs 的 compact envelope + 降级警示 = AI 可分的
-    /// wire 形态（raw_count:0 不再裸奔）。
+    /// bd serena-rust-vzrx.7：引用类降级标记判定——空结果 × 语义未证就绪 →
+    /// SemanticPending（attach_degraded 的输入）；语义已证的空 = 真空不标；
+    /// 非空结果永不标。
+    #[tokio::test]
+    async fn referencing_degraded_gate_on_semantic_flag() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root = Path::new("Z:/no/such/vzrx7-degraded");
+
+        // 生产可达态：空 hits 必经 session_for → mark_ls_started 记账在案、
+        // 语义未证就绪 → 降级标记（wire 走 attach_degraded 双字段）。
+        sup.mark_ls_started(root);
+        assert_eq!(
+            sup.referencing_degraded(root, true),
+            Some(Degraded::SemanticPending)
+        );
+
+        // 首个语义非空成功 → 空即真值，不标（真空 ≠ 未就绪）。
+        sup.mark_semantic_ready(root);
+        assert_eq!(sup.referencing_degraded(root, true), None);
+
+        // 非空结果永不标（无论语义记账状态）。
+        assert_eq!(sup.referencing_degraded(root, false), None);
+    }
+
+    /// bd serena-rust-e0hi + vzrx.7：空 refs 的 compact envelope + 降级警示 +
+    /// degraded/warmup 双字段 = AI 可分的 wire 形态（raw_count:0 不再裸奔）。
     #[test]
     fn empty_refs_envelope_carries_degraded_warning() {
         let hits: Vec<ref_tools::RefSymbolHit> = Vec::new();
         let mut value = ref_symbol_hits_envelope(&hits, true);
         attach_warning(&mut value, &[semantic_not_ready_message()]);
+        // vzrx.7：组装顺序与生产臂一致（attach_warning 后 attach_degraded），
+        // 三字段并存（warning 保留向后兼容，degraded/warmup 增补）。
+        attach_degraded(&mut value, Degraded::SemanticPending);
         assert_eq!(value["compact"], serde_json::json!(true));
         assert_eq!(value["raw_count"], serde_json::json!(0));
         let w = value["warning"].as_str().unwrap();
         assert!(w.contains("not be ready"), "就绪性关键词: {w}");
         assert!(w.contains("30-60s"), "预期窗口: {w}");
+        assert_eq!(value["degraded"], serde_json::json!("semantic-pending"));
+        assert_eq!(value["warmup"]["stage"], serde_json::json!("indexing"));
+        assert_eq!(
+            value["warmup"]["retry_after_warm"],
+            serde_json::json!(true)
+        );
     }
 
     /// bd serena-rust-bxd O2/O4：暖机窗口开/关/过期三态。
