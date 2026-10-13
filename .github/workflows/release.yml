@@ -24,11 +24,10 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          # bd hb2m: Intel mac 长尾用户——macos-13 是 GitHub 最后的 Intel 镜像
-          # （macos-14 起全 arm64）。与 musl/arm 并列，不冲突。
-          - os: macos-13
-            target: x86_64-apple-darwin
-    # v0.2.0: 三平台。ls-runtime/lsp-core 的进程树治理已跨平台（Windows=Job Object
+          # v0.3.0 删 macos-13（GitHub 2025-09 公告退役、2026-09 Node 24 与
+          # macOS 13.4- 不兼容；免费池排队 1h+ 常态）。Intel Mac 用户用
+          # aarch64 二进制配 Rosetta 2（性能损耗 ~15%）。
+    # v0.3.0: 五平台（4 主流 + 1 容器）。ls-runtime/lsp-core 的进程树治理已跨平台（Windows=Job Object
     # KILL_ON_JOB_CLOSE；Unix=进程组 setpgid(0,0) + killpg(SIGKILL)，linux 另挂
     # PR_SET_PDEATHSIG 父死兜底，macos 显式 kill——取舍见 ProcessTreeGuard 文档）。
     runs-on: ${{ matrix.os }}
