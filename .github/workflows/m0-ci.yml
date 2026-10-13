@@ -25,8 +25,9 @@ jobs:
           toolchain: "1.89" # = rust-toolchain.toml（bd serena-rust-fc4i），防 stable 漂移
           # locate_finds_functional_rust_analyzer 探测真 rust-analyzer（rustup which
           # → --version 校验）；minimal profile 不含该组件，rustup proxy 会因组件
-          # 缺失 --version 失败 → locate 链全落空。
-          components: rust-analyzer
+          # 缺失 --version 失败 → locate 链全落空。钉版后 profile 变 minimal，
+          # fmt check / clippy 步骤的组件也必须显式带上（v0.3.0 M0 首跑剥出）。
+          components: rust-analyzer, rustfmt, clippy
       - name: Cache cargo
         uses: actions/cache@v4
         with:
