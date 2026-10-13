@@ -575,6 +575,10 @@ fn log_invocation(state: &AppState, rec: InvocationRecord<'_>) {
         "cold_start": rec.cold_start,
         "retry_count": retry_count,
     });
+    // shortcut: 每请求同步 open+append 在 tokio worker 上（perf-P2-2）——实测
+    // /tools 平台 3.1k qps、现实 CLI 负载（19ms/次）余量 ~150×，非瓶颈；持久
+    // 句柄+专写 task 会引入 Windows 轮转 rename 共享冲突、测试 flush 竞态与
+    // 停机丢尾三重成本。/batch 32 并发持续打满吞吐时再升级。
     if let Err(e) = crate::lockfile::secure_open()
         .create(true)
         .append(true)
@@ -1100,6 +1104,42 @@ mod tests {
         let body = body.expect("json body");
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"], json!([{"name": "main"}]));
+    }
+
+    /// TG-L3：>2MB body 被 axum 默认 DefaultBodyLimit 拒收（413）。防线来自
+    /// 框架默认——此测试钉住它，防止未来显式解除限制而无告警。
+    #[tokio::test]
+    async fn oversized_body_is_rejected() {
+        let st = state("secret", MockSupervisor::ok(json!(null)));
+        let pad = "x".repeat(3 * 1024 * 1024);
+        let body = json!({"project_root": "D:/x", "args": {"pad": pad}});
+        let (status, _) = oneshot_json(
+            router(st),
+            req_post("/tools/overview", Some("secret"), body),
+        )
+        .await;
+        assert_eq!(status, AxStatus::PAYLOAD_TOO_LARGE);
+    }
+
+    /// TG-L3：嵌套超 serde_json 128 层递归限 → 拒收（解析层防线，请求到不了
+    /// handler，返回框架 400 而非 wire `{ok:false}` 形状）。
+    #[tokio::test]
+    async fn deeply_nested_body_is_rejected() {
+        let st = state("secret", MockSupervisor::ok(json!(null)));
+        let mut args = json!(null);
+        for _ in 0..200 {
+            args = json!([args]);
+        }
+        let (status, _) = oneshot_json(
+            router(st),
+            req_post(
+                "/tools/overview",
+                Some("secret"),
+                json!({"project_root": "D:/x", "args": args}),
+            ),
+        )
+        .await;
+        assert_eq!(status, AxStatus::BAD_REQUEST);
     }
 
     /// bd serena-rust-h4i：跨 project 调用 → 响应附 `project switched` warning；

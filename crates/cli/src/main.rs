@@ -1820,7 +1820,7 @@ fn wait_ready_progress(stage: WaitStage, symbol_up: bool, probe_count: usize, re
 
 /// 转发模式：探活 → 转发；死 lock → lazy-spawn --daemon → 轮询就绪 → 转发。
 async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<u8, ForwardFailure> {
-    let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
+    let entry = daemon::lockfile::read_stale_tolerant(lock_path).map_err(|e| format!("read lock: {e}"))?;
     let base = match entry {
         Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
             // bd fakewait：与 ensure_daemon 同一判定——drain 窗口内老 daemon
@@ -1858,7 +1858,7 @@ async fn forward_or_spawn(cli: &Cli, lock_path: &Path) -> Result<u8, ForwardFail
 /// 仍缺失则报错——绝不带空 token 转发（必 403 且掩盖真实状态，bd y2y）。
 async fn read_token_with_retry(lock_path: &Path) -> Result<String, String> {
     for _ in 0..10 {
-        match daemon::lockfile::read(lock_path) {
+        match daemon::lockfile::read_stale_tolerant(lock_path) {
             Ok(Some(e)) => return Ok(e.token),
             Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
             Err(e) => return Err(format!("read lock: {e}")),
@@ -4595,7 +4595,7 @@ async fn wait_drain_outcome(
 ) -> Result<DrainOutcome, String> {
     let deadline = Instant::now() + wait;
     loop {
-        match daemon::lockfile::read(lock_path) {
+        match daemon::lockfile::read_stale_tolerant(lock_path) {
             Ok(Some(e)) => {
                 if daemon::lockfile::is_alive_graceful(e.port) && !alive_but_draining(&e).await {
                     return Ok(DrainOutcome::Attach(e));
@@ -4620,7 +4620,7 @@ async fn wait_drain_outcome(
 
 /// 探活 + lazy-spawn，返回 (base_url, token)。
 async fn ensure_daemon(lock_path: &Path) -> Result<(String, String), String> {
-    let entry = daemon::lockfile::read(lock_path).map_err(|e| format!("read lock: {e}"))?;
+    let entry = daemon::lockfile::read_stale_tolerant(lock_path).map_err(|e| format!("read lock: {e}"))?;
     let base = match entry {
         Some(e) if daemon::lockfile::is_alive_graceful(e.port) => {
             // bd fakewait：drain 窗口内老 daemon TCP 探活必中但请求必 503——

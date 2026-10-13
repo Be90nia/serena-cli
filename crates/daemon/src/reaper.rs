@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use supervisor::Supervisor;
+use supervisor::{Key, Supervisor};
 
 use crate::http::AppState;
 use crate::lockfile;
@@ -159,23 +159,43 @@ pub fn last_activity() -> Instant {
     *GLOBAL_LAST_ACTIVITY.lock().unwrap()
 }
 
+/// reaper 对 supervisor 的最小依赖面。抽 trait 让测试注入 fake、免真 LS spawn
+/// 直驱巡检循环（TG-M5）；生产语义不变——真实现逐方法委托 Supervisor 固有方法。
+#[async_trait::async_trait]
+pub(crate) trait ReaperSup: Send + Sync {
+    async fn evict_failed_instances(&self) -> usize;
+    fn loaded_entries(&self) -> Vec<(Key, Instant)>;
+    async fn evict(&self, key: &Key) -> supervisor::ToolResult<bool>;
+}
+
+#[async_trait::async_trait]
+impl ReaperSup for Supervisor {
+    async fn evict_failed_instances(&self) -> usize {
+        Supervisor::evict_failed_instances(self).await
+    }
+    fn loaded_entries(&self) -> Vec<(Key, Instant)> {
+        Supervisor::loaded_entries(self)
+    }
+    async fn evict(&self, key: &Key) -> supervisor::ToolResult<bool> {
+        Supervisor::evict(self, key).await
+    }
+}
+
 /// 启动 reaper 常驻 task。返回 JoinHandle 供测试/停机取消。
 ///
 /// `lock` = (lock 路径, 自己的 boot_ms 归属戳)，用于 shutdown 收尾的
 /// 归属校验删除；`None`（如测试）不删。
-pub fn spawn_reaper(
-    sup: Arc<Supervisor>,
+pub(crate) fn spawn_reaper<S: ReaperSup + 'static>(
+    sup: Arc<S>,
     state: AppState,
     intervals: ReaperIntervals,
     lock: Option<(std::path::PathBuf, u128)>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        reaper_loop(sup, state, intervals, lock).await;
-    })
+    tokio::spawn(reaper_loop(sup, state, intervals, lock))
 }
 
-async fn reaper_loop(
-    sup: Arc<Supervisor>,
+async fn reaper_loop<S: ReaperSup>(
+    sup: Arc<S>,
     state: AppState,
     iv: ReaperIntervals,
     lock: Option<(std::path::PathBuf, u128)>,
@@ -372,6 +392,104 @@ mod tests {
             global_idle: Duration::from_millis(400),
             max_loaded_ls: 3,
         }
+    }
+
+    /// TG-M5：注入用 fake supervisor——记录 evict 调用并同步扣减 entries，
+    /// 让测试断言 LRU 循环的驱逐选择而不必真 spawn LS。
+    struct FakeSup {
+        entries: Mutex<Vec<(Key, Instant)>>,
+        evicted: Mutex<Vec<Key>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReaperSup for FakeSup {
+        async fn evict_failed_instances(&self) -> usize {
+            0
+        }
+        fn loaded_entries(&self) -> Vec<(Key, Instant)> {
+            self.entries.lock().unwrap().clone()
+        }
+        async fn evict(&self, key: &Key) -> supervisor::ToolResult<bool> {
+            self.evicted.lock().unwrap().push(key.clone());
+            self.entries.lock().unwrap().retain(|(k, _)| *k != *key);
+            Ok(true)
+        }
+    }
+
+    /// n 条同 lang 不同 root 的 loaded 记录，时间戳按 i 递增（i 小 = 最旧）。
+    fn fake_sup_with(n: usize) -> Arc<FakeSup> {
+        let base = Instant::now();
+        Arc::new(FakeSup {
+            entries: Mutex::new(
+                (0..n)
+                    .map(|i| {
+                        (
+                            Key {
+                                root: std::path::PathBuf::from(format!("Z:/fake/{i}")),
+                                lang: "rust".into(),
+                            },
+                            base + Duration::from_secs(i as u64),
+                        )
+                    })
+                    .collect(),
+            ),
+            evicted: Mutex::new(vec![]),
+        })
+    }
+
+    /// 只测 LRU 分支：idle 卸载与全局自杀全部关闭（0 = 永不，bd j8b）。
+    fn lru_only_intervals() -> ReaperIntervals {
+        ReaperIntervals {
+            scan: Duration::from_millis(50),
+            ls_idle: Duration::ZERO,
+            global_idle: Duration::ZERO,
+            max_loaded_ls: 3,
+        }
+    }
+
+    fn fake_key(i: usize) -> Key {
+        Key {
+            root: std::path::PathBuf::from(format!("Z:/fake/{i}")),
+            lang: "rust".into(),
+        }
+    }
+
+    /// TG-M5 / perf-P2-3：>cap 时按 last_used 升序驱逐最旧的、cap 内不动。
+    #[tokio::test]
+    async fn lru_evicts_oldest_beyond_cap_and_keeps_within() {
+        let sup = fake_sup_with(5);
+        let handle = spawn_reaper(sup.clone(), test_state(), lru_only_intervals(), None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && sup.evicted.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        handle.abort();
+        let evicted = sup.evicted.lock().unwrap();
+        assert_eq!(evicted.len(), 2, "恰好驱逐超出 cap 的 2 条；got {evicted:?}");
+        assert!(
+            evicted.contains(&fake_key(0)) && evicted.contains(&fake_key(1)),
+            "最旧两条必须先卸；got {evicted:?}"
+        );
+        let entries = sup.entries.lock().unwrap();
+        assert_eq!(entries.len(), 3, "cap 内 3 条保留");
+        assert!(
+            entries.iter().any(|(k, _)| *k == fake_key(4)),
+            "最新一条必须存活"
+        );
+    }
+
+    /// TG-M5：≤cap 时 LRU 分支不动作（含时间戳很旧的条目也不得误驱逐）。
+    #[tokio::test]
+    async fn lru_within_cap_evicts_nothing() {
+        let sup = fake_sup_with(3);
+        let handle = spawn_reaper(sup.clone(), test_state(), lru_only_intervals(), None);
+        tokio::time::sleep(Duration::from_millis(250)).await; // ≥2 个 scan tick
+        handle.abort();
+        assert!(
+            sup.evicted.lock().unwrap().is_empty(),
+            "cap 内不得驱逐"
+        );
+        assert_eq!(sup.entries.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

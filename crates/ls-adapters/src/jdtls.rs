@@ -16,9 +16,9 @@
 //! （上游大树多为显式化默认值）。
 //!
 //! **snapshot fallback 模式**（网络受限环境）：Eclipse snapshot tar 滚动软链 +
-//! 系统 JDK（M3 原路径，`allow_unsigned_sha` 特例保留）。切换 = 代码内
-//! [`SNAPSHOT_FALLBACK`] const 或 env `SERENA_JDTLS_SNAPSHOT=1`（不改代码的
-//! 运行时逃生门）。
+//! 系统 JDK（M3 原路径）。切换 = 代码内 [`SNAPSHOT_FALLBACK`] const 或 env
+//! `SERENA_JDTLS_SNAPSHOT=1`（不改代码的运行时逃生门）。SEC-3（bd i8jh）后
+//! latest 无 sha 不再自动越狱——§2.9 门拒装，须人工钉已知 hash 方可走此模式。
 //!
 //! **-configuration per-project 复制**（↖ mirror `_start_server` 尾部：发行版
 //! `config_<plat>` 是只读发行物，OSGi 首启写回 `config.ini`——共享/只读目录直指会
@@ -361,9 +361,9 @@ pub(crate) fn jdtls_install_spec() -> InstallSpec {
             version: JDTLS_VERSION.to_string(),
             url: "https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz"
                 .to_string(),
-            // sha256 特例留空：latest 滚动软链 + Eclipse 无伴随 hash 文件（404 实测），
-            // 无法钉 hash —— `ensure_jdtls_installed` 以 allow_unsigned_sha 跳过 §2.9 门
-            // （信任锚 = HTTPS + allowed_hosts 域白名单）。
+            // sha256 留空：latest 滚动软链 + Eclipse 无伴随 hash 文件（404 实测），
+            // 无法钉 hash —— SEC-3（bd i8jh）后 ensure 不再自动越狱，空 sha 在
+            // §2.9 门拒装（UnsignedRefused）；snapshot 模式需人工钉已知 hash。
             sha256: String::new(),
             archive: ArchiveKind::TarGz,
             // snapshot tar 顶层即包体（bin/config_*/plugins 直接在顶，无包装层）——
@@ -385,33 +385,41 @@ pub(crate) fn jdtls_install_spec() -> InstallSpec {
     }
 }
 
+/// jdtls auto-install `InstallCtx`（SEC-3 单测锚：无 sha 不得自动越狱 §2.9 门）。
+fn jdtls_install_ctx(cache_root: &Path) -> InstallCtx {
+    InstallCtx {
+        os: Os::current(),
+        arch: Arch::current(),
+        auto_install: true,
+        // SEC-3（bd i8jh）：snapshot latest 无官方 sha = §2.9 known-unknown →
+        // 门拒（UnsignedRefused），不得以「域白名单即信任锚」自越狱——那要求
+        // scheme+host 双门（已由 check_download_hop 钉死），仍缺内容完整性。
+        allow_unsigned_sha: false,
+        cache_root: cache_root.to_path_buf(),
+    }
+}
+
 /// 触发 jdtls auto-install。返回装好后的 install_dir（`{cache_root}/jdtls/{JDTLS_VERSION}/`）。
 ///
 /// 已装缓存短路在 `DownloadInstaller` 内（`bin/jdtls` 存在即秒回，不触网）。
 ///
-/// sha 门特例：`latest` snapshot 滚动 + Eclipse 无伴随 hash 文件 → 无法钉 sha256，
-/// 信任锚 = HTTPS + `allowed_hosts`（download.eclipse.org 白名单）→ 跳过 §2.9 门。
+/// sha 门（SEC-3/bd i8jh 修正）：`latest` snapshot 无官方 hash → sha256 留空 →
+/// §2.9 门拒装（UnsignedRefused，不触网）。原「域白名单即信任锚跳门」特例已删——
+/// scheme+host 双门只保传输可信，不保内容完整；snapshot 模式须人工钉已知 hash。
 ///
 /// 同步阻塞 IO（HTTP ~51MB + 解压，分钟级；client 自带 connect 30s / 总 600s 超时）——
 /// async 调用方（`launch_info`）以 `spawn_blocking` 包裹。失败（URL 不可达等）→
 /// Err，调用方 wrap 成 `not_installed_error` 形态 → wire 归类 LS_NOT_INSTALLED。
 pub(crate) fn ensure_jdtls_installed(cache_root: &Path) -> Result<PathBuf, anyhow::Error> {
     let spec = jdtls_install_spec();
-    let ctx = InstallCtx {
-        os: Os::current(),
-        arch: Arch::current(),
-        auto_install: true,
-        // jdtls 特例：见函数 doc —— snapshot 滚动无官方 hash，域白名单即信任锚。
-        allow_unsigned_sha: true,
-        cache_root: cache_root.to_path_buf(),
-    };
+    let ctx = jdtls_install_ctx(cache_root);
     let outcome = DownloadInstaller
         .install(&ctx, &spec)
         .map_err(|e| anyhow::anyhow!("jdtls auto-install failed: {e}"))?;
     match outcome {
         InstallOutcome::Ready(_) => Ok(cache_root.join(JDTLS_CACHE_ID).join(JDTLS_VERSION)),
-        // allow_unsigned_sha=true 且 kind=Download 时不可达（UnsignedRefused 仅 sha 门
-        // 拒绝时返回；NotInstalled 仅 PathOnly 返回）——defensive，不吞错不 panic。
+        // SEC-3 后 UnsignedRefused 可达（snapshot 无 sha 被 §2.9 门拒，已装缓存
+        // 走短路不会到这里）；NotInstalled 仅 PathOnly——两态都转 Err 上抛。
         InstallOutcome::UnsignedRefused { hint, .. }
         | InstallOutcome::NotInstalled { hint, .. } => {
             Err(anyhow::anyhow!("jdtls auto-install: {hint}"))
@@ -849,7 +857,7 @@ mod tests {
         );
         assert_eq!(
             sha256, "",
-            "latest 滚动无钉 hash（sha 门由 ensure 特例跳过）"
+            "latest 滚动无钉 hash（SEC-3：ensure 不越狱，§2.9 门拒收）"
         );
         assert!(matches!(archive, ArchiveKind::TarGz));
         assert_eq!(strip_components, 0, "snapshot tar 顶层即包体");
@@ -866,5 +874,30 @@ mod tests {
         std::fs::write(bin.join("jdtls"), b"#!/bin/sh\n").unwrap();
         let got = ensure_jdtls_installed(dir.path()).expect("cached install must short-circuit");
         assert_eq!(got, dir.path().join("jdtls/latest"));
+    }
+
+    /// TG-M7② / SEC-3（bd i8jh）：snapshot latest 无 sha 不得自动越狱 §2.9 门——
+    /// UnsignedRefused 拒装且不落半包（门在 create_dir_all 之前，未授权路径不碰缓存）。
+    /// 断言序：ctx 锁先于 install()——越狱形态下 install 会真触网下载 ~51MB。
+    #[test]
+    fn snapshot_unsigned_spec_refused_without_half_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = jdtls_install_spec();
+        let ctx = jdtls_install_ctx(dir.path());
+        assert!(
+            !ctx.allow_unsigned_sha,
+            "SEC-3: 无 sha 不得自动越狱 §2.9 门（人类显式才可）"
+        );
+        let outcome = DownloadInstaller
+            .install(&ctx, &spec)
+            .expect("门拒走 Ok(UnsignedRefused)，不 Err");
+        assert!(
+            matches!(outcome, InstallOutcome::UnsignedRefused { .. }),
+            "无 sha + 未越狱必须 UnsignedRefused，实际 {outcome:?}"
+        );
+        assert!(
+            !dir.path().join("jdtls").exists(),
+            "未授权路径不得创建半包目录"
+        );
     }
 }

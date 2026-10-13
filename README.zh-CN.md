@@ -220,6 +220,17 @@ serena-cli safe-delete-symbol <file> <symbol>   # 有引用时拒绝删除
 
 完整的 token 纪律指南见 [`skills/serena-cli/SKILL.md`](skills/serena-cli/SKILL.md)。
 
+### 诊断响应中 `pending` 字段的解读
+
+写类工具的回执附带 `post_write_diagnostics` 快照，`diagnostics` 返回 `{items, pending}`。`pending` 标志是新鲜度裁决（bd serena-rust-i52y）：
+
+- `pending: false` —— LS 已确认该代际：**`items` 是权威结果**（空 items = 干净）。
+- `pending: true` —— 等待窗口在 LS 推送新诊断代际之前关闭（大项目重分析、LS 缓慢或重启中）。**空 `items` 不代表「无错误」**——快照可能已过期。在信任「干净」结果前，先显式补一次 `diagnostics <file>`（或 `--wait-gen N`）。
+
+wire 字段名已冻结（v1 契约）；本节是规范性定义。
+
+写类工具回执在快照无 items 时会瘦身（bd tfa3）：未确认（空 items + `pending: true`）压缩为字符串 `"post_write_diagnostics": "pending"`；LS 确认干净（空 items + `pending: false`）整个键省略；非空快照完整附带。`diagnostics` 工具自身的响应永不瘦身。
+
 ## 性能基线
 
 当前复测（2026-10-12，Windows 11 26200 x64，release `serena-cli` 0.3.0 build，温 daemon，workspace 外小 fixture；与 2026-10-12 DeepDocs 审计实测互证）：

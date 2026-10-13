@@ -172,10 +172,11 @@ const RESOLVED_CAP: usize = 8192;
 /// （begin 插入 / end 移除）、`window/workDoneProgress/create` 请求（LS 预告即将
 /// 上报，先于首个 begin，同样插入）。active 为空 = 无在飞索引。
 ///
-/// drain 等待走 `watch` channel（active 计数）而非 `Notify`：`notify_waiters` 只唤醒
-/// 已注册 waiter，stable 无 `Notified::enable`，「查空 → 注册」窗口内 end 到达会
-/// 永久丢唤醒；watch 保留最新值，`changed()` 前先 `borrow_and_update` 消费当前值，
-/// 无丢失窗口。
+/// drain 等待走 `watch` channel（active 计数）而非 `Notify`：`notify_waiters`
+/// 无 permit 存储，多次触发只唤醒**当次**已存在的 waiter（`Notified` 创建后到达
+/// 的 notify_waiters 本身不丢——tokio ≥1.16 计数器语义；但同一 waiter 需要等
+/// **多次**事件中任意一次时，不重复构造 future 就没有「迟到可感知」保证）。
+/// watch 保留最新值，`changed()` 前先 `borrow_and_update` 消费当前值，无丢失窗口。
 pub(crate) struct IndexProgressTracker {
     /// 在飞 token 集合（begin/create 插入、end 移除；同 token 重复 begin 幂等）。
     active: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -809,8 +810,9 @@ impl Session {
             });
         }
 
-        // 未 Ready：在门上等。`notified()` 必须先取 permit 再 await，否则门在 await 之前开
-        // 就丢信号（Notify 标准语义）。
+        // 未 Ready：在门上等。`notified()` future 一旦创建，创建后到达的
+        // `notify_waiters` 即可感知（tokio ≥1.16 计数器语义，无需先 poll 注册）；
+        // 二次检查兜「Ready 先于 future 创建」的更早窗口。
         let notified = self.initialized_notify.notified();
         // 二次检查：拿到 permit 前 Ready 可能已就位。
         if matches!(*self.state.lock().unwrap(), SessionState::Ready) {
@@ -1239,5 +1241,108 @@ mod tests {
         assert_eq!(parse_handshake_secs(Some("-5")), Duration::from_secs(30));
         assert_eq!(parse_handshake_secs(Some("abc")), Duration::from_secs(30));
         assert_eq!(parse_handshake_secs(Some("")), Duration::from_secs(30));
+    }
+
+    // ---- Q10（bd i8jh）：Notify 注册竞态窗口实证锁定 ----
+    //
+    // 审计 Q10 假设「notified() 拿 future ≠ 注册，放锁/二次检查后、首次 poll 前
+    // 到达的 notify_waiters 会永久丢失」。tokio ≥1.16 实际语义（sync/notify.rs
+    // 文档原文）：`notify_waiters` 在 `Notified` future **创建之后**到达即可被
+    // 感知（创建时记录 `notify_waiters_calls` 计数，poll 时检出增量 → Ready），
+    // 与是否已 poll/enable 无关。以下测试把审计声称的丢失窗口真实打出来，
+    // 锁定「不丢」为回归契约；若未来 tokio 语义变化（或降级到 <1.16）在此变红。
+
+    #[tokio::test]
+    async fn notify_waiters_between_creation_and_first_poll_is_not_lost() {
+        let notify = Arc::new(Notify::new());
+        let n2 = notify.clone();
+        let fut = notify.notified(); // 创建（记录计数 C0）
+        tokio::pin!(fut);
+        n2.notify_waiters(); // 审计声称的窗口：创建后、首 poll 前
+        let res = tokio::time::timeout(Duration::from_secs(1), fut).await;
+        assert!(
+            res.is_ok(),
+            "创建后、首 poll 前的 notify_waiters 不得丢失（tokio ≥1.16 计数器语义）"
+        );
+    }
+
+    /// `wait_for_progress` 端到端：waiter 注册（waiters 表出现 token）后、首次
+    /// poll 前，handler 形态（持 progress 锁）的 `notify_waiters` 不得丢唤醒。
+    #[tokio::test]
+    async fn wait_for_progress_not_lost_when_notify_arrives_right_after_registration() {
+        let _env = REPLAY_ENV.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let replay = write_replay(dir.path());
+        // SAFETY: REPLAY_ENV 保证本进程内独占访问 SERENA_REPLAY，用完即清。
+        unsafe { std::env::set_var(ENV_REPLAY, &replay) };
+        let session = Session::start(None, crate::init_params::base_initialize_params())
+            .await
+            .expect("replay session Ready");
+        unsafe { std::env::remove_var(ENV_REPLAY) };
+
+        let s2 = session.clone();
+        let waiter = tokio::spawn(async move {
+            s2.wait_for_progress("q10-tok", Duration::from_secs(2)).await
+        });
+        // 轮询到 waiter 已注册（waiters 表出现 token），立刻在同一临界区内
+        // notify_waiters —— 与 `$/progress` handler 的真实形态完全一致。
+        loop {
+            {
+                let registry = session.progress.lock().unwrap();
+                if let Some(n) = registry.waiters.get("q10-tok") {
+                    n.notify_waiters();
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let res = tokio::time::timeout(Duration::from_secs(3), waiter).await;
+        assert!(
+            matches!(res, Ok(Ok(Ok(())))),
+            "Q10：wait_for_progress 注册后的 notify_waiters 不得丢失，got {res:?}"
+        );
+    }
+
+    /// `Session::request` 门端到端：请求在 check2（state 仍非 Ready）之后、首次
+    /// poll 之前，握手完成侧的 `set Ready + notify_waiters` 不得把 waiter 永久
+    /// 挂在门上（审计声称会「永久挂起」）。
+    #[tokio::test]
+    async fn request_gate_survives_ready_between_check_and_poll() {
+        let _env = REPLAY_ENV.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let replay = write_replay(dir.path());
+        // SAFETY: REPLAY_ENV 保证本进程内独占访问 SERENA_REPLAY，用完即清。
+        unsafe { std::env::set_var(ENV_REPLAY, &replay) };
+        let session = Session::start(None, crate::init_params::base_initialize_params())
+            .await
+            .expect("replay session Ready");
+        unsafe { std::env::remove_var(ENV_REPLAY) };
+
+        // 回拨到 Initializing，让下一次 request 走等门路径（Ready 快路径之外）。
+        *session.state.lock().unwrap() = SessionState::Initializing;
+        let s2 = session.clone();
+        let r = tokio::spawn(async move {
+            let res: Result<Value> =
+                s2.request("textDocument/q10", json!({}), Duration::from_millis(300)).await;
+            res
+        });
+        // 让 request 跑过 check1/check2、notified future 已创建、挂到门上。
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // 握手完成侧：先置 Ready 再 notify_waiters（Session::start 的真实顺序）。
+        *session.state.lock().unwrap() = SessionState::Ready;
+        session.initialized_notify.notify_waiters();
+
+        let res = tokio::time::timeout(Duration::from_secs(3), r).await;
+        assert!(
+            res.is_ok(),
+            "Q10：门唤醒不得丢失——notify_waiters 在 notified() 创建后到达必须放行"
+        );
+        // 门开后走 client.request：outbound writer 正常，但 replay 不回 tool 响应
+        // → 300ms 后 CoreError::Timeout（而非永久挂死）。
+        let inner = res.unwrap().expect("join");
+        assert!(
+            matches!(inner, Err(CoreError::Timeout { .. })),
+            "门开后应走 client.request 并在预算内超时，got {inner:?}"
+        );
     }
 }

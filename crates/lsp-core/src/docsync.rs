@@ -107,6 +107,12 @@ pub struct FileBuffer {
     /// 等 evict 主动回收或 `last_released_at + FILE_GUARD_TTL` 超时。
     /// `None` = 当前有活 guard 持住，或归零时间未到。
     pub last_released_at: Option<Instant>,
+    /// Q4（bd i8jh）：didChange 发送失败的脏标记。失败回滚时记账 version/mtime
+    /// 已 bump 且无法安全回退（并发 guard 可能又 +1），置脏让下次 `ensure_open`
+    /// 的 unchanged 判定失效 → 必走全量 didChange 补发；发送成功后清除。
+    /// 缺它时双因子判「未变」→ `Action::None` 假成功，didChange 永不补发，
+    /// LS 侧永久 stale（语义工具静默返旧）。
+    pub needs_resync: bool,
 }
 
 /// `ensure_open` 返回的 RAII guard。drop 时 ref_count--，归零 → didClose + 移除。
@@ -145,6 +151,11 @@ impl Drop for FileGuard {
 
 impl Session {
     /// 打开一个文件供 LSP 操作：首次 → 全量 didOpen；mtime/size 变了 → 全量 didChange。
+    ///
+    /// Q5（bd i8jh）：`fs::read_to_string` 全程在 `buffers` 锁外执行（§3.4）——
+    /// 乐观读协议：①锁内快照表状态 → ②锁外读盘 → ③锁内复查快照一致性并落账，
+    /// 漂移（并发 ensure_open 抢先改动表）则重来。读失败不会留下半更新的记账
+    /// （读移锁外的附带收益：旧实现锁内读失败时 ref_count 已 ++ 且不回滚）。
     pub async fn ensure_open(self: &Arc<Self>, path: &Path) -> Result<FileGuard> {
         let uri = path_to_uri(path)?;
         let meta = fs::metadata(path).map_err(CoreError::Io)?;
@@ -155,104 +166,182 @@ impl Session {
             Send { method: &'static str, params: Value },
             None,
         }
-
-        let (to_send, _version_after, lru_evicted) = {
-            let mut map = self.buffers.lock().expect("docsync buffers mutex poisoned");
-            let mut lru_evicted: Vec<Uri> = Vec::new();
-            match map.get_mut(&uri) {
-                None => {
-                    let text = fs::read_to_string(path).map_err(CoreError::Io)?;
-                    let version = INITIAL_VERSION;
-                    map.insert(
-                        uri.clone(),
-                        FileBuffer {
-                            uri: uri.clone(),
-                            mtime,
-                            size,
-                            content_version: version,
-                            ref_count: 1,
-                            last_released_at: None,
-                        },
-                    );
-                    // 修 P1 #1：插入新条目后立即跑 LRU 容量闸门。
-                    // 此时池大小 = capacity + 1（newly inserted），evict 把池收回到 capacity。
-                    lru_evicted = evict_lru_idle_locked(&mut map, FILE_BUFFER_CAPACITY);
-                    let action = Action::Send {
-                        method: "textDocument/didOpen",
-                        params: make_did_open(&uri, &text, version, &self.language_id_for(path)),
-                    };
-                    (action, version, lru_evicted)
-                }
-                Some(buf) => {
-                    buf.ref_count += 1;
-                    // 复用命中（同 file 在 TTL 窗口内再访问）：戳清释放时间，
-                    // 让 next drop 的 last_released_at 重新起算。
-                    buf.last_released_at = None;
-                    // mtime+size 双因子：同 mtime 粒度窗口内的外部改写靠 size 检出。
-                    // 记账侧任一为 None（stat 异常）→ 保守按「变了」处理。
-                    let unchanged =
-                        mtime.is_some() && size.is_some() && mtime == buf.mtime && size == buf.size;
-                    if unchanged {
-                        (Action::None, buf.content_version, lru_evicted)
-                    } else {
-                        let text = fs::read_to_string(path).map_err(CoreError::Io)?;
-                        let version = buf.content_version + 1;
-                        buf.mtime = mtime;
-                        buf.size = size;
-                        buf.content_version = version;
-                        let action = Action::Send {
-                            method: "textDocument/didChange",
-                            params: make_did_change(&uri, version, &text),
-                        };
-                        (action, version, lru_evicted)
-                    }
-                }
+        /// 锁内表状态快照（Q5 乐观协议的第①步）。
+        #[derive(Clone, Copy)]
+        enum Snap {
+            Missing,
+            Present {
+                mtime: Option<SystemTime>,
+                size: Option<u64>,
+                version: i64,
+                resync: bool,
+            },
+        }
+        impl Snap {
+            /// 复用命中（unchanged 且未置脏）：记账与当前 stat 双因子一致。
+            fn is_unchanged(&self, mtime: &Option<SystemTime>, size: &Option<u64>) -> bool {
+                matches!(
+                    self,
+                    Snap::Present { mtime: Some(m), size: Some(s), version: _, resync: false }
+                        if mtime == &Some(*m) && size == &Some(*s)
+                )
             }
-        };
+        }
+        enum Outcome {
+            Retry,
+            Done(Action, Vec<Uri>),
+        }
 
-        match to_send {
-            Action::Send { method, params } => {
-                if let Err(e) = self.notify(method, params).await {
-                    // 审计 F1 次生：notify 失败（典型=writer 死亡 channel 关）时回滚
-                    // 记账，否则新插条目变孤儿（ref_count=1 无人 drop）且 mtime 记账
-                    // 让后续 ensure_open 走复用分支永不补发 didOpen——该文件语义
-                    // 请求全部拿空/旧结果。复用/didChange 路径同理回滚 ref_count。
-                    let mut map = self.buffers.lock().expect("docsync buffers mutex poisoned");
-                    match map.get_mut(&uri) {
-                        // ref_count==1：唯一持有者就是本次失败的调用方，条目记账
-                        // （mtime/version）已不可信，直接移表让下次冷启动重新 didOpen。
-                        Some(buf) if buf.ref_count == 1 => {
-                            map.remove(&uri);
-                        }
-                        // 并发 ensure_open 抢先 +1 过：只回滚本次计数。
-                        Some(buf) => {
-                            buf.ref_count = buf.ref_count.saturating_sub(1);
-                            if buf.ref_count == 0 {
-                                buf.last_released_at = Some(Instant::now());
+        loop {
+            // ① 锁内快照（临界区微秒）。
+            let snap = {
+                let map = self.buffers.lock().expect("docsync buffers mutex poisoned");
+                match map.get(&uri) {
+                    None => Snap::Missing,
+                    Some(buf) => Snap::Present {
+                        mtime: buf.mtime,
+                        size: buf.size,
+                        version: buf.content_version,
+                        resync: buf.needs_resync,
+                    },
+                }
+            };
+            // ② 锁外读盘（Q5）：复用命中（unchanged 且未置脏）不读。
+            let text = if snap.is_unchanged(&mtime, &size) {
+                None
+            } else {
+                Some(fs::read_to_string(path).map_err(CoreError::Io)?)
+            };
+            // ③ 锁内复查 + 落账：表状态与快照完全一致才推进；被并发 ensure_open
+            // 改动 → 重来一轮（重新快照 + 重读，乐观协议无丢失窗口）。
+            let outcome = {
+                let mut map = self.buffers.lock().expect("docsync buffers mutex poisoned");
+                match (snap, map.get_mut(&uri)) {
+                    (Snap::Missing, None) => {
+                        let text = text.expect("missing entry requires didOpen text");
+                        let version = INITIAL_VERSION;
+                        map.insert(
+                            uri.clone(),
+                            FileBuffer {
+                                uri: uri.clone(),
+                                mtime,
+                                size,
+                                content_version: version,
+                                ref_count: 1,
+                                last_released_at: None,
+                                needs_resync: false,
+                            },
+                        );
+                        // 修 P1 #1：插入新条目后立即跑 LRU 容量闸门。
+                        let evicted = evict_lru_idle_locked(&mut map, FILE_BUFFER_CAPACITY);
+                        Outcome::Done(
+                            Action::Send {
+                                method: "textDocument/didOpen",
+                                params: make_did_open(
+                                    &uri,
+                                    &text,
+                                    version,
+                                    &self.language_id_for(path),
+                                ),
+                            },
+                            evicted,
+                        )
+                    }
+                    (
+                        Snap::Present { mtime: sm, size: ss, version: sv, resync: sr },
+                        Some(buf),
+                    ) if buf.mtime == sm
+                        && buf.size == ss
+                        && buf.content_version == sv
+                        && buf.needs_resync == sr =>
+                    {
+                        buf.ref_count += 1;
+                        // 复用命中：戳清释放时间，让 next drop 的 last_released_at 重新起算。
+                        buf.last_released_at = None;
+                        match text {
+                            None => Outcome::Done(Action::None, Vec::new()),
+                            Some(text) => {
+                                let version = buf.content_version + 1;
+                                buf.mtime = mtime;
+                                buf.size = size;
+                                buf.content_version = version;
+                                Outcome::Done(
+                                    Action::Send {
+                                        method: "textDocument/didChange",
+                                        params: make_did_change(&uri, version, &text),
+                                    },
+                                    Vec::new(),
+                                )
                             }
                         }
-                        None => {}
                     }
-                    return Err(e);
+                    // 快照漂移（并发抢先 insert/remove/bump）：重试。
+                    _ => Outcome::Retry,
                 }
+            };
+            let (to_send, lru_evicted) = match outcome {
+                Outcome::Done(action, evicted) => (action, evicted),
+                Outcome::Retry => continue,
+            };
+
+            match to_send {
+                Action::Send { method, params } => {
+                    if let Err(e) = self.notify(method, params).await {
+                        // 审计 F1 次生：notify 失败（典型=writer 死亡 channel 关 /
+                        // Q11 的 outbound 满拥塞）时回滚记账，否则新插条目变孤儿
+                        // （ref_count=1 无人 drop）且记账让后续 ensure_open 走复用
+                        // 分支永不补发——该文件语义请求全部拿空/旧结果。
+                        let mut map =
+                            self.buffers.lock().expect("docsync buffers mutex poisoned");
+                        match map.get_mut(&uri) {
+                            // ref_count==1：唯一持有者就是本次失败的调用方，条目记账
+                            // （mtime/version）已不可信，直接移表让下次冷启动重新 didOpen。
+                            Some(buf) if buf.ref_count == 1 => {
+                                map.remove(&uri);
+                            }
+                            // 并发 ensure_open 抢先 +1 过：只回滚本次计数，不能移表。
+                            // Q4（bd i8jh）：didChange 未到达 LS 而记账已 bump 且无法
+                            // 安全回退（并发可能又 bump）——置脏让下次 ensure_open
+                            // 的 unchanged 判定失效，必走全量 didChange 补发。
+                            Some(buf) => {
+                                buf.ref_count = buf.ref_count.saturating_sub(1);
+                                if buf.ref_count == 0 {
+                                    buf.last_released_at = Some(Instant::now());
+                                }
+                                if method == "textDocument/didChange" {
+                                    buf.needs_resync = true;
+                                }
+                            }
+                            None => {}
+                        }
+                        return Err(e);
+                    }
+                    // Q4：didChange 确认到达 LS —— 脏标记清除（LS 内容已追平记账）。
+                    if method == "textDocument/didChange"
+                        && let Some(buf) = self
+                            .buffers
+                            .lock()
+                            .expect("docsync buffers mutex poisoned")
+                            .get_mut(&uri)
+                    {
+                        buf.needs_resync = false;
+                    }
+                }
+                Action::None => {}
             }
-            Action::None => {}
-        }
 
-        // 修 P1 #1：LRU 淘汰的条目锁外发 didClose（outbound 关 send 失败忽略）。
-        // 注意 LRU 辅助是同步函数，drain 已发生；此处不影响锁纪律。
-        // 走 client().notify（同步）而非 self.notify（async）：避免再走一次 ready
-        // gate 等门——session 此时已 Ready，且 notify 等门是冗余开销。
-        for uri in &lru_evicted {
-            let _ = self
-                .client()
-                .notify("textDocument/didClose", make_did_close(uri));
-        }
+            // 修 P1 #1：LRU 淘汰的条目锁外发 didClose（outbound 关 send 失败忽略）。
+            for uri in &lru_evicted {
+                let _ = self
+                    .client()
+                    .notify("textDocument/didClose", make_did_close(uri));
+            }
 
-        Ok(FileGuard {
-            session: Arc::clone(self),
-            uri,
-        })
+            return Ok(FileGuard {
+                session: Arc::clone(self),
+                uri,
+            });
+        }
     }
 
     /// 强制回收所有缓冲：发 didClose + 移表。仅当调用方确认要立即关闭所有文档

@@ -193,31 +193,19 @@ pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), String> {
 
 /// 计算字节流的 sha256（小写 hex），平台分支走系统工具。
 ///
-/// ponytail: 不引 tempfile —— 用 `std::env::temp_dir()` + 进程内原子计数器即可；
-/// 调用方保证不并发（verify 串行走 download 流程）；无 unique 竞争即无 race。
+/// SEC-4（bd i8jh / CWE-377）：临时文件走 `tempfile::NamedTempFile`——随机名 +
+/// O_EXCL + Unix 0600，杜绝多用户共享 /tmp 上可预测名（pid 可跨用户观测）被
+/// 预置 symlink clobber；drop 即删，含错误路径无残留。
 #[cfg_attr(test, allow(dead_code))]
 fn sha256_hex(bytes: &[u8]) -> Result<String, String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     // certutil（Windows）拒收 0 字节文件（ERROR_FILE_INVALID）—— 公开常量兜底。
     if bytes.is_empty() {
         return Ok("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string());
     }
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let path = std::env::temp_dir().join(format!("serena_sha256_{pid}_{n}.bin"));
-    if let Err(e) = write_tempfile(&path, bytes) {
-        return Err(format!("sha256 tempfile: {e}"));
-    }
-    let output = match run_sha256_tool(&path) {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(format!("sha256 tool spawn: {e}"));
-        }
-    };
+    let tmp = sha_tempfile(bytes)?.into_temp_path(); // 关句柄保路径（Windows：certutil 与我方句柄共享冲突 = 0x80070020）
+    let path = tmp.to_path_buf();
+    let output = run_sha256_tool(&path).map_err(|e| format!("sha256 tool spawn: {e}"))?;
     let result = if !output.status.success() {
         Err(format!(
             "sha256 tool exit {:?}: stderr={}",
@@ -227,15 +215,19 @@ fn sha256_hex(bytes: &[u8]) -> Result<String, String> {
     } else {
         extract_sha256_hex(&output.stdout)
     };
-    let _ = std::fs::remove_file(&path);
+    drop(tmp); // TempPath drop = 删临时文件
     result
 }
 
-fn write_tempfile(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+/// SEC-4 单测锚 `sha_tempfile`：随机名 + 属主专用（Unix 0600）+ O_EXCL 的
+/// sha256 临时文件。
+fn sha_tempfile(bytes: &[u8]) -> Result<tempfile::NamedTempFile, String> {
     use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(bytes)?;
-    f.flush()
+    let mut f = tempfile::NamedTempFile::new().map_err(|e| format!("sha256 tempfile: {e}"))?;
+    f.write_all(bytes)
+        .and_then(|_| f.flush())
+        .map_err(|e| format!("sha256 tempfile write: {e}"))?;
+    Ok(f)
 }
 
 #[cfg(windows)]
@@ -481,5 +473,52 @@ mod tests {
                 "rust-analyzer sha256 不应全 0"
             );
         }
+    }
+
+    /// SEC-4（bd i8jh / CWE-377）：sha256 临时文件必须随机名 + 属主专用——
+    /// 可预测名（pid 可跨用户观测）+ 0644 + 无 O_EXCL 在多用户共享 /tmp 上
+    /// 可被预置 symlink clobber。
+    #[test]
+    fn sha256_tempfile_unpredictable_and_owner_only() {
+        let f = sha_tempfile(b"payload").expect("sha tempfile 建成");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(f.path())
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "临时文件必须属主专用（0600），实际 {:o}",
+                mode
+            );
+        }
+        let name = f
+            .path()
+            .file_name()
+            .expect("file_name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            !name.contains(&std::process::id().to_string()),
+            "SEC-4: 文件名不得含可预测 pid（CWE-377）: {name}"
+        );
+        assert!(!name.starts_with("serena_sha256_"), "不得用可预测前缀: {name}");
+        // drop 即删，无残留。
+        let gone = f.path().to_path_buf();
+        drop(f);
+        assert!(!gone.exists(), "NamedTempFile drop 应删除临时文件: {}", gone.display());
+    }
+
+    /// sha256_hex 端到端锚：临时文件 → 系统工具 → 已知向量（NamedTempFile 与
+    /// 系统工具共存的回归锚，Windows = certutil 读共享打开的句柄文件）。
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"hello").unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 }

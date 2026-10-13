@@ -1170,6 +1170,22 @@ pub(crate) async fn write_via_tool(
     }
 }
 
+/// 父目录脚手架。SEC-2（bd i8jh）：先 `guarded_join` 后 mkdir——越界路径在写入
+/// 前整体拒绝，杜绝「写本体被拦但目录树已逃逸落盘」；mkdir 不入 undo 账（undo
+/// 按文件快照，created 文件回滚 = 删文件，空目录残留无害）。
+fn scaffold_parent_dirs(root: &Path, files: [&str; 2]) -> Result<(), ToolError> {
+    for f in files {
+        let abs = crate::path_guard::guarded_join(root, f)
+            .map_err(|detail| ToolError::BadArgs { detail })?;
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ToolError::BadArgs {
+                detail: format!("mkdir {}: {e}", parent.display()),
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// `ct_write_with_tests <file> <code> <test_file> <tests> [name]`：事务内只含
 /// 写步（两文件），测试执行在事务外（计划 §1.7：runner 产物不进 undo/txn 栈）；
 /// 报告 = txn_id + 写清单 + run_test 信封。
@@ -1192,15 +1208,7 @@ pub(crate) async fn ct_write_with_tests(
             detail: "code must not be empty".into(),
         });
     }
-    // 父目录脚手架：mkdir 不入 undo 账（undo 按文件快照，created 文件回滚 =
-    // 删文件，空目录残留无害）。
-    for f in [file, test_file] {
-        if let Some(parent) = root.join(f).parent() {
-            std::fs::create_dir_all(parent).map_err(|e| ToolError::BadArgs {
-                detail: format!("mkdir {}: {e}", parent.display()),
-            })?;
-        }
-    }
+    scaffold_parent_dirs(root, [file, test_file])?;
     let (wrote, txn_id) = ct_txn(root, async {
         let mut wrote = Vec::new();
         for (f, content) in [(file, code), (test_file, tests)] {

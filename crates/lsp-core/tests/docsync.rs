@@ -1262,3 +1262,120 @@ fn path_to_uri_str_encodes_url_unsafe_ascii_only() {
     let plain = lsp_core::docsync::path_to_uri_str(std::path::Path::new("/tmp/plain_v1.2.rs"));
     assert_eq!(plain, "file:///tmp/plain_v1.2.rs");
 }
+
+/// Q4（bd i8jh）：didChange notify 失败的回滚必须置脏强制补发。
+///
+/// 场景取审计本体：**并发 guard（ref_count>1）**下 didChange 失败——回滚只减
+/// 计数、不移表，已提前 bump 的 mtime/size/content_version 残留新值。第三次
+/// ensure_open 双因子判「未变」→ `Action::None` → **Ok 假成功**（didChange 永不
+/// 补发，LS 侧永久 stale）。修复后：回滚置 `needs_resync` → 必重走 didChange。
+///
+/// （ref_count==1 的失败场景走移表分支重新 didOpen，不构成本体路径——测试若只
+/// 覆盖它会假绿。）
+#[tokio::test]
+async fn did_change_failure_marks_dirty_and_next_open_resyncs() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let file = tmp.path().join("q4.cpp");
+    tokio::fs::write(&file, b"v1\n").await.expect("write v1");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    // 双 guard：didOpen 一次 + 复用路径 +1 → ref_count=2（并发持有）。
+    let g_a = session.ensure_open(&file).await.expect("open #a");
+    let g_b = session.ensure_open(&file).await.expect("open #b");
+    drop(g_a); // ref 2→1，guard B 仍持有 → 失败回滚必走「只减计数」分支
+
+    // 外部改文件：mtime + size 双变 → 下次 ensure_open 必走 didChange 分支。
+    tokio::fs::write(&file, b"v2-longer-content\n")
+        .await
+        .expect("rewrite v2");
+
+    // 填满 outbound（64）直至首个 Full。current_thread 下同步 try_send 不让出，
+    // writer task 不被 poll → 无 drain，确定性塞满。
+    let client = session.client().clone();
+    let mut saturated = false;
+    for _ in 0..70 {
+        if client.notify("$/q4-fill", serde_json::json!({})).is_err() {
+            saturated = true;
+            break;
+        }
+    }
+    assert!(saturated, "outbound channel 必须能填满（cap 64）");
+
+    // #2：didChange bump 后 notify Full → 回滚 ref 2→1（不移表，记账残留新值）。
+    assert!(
+        session.ensure_open(&file).await.is_err(),
+        "#2 应因 channel 满而失败"
+    );
+    drop(g_b); // ref 1→0，TTL 窗口保留表项（含脏状态）
+
+    // #3（核心断言）：文件未再变。置脏后必须重走 didChange（仍 Full → Err），
+    // 而非双因子判「未变」走 Action::None 假成功 Ok。
+    assert!(
+        session.ensure_open(&file).await.is_err(),
+        "Q4：didChange 失败回滚后必须置脏——下次 ensure_open 必须补发 didChange（Err），\
+         不得双因子判『未变』假成功 Ok（LS 永久 stale）"
+    );
+
+    // 收尾：shutdown 内 timeout+await 会让出调度，writer drain 后正常走完。
+    session.shutdown().await;
+}
+
+/// Q5（bd i8jh）：`fs::read_to_string` 不得在持有 `buffers` 锁期间执行（§3.4）。
+/// 大文件首次 open（锁外读盘）期间，另一文件的复用路径（unchanged，纯锁临界区）
+/// 必须立即完成，不得被串行到大文件读之后。
+///
+/// multi_thread flavor 必需：big 的读盘是同步阻塞调用，current_thread 下会阻塞
+/// 整个调度线程，测试无意义。128 MiB 读下界（page cache memcpy）≈ 6ms+，
+/// 复用路径纯内存微秒级 —— 修复前 small 卡等 big 的持锁读，耗时必然 ≥6ms。
+#[tokio::test(flavor = "multi_thread")]
+async fn fs_read_runs_outside_buffers_lock_concurrent_open_unblocked() {
+    let tmp = TempDir::new().expect("TempDir::new");
+    let track_log = tmp.path().join("track.log");
+    let big = tmp.path().join("big.cpp");
+    let small = tmp.path().join("small.cpp");
+    tokio::fs::write(&big, vec![b'x'; 128 * 1024 * 1024])
+        .await
+        .expect("write big");
+    tokio::fs::write(&small, b"s\n").await.expect("write small");
+
+    let child = Child::spawn(launch_mock_ls_track(&track_log)).expect("spawn mock_ls");
+    let session = Session::start(Some(child), dummy_init_params())
+        .await
+        .expect("Session::start Ready");
+
+    // 预 open small → drop guard（TTL 保留）→ 之后走复用路径（无读盘无 notify，
+    // 纯锁临界区）。
+    drop(session.ensure_open(&small).await.expect("pre-open small"));
+
+    let s2 = session.clone();
+    let big_path = big.clone();
+    let jbig = tokio::spawn(async move {
+        let g = s2.ensure_open(&big_path).await.expect("open big");
+        (g, std::time::Instant::now())
+    });
+    // 让 big 进入首次读盘窗口（读在锁外时此刻只持有一小段记账临界区）。
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let s3 = session.clone();
+    let jsmall = tokio::spawn(async move {
+        let t0 = std::time::Instant::now();
+        let _g = s3.ensure_open(&small).await.expect("reopen small");
+        t0.elapsed()
+    });
+
+    let (small_elapsed, big_done_at) = tokio::join!(jsmall, jbig);
+    let small_elapsed = small_elapsed.expect("small join");
+    let (_gb, big_done_at) = big_done_at.expect("big join");
+    assert!(
+        small_elapsed < Duration::from_millis(3),
+        "Q5：small 复用路径耗时 {small_elapsed:?} —— 读盘持锁会把它串行到 \
+         128MiB 读之后（big 完成于 {big_done_at:?}）"
+    );
+
+    session.shutdown().await;
+}

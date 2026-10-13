@@ -100,6 +100,10 @@ pub enum FrameError {
     BadContentLength(#[from] std::num::ParseIntError),
     #[error("Content-Length {0} exceeds the 64 MiB frame limit")]
     TooLarge(usize),
+    /// Q6（bd i8jh）：帧头迟迟不出现——垃圾字节流（LS 被杀后孙进程继承 stdout
+    /// 持续写二进制等）无界积压会 OOM。头段与声明 body 同受 64 MiB 上限。
+    #[error("no frame header (\\r\\n\\r\\n) within the 64 MiB limit")]
+    HeaderTooLarge,
     #[error("frame body is not valid JSON-RPC: {0}")]
     BadJson(#[from] serde_json::Error),
 }
@@ -147,6 +151,11 @@ impl Decoder {
                 // 只从上次扫到的位置继续（3 字节重叠防分隔符跨 chunk 裂开）。
                 let start = self.scanned.min(buf.len());
                 let Some(rel) = buf[start..].windows(4).position(|w| w == b"\r\n\r\n") else {
+                    // Q6（bd i8jh）：无帧头的垃圾字节流不得无限积压（泵每 chunk
+                    // extend，恒 Ok(None) 会 OOM）——头段与声明 body 同受上限。
+                    if buf.len() >= MAX_FRAME_BODY {
+                        return Err(FrameError::HeaderTooLarge);
+                    }
                     self.scanned = buf.len().saturating_sub(3);
                     return Ok(None); // headers still streaming
                 };
@@ -312,5 +321,82 @@ mod tests {
         assert_eq!(dec.decode(&mut buf).unwrap().as_ref(), Some(&big));
         assert_eq!(dec.decode(&mut buf).unwrap().as_ref(), Some(&small_msg));
         assert!(buf.is_empty());
+    }
+
+    // ---- TG-H3（bd i8jh Q6）：畸形帧参数化矩阵 ----
+
+    /// ① Q6 本体：无 `\r\n\r\n` 的垃圾字节流必须在头段上限处报错中止，不得
+    /// 恒 `Ok(None)` 让泵无限 `extend_from_slice`（LS 被杀后孙进程继承 stdout
+    /// 持续写二进制的场景）。
+    #[test]
+    fn headerless_stream_rejected_at_limit_not_unbounded() {
+        let mut dec = Decoder::default();
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&vec![0u8; MAX_FRAME_BODY]); // 64 MiB 无分隔符
+        match dec.decode(&mut buf) {
+            Err(FrameError::HeaderTooLarge) => {}
+            other => panic!("expected HeaderTooLarge, got {other:?}"),
+        }
+    }
+
+    /// ② 无 Content-Length 头 → MissingContentLength。
+    #[test]
+    fn garbage_headers_rejected_missing_content_length() {
+        let mut dec = Decoder::default();
+        let mut buf = BytesMut::from(&b"garbage\r\n\r\n"[..]);
+        match dec.decode(&mut buf) {
+            Err(FrameError::MissingContentLength) => {}
+            other => panic!("expected MissingContentLength, got {other:?}"),
+        }
+    }
+
+    /// ③ Content-Length 非数字 → BadContentLength。
+    #[test]
+    fn non_numeric_content_length_rejected() {
+        let mut dec = Decoder::default();
+        let mut buf = BytesMut::from(&b"Content-Length: abc\r\n\r\n"[..]);
+        match dec.decode(&mut buf) {
+            Err(FrameError::BadContentLength(_)) => {}
+            other => panic!("expected BadContentLength, got {other:?}"),
+        }
+    }
+
+    /// ④ 合法头 + 非 JSON 体 → BadJson。
+    #[test]
+    fn valid_header_non_json_body_rejected() {
+        let mut dec = Decoder::default();
+        let mut buf = BytesMut::from(&b"Content-Length: 7\r\n\r\nnot json"[..]);
+        match dec.decode(&mut buf) {
+            Err(FrameError::BadJson(_)) => {}
+            other => panic!("expected BadJson, got {other:?}"),
+        }
+    }
+
+    /// ⑤ 零长 body：不得挂起（Ok(None) 永等）——零长非合法 JSON-RPC，报 BadJson。
+    #[test]
+    fn zero_length_body_does_not_hang() {
+        let mut dec = Decoder::default();
+        let mut buf = BytesMut::from(&b"Content-Length: 0\r\n\r\n"[..]);
+        match dec.decode(&mut buf) {
+            Err(FrameError::BadJson(_)) => {}
+            other => panic!("expected BadJson for empty body, got {other:?}"),
+        }
+    }
+
+    /// ⑥ TG-L1：重复 Content-Length 头最后一条生效。头 1 声明 100（buf 不够），
+    /// 头 2 声明真实长度——取头 1 会挂 Ok(None)，取头 2 才出帧。
+    #[test]
+    fn duplicate_content_length_last_one_wins() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#;
+        let mut wire =
+            format!("Content-Length: 100\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        wire.extend_from_slice(body);
+        let mut dec = Decoder::default();
+        let mut buf = BytesMut::from(&wire[..]);
+        let msg = dec
+            .decode(&mut buf)
+            .expect("duplicate headers must decode")
+            .expect("frame must be complete using the LAST Content-Length");
+        assert_eq!(msg.method.as_deref(), Some("m"));
     }
 }

@@ -21,7 +21,7 @@ lock file 判活 = **TCP 探测（500ms 超时）+ boot 时间戳 + token**，�
 - **boot 时间戳**：daemon 启动时写入 lockfile（`boot_ms`），客户端连接前比较 — 防止活 daemon 误判死
 - **token**：daemon 启动时随机生成（`gen_token`，非加密安全有意为之）
 - **唯一双实例路径**（活 daemon 被误判死）由 idle 自杀收敛（默认 15min 后自杀）
-- **stop-all 残留兜底**：详见 bd `serena-rust-3ab`（锁已删、进程未死 → Get-Process 强杀）
+- **stop-all 残留兜底**：详见 bd `serena-rust-3ab`（锁已删、进程未死 → `netstat -ano` 按端口反查 LISTENING PID + 映像名白名单校验（非本 CLI 映像不动手）+ `taskkill /F` 强杀；Unix 走 `lsof`/`kill -9` 同构路径；反查失败不误杀，转 stderr 告警提示手动处置——`cli/main.rs` residual-reap 模块）
 
 `gen_token` 非加密安全，有意为之：校验目标是**本机防误连 / 防跨会话误投**，不作抗恶意进程边界。
 

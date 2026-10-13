@@ -35,3 +35,4 @@ F2（70bee45）刻意设计：写类工具响应内联 `post_write_diagnostics` 
 
 - ADR-0011（LS 工具级预算）：后台回查里的 pull/push 等待同样受 LS 预算保护，不会成为新的无界点。
 - 写后诊断 pending 双态语义定义见 `post_diag_for_write` doc 注释（tfa3 / blindtest v5 P3-I 锁定）。
+- **断链修正（2026-10-13，bd qq3a 收口）**：立返上线的独立 e2e 抓出写后 `diagnostics --wait-gen` 在 rust-analyzer 1.98-nightly 下恒空——帧录制实锤 nightly 对全量 didChange 不保证推送（1.89 正常推；同内容去重时也不推），确认门 ver>=doc_cur 永等不到，而 bd serena-rust-76d 的 stale 守卫又跳过了 pull 兜底。修复 = tool_diagnostics 窗尽后 stale 场景解禁 pull（LS 现算，非缓存旧条目；76d「pending 不携带缓存旧错误」保留：stale 缓存 items 仍清空）。push/version 确认门与 76d 验收在 stable RA 路径零变化。

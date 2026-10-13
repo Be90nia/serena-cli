@@ -276,27 +276,29 @@ flowchart TB
 ```
 
 - **读并行**：`find-symbol/refs/def/hover/overview` 直接并发调用 Session —— LSP 请求天然并发（DESIGN §3.1），Session 内部无全局长锁（§3.2 拓扑）。
-- **in_flight 挂点与 LRU 全忙策略**：`in_flight` 挂 daemon `AppState`（`crates/daemon/src/http.rs`），由 http 层在工具请求通过 draining 检查后增减（`tools_post` 入口 +1 / 响应返回 -1），drain 窗口排空判据用它；`draining` 期间新请求直接 503 `DAEMON_DRAINING` 不计数。LRU 驱逐遇候选全部 in-flight>0 时允许临时超 `max_loaded_ls`（新实例照起），reaper 下轮巡检再驱逐收敛。（`↖ 挂点修订: bd serena-rust-7hq drain 窗口显式化，计数落在 http 层而非 supervisor`）
+- **in_flight 挂点与 LRU 全忙策略**：`in_flight` 挂 daemon `AppState`（`crates/daemon/src/http.rs`），由 http 层在工具请求通过 draining 检查后增减（`tools_post` 入口 +1 / 响应返回 -1），drain 窗口排空判据用它；`draining` 期间新请求直接 503 `DAEMON_DRAINING` 不计数。LRU 驱逐遇候选全部 in-flight>0 时允许临时超 `max_loaded_ls`（新实例照起），reaper 下轮巡检再驱逐收敛。（`↖ 挂点修订: bd serena-rust-7hq drain 窗口显式化，计数落在 http 层而非 supervisor`）`max_loaded_ls` 语义 = **reaper 周期收敛的稳态上限，非 spawn 前置硬闸**——单巡检窗口（默认 30s）内的多 root burst 冷启动可瞬时超限（perf-P2-3 实测峰值 13 > 6），由下轮 tick 压回；spawn 慢路径若要前置硬闸需在 supervisor 实例池内实现，属后续可选优化。
 - **写互斥**：DESIGN §3.1 的"全局互斥队列"落地为 supervisor 内**一把全局 `tokio::sync::Mutex`**。tokio Mutex 本身 FIFO 公平，等待者天然排队，不需要独立的队列数据结构。`ponytail: 全局单写门，若未来证明同文件高频并发写是热点，再按 project_root 分键`
 - **写事务的持锁范围**（工具：`replace-body`；客户端只传符号名）：acquire 门 → **锁内**经 documentSymbol 解析符号 range（杜绝客户端 range 过期）→ 读盘 + content-hash 对账 → 临时文件写 + rename（`tempfile` 原子写，共享冲突重试 5×50ms，I5）→ **读回 diff 校验，不符则从写前临时副本回滚并报 `WRITE_CONFLICT`**（DESIGN C3 ③）→ `didChange` 全量同步 → 等诊断代际推进（§3.4，带 2s 超时，超时不回滚只告警）→ 失效 symbol 缓存 → release。**盘上内容与 LSP 已知内容 fingerprint 不符时拒绝执行**（§6.3）——这是两个子代理先后写同一文件的防线。
 - **per-key 加载门**：`Entry.load_gate: Arc<tokio::sync::Mutex<()>>`，防止同 key 并发冷启动双拉 LS（`↖ mirror（形态）: serena project_server.py 的 per-root 加载锁`）。
 - **实例键规范化**：key 的 root 经 `dunce::canonicalize`（避免 `\\?\` UNC 前缀污染 LSP 参数与 file URI），语言为 `LanguageId`。LS 实例不跨项目共享（DESIGN §3.1 第 5 条，`initialize.rootUri` 绑定）。
 
-### 3.4 锁与同步原语清单（全项目唯一权威表）
+### 3.4 锁与同步原语清单（语义性原语权威表；全量登记见 constitution §7.1）
 
 | 原语 | 位置 | 保护对象 | 临界区 |
 |---|---|---|---|
 | `AtomicI64` | lsp-core `client.rs` | 请求 id 分配 | 无锁 |
 | `Mutex<HashMap<Id, oneshot::Sender>>` | lsp-core `client.rs` | pending 表 | 微秒，无 await |
-| `Mutex<HashMap<Uri, FileBuffer>>` | lsp-core `docsync.rs` | 打开文件表 | 微秒，无 await；didOpen/didChange 的实际发送在锁外 |
+| `Mutex<HashMap<Uri, FileBuffer>>` | lsp-core `session.rs:297`（字段声明；`FileBuffer` 类型与语义归属 `docsync.rs`） | 打开文件表 | 微秒，无 await；didOpen/didChange 的实际发送在锁外 |
 | 索引跟踪 `IndexProgressTracker`（`Mutex<HashSet<String>>` active 表 + `watch` 计数广播） | lsp-core `session.rs`（cf54869a mirror） | `$/progress`/`window/workDoneProgress/create` 在飞索引 token | 微秒，无 await；等待侧仅 `watch::changed`，不持锁 |
 | 诊断缓存 `DiagCache`（`Mutex<HashMap<(root,uri), items>>`）+ `diag_generation: AtomicU64` | supervisor `lib.rs`（`Δ` 自 lsp-core 上移；`↖ mirror: _published_diagnostics_condition`） | 诊断缓存与代际（`diagnostics --wait-gen`） | 微秒；wait_gen 为 100ms 探询（5s 上限），不跨 await 持锁 |
 | 符号缓存 `symbol_cache`（`Mutex<HashMap<SymbolCacheKey, _>>`，mtime/指纹键控） | supervisor `lib.rs`（`Δ` 同上） | 文件指纹→符号缓存 | 微秒；磁盘 IO 在锁外 |
 | `tokio::sync::Mutex` ×N（per-key） | supervisor `lib.rs` | LS 冷启动去重 | 跨 await（秒级） |
 | `tokio::sync::Mutex<()>` ×1（全局） | supervisor `write_gate.rs` | 写事务串行化 | 跨 await（写事务全程） |
 | `Mutex<HashMap<Key, Entry>>` | supervisor `lib.rs` | 实例表 | 微秒，无 await |
-| `mpsc`（cap 64）×1/Session | lsp-core `transport` | client→LS 出站 | — |
+| `mpsc` 出站 cap 64 + 回程 cap 8 ×1/Session | lsp-core `session.rs:386-387`（创建于 `Session::start`；消费在 `transport/stdio.rs`） | client→LS 出站三路路由 / server→client 请求回程 | — |
 | `oneshot` ×1/请求 | lsp-core `client.rs` | 响应完成 | — |
+
+> 本表登记语义性原语与临界区/锁序约定；生产代码**全量**登记表（含叶锁）见 `docs/constitution.md` §7.1——两表重叠行以 constitution 为超集，内容保持一致。
 
 ---
 
@@ -643,6 +645,8 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 
 ## 9. 相对 DESIGN.md 的差异记录（ADR 式，供 v0.2 汇总）
 
+> A1–A11 逐条对应 `docs/adr/0001~0011` 完整决策记录（NNN-kebab 文件名，序号不复用）；本表为摘要，背景/备选/后果以 ADR 文件为准。
+
 | # | 决策 | 理由与代价 |
 |---|---|---|
 | A1 | DESIGN §4 的 5 crate 细化为 7（拆出 `supervisor`；daemon 拆 lib + 唯一 bin `cli`） | supervisor 承载实例池+工具语义，若埋在 daemon 则未来任何 HTTP 端点被迫依赖 axum；拆分代价是多一个薄 crate |
@@ -652,6 +656,10 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 | A5 | 工具级失败走 HTTP 200 + `{ok:false}`，传输层错误才用 4xx/5xx | CLI 判定单一入口；代价是纯 REST 工具（如 curl 探活）需读 body |
 | A6 | lock file 判活 = TCP 探测（500ms 超时）+ boot 时间戳 + token，不引进程探活 API；唯一双实例路径（活 daemon 被误判死）由 idle 自杀收敛 | 最少机制覆盖崩溃残留；代价是极小概率的短暂双实例（无正确性影响） |
 | A7 | 新增 `--direct` 开发模式（CLI 进程内直调 supervisor） | M0 冒烟与单测不经 HTTP；代价是 cli 多一条对 supervisor 的依赖路径（本来就有） |
+| A8 | 第 10 个 wire 错误码 `DAEMON_DRAINING` 登记进 `WireErrorCode` 枚举（`docs/adr/0008`） | 硬编码字符串退出 http.rs 分支，dto 对账单测锁定 wire 形态 + exit=3；纯登记，非破坏性 |
+| A9 | 配置分层收敛为 3 层（删用户目录独立 `servers.toml` 层）（`docs/adr/0009`） | 代码是事实源——4 层是宪法写错（文档向代码收敛）；未来真要独立层再加回，成本极低 |
+| A10 | 写类工具响应立返，诊断确认异步化走 `wait_gen` 通道（`docs/adr/0010`） | 写响应 p50 3029ms→<500ms；诊断价值保留（异步回查进 diag_cache），调用方 JSON 契约零变化 |
+| A11 | LS 工具级预算覆盖出站发送段（`docs/adr/0011`） | 发送与响应等待共享同一 timeout，出站积压场景 300ms 内返 retryable `LS_TIMEOUT`（修复前无界挂死）；零新 wire 码 |
 
 **本文档不决定**（遵循任务非目标）：§11 开放问题（项目名、replace-body 里程碑归属等）维持 DESIGN.md 现状，不在此拍板。
 

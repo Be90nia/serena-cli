@@ -835,3 +835,50 @@ async fn first_lines_rejects_paths_outside_root() {
         "{err:?}"
     );
 }
+
+/// SEC-2（bd i8jh）：目录脚手架必须先 guarded_join 后 mkdir——越界 file/test_file
+/// 先被拒，不得在 root 外留下目录树（写本体被拦但 mkdir 已逃逸 = path_guard
+/// 「唯一拼接收口」被绕过）。
+#[test]
+fn scaffold_parent_dirs_rejects_out_of_root_without_mkdir() {
+    let root = tmpdir("sec2");
+    let host = tmpdir("sec2_host");
+    // 放行面不回退：root 内相对路径照常建父目录。
+    scaffold_parent_dirs(&root, ["src/a.rs", "tests/b.rs"]).expect("root 内必须放行");
+    assert!(root.join("src").is_dir() && root.join("tests").is_dir());
+
+    // 绝对路径形态：Err + 零残留（红 = 目录已落盘）。
+    let evil = host.join("out");
+    let evil_arg = evil.join("x_test.rs").to_string_lossy().into_owned();
+    let result = scaffold_parent_dirs(&root, ["lib.rs", evil_arg.as_str()]);
+    assert!(
+        !evil.exists(),
+        "SEC-2: root 外目录树已逃逸落盘（结果 {result:?}）"
+    );
+    match result {
+        Err(crate::ToolError::BadArgs { detail }) => {
+            assert!(detail.contains("escapes project root"), "{detail}");
+        }
+        other => panic!("越界 test_file 必须被拒，实际 {other:?}"),
+    }
+
+    // 相对 `..` 形态同理（逃逸锚限制在本 tmpdir 内，不污染用户目录）。
+    let base = tmpdir("sec2_rel");
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let result = scaffold_parent_dirs(&proj, ["../../outside/x.rs", "lib.rs"]);
+    assert!(
+        !base.join("outside").exists(),
+        "SEC-2: `..` 形态目录树已逃逸落盘（结果 {result:?}）"
+    );
+    match result {
+        Err(crate::ToolError::BadArgs { detail }) => {
+            assert!(detail.contains("escapes project root"), "{detail}");
+        }
+        other => panic!("越界 `..` 必须被拒，实际 {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&host);
+    let _ = std::fs::remove_dir_all(&base);
+}

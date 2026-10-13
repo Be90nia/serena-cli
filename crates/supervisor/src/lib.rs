@@ -80,6 +80,15 @@ const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
 /// 禁 dashmap/parking_lot/3rd party ordered-map（ARCH §6）。
 const SYMBOL_CACHE_MAX_ENTRIES: usize = 512;
 
+/// 诊断推送缓存（diag_cache / version_seen）条目上限（perf-P2-1）。两表按
+/// (root, uri) 同点写入（make_diag_handler），运行期无淘汰点（evict 只按 root
+/// 清 version_seen），超限整表清空再建——与 [`SYMBOL_CACHE_MAX_ENTRIES`] 同款
+/// （ARCH §3.2；禁 LRU 的依赖理由同上）。全清代价：已清文件的 diagnostics 查询
+/// 短暂回落 pending/pull 兜底，LS 下一条推送即恢复；diag_generation 不清，
+/// wait_gen 语义不变。version_seen 全清会短暂重开「缺 version 推送凭 generation
+/// 确认」窗口（bd serena-rust-76d 场景），下一条 versioned push 自愈。
+const DIAG_CACHE_MAX_ENTRIES: usize = 512;
+
 /// Phase 4 基建 Task 22b：三层 timeout 合并（CLI > servers.toml > 默认）。
 /// CLI flag 透传走 `args._timeout_ms` / `args._index_timeout_ms`（私有约定，
 /// CLI daemon HTTP / shell JSONL 都按 args 字段透传），`None` = 走 servers.toml 或默认。
@@ -458,6 +467,7 @@ pub struct Supervisor {
     launch_exe: Mutex<HashMap<Key, PathBuf>>,
     direct_mode: bool,
     /// publishDiagnostics 通知缓存：key = (root, uri)，value = items 数组。
+    /// 容量闸 `DIAG_CACHE_MAX_ENTRIES`（perf-P2-1）：超限整表清空再建。
     diag_cache: DiagCache,
     /// diagnostics generation：每次 publishDiagnostics 通知 ++（含空 items 的"无错"推送）。
     /// 客户端可请求 `wait_gen >= N` 等新一代诊断，避免盲轮询 5s。
@@ -471,6 +481,7 @@ pub struct Supervisor {
     /// 有 version 纪律的 LS（rust-analyzer）→ 缺 version 的推送（如文件 watcher 通
     /// 道对旧内容分析的推送）不得凭 generation 达标误确认（bd serena-rust-76d）；
     /// 从不发 version 的 LS（clangd）→ 保留 generation 判定（旧行为不回退）。
+    /// 容量闸 `DIAG_CACHE_MAX_ENTRIES`（perf-P2-1），与 diag_cache 同款。
     version_seen: std::sync::Arc<Mutex<HashMap<(PathBuf, String), bool>>>,
     /// bd dmsm：连续空 pending 轮次记账 (root, uri) → (连续轮数, 首轮时刻)。
     /// LS 对该文件连续多轮 (≥3 轮且 ≥10s) 只给 `pending:true` + 空 items 时，
@@ -870,6 +881,7 @@ impl Supervisor {
     ///
     /// `diag_cache` 按 (root, uri) 键与 session 解耦，刻意保留（文件级诊断跨世代
     /// 仍有效；新一轮 session 第一条 pushDiagnostics 会覆写/清空对应条目）。
+    /// 运行期上界由 `DIAG_CACHE_MAX_ENTRIES` 闸约束（perf-P2-1），evict 不重复清。
     pub async fn evict(&self, key: &Key) -> ToolResult<bool> {
         let session = self.instances.lock().unwrap().remove(key);
         self.last_used.lock().unwrap().remove(key);
@@ -1598,11 +1610,15 @@ impl Supervisor {
         }
 
         // 窗口尽未达标：LS 没推送当前版本的新鲜诊断（可能分析中、可能 LS 慢）。
-        // bd serena-rust-76d：版本落后（entry_ver < doc_cur）的缓存条目是**上一版
-        // 内容**的分析结果（repair 场景 = 旧错误）—— pending 兜底也不得携带
-        // （验收：pending:true 且不返旧错误）；pull 快照是同类旧版计算结果且无法
-        // 归属版本（裸探针实锤"pull 返回上次计算快照"），版本落后时一并跳过。
-        // LS 不发 version（clangd）→ 无法判定 → 保留旧 items + pull 兜底（旧行为）。
+        // bd serena-rust-76d：版本落后（entry_ver < doc_cur）的**缓存条目**是上一版
+        // 内容的分析结果（repair 场景 = 旧错误）—— items 清空，pending 兜底不得
+        // 携带缓存旧错误（验收：pending:true 且不带旧缓存 items）。
+        // pull 兜底对 stale 场景保持解禁（bd serena-rust-qq3a 断链修复）：裸探针
+        // 实锤 rust-analyzer 1.98.0-nightly 对全量 didChange 不保证推送（1.89 正常
+        // 推；同内容去重时也不推）——确认门永等不到 ver>=doc_cur，跳过 pull = 写后
+        // 诊断链死路（恒 pending:true 空 items）。pull 走 LS 现算（非缓存旧条目），
+        // 返回 items 属 v5 P3-I 既有语义（非空 ≠ 版本确认，AI 显式 wait-gen 复核）。
+        // LS 不发 version（clangd）→ 无法判定 stale → 保留旧 items + pull（旧行为）。
         let (mut items, entry_ver) = self
             .diag_cache
             .lock()
@@ -1616,7 +1632,6 @@ impl Supervisor {
         }
         if items.is_empty()
             && supports_pull
-            && !stale_entry
             // blindtest v5 P2-F：同 hybrid 路径——warmup 预算而非 30s；超时经
             // `let Ok` 落空 → register_empty_pending_exit 的 dmsm 式降级。
             && let Ok(value) = session
@@ -5173,12 +5188,18 @@ fn make_diag_handler(
             .and_then(|p| p.get("version"))
             .and_then(|v| v.as_i64());
         if ver.is_some() {
-            version_seen
-                .lock()
-                .unwrap()
-                .insert((cache_root.clone(), diag_uri_key(uri)), true);
+            let mut seen = version_seen.lock().unwrap();
+            // perf-P2-1：容量闸（[`DIAG_CACHE_MAX_ENTRIES`]）。
+            if seen.len() >= DIAG_CACHE_MAX_ENTRIES {
+                seen.clear();
+            }
+            seen.insert((cache_root.clone(), diag_uri_key(uri)), true);
         }
         let mut cache = cache.lock().unwrap();
+        // perf-P2-1：容量闸（[`DIAG_CACHE_MAX_ENTRIES`]），理由与代价见常量文档。
+        if cache.len() >= DIAG_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
         let key = (cache_root.clone(), diag_uri_key(uri));
         if items.is_empty() {
             cache.insert(key, (Vec::new(), ver));
@@ -14449,6 +14470,73 @@ mod offset_encoding_cjk_tests {
         assert_eq!(
             body, "/* 中文 *",
             "utf-8 协商下 C0..C11 = 11 字节恰为注释段；拿到 {body:?} 说明切片仍按 Utf16 计数（W1 回归）"
+        );
+    }
+}
+
+/// perf-P2-1 / TG-M6：diag_cache / version_seen 容量闸回归。burst 注入 2×cap+17
+/// 条 unique-uri publishDiagnostics，断言两表均有上界（修前无闸全保留 → 红）。
+/// 对照样板：lsp-core `progress_resolved_table_is_bounded_under_burst`。
+/// 纪律：直调真实 `make_diag_handler`（非手工镜像闭包），handler 语义改动即红。
+#[cfg(test)]
+mod diag_cache_bound_tests {
+    use super::*;
+
+    fn diag_push(uri: &str, version: i64) -> lsp_core::framing::JsonRpc {
+        lsp_core::framing::JsonRpc {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: Some("textDocument/publishDiagnostics".into()),
+            params: Some(json!({
+                "uri": uri,
+                "version": version,
+                "diagnostics": [{
+                    "message": "e",
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}
+                }],
+            })),
+            result: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn diag_cache_and_version_seen_are_bounded_under_burst() {
+        let root = PathBuf::from("Z:/no/such/diag_bound_proj");
+        let cache: DiagCache = std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let version_seen: std::sync::Arc<Mutex<HashMap<(PathBuf, String), bool>>> =
+            std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handler = make_diag_handler(
+            root,
+            std::sync::Arc::clone(&cache),
+            std::sync::Arc::clone(&generation),
+            std::sync::Arc::clone(&version_seen),
+        );
+
+        let total = DIAG_CACHE_MAX_ENTRIES * 2 + 17;
+        for i in 0..total {
+            handler(diag_push(
+                &format!("file:///z/no/such/diag_bound_proj/f{i}.rs"),
+                i as i64,
+            ));
+        }
+
+        let cache_len = cache.lock().unwrap().len();
+        let seen_len = version_seen.lock().unwrap().len();
+        assert!(
+            cache_len <= DIAG_CACHE_MAX_ENTRIES,
+            "diag_cache 无界（perf-P2-1）：{cache_len} 条 > {DIAG_CACHE_MAX_ENTRIES}"
+        );
+        assert!(
+            seen_len <= DIAG_CACHE_MAX_ENTRIES,
+            "version_seen 无界（perf-P2-1）：{seen_len} 条 > {DIAG_CACHE_MAX_ENTRIES}"
+        );
+        // 全清闸不误伤 generation 计数：非空推送条条 ++。
+        assert_eq!(
+            generation.load(std::sync::atomic::Ordering::Relaxed),
+            total as u64,
+            "容量闸不得影响 generation 语义"
         );
     }
 }

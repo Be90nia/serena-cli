@@ -357,7 +357,13 @@ impl Client {
                     ls: self.inner.ls_name.clone(),
                     cause: "outbound channel closed (writer dead)".into(),
                 },
-                other => CoreError::Io(std::io::Error::other(format!("outbound: {other}"))),
+                // Q11（bd i8jh）：LS 短暂读 stdin 停滞 + 通知突发时 `Full` 是瞬态
+                // 拥塞，必须保留 retryable 语义（wire LS_TIMEOUT，与 write_gate 的
+                // 拥塞→Timeout 先例同构）——折叠成 Io 会把可重试错变成 INTERNAL。
+                tokio::sync::mpsc::error::TrySendError::Full(_) => CoreError::Timeout {
+                    method: format!("outbound-congested({method_ref})"),
+                    secs: 0,
+                },
             })
     }
 
@@ -368,7 +374,8 @@ impl Client {
         params: Value,
         priority: Priority,
     ) -> Result<()> {
-        let msg = JsonRpc::notification(method.as_ref(), params);
+        let method_ref = method.as_ref();
+        let msg = JsonRpc::notification(method_ref, params);
         self.inner
             .outbound
             .try_send(OutboundItem { msg, priority })
@@ -378,7 +385,11 @@ impl Client {
                     ls: self.inner.ls_name.clone(),
                     cause: "outbound channel closed (writer dead)".into(),
                 },
-                other => CoreError::Io(std::io::Error::other(format!("outbound: {other}"))),
+                // Q11：同 notify——Full 瞬态拥塞保留 retryable 语义。
+                tokio::sync::mpsc::error::TrySendError::Full(_) => CoreError::Timeout {
+                    method: format!("outbound-congested({method_ref})"),
+                    secs: 0,
+                },
             })
     }
 
@@ -545,9 +556,16 @@ impl Client {
 
             // 通知（id 无，method 有）：调 handler，未注册则丢弃。
             (None, Some(method)) => {
-                let handlers = self.inner.notification_handlers.lock().unwrap();
-                if let Some(handler) = handlers.get(method.as_str()) {
-                    (handler)(msg);
+                // Q9（bd i8jh）：clone Arc 出锁、锁外调用——handler 持注册表锁同步
+                // 执行时，handler 内再碰注册表（clear/on_notification，如 shutdown
+                // 清 $/progress 撞上在途通知）即自死锁，慢 handler 还会阻塞整条
+                // stdout 泵的分发。
+                let handler = {
+                    let handlers = self.inner.notification_handlers.lock().unwrap();
+                    handlers.get(method.as_str()).cloned()
+                };
+                if let Some(handler) = handler {
+                    handler(msg);
                 } else {
                     tracing::trace!(method = %method, "未注册的通知 handler，丢弃");
                 }
@@ -560,13 +578,14 @@ impl Client {
                     tracing::warn!(?id_value, "server request id 无法归一化");
                     return None;
                 };
-                let result = {
+                // Q9：同通知分支——handler clone 出注册表锁，锁外调用。
+                let handler = {
                     let handlers = self.inner.server_request_handlers.lock().unwrap();
-                    handlers
-                        .get(method.as_str())
-                        .and_then(|h| (h)(msg.clone()))
-                        .unwrap_or_else(|| default_server_request_result(method, &msg))
+                    handlers.get(method.as_str()).cloned()
                 };
+                let result = handler
+                    .and_then(|h| h(msg.clone()))
+                    .unwrap_or_else(|| default_server_request_result(method, &msg));
                 Some(JsonRpc::response_ok(id.to_value(), result))
             }
 
@@ -613,5 +632,128 @@ fn rpc_err_from(e: &RpcError) -> CoreError {
             code: e.code,
             message: e.message.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Q11（bd i8jh / TG-M3）：outbound 满（64 cap）时 `try_send` 的 `Full` 必须
+    /// 映射 retryable 形态（`CoreError::Timeout`，wire LS_TIMEOUT，与 write_gate
+    /// 的拥塞→Timeout 先例同构），不得折叠成 `CoreError::Io`（非 retryable，
+    /// 丢瞬态拥塞语义）。对照：`Closed` 仍必须映射 `Terminated`（自愈语义）。
+    #[test]
+    fn outbound_full_maps_to_retryable_variant() {
+        let (tx, rx) = mpsc::channel::<OutboundItem>(2);
+        let client = Client::new(tx);
+        let mut filled = 0;
+        for _ in 0..10 {
+            match client.notify("$/fill", json!({})) {
+                Ok(()) => filled += 1,
+                Err(_) => break,
+            }
+        }
+        assert_eq!(filled, 2, "cap=2 应恰好容纳 2 帧");
+        // 无消费者（rx 留在测试里不 spawn writer）→ 第 3 帧 Full。
+        let err = client
+            .notify("$/overflow", json!({}))
+            .expect_err("channel full must error");
+        assert!(
+            matches!(err, CoreError::Timeout { .. }),
+            "Full 必须映射 retryable 的 Timeout 形态，got {err:?}"
+        );
+        // 对照组：writer 死亡（rx drop）→ Closed → Terminated。
+        drop(rx);
+        let err2 = client
+            .notify("$/after-close", json!({}))
+            .expect_err("closed channel must error");
+        assert!(
+            matches!(err2, CoreError::Terminated { .. }),
+            "Closed 必须保持 Terminated 映射，got {err2:?}"
+        );
+    }
+
+    /// Q9（bd i8jh）：通知 handler 必须在注册表锁外执行——handler 内重入注册表
+    /// 操作（真实场景：handler 调 `clear_notification`/`on_notification`，如
+    /// shutdown 清 `$/progress` 触发在途通知）不得自死锁（std Mutex 不可重入）。
+    #[test]
+    fn notification_handler_may_reenter_registry() {
+        let (tx, _rx) = mpsc::channel::<OutboundItem>(16);
+        let client = Client::new(tx);
+        let c2 = client.clone();
+        client.on_notification("$/reenter", move |_m| {
+            assert!(c2.clear_notification("$/reenter"));
+            c2.on_notification("$/reenter2", |_| {});
+        });
+        let msg = JsonRpc::notification("$/reenter", json!({}));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let c3 = client.clone();
+        std::thread::spawn(move || {
+            c3.handle_message(msg);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "Q9：handler 重入注册表死锁——handler 必须在锁外执行"
+        );
+    }
+
+    /// Q9：慢 handler 不得阻塞其他帧的分发（泵活性）。handler 持注册表锁执行时，
+    /// 并发到达的另一帧会在 `notification_handlers.lock()` 上排队等慢 handler 完成。
+    #[test]
+    fn slow_notification_handler_does_not_block_other_frames() {
+        let (tx, _rx) = mpsc::channel::<OutboundItem>(16);
+        let client = Client::new(tx);
+        let started = Arc::new(AtomicBool::new(false));
+        let s2 = started.clone();
+        client.on_notification("$/slow", move |_| {
+            s2.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        client.on_notification("$/fast", |_| {});
+        let c2 = client.clone();
+        let slow = JsonRpc::notification("$/slow", json!({}));
+        let t_slow = std::thread::spawn(move || {
+            c2.handle_message(slow);
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let t0 = std::time::Instant::now();
+        client.handle_message(JsonRpc::notification("$/fast", json!({})));
+        let fast_elapsed = t0.elapsed();
+        t_slow.join().unwrap();
+        assert!(
+            fast_elapsed < Duration::from_millis(200),
+            "Q9：慢 handler 执行期间另一帧分发耗时 {fast_elapsed:?}（持锁执行会等满 300ms）"
+        );
+    }
+
+    /// Q9：server→client request handler 同样必须锁外执行（注册表同款重入死锁面）。
+    #[test]
+    fn server_request_handler_may_reenter_registry() {
+        let (tx, _rx) = mpsc::channel::<OutboundItem>(16);
+        let client = Client::new(tx);
+        let c2 = client.clone();
+        client.on_server_request("workspace/q9", move |_m| {
+            assert!(c2.clear_server_request("workspace/q9"));
+            c2.on_server_request("workspace/q9-2", |_| None);
+            Some(json!({"ok": true}))
+        });
+        let msg = JsonRpc::request(9, "workspace/q9", json!({}));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let c3 = client.clone();
+        std::thread::spawn(move || {
+            let reply = c3.handle_message(msg);
+            let _ = done_tx.send(reply.is_some());
+        });
+        let replied = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Q9：server request handler 重入注册表死锁");
+        assert!(replied, "handler 返回 Some 必须产出回执帧");
     }
 }

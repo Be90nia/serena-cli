@@ -356,6 +356,25 @@ fn host_allowed(host: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|a| a.to_ascii_lowercase() == host)
 }
 
+/// §5.1 单跳校验（首跳 + 重定向逐跳共用）：scheme 必须 https + host 精确白名单。
+/// SEC-3（bd i8jh）：仅比 host 时白名单域的重定向可降级 `http://` 明文取包——
+/// 「信任锚 = HTTPS + allowed_hosts」必须两门同验才在代码里成立。
+fn check_download_hop(url: &reqwest::Url, allowed: &[String]) -> Result<(), String> {
+    let scheme = url.scheme();
+    if scheme != "https" {
+        return Err(format!(
+            "insecure scheme `{scheme}` rejected (https only): {url}"
+        ));
+    }
+    let host = url.host_str().unwrap_or("?");
+    if !host_allowed(host, allowed) {
+        return Err(format!(
+            "host not in allowed_hosts: {host} (allowed: {allowed:?})"
+        ));
+    }
+    Ok(())
+}
+
 /// 默认安装缓存根（design §5 cache_root）：Windows `%LOCALAPPDATA%\serena\ls`，
 /// Unix `~/.local/share/serena/ls`。
 ///
@@ -405,16 +424,13 @@ pub fn build_download_client(
             if attempt.previous().len() > 10 {
                 return attempt.error("too many redirects");
             }
-            let host_ok = attempt
-                .url()
-                .host_str()
-                .map(|h| host_allowed(h, &allowed))
-                .unwrap_or(false);
-            if host_ok {
-                attempt.follow()
-            } else {
-                let url = attempt.url().to_string();
-                attempt.error(format!("redirect host not in allowed_hosts: {url}"))
+            let hop = check_download_hop(attempt.url(), &allowed);
+            match hop {
+                Ok(()) => attempt.follow(),
+                Err(cause) => {
+                    let target = attempt.url().to_string();
+                    attempt.error(format!("redirect to {target} rejected: {cause}"))
+                }
             }
         }))
         // 总时长 timeout 是 blocking builder 唯一可用的停摆保护（read_timeout 仅 async
@@ -439,19 +455,12 @@ fn download(
         actual_sha: None,
         cause: format!("parse url: {e}"),
     })?;
-    let first_host_ok = parsed
-        .host_str()
-        .map(|h| host_allowed(h, allowed))
-        .unwrap_or(false);
-    if !first_host_ok {
+    if let Err(cause) = check_download_hop(&parsed, allowed) {
         return Err(RuntimeError::Download {
             url: url.to_string(),
             expected_sha: None,
             actual_sha: None,
-            cause: format!(
-                "host not in allowed_hosts: {} (allowed: {allowed:?})",
-                parsed.host_str().unwrap_or("?")
-            ),
+            cause,
         });
     }
     let resp = client.get(url).send().map_err(|e| RuntimeError::Download {
@@ -963,5 +972,49 @@ mod tests {
         let dest = dir.path().join("out");
         extract(&pkg, ArchiveKind::TarGz, 0, &dest).expect("干净 tar.gz 应解压成功");
         assert!(dest.join("bin/ls").is_file());
+    }
+
+    /// SEC-3/TG-M7①（bd i8jh）：单跳校验必须同时钉 scheme——白名单 host 的
+    /// http:// 形态拒绝（修前仅比 host → Ok，重定向链可被降级明文取包）。
+    #[test]
+    fn download_hop_rejects_non_https_even_when_host_allowed() {
+        let allowed = vec!["github.com".to_string()];
+        let https: reqwest::Url = "https://github.com/x/y.zip".parse().unwrap();
+        assert!(check_download_hop(&https, &allowed).is_ok(), "https+白名单放行");
+        let http: reqwest::Url = "http://github.com/x/y.zip".parse().unwrap();
+        let err =
+            check_download_hop(&http, &allowed).expect_err("http 降级必须被拒（SEC-3）");
+        assert!(err.contains("https"), "错误须指明 scheme 要求: {err}");
+        // host 门不松：白名单外照旧拒（原 §5.1 语义）。
+        let evil: reqwest::Url = "https://evil.io/x".parse().unwrap();
+        let err = check_download_hop(&evil, &allowed).expect_err("白名单外必须被拒");
+        assert!(err.contains("allowed_hosts"), "{err}");
+    }
+
+    /// SEC-3 端到端（本地单发 mock，不触外网）：http:// 首跳必须拒收。
+    /// 红 = 修前 host 白名单放行 → Ok(payload)。
+    #[test]
+    fn download_rejects_plain_http_first_hop() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                let _ = stream.flush();
+            }
+        });
+        let allowed = vec!["127.0.0.1".to_string()];
+        let client = build_download_client(&allowed).expect("client");
+        let err =
+            download(&client, &format!("http://{addr}/payload"), &allowed).unwrap_err();
+        assert!(
+            err.to_string().contains("https"),
+            "http 首跳必须被 scheme 门拒: {err}"
+        );
     }
 }

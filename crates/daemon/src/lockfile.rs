@@ -155,8 +155,18 @@ fn try_become_daemon_impl(lock_path: &Path, candidate_port: u16) -> Result<Outco
             // 败者：读现有 lock → 宽限探活。主人可能正在启动（lock 已建、端口未
             // bind）或在 draining 收尾（端口已关、进程未退）——单次探活失败就删
             // lock 会误判 stale，产生孤儿 daemon / token 错配（bd y2y 根因 2）。
-            let raw = std::fs::read_to_string(lock_path)?;
-            let existing: LockEntry = serde_json::from_str(&raw)?;
+            // 半写/坏 lock（daemon 死于 create_new 与 write_all 之间）或锁已被
+            // 并发接管者删除：视同 stale 走同一条 remove+recurse 接管路径——
+            // serde 报错上抛会让 spawn 链永久断在坏 lock 上（Q3）。IO 读错误
+            // 仍上抛：读不了盘 ≠ 内容坏，盲目删锁会放大故障。
+            let existing = match read(lock_path) {
+                Ok(Some(entry)) => entry,
+                Ok(None) | Err(LockError::Serde(_)) => {
+                    let _ = std::fs::remove_file(lock_path);
+                    return try_become_daemon_impl(lock_path, candidate_port);
+                }
+                Err(e) => return Err(e),
+            };
             let addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, existing.port).into();
             // bind-first 仲裁：走到这里时本进程已 bind 成功 candidate_port，端口上
             // 必无其他 listener。若 lock 记录的端口 == candidate_port，宽限探活的
@@ -205,6 +215,20 @@ pub fn read(lock_path: &Path) -> Result<Option<LockEntry>, LockError> {
     let raw = std::fs::read_to_string(lock_path)?;
     let entry: LockEntry = serde_json::from_str(&raw)?;
     Ok(Some(entry))
+}
+
+/// CLI 探活前置读取：坏 lock（半写产物）视同不存在，返回 `Ok(None)`。
+///
+/// lock 内容坏 ⇒ 其主必死于 create_new 与 write_all 之间（健康 lock 只经
+/// 这条一次性写入或 write_final 原子替换），无人能持它服务，故视同无锁走
+/// spawn 链。不在此处删文件：接管动作统一归 spawn 出的 daemon——
+/// try_become_daemon 败者分支对坏 lock 走 remove+recurse（Q3 同源语义），
+/// CLI 只读不抢写，避免与写中进程抢删。
+pub fn read_stale_tolerant(lock_path: &Path) -> Result<Option<LockEntry>, LockError> {
+    match read(lock_path) {
+        Err(LockError::Serde(_)) => Ok(None),
+        other => other,
+    }
 }
 
 /// 归属校验删除 lock：`pid` + `boot_ms` 都匹配当前 lock 内容才删；
@@ -359,6 +383,48 @@ mod tests {
     fn read_missing_returns_none() {
         let (_dir, path) = fresh_lock();
         assert!(read(&path).unwrap().is_none());
+    }
+
+    /// Q3 配套：CLI 探活入口对坏 lock 返回 Ok(None)（走 spawn 链）而非
+    /// Err 断链；IO 读错误不属于"内容坏"，仍上抛。
+    #[test]
+    fn read_stale_tolerant_maps_corrupt_to_none() {
+        let (_dir, path) = fresh_lock();
+        std::fs::write(&path, b"{oops").expect("write corrupt lock");
+        assert!(matches!(
+            read_stale_tolerant(&path),
+            Ok(None)
+        ), "corrupt lock must read as Ok(None) for the CLI probe");
+        // 健康 lock 照常读出；真 IO 错误（lock 路径是目录）保持上抛语义。
+        write_final(
+            &path,
+            &LockEntry { pid: 1, port: 1, boot_ms: 1, token: "t".into() },
+        )
+        .expect("write valid lock");
+        assert!(read_stale_tolerant(&path).unwrap().is_some());
+        std::fs::remove_file(&path).expect("remove lock file");
+        std::fs::create_dir(&path).expect("replace lock with dir");
+        assert!(
+            matches!(read_stale_tolerant(&path), Err(LockError::Io(_))),
+            "IO failure must propagate, not be swallowed as stale"
+        );
+    }
+
+    /// TG-M1 / Q3 回归：daemon 死于 create_new 与 write_all 之间的半写 lock
+    /// （内容非 JSON）必须被接管而非永久 serde 报错断链。read() 对坏内容仍
+    /// 返回 Err（锁存在但内容无效 ≠ 锁不存在，调用方必须看得见）。
+    #[test]
+    fn corrupt_lock_is_taken_over() {
+        let (_dir, path) = fresh_lock();
+        std::fs::write(&path, b"{oops").expect("write corrupt lock");
+        assert!(read(&path).is_err(), "corrupt lock content must read as Err");
+        match try_become_daemon(&path, 7860) {
+            Ok(Outcome::Won { port, .. }) => assert_eq!(port, 7860),
+            other => panic!("corrupt lock must be taken over; got {other:?}"),
+        }
+        // 接管后 lock 内容恢复为有效的新归属。
+        let fresh = read(&path).expect("read after takeover").expect("lock exists");
+        assert_eq!(fresh.pid, std::process::id(), "lock must be owned by us now");
     }
 
     #[test]
