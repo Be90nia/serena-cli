@@ -220,6 +220,93 @@ async fn line_edit_hash_mismatch_rejects_write() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// bd serena-rust-yim0：CRLF fixture——盘面字节回读断言行级写不把行尾漂移成 mixed。
+fn scratch_crlf(tag: &str) -> (PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("serena-w5-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("demo.cpp");
+    std::fs::write(
+        &file,
+        "int old_value = 1;\r\nint keep_me() { return 42; }\r\nint main() { return old_value; }\r\n",
+    )
+    .unwrap();
+    (dir, file)
+}
+
+/// 纯 CRLF 断言：任何 `\n` 的前一字节必须是 `\r`，且文件以 `\r\n` 收尾。
+fn assert_pure_crlf(bytes: &[u8]) {
+    let bare = usize::from(bytes.first() == Some(&b'\n'))
+        + bytes
+            .windows(2)
+            .filter(|w| w[1] == b'\n' && w[0] != b'\r')
+            .count();
+    assert_eq!(bare, 0, "出现裸 \\n = 行尾漂移: {bytes:?}");
+    assert!(bytes.ends_with(b"\r\n"), "文件尾必须保持 \\r\\n: {bytes:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_lines_keeps_crlf_disk_bytes() {
+    if !has_clangd() {
+        println!("skipped: clangd not in PATH");
+        return;
+    }
+    let (root, file) = scratch_crlf("rep");
+    let sup = supervisor::Supervisor::direct().await.expect("supervisor");
+    let _ = sup
+        .tool_overview(&root, "demo.cpp", None)
+        .await
+        .expect("overview");
+
+    sup.tool_replace_lines(
+        &root,
+        "demo.cpp",
+        2,
+        2,
+        "int swapped() { return 0; }",
+        None,
+        None,
+    )
+    .await
+    .expect("replace_lines");
+
+    let bytes = std::fs::read(&file).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        text.contains("int swapped() { return 0; }") && !text.contains("keep_me"),
+        "line 2 应被替换: {text}"
+    );
+    assert_pure_crlf(&bytes);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_lines_keeps_crlf_disk_bytes() {
+    if !has_clangd() {
+        println!("skipped: clangd not in PATH");
+        return;
+    }
+    let (root, file) = scratch_crlf("del");
+    let sup = supervisor::Supervisor::direct().await.expect("supervisor");
+    let _ = sup
+        .tool_overview(&root, "demo.cpp", None)
+        .await
+        .expect("overview");
+
+    sup.tool_delete_lines(&root, "demo.cpp", 2, 2, None, None)
+        .await
+        .expect("delete_lines");
+
+    let bytes = std::fs::read(&file).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        !text.contains("keep_me") && text.contains("old_value") && text.contains("main"),
+        "line 2 应被删除: {text}"
+    );
+    assert_pure_crlf(&bytes);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ============ safe-delete ============
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

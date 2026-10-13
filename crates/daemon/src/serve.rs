@@ -43,8 +43,7 @@ impl Default for ServeConfig {
 pub fn default_lock_path() -> PathBuf {
     #[cfg(windows)]
     {
-        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-        PathBuf::from(base).join("serena").join("daemon.lock")
+        windows_lock_path(std::env::var("LOCALAPPDATA").ok().as_deref())
     }
     #[cfg(not(windows))]
     {
@@ -59,6 +58,14 @@ fn unix_lock_path(runtime_dir: Option<&std::ffi::OsStr>, home: Option<&str>) -> 
         return PathBuf::from(runtime).join("serena").join("daemon.lock");
     }
     PathBuf::from(home.unwrap_or(".")).join(".serena").join("daemon.lock")
+}
+
+/// `default_lock_path` 的 Windows 分支纯函数（参数注入供单测，不碰进程 env）。
+#[cfg(windows)]
+fn windows_lock_path(local_app_data: Option<&str>) -> PathBuf {
+    PathBuf::from(local_app_data.unwrap_or("."))
+        .join("serena")
+        .join("daemon.lock")
 }
 
 /// 工具调用重放日志（d3a）：daemon.lock 同目录 `invocations.jsonl`。
@@ -175,6 +182,40 @@ pub async fn signal_shutdown(state: &AppState) {
 pub fn backfill_lock(lock_path: &Path, entry: &LockEntry) -> anyhow::Result<()> {
     lockfile::write_final(lock_path, entry)?;
     Ok(())
+}
+
+/// TG-L2：Windows LOCALAPPDATA 分支单测（与 unix_lock_path 同款参数注入，
+/// 不碰进程 env——edition 2024 env 写是 unsafe 且与并行测试互踩）。
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_lock_path_joins_localappdata_and_falls_back_to_cwd() {
+        assert_eq!(
+            windows_lock_path(Some(r"C:\Users\u\AppData\Local")),
+            PathBuf::from(r"C:\Users\u\AppData\Local")
+                .join("serena")
+                .join("daemon.lock"),
+            "LOCALAPPDATA 设置时必须拼接 serena/daemon.lock"
+        );
+        assert_eq!(
+            windows_lock_path(None),
+            PathBuf::from("./serena/daemon.lock"),
+            "缺省回落 cwd（既有 unwrap_or 语义）"
+        );
+    }
+
+    /// 集成面：真机 env（或缺省回落）经 default_lock_path 后必须落在
+    /// serena/daemon.lock——env 读取只读不写，两种环境形态断言同形。
+    #[test]
+    fn default_lock_path_ends_with_serena_daemon_lock() {
+        let p = default_lock_path();
+        assert!(
+            p.ends_with(Path::new("serena").join("daemon.lock")),
+            "default_lock_path 必须以 serena/daemon.lock 结尾: {p:?}"
+        );
+    }
 }
 
 #[cfg(all(test, not(windows)))]

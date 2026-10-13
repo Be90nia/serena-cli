@@ -508,7 +508,7 @@ pub(crate) fn apply_delete_lines(text: &str, start: u32, end: u32) -> EditResult
     Ok(out)
 }
 
-/// 用 content 整体替换 `[start, end]` 行（规范化补尾 `\n`）。
+/// 用 content 整体替换 `[start, end]` 行（规范化补尾，行尾跟随宿主主导行尾）。
 pub(crate) fn apply_replace_lines(
     text: &str,
     start: u32,
@@ -522,9 +522,13 @@ pub(crate) fn apply_replace_lines(
     }
     let from = starts[(start - 1) as usize];
     let to = starts[end as usize];
-    let mut content = content.to_string();
-    if !content.ends_with('\n') {
-        content.push('\n'); // ↖ mirror: file_tools.py@43ae021 ReplaceLinesTool.apply
+    // bd yim0：替换行尾跟随宿主主导行尾——CRLF 文件硬写 \n 会漂移成 mixed 行尾
+    // （与 insert F5 同类）。内容已有 \r\n 先折平防 \r\r\n，再统一展开。
+    // Δ 上游恒写 \n（mirror: file_tools.py@43ae021 ReplaceLinesTool.apply）。
+    let eol = dominant_eol(text);
+    let mut content = content.replace("\r\n", "\n").replace('\n', eol);
+    if !content.ends_with(eol) {
+        content.push_str(eol);
     }
     Ok(format!("{}{}{}", &text[..from], content, &text[to..]))
 }
@@ -734,6 +738,37 @@ mod tests {
     #[test]
     fn replace_out_of_bounds_rejected() {
         assert!(apply_replace_lines("1\n", 1, 2, "x\n").is_err());
+    }
+
+    /// bd serena-rust-yim0：replace-lines 行尾跟随宿主主导行尾（与 insert F5 同类漂移）。
+    #[test]
+    fn replace_lines_follows_crlf_host_line_endings() {
+        // CRLF 宿主：替换内容（含缺尾补齐）用 \r\n，文件保持纯 CRLF。
+        assert_eq!(
+            apply_replace_lines("1\r\n2\r\n3\r\n", 2, 2, "two").unwrap(),
+            "1\r\ntwo\r\n3\r\n"
+        );
+        // 内容自带 \n / \r\n 一律归一到宿主行尾（防 \r\r\n 与 mixed）。
+        assert_eq!(
+            apply_replace_lines("1\r\n2\r\n3\r\n", 1, 3, "x\ny\r\n").unwrap(),
+            "x\r\ny\r\n"
+        );
+        // LF 宿主行为对称：内容自带 \r\n 折平为 \n。
+        assert_eq!(
+            apply_replace_lines("1\n2\n", 1, 1, "x\r\n").unwrap(),
+            "x\n2\n"
+        );
+    }
+
+    /// bd serena-rust-yim0：删除只拼接既有字节、不产新行尾——CRLF 宿主删除后仍纯 CRLF。
+    #[test]
+    fn delete_lines_preserves_crlf_host_bytes() {
+        assert_eq!(
+            apply_delete_lines("1\r\n2\r\n3\r\n", 2, 2).unwrap(),
+            "1\r\n3\r\n"
+        );
+        // 删到 EOF：余下前缀字节原样保留。
+        assert_eq!(apply_delete_lines("1\r\n2\r\n3\r\n", 2, 3).unwrap(), "1\r\n");
     }
 
     #[test]

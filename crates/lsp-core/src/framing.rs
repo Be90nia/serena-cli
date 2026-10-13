@@ -112,6 +112,14 @@ pub enum FrameError {
 ///
 /// ↖ mirror: lsp_protocol_handler/server.py@43ae021 `create_message`
 pub fn encode(msg: &JsonRpc) -> Vec<u8> {
+    // B-P2-1：出站帧边界 trace——stdio.rs 各 writer 循环共用的装配单点。
+    tracing::trace!(
+        target: "lsp_frames",
+        dir = "out",
+        method = msg.method.as_deref().unwrap_or("<response>"),
+        has_id = msg.id.is_some(),
+        "frame boundary"
+    );
     let mut wire = msg.clone();
     if wire
         .method

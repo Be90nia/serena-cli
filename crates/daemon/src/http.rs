@@ -504,9 +504,10 @@ pub(crate) fn rotate_invocation_log(path: &std::path::Path, keep: u32) {
         let _ = std::fs::rename(invocation_log_gen(path, i), invocation_log_gen(path, i + 1));
     }
     if let Err(e) = std::fs::rename(path, invocation_log_gen(path, 1)) {
-        eprintln!(
-            "[serena] invocation log rotate failed (path={:?}): {e}; append continues",
-            path
+        tracing::error!(
+            path = %redact_path(path),
+            error = %e,
+            "invocation log rotate failed; append continues"
         );
     } else {
         tracing::info!(path = %redact_path(path), keep, "invocation log rotated");
@@ -585,9 +586,10 @@ fn log_invocation(state: &AppState, rec: InvocationRecord<'_>) {
         .open(&state.invocation_log_path)
         .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()))
     {
-        eprintln!(
-            "[serena] invocation log append failed (path={:?}): {e}; tool execution unaffected",
-            state.invocation_log_path
+        tracing::error!(
+            path = %redact_path(&state.invocation_log_path),
+            error = %e,
+            "invocation log append failed; tool execution unaffected"
         );
     }
 }

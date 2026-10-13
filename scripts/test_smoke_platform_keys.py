@@ -27,7 +27,7 @@ EXPECTED_KEYS = [
     "id", "via", "install", "pin", "fixture", "lang_flag",
     "budget_secs", "extra_assert", "fallback_assert", "skip_class",
     "skip_reason", "skip_evidence", "verified", "remark",
-    "install_windows", "install_macos",
+    "install_windows", "install_macos", "ci_only",
 ]
 
 

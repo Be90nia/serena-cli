@@ -276,6 +276,7 @@ wire 字段名已冻结（v1 契约）；本节是规范性定义。
 | 仅有 per-LS 全局超时 | 单个慢文件阻塞整个会话 | 增加 per-call `timeout_ms` 参数 |
 | `typescript-language-server` 7.x 不兼容 | LSP 返回 `-32603`（无 `tsserver.js`） | 在 fixture / 用户项目中钉住 `typescript@<6` |
 | typescript-language-server 在 Windows 上：npm shim 必须是 `.cmd` | 裸名 shim 是 `sh` 脚本，不可 spawn | 已强制 —— 见 Task 20 commit `c0e3cea` |
+| 写后类型层诊断（rust-analyzer flycheck）不随写实时刷新 | RA 的 cargo check（flycheck）管线默认 save（`didSave`）触发：写类工具编辑（`didChange`）后语法层诊断立即可用，但 E0308 类类型层诊断的 flycheck 源为空，需 save/重启窗才可见——RA 语义层本身已看到新内容（bd serena-rust-yxa9；PM 亲验对照：`didOpen` 3.67s 得 4 条 vs 写后 `diagnostics --wait-gen` 恒空）。Workaround：显式 save 类操作或重启窗 | 若后续采纳写后合成 `didSave`（暂否决：大 workspace 后台 cargo check 风暴代价高）或 RA 变更 flycheck 触发时机 |
 
 含理由的完整 Phase 6 局限表：[`local/solidlsp-development-plan.md`](local/solidlsp-development-plan.md) § Phase 6。
 

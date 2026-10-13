@@ -14540,3 +14540,73 @@ mod diag_cache_bound_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod empty_results_no_cache_tests {
+    //! B-P2-4：空结果不入缓存专项锁（§6.4「宁重查不可错缓存」）。执行点 =
+    //! [`symbol_cache_put_impl`] 的空集跳过：空集入库会以同 key 遮蔽就绪后真
+    //! 符号（命中路径先于 LS）；且容量满时空集 put 不得触发全清误伤旧条目。
+    //! 端到端面（真 RA 冷启动 → warm → overview）见 tests/empty_results_no_cache.rs。
+    use super::*;
+
+    fn hit_at(name: &str) -> SymbolHit {
+        SymbolHit {
+            name: name.into(),
+            kind: SymbolKindTag::Function,
+            uri: format!("file:///p/{name}.rs"),
+            range: lsp_types::Range {
+                start: lsp_types::Position { line: 0, character: 0 },
+                end: lsp_types::Position { line: 0, character: 4 },
+            },
+            container: None,
+        }
+    }
+
+    #[test]
+    fn empty_put_is_skipped_and_never_triggers_capacity_clear() {
+        let mut cache = HashMap::new();
+        let root = Path::new("Z:/no/such/bp24");
+        let key_a = doc_symbol_cache_key(root, "a.rs", None);
+        let key_b = doc_symbol_cache_key(root, "b.rs", None);
+
+        symbol_cache_put_impl(&mut cache, key_a.clone(), vec![hit_at("alpha")]);
+        assert_eq!(cache.len(), 1);
+
+        // 空集：跳过写入（错此行为 = 空 key 可查 + 计数虚增）。
+        symbol_cache_put_impl(&mut cache, key_b.clone(), Vec::new());
+        assert!(!cache.contains_key(&key_b), "空集必须跳过写入");
+        assert_eq!(cache.len(), 1, "空集 put 不得改变条目数");
+
+        // 容量满：空集 put 不得触发全清——跳过缺失时 insert 会撞闸 clear()，
+        // 整表被一个空集误清。
+        for i in 0..SYMBOL_CACHE_MAX_ENTRIES - 1 {
+            let key = doc_symbol_cache_key(root, &format!("fill{i}.rs"), None);
+            symbol_cache_put_impl(&mut cache, key, vec![hit_at("fill")]);
+        }
+        assert_eq!(cache.len(), SYMBOL_CACHE_MAX_ENTRIES);
+        symbol_cache_put_impl(&mut cache, doc_symbol_cache_key(root, "c.rs", None), Vec::new());
+        assert_eq!(
+            cache.len(),
+            SYMBOL_CACHE_MAX_ENTRIES,
+            "满容量时空集 put 不得触发全清"
+        );
+        assert!(cache.contains_key(&key_a), "空集 put 不得误伤既有条目");
+    }
+
+    #[test]
+    fn empty_then_real_on_same_key_is_visible() {
+        let mut cache = HashMap::new();
+        let key = doc_symbol_cache_key(Path::new("Z:/no/such/bp24"), "a.rs", None);
+
+        symbol_cache_put_impl(&mut cache, key.clone(), Vec::new());
+        assert!(
+            !cache.contains_key(&key),
+            "空集不缓存：同 key 后续真结果不被遮蔽"
+        );
+
+        symbol_cache_put_impl(&mut cache, key.clone(), vec![hit_at("real_sym")]);
+        let got = cache.get(&key).expect("真结果必须可达");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "real_sym");
+    }
+}

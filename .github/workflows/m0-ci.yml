@@ -16,6 +16,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # B-P2-5：smoke 平台键 schema 对齐单测（纯 python，无 rust 依赖；三平台矩阵
+      # 各跑一遍，秒级）。锁 EXPECTED_KEYS ↔ smoke_one.sh keys 元组逐位一致。
+      - name: smoke platform keys
+        run: python scripts/test_smoke_platform_keys.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.89" # = rust-toolchain.toml（bd serena-rust-fc4i），防 stable 漂移

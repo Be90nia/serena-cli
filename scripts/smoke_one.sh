@@ -315,7 +315,7 @@ one_door() {
         return 1
     fi
     IFS=$'\x1f' read -r id via install pin fixture lang_flag budget extra fallback skip_class \
-        skip_reason skip_evidence verified remark install_windows install_macos <<<"$row"
+        skip_reason skip_evidence verified remark install_windows install_macos ci_only <<<"$row"
 
     if [ -n "$skip_class" ]; then
         log "SKIP $id $skip_class: $skip_reason [$skip_evidence] verified=$verified"

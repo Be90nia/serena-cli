@@ -288,6 +288,7 @@ The single source of architectural truth is [`ARCHITECTURE.md`](ARCHITECTURE.md)
 | Per-LS global timeout only | A slow single file blocks the whole session | Add per-call `timeout_ms` arg |
 | `typescript-language-server` 7.x incompatible | LSP returns `-32603` (no `tsserver.js`) | Pin `typescript@<6` in fixture / user projects |
 | typescript-language-server on Windows: npm shim must be `.cmd` | Bare-name shim is a `sh` script, not spawnable | Already enforced — see Task 20 commit `c0e3cea` |
+| Post-write type-level diagnostics (rust-analyzer flycheck) don't refresh on writes | RA's cargo-check (flycheck) pipeline triggers on save (`didSave`) by default: after a write-tool edit (`didChange`), syntax-level diagnostics are available immediately, but type-level errors (e.g. E0308) have an empty flycheck source until the file is saved or the window is restarted — RA's semantic layer itself already sees the new content (bd serena-rust-yxa9; PM-verified: `didOpen` 3.67s → 4 diagnostics vs post-`didChange` `diagnostics --wait-gen` permanently empty). Workaround: trigger an explicit save-style operation or restart the window | If a post-write synthetic `didSave` is ever adopted (rejected for now: background cargo-check storm cost on large workspaces) or RA changes the flycheck trigger |
 
 Full Phase 6 limitation table with rationale: [`local/solidlsp-development-plan.md`](local/solidlsp-development-plan.md) § Phase 6.
 

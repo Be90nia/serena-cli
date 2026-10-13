@@ -7101,6 +7101,19 @@ mod clap_exit_json_tests {
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
+    /// bd serena-rust-p2zp：shell 协议 help 示例字段必须与 tool_request 透传表
+    /// 一致——曾写 name_path，实际 find-symbol args 收 query。
+    #[test]
+    fn shell_help_example_uses_query_field() {
+        let err = Cli::try_parse_from(["serena-cli", "shell", "--help"]).expect_err("--help");
+        let help = err.render().to_string();
+        assert!(
+            help.contains("\"query\":\"foo\""),
+            "shell help 协议示例必须用 query 字段: {help}"
+        );
+        assert!(!help.contains("name_path"), "name_path 是已废弃错字段: {help}");
+    }
+
     // ---- bd serena-rust-mfht F7：status 接受 --project（与 project-info 形状对齐）----
 
     #[test]

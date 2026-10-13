@@ -1032,4 +1032,57 @@ mod tests {
         assert!(matches!(c.status, Status::Ok), "{:?}", c.status);
         assert!(c.detail.contains("absent"), "{}", c.detail);
     }
+
+    /// TG-L4：CI runner 环境差异回归锁（GITHUB_ACTIONS 门控——本地/真机恒跳过）。
+    /// 锁 v0.1.0 CI 洋葱三类 runner 差异（TEMP 8.3 短名 / PATH 上 System32 WSL
+    /// stub bash / rustup minimal profile 缺 rust-analyzer 组件）不得让 doctor
+    /// 的 PATH/runtime/LS 探测误报：workflow 明确安装的工具链必须可见。
+    #[test]
+    fn ci_runner_workflow_installed_toolchain_is_visible() {
+        if std::env::var_os("GITHUB_ACTIONS").is_none_or(|v| v != "true") {
+            println!("skipped: not a GitHub Actions runner");
+            return;
+        }
+        let r = run_all(&PathBuf::from("Z:/nonexistent_lock_xyz_12345"));
+        let status_of = |id: &str| {
+            r.checks
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("doctor 必须包含条目 {id}"))
+                .status
+        };
+        // v0.1.0 教训：rustup minimal profile 无 rust-analyzer 组件 → rustup proxy
+        // --version 失败、locate 链全落空。workflow 显式 components: rust-analyzer，
+        // 此处锁「组件在 runner PATH 上可见」。
+        assert_eq!(
+            status_of("rust-analyzer"),
+            Status::Ok,
+            "CI workflow 安装的 rust-analyzer 必须被 doctor 探到"
+        );
+        for id in ["cargo", "rustup", "python"] {
+            assert_eq!(status_of(id), Status::Ok, "{id} 必须在 CI runner PATH 可解析");
+        }
+        assert_eq!(
+            status_of("PATH"),
+            Status::Ok,
+            "runner PATH 段数必须 ≥3（check_path_dirs 判据）"
+        );
+    }
+
+    /// TG-L4 同件：runner 上五类检查类别齐全（daemon/net 允许 WARN/MISS——环境
+    /// 事实不锁状态；只锁类别不缺席，防 runner 差异让整类检查静默消失）。
+    #[test]
+    fn ci_runner_doctor_report_covers_all_categories() {
+        if std::env::var_os("GITHUB_ACTIONS").is_none_or(|v| v != "true") {
+            println!("skipped: not a GitHub Actions runner");
+            return;
+        }
+        let r = run_all(&PathBuf::from("Z:/nonexistent_lock_xyz_12345"));
+        for cat in ["runtime", "path", "ls", "daemon", "net"] {
+            assert!(
+                r.checks.iter().any(|c| c.category == cat),
+                "doctor 报告缺类别 {cat}"
+            );
+        }
+    }
 }

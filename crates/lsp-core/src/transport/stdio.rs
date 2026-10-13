@@ -178,6 +178,14 @@ pub fn pump(
 /// 响应帧 / 通知 / server→client request 三种入站形态由 `OnMsg`（= Client）自行处理；
 /// server→client request 产生的回执由 pump 经 `reply_tx` → writer 写回 LS。
 fn dispatch(msg: JsonRpc, on_msg: &OnMsg, reply_tx: &mpsc::Sender<JsonRpc>) {
+    // B-P2-1：入站帧边界 trace——全部泵变体共用的分发单点。
+    tracing::trace!(
+        target: "lsp_frames",
+        dir = "in",
+        method = msg.method.as_deref().unwrap_or("<response>"),
+        has_id = msg.id.is_some(),
+        "frame boundary"
+    );
     if let Some(reply) = (on_msg)(msg)
         && let Err(e) = reply_tx.try_send(reply)
     {
