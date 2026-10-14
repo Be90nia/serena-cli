@@ -439,12 +439,22 @@ impl Client {
                     attempt += 1;
                     if attempt >= max_retries {
                         // 重试用尽 —— 按 Rpc 外抛，调用方可识别 -32801 自行决定。
-                        return Err(rpc_err_from(reply.error.as_ref().unwrap()));
+                        return Err(rpc_err_from(
+                            reply.error.as_ref().unwrap(),
+                            &self.inner.ls_name,
+                            &method,
+                        ));
                     }
                     time::sleep(retry_delay).await;
                     continue;
                 }
-                Some(_) => return Err(rpc_err_from(reply.error.as_ref().unwrap())),
+                Some(_) => {
+                    return Err(rpc_err_from(
+                        reply.error.as_ref().unwrap(),
+                        &self.inner.ls_name,
+                        &method,
+                    ));
+                }
                 None => {
                     let result = reply.result.unwrap_or(Value::Null);
                     return serde_json::from_value(result).map_err(|e| CoreError::Rpc {
@@ -619,10 +629,24 @@ impl Client {
     }
 }
 
-fn rpc_err_from(e: &RpcError) -> CoreError {
+/// LS 返回的 error response → `CoreError`。
+///
+/// `ls` / `method` 供 panic 特征分支组装可定位 message（wire RPC_ERROR 的
+/// message 随之带上下文；wire 码与变体不变）。
+fn rpc_err_from(e: &RpcError, ls: &str, method: &str) -> CoreError {
     if e.code == SERVER_CANCELLED {
+        // 行为契约不动（blindtest P0-4 只修 panic 分支）：仍用占位 method。
         CoreError::ServerCancelled {
             method: "<response>".into(),
+        }
+    } else if e.code == 0 && e.message.starts_with("unexpected panic:") {
+        // LS 进程内 panic——其 jsonrpc 框架 recover 后回 code 0
+        // （实锚：sqls 0.2.48 sourcegraph/jsonrpc2，`format views.sql` nil
+        // deref 100% 复现，local/blindtest-sql.md §4.8）。原样透传只剩裸
+        // "rpc 0: unexpected panic: ..."，agent 无从定位是哪个 LS 哪个方法。
+        CoreError::Rpc {
+            code: e.code,
+            message: format!("{ls} panicked while handling `{method}`: {}", e.message),
         }
     } else {
         CoreError::Rpc {
@@ -672,6 +696,59 @@ mod tests {
             matches!(err2, CoreError::Terminated { .. }),
             "Closed 必须保持 Terminated 映射，got {err2:?}"
         );
+    }
+
+    /// blindtest P0-4（local/blindtest-sql.md §4.8）：LS 进程内 panic 以
+    /// code 0 + "unexpected panic:" error response 到达时，转出的 `CoreError::Rpc`
+    /// message 必须带 LS id 与 method——裸 "rpc 0: unexpected panic: ..." 让
+    /// agent 无从定位（sqls `format views.sql` nil deref 100% 复现实锚）。
+    #[test]
+    fn ls_panic_error_response_carries_ls_and_method() {
+        let e = RpcError {
+            code: 0,
+            message:
+                "unexpected panic: runtime error: invalid memory address or nil pointer dereference"
+                    .into(),
+            data: None,
+        };
+        let err = rpc_err_from(&e, "sqls", "textDocument/formatting");
+        match &err {
+            CoreError::Rpc { code, message } => {
+                assert_eq!(*code, 0, "code 0 原样透传（wire RPC_ERROR 归类不变）");
+                assert!(message.contains("sqls"), "message 必须带 LS id: {message}");
+                assert!(
+                    message.contains("textDocument/formatting"),
+                    "message 必须带 method: {message}"
+                );
+                assert!(
+                    message.contains("unexpected panic:"),
+                    "原始 panic 文本必须保留: {message}"
+                );
+            }
+            other => panic!("panic 特征必须仍映射 Rpc 变体，got {other:?}"),
+        }
+    }
+
+    /// 净提升铁律（用户工程铁律 2026-10-13）：非 panic 特征的普通 RPC error
+    /// message 一分不变——-32601 等既有错误路径的 wire message 是消费方契约。
+    #[test]
+    fn non_panic_rpc_error_message_untouched() {
+        let e = RpcError {
+            code: -32601,
+            message: "method not supported: textDocument/references".into(),
+            data: None,
+        };
+        let err = rpc_err_from(&e, "sqls", "textDocument/references");
+        match &err {
+            CoreError::Rpc { code, message } => {
+                assert_eq!(*code, -32601);
+                assert_eq!(
+                    message, "method not supported: textDocument/references",
+                    "非 panic 错误不得被加前缀"
+                );
+            }
+            other => panic!("普通 RPC error 必须保持 Rpc 变体，got {other:?}"),
+        }
     }
 
     /// Q9（bd i8jh）：通知 handler 必须在注册表锁外执行——handler 内重入注册表

@@ -742,10 +742,10 @@ enum Cmd {
     ///   {"id":3,"cmd":"exit"}
     /// 响应：{"id":<n>,"ok":true,"data":...} 或 {"id":<n>,"ok":false,"error":...}。
     /// 单 daemon 顺序多 project：跨 project 调用会隐式切换 active_project（LS
-        /// session 按 project 复用池），首次切换响应带 `project switched: A -> B`
-        /// warning（transition-id：daemon 生命周期只首报一次，bd vzrx.5 接 ts9d
-        /// 修 pair-based 漏 Windows 路径大小写双重身份的污染）。EOF 或 exit
-        /// 请求后退出 0。
+    /// session 按 project 复用池），首次切换响应带 `project switched: A -> B`
+    /// warning（transition-id：daemon 生命周期只首报一次，bd vzrx.5 接 ts9d
+    /// 修 pair-based 漏 Windows 路径大小写双重身份的污染）。EOF 或 exit
+    /// 请求后退出 0。
     ///
     /// 各 tool 的 args 字段名与 CLI 透传参数同名（project_root 走 shell 全局
     /// `--project`，不重复传）：find-symbol={query,limit?,format?}、read-file=
@@ -1502,6 +1502,51 @@ fn not_installed_exit(e: &str, lang: Option<&str>) -> Option<ExitCode> {
     Some(ExitCode::from(1))
 }
 
+/// P0-3（盲测模式 C）：探针响应/错误里的「LS 明确不支持该方法」信号（-32601
+/// 永久态，等不出来）。Some(细节) = fail-fast；None = 继续等。
+/// 判据（三形态，覆盖 supervisor 修后全部出口）：
+/// 1. wire 错误 code=RPC_ERROR（message 形如 `rpc -32601: method not supported: X`）；
+/// 2. 错误/detail 文本含 `method not supported`（find-symbol 全 lang 不支持转
+///    BadArgs 的 detail）；
+/// 3. overview 成功载荷带 `overview_skipped` 键（-32601 → 优雅降级的既有出口）；
+/// 4. 成功载荷 `warning` 字段含 `method not supported`（hover/def 空结果 + LS
+///    不支持 documentSymbol 的修后出口）。
+fn unsupported_probe_reason(data: Option<&serde_json::Value>, err: Option<&str>) -> Option<String> {
+    if let Some(d) = data {
+        if let Some(skipped) = d.get("overview_skipped").and_then(|v| v.as_str()) {
+            return Some(format!("overview_skipped: {skipped}"));
+        }
+        // hover/def 空结果 + LS 不支持 documentSymbol：warning 换「不支持」话术
+        //（supervisor semantic_unsupported_message），pending 不再置位。
+        if let Some(w) = d.get("warning").and_then(|v| v.as_str())
+            && w.contains("method not supported")
+        {
+            return Some(w.to_string());
+        }
+    }
+    let e = err?;
+    if wire_err_code(e).as_deref() == Some("RPC_ERROR") || e.contains("method not supported") {
+        return Some(e.to_string());
+    }
+    None
+}
+
+/// P0-3：探针撞「方法不支持」→ 打印 LS 身份 + method 细节并立即失败（exit 1，
+/// 非 retryable——这不是超时，等下去永远不会好）。契约：错误文本含 LS 身份与
+/// method 名（细节在 reason 里，含 `textDocument/X` 或 method 全名）。
+fn unsupported_exit(reason: &str, lang: Option<&str>) -> ExitCode {
+    eprintln!(
+        "wait-ready: LS for lang `{}` does not implement a required method (method not supported); \
+         these probes can never become ready",
+        lang.unwrap_or("(auto)")
+    );
+    eprintln!("detail: {reason}");
+    eprintln!(
+        "hint: use a different LS (--lang) or non-semantic tools (search / read-file / grep)"
+    );
+    ExitCode::from(1)
+}
+
 /// l5nv：短输入糖——argv 首个位置参数 `?query` → `find-symbol query`（后续 token
 /// 不动，如 `?clamp --format brief`），`cmd?` → `cmd`（剥尾 '?'，如 `list-dir? crates`）。
 /// 返回 None = 无需重写（原样 parse）。取值型全局旗的值不算位置参数；
@@ -1628,12 +1673,23 @@ async fn cmd_wait_ready(
                 ls_env_mismatch_hint(lang.as_deref(), &root).await;
                 return code;
             }
+            // P0-3：-32601 类确定性「方法不支持」→ 立即失败，禁无限轮询。
+            if let Some(reason) = unsupported_probe_reason(None, Some(e)) {
+                ls_env_mismatch_hint(lang.as_deref(), &root).await;
+                return unsupported_exit(&reason, lang.as_deref());
+            }
             // 7m8 观测补口：.ok() 静默吞错会让「恒 symbol-pending」无法与「真未就绪」
             // 区分（实例：token 失配 403 / LS spawn 失败被误读为索引未就绪）。
             eprintln!("probe overview error (keep waiting): {e}");
             reensure = true;
         }
         let overview = overview.ok();
+        // P0-3：overview_skipped（LS 不实现 documentSymbol）= 符号索引探针永久失效，
+        // 各档位判据全建立在 overview 上——立即失败并明说，禁继续轮询。
+        if let Some(reason) = unsupported_probe_reason(overview.as_ref(), None) {
+            ls_env_mismatch_hint(lang.as_deref(), &root).await;
+            return unsupported_exit(&reason, lang.as_deref());
+        }
         let symbol_up = overview.as_ref().and_then(|data| {
             data.get(0)
                 .and_then(|h| h.get("range"))
@@ -1698,11 +1754,19 @@ async fn cmd_wait_ready(
                             eprintln!("ready (def) in {}s", started.elapsed().as_secs());
                             return ExitCode::SUCCESS;
                         }
-                        Ok(_) => {}
+                        Ok(data) => {
+                            // P0-3：空结果 + 「不支持」warning = 永久态，禁续等。
+                            if let Some(reason) = unsupported_probe_reason(Some(&data), None) {
+                                return unsupported_exit(&reason, lang.as_deref());
+                            }
+                        }
                         Err(e) => {
                             if let Some(code) = not_installed_exit(&e, lang.as_deref()) {
                                 ls_env_mismatch_hint(lang.as_deref(), &root).await;
                                 return code;
+                            }
+                            if let Some(reason) = unsupported_probe_reason(None, Some(&e)) {
+                                return unsupported_exit(&reason, lang.as_deref());
                             }
                             eprintln!("probe def error (keep waiting): {e}");
                             reensure = true;
@@ -1725,11 +1789,19 @@ async fn cmd_wait_ready(
                         eprintln!("ready in {}s", started.elapsed().as_secs());
                         return ExitCode::SUCCESS;
                     }
-                    Ok(_) => {}
+                    Ok(data) => {
+                        // P0-3：空结果 + 「不支持」warning = 永久态，禁续等。
+                        if let Some(reason) = unsupported_probe_reason(Some(&data), None) {
+                            return unsupported_exit(&reason, lang.as_deref());
+                        }
+                    }
                     Err(e) => {
                         if let Some(code) = not_installed_exit(&e, lang.as_deref()) {
                             ls_env_mismatch_hint(lang.as_deref(), &root).await;
                             return code;
+                        }
+                        if let Some(reason) = unsupported_probe_reason(None, Some(&e)) {
+                            return unsupported_exit(&reason, lang.as_deref());
                         }
                         eprintln!("probe error (keep waiting): {e}");
                         reensure = true;
@@ -1765,11 +1837,22 @@ async fn cmd_wait_ready(
                         );
                         return ExitCode::SUCCESS;
                     }
-                    Ok(_) => {}
+                    Ok(data) => {
+                        // P0-3：-32601 类 BadArgs 不经此路径（走 Err），成功载荷的
+                        // 「不支持」warning 同样永久态。
+                        if let Some(reason) = unsupported_probe_reason(Some(&data), None) {
+                            return unsupported_exit(&reason, lang.as_deref());
+                        }
+                    }
                     Err(e) => {
                         if let Some(code) = not_installed_exit(&e, lang.as_deref()) {
                             ls_env_mismatch_hint(lang.as_deref(), &root).await;
                             return code;
+                        }
+                        // P0-3：find-symbol 全 lang 不支持 → BadArgs detail 含
+                        // "method not supported"（supervisor P0-3 修后）→ 快速失败。
+                        if let Some(reason) = unsupported_probe_reason(None, Some(&e)) {
+                            return unsupported_exit(&reason, lang.as_deref());
                         }
                         eprintln!("probe find-symbol error (keep waiting): {e}");
                         reensure = true;
@@ -7246,6 +7329,57 @@ mod wait_ready_progress_tests {
             wait_ready_progress(WaitStage::Symbol, true, 1, "lib.rs"),
             "symbol-ok"
         );
+    }
+}
+
+/// P0-3（盲测模式 C）：探针「方法不支持」fail-fast 判定的纯函数契约。
+#[cfg(test)]
+mod fix_p0_unsupported_probe_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_probe_reason_detects_all_four_forms() {
+        // 形态 1：wire RPC_ERROR（-32601 裸穿，hover/def/overview 直撞）。
+        let rpc = r#"{"code":"RPC_ERROR","message":"rpc -32601: method not supported: textDocument/hover","retryable":false}"#;
+        let r = unsupported_probe_reason(None, Some(rpc)).expect("RPC_ERROR 判不支持");
+        assert!(r.contains("-32601"), "{r}");
+        // 形态 2：BadArgs detail（find-symbol 全 lang 不支持，supervisor 修后）。
+        let ba = r#"{"code":"BAD_ARGS","message":"find-symbol: language server(s) [\"sql\"] do not implement workspace/symbol (method not supported); this never converges with warming — use `search` / `read-file` instead","retryable":false}"#;
+        assert!(
+            unsupported_probe_reason(None, Some(ba)).is_some(),
+            "detail 含 method not supported 判不支持"
+        );
+        // 形态 3：overview_skipped 键（-32601 → 优雅降级的既有出口）。
+        let skipped = serde_json::json!({
+            "symbols": [],
+            "overview_skipped": "LS does not support textDocument/documentSymbol for this language; use read-file / search to inspect the file structure"
+        });
+        let r = unsupported_probe_reason(Some(&skipped), None).expect("overview_skipped 判不支持");
+        assert!(r.contains("overview_skipped"), "{r}");
+        // 形态 4：warning 字段（hover/def 空结果 + 不支持话术，supervisor 修后）。
+        let warned = serde_json::json!({
+            "items": null,
+            "warning": "overview probe: LS does not implement textDocument/documentSymbol (method not supported); empty result reflects missing LS capability, not warming — it will never converge"
+        });
+        assert!(unsupported_probe_reason(Some(&warned), None).is_some());
+    }
+
+    #[test]
+    fn unsupported_probe_reason_keeps_transient_errors_waiting() {
+        // 超时/未就绪是瞬态——继续等，不误杀。
+        let timeout =
+            r#"{"code":"LS_TIMEOUT","message":"hover timed out after 30s","retryable":true}"#;
+        assert!(
+            unsupported_probe_reason(None, Some(timeout)).is_none(),
+            "超时是瞬态"
+        );
+        let not_ready = r#"{"code":"LS_NOT_READY","message":"initializing","retryable":true}"#;
+        assert!(unsupported_probe_reason(None, Some(not_ready)).is_none());
+        // 空 overview 载荷（正常 pending 轮询形态）不误判。
+        assert!(
+            unsupported_probe_reason(Some(&serde_json::json!([{ "name": "x" }])), None).is_none()
+        );
+        assert!(unsupported_probe_reason(Some(&serde_json::json!([])), None).is_none());
     }
 }
 

@@ -14,6 +14,7 @@
 //! - `MOCK_LS_CONTENTMODIFIED_METHODS=documentSymbol` → 这些方法头 N 次回 -32801。
 //! - `MOCK_LS_CONTENTMODIFIED_FAILS=2` → 配合上一项：前 N 次回 -32801，第 N+1 次成功。
 //! - `MOCK_LS_DIAGNOSTIC_UNSUPPORTED=1` → `textDocument/diagnostic` 回 -32601。
+//! - `MOCK_LS_UNSUPPORTED_METHODS=workspace/symbol,workspace/diagnostic` → 这些方法回 -32601（P0-3 分类测试钩子）。
 //! - `MOCK_LS_POSITION_ENCODING=utf-8` → capabilities.positionEncoding 协商值
 //!   （缺省 utf-16；W1 bd 0pgr 位置编码测试钩子）。
 //! - `MOCK_LS_TRACK_FILE_EVENTS=/path/to/track.log` → 把收到的
@@ -55,6 +56,9 @@ struct Config {
     diagnostic_provider: bool,
     /// 开启后 `textDocument/diagnostic` 返 -32601 MethodNotFound（fallback 路径测试用）。
     diagnostic_unsupported: bool,
+    /// 这些方法回 -32601 MethodNotFound（P0-3：-32601 分类测试——模拟 sqls 类
+    /// 「不实现 workspace/symbol / workspace/diagnostic」的 LS，永久态非 warming）。
+    unsupported_methods: HashSet<String>,
     /// capabilities.positionEncoding 的协商值（bd 0pgr W1 测试钩子）。
     /// 缺省 "utf-16"（既有行为）。设 "utf-8" 模拟 rust-analyzer 真机协商结果。
     position_encoding: Option<String>,
@@ -100,6 +104,7 @@ fn load_config() -> Config {
         diagnostic_unsupported: std::env::var("MOCK_LS_DIAGNOSTIC_UNSUPPORTED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
+        unsupported_methods: parse_set(std::env::var("MOCK_LS_UNSUPPORTED_METHODS").ok()),
         position_encoding: std::env::var("MOCK_LS_POSITION_ENCODING").ok(),
         log_initialize: std::env::var("MOCK_LS_LOG_INITIALIZE")
             .ok()
@@ -239,6 +244,28 @@ async fn main() {
                 .as_deref()
                 .is_some_and(|m| config.silent_methods.contains(m));
             if is_silent {
+                continue;
+            }
+
+            // unsupported 方法回 -32601（P0-3 测试钩子：永久态 method-not-found）。
+            let is_unsupported = msg.id.is_some()
+                && msg
+                    .method
+                    .as_deref()
+                    .is_some_and(|m| config.unsupported_methods.contains(m));
+            if is_unsupported {
+                let reply = JsonRpc::response_err(
+                    msg.id.clone().unwrap(),
+                    RpcError {
+                        code: -32601,
+                        message: "Method not found".into(),
+                        data: None,
+                    },
+                );
+                if stdout.write_all(&encode(&reply)).await.is_err() {
+                    return;
+                }
+                let _ = stdout.flush().await;
                 continue;
             }
 

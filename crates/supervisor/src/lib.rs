@@ -2402,24 +2402,39 @@ impl Supervisor {
         root: &Path,
         lang_override: Option<&str>,
     ) -> ToolResult<Vec<lsp_types::Diagnostic>> {
-        // 无 file 锚点：按 root 唯一 LS 探测；多 lang 项目请用 --lang 限定。
+        // 无 file 锚点：按当前项目活跃 LS 探测；多 lang 项目请用 --lang 限定。
+        // P0-2（盲测模式 B）：全局实例表是跨项目共享的（daemon 常驻，装着所有
+        // agent 的 session）——旧实现任取 `entries.first()` 会命中别的项目/语言的
+        // LS（python 项目报 "LS rust"、sql 项目报 "LS powershell"）。路由链：
+        // 当前 root 已加载实例（取最近使用 = 当前活跃语言）→ root 扩展名探测出的
+        // 唯一语言 → 报错带 root/langs 上下文。
         let lang: String = match lang_override {
             Some(l) => l.to_ascii_lowercase(),
             None => {
-                // 走 default LS（adapter 默认 lang）。
-                let entries = self
-                    .last_used
-                    .lock()
-                    .unwrap()
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                match entries.first() {
-                    Some(k) => k.lang.to_string(),
+                let entries = self.last_used.lock().unwrap().clone();
+                let root_id = key_root_identity(root);
+                let active = entries
+                    .iter()
+                    .filter(|(k, _)| key_root_identity(&k.root) == root_id)
+                    .max_by_key(|(_, t)| *t)
+                    .map(|(k, _)| k.lang.to_string());
+                match active {
+                    Some(l) => l,
                     None => {
-                        return Err(ToolError::BadArgs {
-                            detail: "no active LS; specify --lang or run any tool first".into(),
-                        });
+                        let (_, walked_langs) = root_signal_cached(root).await;
+                        let mut it = walked_langs.iter();
+                        match (it.next(), it.next()) {
+                            (Some(only), None) => only.clone(),
+                            _ => {
+                                return Err(ToolError::BadArgs {
+                                    detail: format!(
+                                        "workspace-diagnostic: no active LS for root {root:?} \
+                                         (detected langs: {walked_langs:?}); specify --lang or \
+                                         run any tool first"
+                                    ),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -2583,6 +2598,10 @@ impl Supervisor {
     /// 探测自身失败（如 RA 索引刷新期 `-32801 content modified` 竞态）= LS 不稳定
     /// 窗口，空结果同样可疑 → 一并标记（探测走 tool_overview，Phase 3.1 缓存命中
     /// 免 LS 往返；未就绪窗口多一次 documentSymbol 往返可接受）。
+    /// 返回 `(warnings, pending)`：pending=true 才允许调用方标 degraded
+    /// semantic-pending（重试会收敛）。P0-3：探测撞 `-32601`（该 LS 不实现
+    /// documentSymbol）= 永久态能力缺失，报「不支持」而非「未就绪」——warming
+    /// 话术对 sqls 类 LS 是永不兑现的承诺（wait-ready 4 轮 7.5 分钟实锤）。
     async fn semantic_not_ready_warnings(
         &self,
         root: &Path,
@@ -2590,13 +2609,16 @@ impl Supervisor {
         line: u32,
         col: u32,
         lang: Option<&str>,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, bool) {
         match self.tool_overview(root, file, lang).await {
-            Err(_) => vec![semantic_not_ready_message()],
-            Ok(hits) if hits.is_empty() || position_in_hits(&hits, line, col) => {
-                vec![semantic_not_ready_message()]
+            Err(ToolError::Core(CoreError::Rpc { code: -32601, .. })) => {
+                (vec![semantic_unsupported_message()], false)
             }
-            Ok(_) => Vec::new(),
+            Err(_) => (vec![semantic_not_ready_message()], true),
+            Ok(hits) if hits.is_empty() || position_in_hits(&hits, line, col) => {
+                (vec![semantic_not_ready_message()], true)
+            }
+            Ok(_) => (Vec::new(), false),
         }
     }
 
@@ -3394,11 +3416,12 @@ impl Supervisor {
         }
 
         // ponytail: 串行拿 session (load_gate_for 防双 spawn), 然后并行 fan-out 请求。
+        // 携带 lang：P0-3 聚合时 -32601 的 lang 要进「不支持」清单（报错/warning 定位）。
         let mut sessions = Vec::with_capacity(langs.len());
         let mut failures: Vec<(String, ToolError)> = Vec::with_capacity(langs.len());
         for lang in &langs {
             match self.session_for(root, lang).await {
-                Ok(s) => sessions.push(s),
+                Ok(s) => sessions.push((lang.clone(), s)),
                 // 单 LS 拉起失败不阻塞其它 lang，但必须可见 —— 静默 continue 会让
                 // 「全失败」伪装成「无符号」（bd serena-rust-x67）。
                 Err(e) => failures.push((lang.clone(), e)),
@@ -3412,7 +3435,7 @@ impl Supervisor {
         let query = query.to_string();
         let budget = self.warmup_budget();
         let mut tasks = Vec::with_capacity(sessions.len());
-        for session in sessions {
+        for (lang, session) in sessions {
             let q = query.clone();
             tasks.push(tokio::spawn(async move {
                 let params = json!({ "query": q });
@@ -3432,13 +3455,20 @@ impl Supervisor {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return (
-                            Vec::<SymbolHit>::new(),
-                            Some(matches!(e, CoreError::Timeout { .. })),
-                        );
+                        // P0-3：-32601 是 LS 明确「不实现」，永久态——与超时（瞬态
+                        // warming）分开；混装会让 wait-ready 对 sqls 类 LS 永不收敛。
+                        let err = if matches!(e, CoreError::Timeout { .. }) {
+                            WsSymErr::Timeout
+                        } else if matches!(e, CoreError::Rpc { code: -32601, .. }) {
+                            WsSymErr::Unsupported
+                        } else {
+                            WsSymErr::Other
+                        };
+                        return (lang, Vec::<SymbolHit>::new(), Some(err));
                     }
                 };
                 (
+                    lang,
                     resp.into_iter()
                         .map(|si| SymbolHit {
                             name: si.name,
@@ -3455,15 +3485,30 @@ impl Supervisor {
         let mut merged: Vec<SymbolHit> = Vec::new();
         let mut timed_out = 0usize;
         let mut errored = 0usize;
+        let mut unsupported: Vec<String> = Vec::new();
+        let mut ok = 0usize;
         for t in tasks {
-            if let Ok((v, err)) = t.await {
+            if let Ok((lang, v, err)) = t.await {
                 match err {
-                    Some(true) => timed_out += 1,
-                    Some(false) => errored += 1,
-                    None => {}
+                    None => ok += 1,
+                    Some(WsSymErr::Timeout) => timed_out += 1,
+                    Some(WsSymErr::Other) => errored += 1,
+                    Some(WsSymErr::Unsupported) => unsupported.push(lang),
                 }
                 merged.extend(v);
             }
+        }
+        // P0-3：应答的 lang 全部是 -32601（无超时/无其他错误/零命中）= 权威「方法
+        // 不支持」。空结果是稳态事实，包装成 warming 会让 AI 反复 wait-ready 永不
+        // 收敛（sqls 盲测：4 轮 7.5 分钟）——转明确 BadArgs 指路替代工具。
+        if ok == 0 && timed_out == 0 && errored == 0 && !unsupported.is_empty() {
+            return Err(ToolError::BadArgs {
+                detail: format!(
+                    "find-symbol: language server(s) {unsupported:?} do not implement \
+                     workspace/symbol (method not supported); this never converges with \
+                     warming — use `search` / `read-file` instead"
+                ),
+            });
         }
         // 批1-C：workspace/symbol 出界过滤（先于对齐/缓存，保证缓存是净快照）。
         // 实锤：tsserver inferred project 对无 tsconfig workspace 沿父链解析
@@ -3493,6 +3538,12 @@ impl Supervisor {
         } else if errored > 0 {
             warnings.push(format!(
                 "workspace/symbol request failed on {errored} language server(s); results may be incomplete"
+            ));
+        }
+        // P0-3：部分 lang 不支持 = 稳态缺失（非 warming），不计 degraded 但必须可见。
+        if !unsupported.is_empty() {
+            warnings.push(format!(
+                "find-symbol: language server(s) {unsupported:?} do not implement workspace/symbol (method not supported); results exclude them"
             ));
         }
         // 空结果路径不写缓存：warning 只在本次调用产生（命中路径不过 session_for，
@@ -4740,6 +4791,36 @@ impl Supervisor {
             reason: "rename response has neither `changes` map nor `documentChanges`".into(),
         })?;
 
+        // 3.5) 语义引用对账（盲测 P0-1）：refs ⊄ edits → partial。在应用 edits
+        // 前查询 —— 与 WorkspaceEdit 同处改名前坐标系，位置可直接对账。保守防
+        // 误报：refs 请求失败 / 返回空 → 跳过对账，不改既有成功语义。
+        let ref_params = json!({
+            "textDocument": { "uri": uri_str },
+            "position": { "line": pos.line, "character": pos.character },
+            "context": { "includeDeclaration": false },
+        });
+        let refs: Vec<Location> = match session
+            .request::<Option<serde_json::Value>>(
+                "textDocument/references",
+                ref_params,
+                TOOL_TIMEOUT,
+            )
+            .await
+        {
+            Ok(v) => normalize_implementations(v.as_ref()),
+            Err(e) => {
+                tracing::warn!(error = %e, "rename: refs reconciliation query failed; partial check skipped");
+                Vec::new()
+            }
+        };
+
+        // 3.6) 对账计算（借用 by_uri，须在其被应用循环 move 前完成）。
+        let missed_raw = if refs.is_empty() {
+            Vec::new()
+        } else {
+            compute_rename_missed(&refs, &by_uri)
+        };
+
         // 4) 对每个文件应用 edits。单文件失败 = 记入 skipped 后继续其余文件
         // （不得静默，BD serena-rust-93q）。
         let mut report = RenameReport::default();
@@ -4780,6 +4861,41 @@ impl Supervisor {
                 .to_string_lossy()
                 .replace('\\', "/");
             report.files.push(rel);
+        }
+
+        // 4.5) 对账组装：refs ⊄ edits → partial + missed + warning（人读行由 CLI
+        // 既有 warning 字段机制打 stderr [warn]，CLI 零改动）。
+        if !missed_raw.is_empty() {
+            report.partial = true;
+            report.missed = missed_raw
+                .iter()
+                .map(|(uri, line)| {
+                    let file = match uri_to_path(uri) {
+                        Some(p) => p
+                            .strip_prefix(&root_canon)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        None => uri.clone(),
+                    };
+                    RenameMissed {
+                        file,
+                        line: line + 1,
+                    }
+                })
+                .collect();
+            report.missed.sort();
+            report.missed.dedup();
+            tracing::warn!(
+                missed = report.missed.len(),
+                refs_total = refs.len(),
+                "rename marked partial: some reference locations not covered by the edit set"
+            );
+            report.warning = Some(format!(
+                "partial rename: {} of {} reference location(s) not covered by the language server's edit set; files listed in `missed` still use the old name",
+                report.missed.len(),
+                refs.len()
+            ));
         }
 
         Ok(report)
@@ -5079,6 +5195,29 @@ pub struct RenameReport {
     /// 静默 continue）。空则省略，对旧客户端向后兼容（B0 hint 字段先例）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<RenameSkipped>,
+    /// 语义引用对账（盲测 P0-1：bash-LS rename 只覆盖光标所在文件，refs 列出的
+    /// 跨文件 callsite 静默漏改）：true = 存在引用位置未被 rename edit 覆盖。
+    /// refs 查询失败/返回空时不对账，恒 false —— 保守防误报，绝不让完美
+    /// rename 背 partial 标记。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
+    /// 未被任何 edit 覆盖的引用位置（1-based 行号，改名前坐标系；missed 文件
+    /// 通常未被 edit 触及，行号有效）。按 file+line 去重排序。空则省略。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missed: Vec<RenameMissed>,
+    /// 人读警告（partial 时设置；CLI 检测响应 warning 字段打 `[warn]` stderr 行，
+    /// 既有机制零改动）。空则省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// rename 对账 missed 记录：refs 列出但 rename edit 未覆盖的引用位置。
+#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RenameMissed {
+    /// 相对 root 路径；URI 无法解析时为原始 URI（同 RenameSkipped）。
+    pub file: String,
+    /// 1-based 行号（rename 前坐标系）。
+    pub line: u32,
 }
 
 /// rename 单文件跳过记录。
@@ -5275,6 +5414,51 @@ fn percent_decode(s: &str) -> String {
 
 /// rename 单文件编辑：(排序 key（end 线性 index，粗略）, range, new_text)。
 type EditSpec = (u64, lsp_types::Range, String);
+
+/// rename refs 对账（盲测 P0-1，纯函数）：返回未被任何 edit 覆盖的引用位置
+/// (原始 uri, 0-based line)。覆盖判定 = 同文件（uri 归一键 = percent-decode +
+/// 小写，`diag_uri_key` 同款——LS 间 uri 形态不一：RA 推盘符小写、tsserver
+/// percent-encode）且区间相交。一个 edit 盖多个 ref 的折叠自然成立；同位置多
+/// ref 归并后按 (归一uri, line) 去重。
+fn compute_rename_missed(
+    refs: &[Location],
+    by_uri: &[(String, Vec<EditSpec>)],
+) -> Vec<(String, u32)> {
+    let mut missed: Vec<(String, u32)> = refs
+        .iter()
+        .filter(|r| !ref_covered_by_edits(r, by_uri))
+        .map(|r| (r.uri.as_str().to_string(), r.range.start.line))
+        .collect();
+    missed.sort_by(|a, b| {
+        diag_uri_key(&a.0)
+            .cmp(&diag_uri_key(&b.0))
+            .then(a.1.cmp(&b.1))
+    });
+    missed.dedup_by(|a, b| diag_uri_key(&a.0) == diag_uri_key(&b.0) && a.1 == b.1);
+    missed
+}
+
+/// 单个引用位置是否被任一 rename edit 覆盖（同归一文件 + 区间相交）。
+fn ref_covered_by_edits(r: &Location, by_uri: &[(String, Vec<EditSpec>)]) -> bool {
+    let key = diag_uri_key(r.uri.as_str());
+    by_uri.iter().any(|(uri, edits)| {
+        diag_uri_key(uri) == key
+            && edits
+                .iter()
+                .any(|(_, range, _)| ranges_overlap(*range, r.range))
+    })
+}
+
+/// Position 字典序 ≤。
+fn position_le(a: lsp_types::Position, b: lsp_types::Position) -> bool {
+    (a.line, a.character) <= (b.line, b.character)
+}
+
+/// 两区间相交：edit 与 ref 指向同一标识符时相等/包含均命中；同行不同 token
+/// 不相交（正确判 missed）。
+fn ranges_overlap(a: lsp_types::Range, b: lsp_types::Range) -> bool {
+    position_le(a.start, b.end) && position_le(b.start, a.end)
+}
 
 /// 拆单文件 edits 数组；缺 range/newText 的条目跳过（AnnotatedTextEdit 等富形态
 /// 字段是超集，读子集即可）。
@@ -6360,9 +6544,21 @@ pub(crate) fn semantic_warming_warning() -> String {
         .to_string()
 }
 
+/// find-symbol 并发 task 的请求错误三分类（P0-3 前混在 `Option<bool>` 的 timeout 位）。
+enum WsSymErr {
+    /// 瞬态：warming 语义保留（空结果 = semantic-pending）。
+    Timeout,
+    /// LS 回 -32601：明确不实现该 method，永久态——禁入 warming 流。
+    Unsupported,
+    /// 其余请求错误：保留「快速回错也不可信」的既有 pending 语义。
+    Other,
+}
+
 /// 批2-A：find-symbol 降级分类。任一 lang 超时或请求错误 → 全量性破坏：
 /// 有结果 = partial；空结果 = semantic-pending（空不可信，无论 LS 是挂满预算
 /// 还是快速回错）。全部 lang 正常答复 → None（全量，无标记）。
+/// P0-3：`-32601`（方法不支持，永久态）在调用方单独分类，**不进**本函数——
+/// 它既非瞬态也非「不可信空」，混入会让 wait-ready 永不收敛（sqls 实锤）。
 fn classify_find_symbol_degraded(
     timed_out: usize,
     errored: usize,
@@ -6455,6 +6651,14 @@ fn semantic_not_ready_message() -> String {
     "semantic layer returned empty; the language server's type analysis may not be ready yet \
      (typically ready 30-60s after symbol index on a fresh workspace; a non-empty symbol index \
      does not imply type analysis is ready)"
+        .to_string()
+}
+
+/// P0-3：LS 明确不实现 documentSymbol（-32601 永久态）时的空结果提示——
+/// 与「未就绪」话术严格区分，禁让 AI 等一个不会到来的就绪。
+fn semantic_unsupported_message() -> String {
+    "overview probe: LS does not implement textDocument/documentSymbol (method not supported); \
+     empty result reflects missing LS capability, not warming — it will never converge"
         .to_string()
 }
 
@@ -7791,12 +7995,13 @@ impl Supervisor {
                 // bd serena-rust-xzb：workspace 加载错误无条件透出（结果不可信）。
                 let mut ws = self.workspace_error_warnings(root);
                 if hover_is_empty(&value) {
-                    let not_ready = self
+                    // P0-3：`not_ready` 返回 `(warnings, pending)`——探测撞 -32601 时
+                    // warning 换「不支持」话术且 pending=false，禁标 semantic-pending。
+                    let (not_ready, pending) = self
                         .semantic_not_ready_warnings(root, &file, line, col, lang)
                         .await;
                     // 批2-A：未就绪窗口的空 hover = semantic-pending（非权威空），
                     // 结构化告知 AI 重查而非接受 null。
-                    let pending = !not_ready.is_empty();
                     ws.extend(not_ready);
                     // 杠精 ke2a-5：裸 null 5 字符无法区分「位置无符号」和「未就绪」；
                     // 未就绪已由 we0 warning 表达，就绪态的空结果补静态 hint 收口。
@@ -7835,11 +8040,12 @@ impl Supervisor {
                 // bd serena-rust-xzb：workspace 加载错误无条件透出。
                 let mut ws = self.workspace_error_warnings(root);
                 if empty {
-                    let not_ready = self
+                    // P0-3：解构 `(warnings, pending)`——-32601 时 warning 换「不支持」
+                    // 话术且 pending=false，禁标 semantic-pending。
+                    let (not_ready, pending) = self
                         .semantic_not_ready_warnings(root, &file, line, col, lang)
                         .await;
                     // 批2-A：未就绪窗口的空 def = semantic-pending（非权威空）。
-                    let pending = !not_ready.is_empty();
                     ws.extend(not_ready);
                     attach_warning(&mut value, &ws);
                     if pending {
@@ -7878,10 +8084,11 @@ impl Supervisor {
                 // bd serena-rust-xzb：workspace 加载错误无条件透出。
                 let mut ws = self.workspace_error_warnings(root);
                 if empty {
-                    ws.extend(
-                        self.semantic_not_ready_warnings(root, &file, line, col, lang)
-                            .await,
-                    );
+                    // P0-3：解构 tuple（refs 分支不用 pending 位，warning 照常透出）。
+                    let (not_ready, _) = self
+                        .semantic_not_ready_warnings(root, &file, line, col, lang)
+                        .await;
+                    ws.extend(not_ready);
                 } else {
                     self.mark_semantic_ready(root);
                 }
@@ -7915,10 +8122,11 @@ impl Supervisor {
                 // bd serena-rust-xzb：workspace 加载错误无条件透出。
                 let mut ws = self.workspace_error_warnings(root);
                 if empty {
-                    ws.extend(
-                        self.semantic_not_ready_warnings(root, &file, line, col, lang)
-                            .await,
-                    );
+                    // P0-3：解构 tuple（find-implementations 分支不用 pending 位）。
+                    let (not_ready, _) = self
+                        .semantic_not_ready_warnings(root, &file, line, col, lang)
+                        .await;
+                    ws.extend(not_ready);
                 } else {
                     self.mark_semantic_ready(root);
                 }
@@ -10500,10 +10708,7 @@ mod symbol_cache_tests {
         assert!(w.contains("30-60s"), "预期窗口: {w}");
         assert_eq!(value["degraded"], serde_json::json!("semantic-pending"));
         assert_eq!(value["warmup"]["stage"], serde_json::json!("indexing"));
-        assert_eq!(
-            value["warmup"]["retry_after_warm"],
-            serde_json::json!(true)
-        );
+        assert_eq!(value["warmup"]["retry_after_warm"], serde_json::json!(true));
     }
 
     /// bd serena-rust-bxd O2/O4：暖机窗口开/关/过期三态。
@@ -12881,6 +13086,10 @@ mod find_symbol_ls_error_tests {
     /// Err NotInstalled 含 lang 与安装 hint，不再 rc=0 静默空。
     /// 环境不变量：pyright 故意不装（find_symbol.rs::has_clangd 同款守卫——
     /// pyright 已装的环境本测试前提失效，跳过不计失败）。
+    /// 「已装」判据两查（PM 拍板 b 最小版，2026-10-14 实锤）：① PATH 上有
+    /// pyright 可执行；② external-servers.toml path_only 注册且二进制在盘——
+    /// `ls-use` 注册绝对路径后 python session 经产品通道可正常拉起（不在 PATH），
+    /// 旧守卫看不见 → all-missing 前提崩溃（本测试收到 Ok 而非 NotInstalled）。
     fn has_pyright() -> bool {
         if let Some(path_var) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path_var) {
@@ -12894,7 +13103,14 @@ mod find_symbol_ls_error_tests {
                 }
             }
         }
-        false
+        // external 注册覆盖（priority 0 external 胜出，merged_spec_for 命中即该条）。
+        matches!(
+            ls_registry::config::merged_spec_for("pyright"),
+            Some((_, spec)) if spec
+                .path_only
+                .as_ref()
+                .is_some_and(|p| Path::new(&p.binary_name).is_file())
+        )
     }
 
     #[tokio::test]
@@ -12933,6 +13149,12 @@ mod find_symbol_ls_error_tests {
             .unwrap_or(false)
         {
             // 真 LS fixture 测试：CI 门禁外（runner 语义就绪窗口不可控），真机/nightly 覆盖。
+            return;
+        }
+        if has_pyright() {
+            // 同款环境不变量：pyright 可用（PATH 或 external path_only 注册）时
+            // 「py 缺失 → warning 归属 python」分支的前提失效，跳过不计失败。
+            println!("skipped: pyright installed — partial-failure env invariant broken");
             return;
         }
         use std::time::{Duration, Instant};
@@ -13835,9 +14057,16 @@ mod silent_failure_tests {
             edits_applied: 2,
             files: vec!["a.rs".into()],
             skipped: vec![],
+            partial: false,
+            missed: vec![],
+            warning: None,
         };
         let s = serde_json::to_string(&empty).unwrap();
         assert!(!s.contains("skipped"), "{s}");
+        // 盲测 P0-1 三字段同款：完美 rename 不带 partial/missed/warning。
+        assert!(!s.contains("partial"), "{s}");
+        assert!(!s.contains("missed"), "{s}");
+        assert!(!s.contains("warning"), "{s}");
 
         let partial = RenameReport {
             files_modified: 1,
@@ -13847,10 +14076,100 @@ mod silent_failure_tests {
                 file: "b.rs".into(),
                 reason: "read failed: os error 2".into(),
             }],
+            partial: false,
+            missed: vec![],
+            warning: None,
         };
         let s = serde_json::to_string(&partial).unwrap();
         assert!(s.contains("skipped"), "{s}");
         assert!(s.contains("read failed"), "{s}");
+    }
+
+    // ---- 盲测 P0-1：rename 静默半改的对账回归 ----
+
+    fn ref_loc(uri: &str, line: u32, c0: u32, c1: u32) -> Location {
+        Location {
+            uri: uri.parse().expect("uri"),
+            range: lsp_types::Range {
+                start: lsp_types::Position::new(line, c0),
+                end: lsp_types::Position::new(line, c1),
+            },
+        }
+    }
+
+    fn edit_at(line: u32, c0: u32, c1: u32) -> EditSpec {
+        let key = (line as u64) << 32 | c1 as u64;
+        (
+            key,
+            lsp_types::Range {
+                start: lsp_types::Position::new(line, c0),
+                end: lsp_types::Position::new(line, c1),
+            },
+            "new_name".into(),
+        )
+    }
+
+    /// mock refs 12 处（跨 5 文件）、edit 只覆盖定义点 1 处 → missed 11 条；
+    /// 归一 uri 命中：edit 侧大写盘符、ref 侧小写盘符不误报定义点。
+    #[test]
+    fn rename_partial_detected_when_refs_exceed_edits() {
+        let def = "file:///D:/t/lib/common.sh";
+        let by_uri = vec![(def.to_string(), vec![edit_at(8, 4, 22)])];
+        let refs = vec![
+            ref_loc("file:///d:/t/lib/common.sh", 8, 4, 22), // 定义（小写盘符）
+            ref_loc("file:///D:/t/bin/deploy.sh", 14, 7, 25),
+            ref_loc("file:///D:/t/bin/deploy.sh", 15, 7, 25),
+            ref_loc("file:///D:/t/bin/rotate_keys.sh", 16, 7, 25),
+            ref_loc("file:///D:/t/bin/rotate_keys.sh", 17, 7, 25),
+            ref_loc("file:///D:/t/lib/kvstore.sh", 18, 11, 29),
+            ref_loc("file:///D:/t/lib/kvstore.sh", 29, 11, 29),
+            ref_loc("file:///D:/t/lib/kvstore.sh", 37, 11, 29),
+            ref_loc("file:///D:/t/lib/kvstore.sh", 38, 11, 29),
+            ref_loc("file:///D:/t/lib/network.sh", 11, 15, 33),
+            ref_loc("file:///D:/t/lib/network.sh", 12, 15, 33),
+            ref_loc("file:///D:/t/config/conf.sh", 4, 3, 21),
+        ];
+        let missed = compute_rename_missed(&refs, &by_uri);
+        assert_eq!(missed.len(), 11, "{missed:?}");
+        assert!(missed.iter().all(|(u, _)| !u.contains("common.sh")));
+    }
+
+    /// 完美 rename 防误报：refs ⊆ edits（同位置相等、一 edit 盖同行两 ref、
+    /// percent-encode 形态差异归一）→ 无 missed。
+    #[test]
+    fn rename_no_partial_when_refs_subset_of_edits() {
+        let by_uri = vec![(
+            "file:///D:/t/lib/a.py".to_string(),
+            vec![edit_at(2, 6, 9), edit_at(5, 0, 40)],
+        )];
+        let refs = vec![
+            ref_loc("file:///d%3A/t/lib/a.py", 2, 6, 9), // 声明，percent-encode 形态
+            ref_loc("file:///D:/t/lib/a.py", 5, 3, 6),   // 同行两 ref 被整语句 edit 盖住
+            ref_loc("file:///D:/t/lib/a.py", 5, 20, 23),
+        ];
+        assert!(compute_rename_missed(&refs, &by_uri).is_empty());
+    }
+
+    /// partial 报告 wire 形态：partial:true + missed[{file,line}] + warning 齐出。
+    #[test]
+    fn rename_partial_report_serializes_all_fields() {
+        let r = RenameReport {
+            files_modified: 1,
+            edits_applied: 1,
+            files: vec!["lib/common.sh".into()],
+            skipped: vec![],
+            partial: true,
+            missed: vec![RenameMissed {
+                file: "bin/deploy.sh".into(),
+                line: 15,
+            }],
+            warning: Some("partial rename: 11 of 12 reference location(s) not covered".into()),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"partial\":true"), "{s}");
+        assert!(s.contains("\"file\":\"bin/deploy.sh\""), "{s}");
+        assert!(s.contains("\"line\":15"), "{s}");
+        assert!(s.contains("partial rename"), "{s}");
     }
 }
 
@@ -14764,5 +15083,142 @@ mod empty_results_no_cache_tests {
         let got = cache.get(&key).expect("真结果必须可达");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "real_sym");
+    }
+}
+
+/// P0-2/P0-3（盲测模式 B/C）修复回归：-32601 分类 + workspace 级工具路由。
+#[cfg(test)]
+mod fix_p0_routing_classify_tests {
+    use super::*;
+    use ls_runtime::process::{Child, LaunchInfo, TransportKind};
+    use std::ffi::OsString;
+
+    fn mock_launch(env: &[(&str, &str)]) -> Option<LaunchInfo> {
+        let exe = reclaim_idle_buffers_tests::find_mock_ls()?;
+        Some(LaunchInfo {
+            cmd: vec![OsString::from(exe)],
+            cwd: std::env::temp_dir(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            transport: TransportKind::Stdio,
+        })
+    }
+
+    async fn mock_session(env: &[(&str, &str)]) -> std::sync::Arc<lsp_core::session::Session> {
+        let child =
+            Child::spawn(mock_launch(env).expect("mock_ls 必须在（cargo test 自动 build）"))
+                .expect("spawn mock_ls");
+        lsp_core::session::Session::start(
+            Some(child),
+            lsp_core::init_params::base_initialize_params(),
+        )
+        .await
+        .expect("Session::start Ready")
+    }
+
+    /// 注入实例池（instances + last_used 两件套；launch_exe 无登记 = 有效，见
+    /// `launch_exe_valid` 的 reuse_allowed 契约）。
+    fn inject(
+        sup: &Supervisor,
+        root: &Path,
+        lang: &str,
+        session: std::sync::Arc<lsp_core::session::Session>,
+    ) {
+        let key = Supervisor::key(root, lang);
+        sup.instances.lock().unwrap().insert(key.clone(), session);
+        sup.last_used
+            .lock()
+            .unwrap()
+            .insert(key, std::time::Instant::now());
+    }
+
+    /// P0-3 验收 (a)：mock LS 对 workspace/symbol 回 -32601 → find-symbol 归类
+    /// 「方法不支持」（BadArgs 明确错误），禁再包装成 semantic-pending warming。
+    #[tokio::test]
+    async fn find_symbol_all_unsupported_errors_instead_of_pending() {
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let session = mock_session(&[("MOCK_LS_UNSUPPORTED_METHODS", "workspace/symbol")]).await;
+        inject(&sup, root, "mock", session);
+
+        let err = sup
+            .tool_find_symbol(root, "anything", 5, Some("mock"))
+            .await
+            .expect_err("-32601 必须报明确错误而非 warming 空结果");
+        match err {
+            ToolError::BadArgs { detail } => {
+                assert!(detail.contains("method not supported"), "{detail}");
+                assert!(detail.contains("workspace/symbol"), "{detail}");
+                assert!(detail.contains("mock"), "lang 身份在场: {detail}");
+            }
+            other => panic!("expected BadArgs, got {other:?}"),
+        }
+    }
+
+    /// P0-2 验收 (b)：多 LS 环境（双 root 各挂一个 mock）→ workspace-diagnostic
+    /// 无 --lang 时命中当前 root 的 LS（以 -32601 → BadArgs 的 lang 身份断言）。
+    #[tokio::test]
+    async fn workspace_diagnostic_routes_to_current_root_session() {
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        let sess_a = mock_session(&[("MOCK_LS_UNSUPPORTED_METHODS", "workspace/diagnostic")]).await;
+        let sess_b = mock_session(&[("MOCK_LS_UNSUPPORTED_METHODS", "workspace/diagnostic")]).await;
+        inject(&sup, tmp_a.path(), "mocka", sess_a);
+        inject(&sup, tmp_b.path(), "mockb", sess_b);
+
+        for (root, expect_lang) in [(tmp_a.path(), "mocka"), (tmp_b.path(), "mockb")] {
+            let err = sup
+                .tool_workspace_diagnostic(root, None)
+                .await
+                .expect_err("mock 不实现 workspace/diagnostic → BadArgs");
+            match err {
+                ToolError::BadArgs { detail } => {
+                    assert!(
+                        detail.contains(&format!("`{expect_lang}`")),
+                        "路由必须命中当前 root 的 LS {expect_lang}: {detail}"
+                    );
+                    assert!(
+                        detail.contains("does not support workspace/diagnostic"),
+                        "{detail}"
+                    );
+                }
+                other => panic!("expected BadArgs, got {other:?}"),
+            }
+        }
+    }
+
+    /// P0-2 反向：当前 root 无活跃 LS 且探测不出语言 → 报错带 root 上下文，
+    /// 禁命中其他项目的 LS（盲测模式 B 实锤形态：python 项目报 "LS rust"）。
+    #[tokio::test]
+    async fn workspace_diagnostic_empty_root_errors_with_root_context() {
+        let sup = Supervisor::direct().await.expect("Supervisor::direct");
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let tmp_b = tempfile::TempDir::new().unwrap(); // 别人的项目（有活跃 LS）
+        let sess = mock_session(&[]).await;
+        inject(&sup, tmp_b.path(), "rust", sess);
+
+        let err = sup
+            .tool_workspace_diagnostic(tmp_a.path(), None)
+            .await
+            .expect_err("无活跃 LS 必须报错，禁跨项目回退");
+        match err {
+            ToolError::BadArgs { detail } => {
+                assert!(detail.contains("no active LS for root"), "{detail}");
+                // detail 里 root 走 {:?} Debug 格式（反斜杠转义），断言同形态取串。
+                assert!(
+                    detail.contains(&format!("{:?}", tmp_a.path())),
+                    "报错带 root 上下文: {detail}"
+                );
+                assert!(
+                    !detail.contains("`rust`"),
+                    "禁把别的项目的 LS 当路由目标: {detail}"
+                );
+            }
+            other => panic!("expected BadArgs, got {other:?}"),
+        }
     }
 }
