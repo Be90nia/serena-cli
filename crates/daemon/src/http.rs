@@ -1277,11 +1277,7 @@ mod tests {
         // A→A：同 project，不报；wire 零变化。
         let (_, body) = oneshot_json(router, call("D:/proj-a")).await;
         let body = body.expect("json body");
-        assert_eq!(
-            warning_of(body.clone()),
-            None,
-            "同 project 紧接不报"
-        );
+        assert_eq!(warning_of(body.clone()), None, "同 project 紧接不报");
         assert_eq!(body["data"], json!("overview"), "去重路径 wire 零变化");
     }
 
