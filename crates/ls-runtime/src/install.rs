@@ -8,8 +8,9 @@
 //! 同步签名（设计 §3）：daemon(tokio) 调用方须 `spawn_blocking` 包裹（下载分钟级）。
 //! HTTP 走 `reqwest::blocking`（workspace 统一版本，rustls）。
 
+use std::io::{IsTerminal, Read as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::deps::{Arch, Os, verify_sha256};
 use crate::process::RuntimeError;
@@ -272,6 +273,8 @@ impl DownloadInstaller {
             .map_err(|e| download_err(url, &format!("write archive: {e}")))?;
 
         extract(&pkg, archive, strip, &install_dir).map_err(|cause| download_err(url, &cause))?;
+        // bd 77w2：解压完成行（与上方 extracting 起始行配对）。
+        eprintln!("[hint] extract done");
         let _ = std::fs::remove_file(&pkg);
 
         if !exe.is_file() {
@@ -443,6 +446,101 @@ pub fn build_download_client(
         .build()
 }
 
+/// bd 77w2：下载进度行（stderr）。节流 + 单行刷新策略见 [`progress_should_print`]；
+/// 完成行强制落盘。内存策略与旧 `resp.bytes()` 等价（全量累积，Bytes::from 零拷贝）。
+struct DownloadProgress {
+    label: String,
+    total: Option<u64>,
+    start: Instant,
+    last_print: Option<Instant>,
+    tty: bool,
+}
+
+impl DownloadProgress {
+    fn new(label: String, total: Option<u64>) -> Self {
+        Self {
+            label,
+            total,
+            start: Instant::now(),
+            last_print: None,
+            tty: std::io::stderr().is_terminal(),
+        }
+    }
+
+    fn tick(&mut self, done: u64) {
+        let since_last = self.last_print.map_or(Duration::ZERO, |t| t.elapsed());
+        if progress_should_print(self.last_print.is_some(), since_last, self.tty) {
+            self.emit(done);
+        }
+    }
+
+    fn finish(&mut self, done: u64) {
+        self.emit(done);
+        // tty 进行中行用 \r 覆盖刷新，完成行补换行收尾；非 tty 每行自带 \n。
+        if self.tty {
+            eprintln!();
+        }
+    }
+
+    fn emit(&mut self, done: u64) {
+        self.last_print = Some(Instant::now());
+        let elapsed = self.start.elapsed().as_secs_f64().max(0.001);
+        let line = progress_line(done, self.total, elapsed, &self.label);
+        if self.tty {
+            eprint!("\r[hint] downloading {line} ");
+        } else {
+            eprintln!("[hint] downloading {line}");
+        }
+    }
+}
+
+/// 进度行正文（纯函数，单测锚）：`<label>: X/Y MiB (P%) R MiB/s eta T`（X 裸数值
+/// 不重复单位）；无 content_length 时无百分比/ETA 段；done 超出 total 时封顶 100%。
+fn progress_line(done: u64, total: Option<u64>, elapsed_secs: f64, label: &str) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let elapsed_secs = elapsed_secs.max(0.001);
+    let mibps = done as f64 / elapsed_secs / MIB;
+    match total {
+        Some(total) if total > 0 => {
+            let pct = (done as f64 / total as f64 * 100.0).min(100.0);
+            let eta_secs =
+                (total.saturating_sub(done)) as f64 / (done as f64 / elapsed_secs).max(1.0);
+            format!(
+                "{label}: {:.1}/{:.1} MiB ({pct:.0}%) {mibps:.1} MiB/s eta {}",
+                done as f64 / MIB,
+                total as f64 / MIB,
+                fmt_duration(Duration::from_secs(eta_secs as u64)),
+            )
+        }
+        _ => format!("{label}: {} {mibps:.1} MiB/s", fmt_mib(done)),
+    }
+}
+
+/// 节流判定（纯函数，单测锚）：首字节立即打一行（连接建立即有反馈）；tty 每 2s
+/// 单行覆盖刷新（禁刷屏）；非 tty（daemon log / 重定向）每 30s 一行。
+fn progress_should_print(printed_before: bool, since_last: Duration, tty: bool) -> bool {
+    if !printed_before {
+        return true;
+    }
+    since_last.as_secs() >= if tty { 2 } else { 30 }
+}
+
+fn fmt_mib(n: u64) -> String {
+    format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
+}
+
+fn fmt_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// 与 [`build_download_client`] 1800s 总预算注释同源的保守速率锚（300 KiB/s）。
+const MIN_ASSUMED_RATE_BPS: f64 = 300.0 * 1024.0;
+
 fn download(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -477,12 +575,53 @@ fn download(
             cause: format!("http status {}", resp.status()),
         });
     }
-    resp.bytes().map_err(|e| RuntimeError::Download {
-        url: url.to_string(),
-        expected_sha: None,
-        actual_sha: None,
-        cause: format!("read body: {e}"),
-    })
+    // bd 77w2：chunk 循环 + 进度行（312MB 级下载 5-6 分钟盲等的 UX 修复）。
+    // 预算联动 = 按保守速率预判：可能撞 1800s 预算时先明示（"有进展续命"需要
+    // per-read 超时，blocking builder 无此 API，见 build_download_client 注释）。
+    let total = resp.content_length();
+    if let Some(total) = total {
+        let est_secs = total as f64 / MIN_ASSUMED_RATE_BPS;
+        if est_secs > 1800.0 * 0.9 {
+            eprintln!(
+                "[warn] download {} at assumed 300 KiB/s needs ~{} — {} the 30m client budget; \
+                 aborts on budget hit, rerun restarts (idempotent install)",
+                fmt_mib(total),
+                fmt_duration(Duration::from_secs(est_secs as u64)),
+                if est_secs > 1800.0 {
+                    "exceeds"
+                } else {
+                    "nears"
+                },
+            );
+        }
+    }
+    let mut progress =
+        DownloadProgress::new(url.rsplit('/').next().unwrap_or(url).to_string(), total);
+    let mut body = Vec::with_capacity(total.map_or(64 * 1024, |n| n as usize + 16));
+    let mut resp = resp;
+    let mut done: u64 = 0;
+    // blocking Response 无 chunk()（async API），走 std::io::Read 64KiB 块循环。
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match resp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                done += n as u64;
+                body.extend_from_slice(&buf[..n]);
+                progress.tick(done);
+            }
+            Err(e) => {
+                return Err(RuntimeError::Download {
+                    url: url.to_string(),
+                    expected_sha: None,
+                    actual_sha: None,
+                    cause: format!("read body: {e}"),
+                });
+            }
+        }
+    }
+    progress.finish(done);
+    Ok(bytes::Bytes::from(body))
 }
 
 /// §5.2 zip-slip 条目消毒（纯函数）：拒 `..` 组件、绝对路径、盘符。
@@ -522,6 +661,7 @@ fn extract(
 ) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("create dest: {e}"))?;
     // §5.2 预检：解压前列清单逐条目消毒（裸 gz 无清单，单文件无路径语义）。
+    let mut entry_count = 0usize;
     if kind != ArchiveKind::SingleGz {
         let list = list_archive_entries(pkg, kind)
             .map_err(|e| format!("archive list (zip-slip precheck): {e}"))?;
@@ -529,11 +669,23 @@ fn extract(
             if name.is_empty() {
                 continue; // 列表尾空行等产物，非条目
             }
+            entry_count += 1;
             if !entry_is_safe(name) {
                 return Err(format!("unsafe archive entry: {name:?}"));
             }
         }
     }
+    // bd 77w2：解压段起止可见（大包解压 ~1min 不再是静默黑洞；条目数来自预检清单）。
+    eprintln!(
+        "[hint] extracting {} from {} -> {}",
+        if entry_count > 0 {
+            format!("{entry_count} entries")
+        } else {
+            "single file".to_string()
+        },
+        pkg.display(),
+        dest.display()
+    );
     match kind {
         ArchiveKind::Zip => {
             let mut args = vec!["-xf".to_string(), pkg.to_string_lossy().to_string()];
@@ -727,6 +879,37 @@ mod tests {
         // std::os::unix::fs::symlink（Windows host 编译面不编译本测试，两态皆绿）。
         std::os::unix::fs::symlink(&victim, root.join("html")).unwrap();
         assert!(ensure_within_cache_root(&root, &root.join("html")).is_err());
+    }
+
+    /// bd 77w2：进度行节流判定——首行立即、tty 2s / 非 tty 30s 门。
+    #[test]
+    fn progress_should_print_throttles_by_tty_interval() {
+        // 首字节：无论 tty 与间隔，立即打（连接建立即有反馈）。
+        assert!(progress_should_print(false, Duration::ZERO, true));
+        assert!(progress_should_print(false, Duration::ZERO, false));
+        // tty：2s 内不打，满 2s 打。
+        assert!(!progress_should_print(true, Duration::from_secs(1), true));
+        assert!(progress_should_print(true, Duration::from_secs(2), true));
+        // 非 tty（daemon log / 重定向）：30s 门。
+        assert!(!progress_should_print(true, Duration::from_secs(29), false));
+        assert!(progress_should_print(true, Duration::from_secs(30), false));
+    }
+
+    /// bd 77w2：进度行正文格式——字节/百分比/速率/ETA 四段齐出；无 content_length
+    /// 退化形态；超下封顶。
+    #[test]
+    fn progress_line_formats_bytes_pct_rate_eta() {
+        // 50 MiB in 10s = 5.0 MiB/s（1024 基），剩一半 eta 10s。
+        let line = progress_line(50 * 1024 * 1024, Some(100 * 1024 * 1024), 10.0, "x.exe");
+        assert!(line.contains("x.exe: 50.0/100.0 MiB (50%)"), "{line}");
+        assert!(line.contains("5.0 MiB/s eta 10s"), "{line}");
+        // 无 content_length：无百分比/ETA 段。
+        let line = progress_line(1024 * 1024, None, 1.0, "y.bin");
+        assert!(line.starts_with("y.bin: 1.0 MiB "), "{line}");
+        assert!(!line.contains('%') && !line.contains("eta"), "{line}");
+        // done > total（服务器谎报 content_length）：百分比封顶 100%。
+        let line = progress_line(200 * 1024 * 1024, Some(100 * 1024 * 1024), 1.0, "z");
+        assert!(line.contains("(100%)"), "{line}");
     }
 
     #[test]

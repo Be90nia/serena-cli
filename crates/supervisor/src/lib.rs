@@ -43,6 +43,7 @@ pub mod recipe;
 pub mod recipe_ops;
 pub mod ref_tools;
 pub mod repo_map;
+mod symbol_fallback;
 pub mod undo;
 pub mod warm;
 pub mod write_gate;
@@ -452,6 +453,13 @@ pub trait SupervisorTrait: Send + Sync {
     fn cache_hits_total(&self) -> u64 {
         0
     }
+
+    /// bd n0uh：semantic 层确认不可用的永久态快照（lang → reason；含 hover 域
+    /// 平台限制与全域能力缺失，daemon 生命周期内）。/status 一次性声明用；
+    /// 默认空 = mock/桩无记忆语义，字段不出现。
+    fn semantic_unavailable_snapshot(&self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
+    }
 }
 
 /// M0 单实例 supervisor。
@@ -545,6 +553,12 @@ pub struct Supervisor {
     /// 包装后经 [`Supervisor::attach_self_weak`] 回填；未回填（CLI direct / 测试）
     /// → 回查优雅跳过（写响应已立返，仅少一条可观察日志）。
     me: std::sync::OnceLock<std::sync::Weak<Supervisor>>,
+    /// bd n0uh：semantic 层确认不可用的永久态记忆（(lang, scope) → reason）。
+    /// 写入只来自铁证（-32601 RPC 能力缺失 → All 域 / 平台限制表 → Hover 域），
+    /// daemon 生命周期内有效；永不收敛的场景一次声明后 warning 收敛为短话术，
+    /// 禁每轮重烧 30-60s warming 话术。TS/Py/Rust/Go 的真实 warming 语义零变化
+    /// （此表查不到即走原路径）。
+    semantic_unavailable: Mutex<std::collections::BTreeMap<(String, SemanticScope), String>>,
 }
 
 /// memo 记账类别（重建同 wire 类错误用；NotInstalled 短 TTL——装上 LS 即可自愈，
@@ -747,6 +761,7 @@ impl Supervisor {
             warmup_budget_ms: AtomicU64::new(WARMUP_BUDGET_DEFAULT.as_millis() as u64),
             failure_memo: Mutex::new(HashMap::new()),
             timeout_streak: Mutex::new(HashMap::new()),
+            semantic_unavailable: Mutex::new(std::collections::BTreeMap::new()),
             me: std::sync::OnceLock::new(),
             #[cfg(test)]
             _idle_ttl_override: std::sync::Arc::new(Mutex::new(None)),
@@ -2610,8 +2625,25 @@ impl Supervisor {
         col: u32,
         lang: Option<&str>,
     ) -> (Vec<String>, bool) {
+        // bd n0uh：已记忆的全域永久态（-32601 能力缺失）→ 单行短话术 +
+        // pending=false，禁每轮重烧 30-60s warming 全量话术。lang 未知（None）
+        // 不查——记忆按 lang 键，防跨语言误收敛。
+        if let Some(reason) = self.semantic_unavailable_for(lang, SemanticScope::All) {
+            return (
+                vec![format!("semantic unavailable (permanent): {reason}")],
+                false,
+            );
+        }
         match self.tool_overview(root, file, lang).await {
             Err(ToolError::Core(CoreError::Rpc { code: -32601, .. })) => {
+                // P0-3 × n0uh：-32601 = 能力级永久态，顺手记忆（后续调用免重探）。
+                if let Some(l) = lang {
+                    self.record_semantic_unavailable(
+                        l,
+                        SemanticScope::All,
+                        "LS does not implement textDocument/documentSymbol (method not supported)",
+                    );
+                }
                 (vec![semantic_unsupported_message()], false)
             }
             Err(_) => (vec![semantic_not_ready_message()], true),
@@ -2620,6 +2652,25 @@ impl Supervisor {
             }
             Ok(_) => (Vec::new(), false),
         }
+    }
+
+    /// bd n0uh：lang 的 semantic 永久不可用 reason。先查请求域，再回落 All 域
+    /// （全域能力缺失连坐所有域）。
+    fn semantic_unavailable_for(&self, lang: Option<&str>, scope: SemanticScope) -> Option<String> {
+        let l = lang?;
+        let map = self.semantic_unavailable.lock().unwrap();
+        map.get(&(l.to_string(), scope))
+            .or_else(|| map.get(&(l.to_string(), SemanticScope::All)))
+            .cloned()
+    }
+
+    /// bd n0uh：记一笔永久态（幂等——首笔即定，防后续抖动覆盖铁证）。
+    fn record_semantic_unavailable(&self, lang: &str, scope: SemanticScope, reason: &str) {
+        self.semantic_unavailable
+            .lock()
+            .unwrap()
+            .entry((lang.to_string(), scope))
+            .or_insert_with(|| reason.to_string());
     }
 
     /// LS 会话新建（session_for spawn 点）记账：开窗 + 清语义就绪标记。
@@ -4105,7 +4156,7 @@ impl Supervisor {
         old_text: &str,
         new_text: &str,
         lang_override: Option<&str>,
-    ) -> ToolResult<()> {
+    ) -> ToolResult<Option<String>> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs =
@@ -4128,7 +4179,7 @@ impl Supervisor {
         text: &str,
         auto_indent: bool,
         lang_override: Option<&str>,
-    ) -> ToolResult<(u32, u32)> {
+    ) -> ToolResult<((u32, u32), Option<String>)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs =
@@ -4148,7 +4199,7 @@ impl Supervisor {
         text: &str,
         auto_indent: bool,
         lang_override: Option<&str>,
-    ) -> ToolResult<(u32, u32)> {
+    ) -> ToolResult<((u32, u32), Option<String>)> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs =
@@ -4167,7 +4218,7 @@ impl Supervisor {
         start_line: u32,
         end_line: u32,
         lang_override: Option<&str>,
-    ) -> ToolResult<()> {
+    ) -> ToolResult<Option<String>> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let session = self.session_for(root, lang.as_str()).await?;
         let abs =
@@ -4187,6 +4238,23 @@ impl Supervisor {
         symbol: &str,
         lang_override: Option<&str>,
     ) -> ToolResult<String> {
+        Ok(self
+            .tool_symbol_body_with_note(root, file, symbol, lang_override)
+            .await?
+            .body)
+    }
+
+    /// 回退感知形态（bd serena-rust-vqdg）：body + 回退命中的 LS 名/解释。
+    /// 精确命中路径与历史行为逐字节一致（`ls_name`/`note` 均 None，wire 零变化）；
+    /// 仅精确匹配失败后启用回退链（Go receiver 剥除 / 签名剥除 / 调用后缀剥除），
+    /// 唯一命中才生效，多命中报歧义。
+    pub async fn tool_symbol_body_with_note(
+        &self,
+        root: &Path,
+        file: &str,
+        symbol: &str,
+        lang_override: Option<&str>,
+    ) -> ToolResult<symbol_fallback::SymbolBodyHit> {
         let path = root.join(file);
         // Phase 3.1 缓存：documentSymbol 往返命中 → 直接在缓存列表找 range 切片（盘上
         // 文本仍现读）。not-found 与 miss 路径同语义。Δ: find_symbol_range 对 Flat 形态返
@@ -4196,8 +4264,9 @@ impl Supervisor {
         if let Some(cached) = self.symbol_cache_get(&cache_key) {
             // bd 0pgr W1：编码跟 session 协商值走。hit 分支刻意不 session_for
             //（省 LS 往返）—— 从实例表直读；session 已被驱逐时落 LSP 默认 utf-16。
-            let enc = resolve_lang_for_file(file, lang_override)
-                .ok()
+            let lang_res = resolve_lang_for_file(file, lang_override).ok();
+            let enc = lang_res
+                .clone()
                 .and_then(|lang| {
                     self.instances
                         .lock()
@@ -4207,12 +4276,16 @@ impl Supervisor {
                 })
                 .map(|s| s.offset_encoding())
                 .unwrap_or(OffsetEncoding::Utf16);
-            return match cached.iter().find(|h| h.name == symbol) {
-                Some(h) => read_and_slice(&path, file, h.range, enc).await,
-                None => Err(ToolError::BadArgs {
-                    detail: format!("symbol `{symbol}` not found in {file}"),
-                }),
-            }; // cache_hit
+            let entries: Vec<symbol_fallback::Entry> = cached
+                .iter()
+                .map(|h| symbol_fallback::Entry {
+                    name: h.name.clone(),
+                    range: h.range,
+                })
+                .collect();
+            let resolved =
+                symbol_fallback::resolve(&entries, symbol, lang_res.as_deref().unwrap_or(""));
+            return symbol_body_hit_from(resolved, symbol, &path, file, enc).await; // cache_hit
         }
         // P2-18h miss 路径对账：清同文件残留旧 stamp 条目（didChange 由下方
         // ensure_open 按 mtime/size 差异自动重放）。
@@ -4232,14 +4305,20 @@ impl Supervisor {
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
 
-        // 递归找第一个 name == symbol 的 DocumentSymbol（Nested 形态）。
-        let range =
-            find_symbol_range(resp.as_ref(), symbol, &lang).ok_or_else(|| ToolError::BadArgs {
-                detail: format!("symbol `{symbol}` not found in {file}"),
-            })?;
-        let out = read_and_slice(&path, file, range, session.offset_encoding()).await?;
+        // 递归找第一个 name == symbol 的 DocumentSymbol（Nested 形态）；精确失败
+        // → 回退链（vqdg）。
+        let resolved = match find_symbol_range(resp.as_ref(), symbol, &lang) {
+            Some(range) => symbol_fallback::Resolved::Exact { range },
+            None => symbol_fallback::resolve(
+                &symbol_fallback::collect_entries(resp.as_ref(), &lang, true),
+                symbol,
+                &lang,
+            ),
+        };
+        let hit =
+            symbol_body_hit_from(resolved, symbol, &path, file, session.offset_encoding()).await?;
         self.symbol_cache_put(cache_key, flatten_symbols(resp, &uri, &lang)); // cache_miss → 写入
-        Ok(out)
+        Ok(hit)
     }
 
     /// bd qre0：batch-read —— 一次调用读多文件（纯读，不经写门）。逐文件走
@@ -4298,16 +4377,18 @@ impl Supervisor {
     /// signature（body 首行）+ location（1-based）+ 上一行/下一行。依赖
     /// `tool_symbol_body` 先暖 docsym 缓存再取 range；盘上文件现读。任一附带字段
     /// 取不到就在响应里省略（skip 语义），body 缺失仍报错（与裸形态一致）。
+    /// 第二返回值 = vqdg 回退命中说明（wire 层 attach）。
     pub async fn tool_symbol_body_meta(
         &self,
         root: &Path,
         file: &str,
         symbol: &str,
         lang_override: Option<&str>,
-    ) -> ToolResult<serde_json::Value> {
-        let body = self
-            .tool_symbol_body(root, file, symbol, lang_override)
+    ) -> ToolResult<(serde_json::Value, Option<String>)> {
+        let hit = self
+            .tool_symbol_body_with_note(root, file, symbol, lang_override)
             .await?;
+        let body = hit.body;
         let (s0, e0) =
             crate::edit_context::range_from_symbol_cache(self, root, file, symbol, lang_override)
                 .unwrap_or((0, 0));
@@ -4346,7 +4427,7 @@ impl Supervisor {
             o.insert("next_line".into(), json!(n));
         }
         o.insert("body".into(), json!(body));
-        Ok(serde_json::Value::Object(o))
+        Ok((serde_json::Value::Object(o), hit.note))
     }
 
     /// `replace-body`：按符号名替换函数/类体（C3 一致性链路，PLAN Task 15）。
@@ -4361,6 +4442,7 @@ impl Supervisor {
     /// Self-heal：闭包内 session.request / ensure_open 任何一步收到
     /// `Core(Terminated)`（RA 因前置写入 didChange 错序 / 索引风暴把 LS 拉死），
     /// `with_session_retry` 驱逐旧 session + 重试一次。再 fail 透传原错误给 agent。
+    /// 返回回退命中说明（精确命中 None；wire 层 attach 到响应 warning）。
     pub async fn tool_replace_body(
         &self,
         root: &Path,
@@ -4368,7 +4450,7 @@ impl Supervisor {
         symbol: &str,
         new_body: &str,
         lang_override: Option<&str>,
-    ) -> ToolResult<()> {
+    ) -> ToolResult<Option<String>> {
         let lang = resolve_lang_for_file(file, lang_override)?;
         let path =
             path_guard::guarded_join(root, file).map_err(|detail| ToolError::BadArgs { detail })?;
@@ -4409,7 +4491,7 @@ impl Supervisor {
         symbol: &str,
         new_body: &str,
         lang: &str,
-    ) -> ToolResult<()> {
+    ) -> ToolResult<Option<String>> {
         // 0) 索引等待（PLAN Phase 3.2）：cold-start 下 LS 未索引时 documentSymbol 会
         //    给过期/错位 range —— replace-body 错位的根因。先 didOpen + documentSymbol
         //    探针等就绪再进写门；探针超时只 warn 不阻断（回退契约同 on_server_ready）。
@@ -4431,17 +4513,43 @@ impl Supervisor {
         // ===== 全局写门：以下所有步骤持锁（A4 FIFO）=====
         let _gate = write_gate::acquire("replace-body").await?;
 
-        // 1) 锁内解析符号 range（杜绝客户端 range 过期）。
+        // 1) 锁内解析符号 range（杜绝客户端 range 过期）；精确失败 → 回退链（vqdg）。
         let _guard = session.ensure_open(path).await.map_err(ToolError::Core)?;
         let params = json!({ "textDocument": { "uri": uri_str } });
         // Option 宽容：RA 等对未就绪文档返 null（untagged enum 不匹配 null → 硬错）。
         let resp: Option<DocumentSymbolResponse> = session
             .request("textDocument/documentSymbol", params, TOOL_TIMEOUT)
             .await?;
-        let range =
-            find_symbol_range(resp.as_ref(), symbol, lang).ok_or_else(|| ToolError::BadArgs {
-                detail: format!("symbol `{symbol}` not found in {}", user_path(root, path)),
-            })?;
+        let (range, fallback_note) = match find_symbol_range(resp.as_ref(), symbol, lang) {
+            Some(r) => (r, None),
+            None => {
+                match symbol_fallback::resolve(
+                    &symbol_fallback::collect_entries(resp.as_ref(), lang, true),
+                    symbol,
+                    lang,
+                ) {
+                    symbol_fallback::Resolved::Exact { range, .. } => (range, None),
+                    symbol_fallback::Resolved::Fallback { range, note, .. } => (range, Some(note)),
+                    symbol_fallback::Resolved::Ambiguous { candidates } => {
+                        return Err(ToolError::BadArgs {
+                            detail: format!(
+                                "symbol `{symbol}` is ambiguous in {}: {}; refine the symbol name",
+                                user_path(root, path),
+                                candidates.join("; ")
+                            ),
+                        });
+                    }
+                    symbol_fallback::Resolved::NotFound => {
+                        return Err(ToolError::BadArgs {
+                            detail: format!(
+                                "symbol `{symbol}` not found in {}",
+                                user_path(root, path)
+                            ),
+                        });
+                    }
+                }
+            }
+        };
 
         // 2) 读盘 + content-hash 对账（C3 防线 ①）。
         let old_text = tokio::fs::read_to_string(path)
@@ -4503,7 +4611,7 @@ impl Supervisor {
 
         // 防御：old_hash 在此仅供将来做"多客户端并发"检测（M2 扩展）。
         let _ = old_hash;
-        Ok(())
+        Ok(fallback_note)
     }
 
     /// 全 codebase grep（AI 替代"读全文件"）。
@@ -4763,6 +4871,21 @@ impl Supervisor {
             });
         }
 
+        // 1.5) 旧名抓取（bd necv）：prepareRename placeholder 是 LSP 对该位置符号
+        // 原名的权威回答；缺失（bash-language-server 5.6.0 等回裸 Range 的旧
+        // LSP 形态）→ 从盘面位置提取标识符兜底（prepareRename 成功 = 位置在
+        // 符号词上）；仍拿不到 → 跳过 string_literal_hits 扫描，不影响主语义。
+        let old_name: Option<String> = prep
+            .as_ref()
+            .and_then(|v| v.get("placeholder"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                let content = std::fs::read_to_string(&path).ok()?;
+                let line = content.lines().nth(pos.line as usize)?;
+                word_at_position(line, pos.character, session.offset_encoding())
+            });
+
         // 2) textDocument/rename → WorkspaceEdit JSON。-32602 交语义改判。
         let edit_params = json!({
             "textDocument": { "uri": uri_str },
@@ -4896,6 +5019,53 @@ impl Supervisor {
                 report.missed.len(),
                 refs.len()
             ));
+        }
+
+        // 4.6) 字符串字面量/docstring 残留扫描（bd necv）：LSP rename 只改语义
+        // 引用，字符串/注释里的旧名不在引用图 —— 全仓词边界文本扫描兜底提示
+        // （只提示不改写）。既有 search 扫描通道复用（ignore 表 + 大文件/二进制
+        // 过滤同款）；失败仅 warn 不影响 rename 成功语义。上限
+        // STRING_LITERAL_SCAN_LIMIT，超出标 string_literal_truncated。
+        if let Some(old) = old_name.as_deref()
+            && let Some(regex) = literal_scan_regex(old)
+        {
+            let scan_root = root_canon.clone();
+            // max_results 传 LIMIT 本身：scan 的 truncated 信号 = 第 51 个候选
+            // 被丢弃，恰 50 条真实命中不会误标（len 判定会误伤 51 条整形态）。
+            let scanned = tokio::task::spawn_blocking(move || {
+                Self::search_sync_scan(
+                    &scan_root,
+                    &regex,
+                    None,
+                    &[],
+                    STRING_LITERAL_SCAN_LIMIT,
+                    false,
+                )
+            })
+            .await;
+            match scanned {
+                Ok((hits, scan_truncated, _)) => {
+                    report.string_literal_truncated = scan_truncated;
+                    report.string_literal_hits = hits
+                        .into_iter()
+                        .map(|h| RenameLiteralHit {
+                            file: h.file,
+                            line: h.line,
+                            text: h.text,
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "rename: string literal scan join failed; hits omitted");
+                }
+            }
+            if !report.string_literal_hits.is_empty() {
+                tracing::info!(
+                    hits = report.string_literal_hits.len(),
+                    truncated = report.string_literal_truncated,
+                    "rename: old name text-level residuals found (string literals/comments)"
+                );
+            }
         }
 
         Ok(report)
@@ -5209,7 +5379,30 @@ pub struct RenameReport {
     /// 既有机制零改动）。空则省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// 旧名在字符串字面量/注释/docstring 的疑似残留（bd necv）：LSP rename 只
+    /// 覆盖语义引用图，文本层残留用全仓词边界扫描兜底提示（只提示不改写）。
+    /// 扫描失败/旧名未知时为空；空则省略（与 partial/missed 同款向后兼容）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub string_literal_hits: Vec<RenameLiteralHit>,
+    /// hits 超过 [`STRING_LITERAL_SCAN_LIMIT`] 被截断。空则省略（恒与
+    /// string_literal_hits 同现）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub string_literal_truncated: bool,
 }
+
+/// rename 后旧名文本残留记录（bd necv）。
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RenameLiteralHit {
+    /// 相对 root 路径。
+    pub file: String,
+    /// 1-based 行号（改名后坐标系——扫描发生在 edits 落盘之后）。
+    pub line: u32,
+    /// 命中行原文（行尾空白裁剪，同 SearchHit 习惯）。
+    pub text: String,
+}
+
+/// string_literal_hits 上限（契约：50 条截断并标 truncated）。
+pub const STRING_LITERAL_SCAN_LIMIT: usize = 50;
 
 /// rename 对账 missed 记录：refs 列出但 rename edit 未覆盖的引用位置。
 #[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -5436,6 +5629,41 @@ fn compute_rename_missed(
     });
     missed.dedup_by(|a, b| diag_uri_key(&a.0) == diag_uri_key(&b.0) && a.1 == b.1);
     missed
+}
+
+/// bd necv：旧名词边界扫描 regex。词边界防子串误报（`user` 不命中 `users` /
+/// `user_id`）；空名/构造失败返回 None = 跳过扫描（空名 `\b<empty>\b` 退化为
+/// 单 `\b`，会命中一切词边界位置）。
+fn literal_scan_regex(old_name: &str) -> Option<regex::Regex> {
+    if old_name.is_empty() {
+        return None;
+    }
+    regex::Regex::new(&format!(r"\b{}\b", regex::escape(old_name))).ok()
+}
+
+/// bd necv 旧名兜底：从盘面行提取 `character`（按编码计数）所在标识符。列落在
+/// 词尾后一格（eol 位置语义）时回退一格；不在词上 → None（跳过扫描）。
+fn word_at_position(line: &str, character: u32, enc: OffsetEncoding) -> Option<String> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let byte =
+        lsp_core::offsets::position_to_byte(line, LspPos { line: 0, character }, enc).ok()?;
+    let chars: Vec<char> = line.chars().collect();
+    let mut idx = line[..byte].chars().count();
+    if !chars.get(idx).copied().is_some_and(is_word) {
+        idx = idx.checked_sub(1)?;
+    }
+    if !chars.get(idx).copied().is_some_and(is_word) {
+        return None;
+    }
+    let mut start = idx;
+    while start > 0 && is_word(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = idx;
+    while end + 1 < chars.len() && is_word(chars[end + 1]) {
+        end += 1;
+    }
+    Some(chars[start..=end].iter().collect())
 }
 
 /// 单个引用位置是否被任一 rename edit 覆盖（同归一文件 + 区间相交）。
@@ -6662,6 +6890,27 @@ fn semantic_unsupported_message() -> String {
         .to_string()
 }
 
+/// bd n0uh：semantic 永久不可用的作用域。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SemanticScope {
+    /// 全域：documentSymbol 缺失（-32601）——所有依赖语义探测的工具全部废。
+    All,
+    /// 仅 hover：bash-language-server 的 hover 输出依赖 Unix man 页，Windows
+    /// 恒空（LS 侧平台限制）；def/refs/documentSymbol 仍正常，不得连坐。
+    Hover,
+}
+
+/// bd n0uh：已知平台限制表（运行环境相关的能力级永久态）。命中 = hover 空结果
+/// 无需再探测 warming，直接收敛短话术并记忆。TS/Py/Rust/Go 等无表项 → None，
+/// 真实 warming 语义零变化。
+fn known_semantic_platform_limitation(lang: Option<&str>) -> Option<&'static str> {
+    if cfg!(windows) && matches!(lang, Some("bash")) {
+        Some("hover: bash-language-server hover output depends on Unix man pages, empty on Windows")
+    } else {
+        None
+    }
+}
+
 /// -32602 语义改判（critic3-F4，纯函数供单测锚定）：RA 类型分析
 /// 未就绪时 rename 对**语法层合法的位置**抛 `rpc -32602: No references found
 /// at position` —— 用户按错误信息排查位置（实际位置正确），白耗排查时间。
@@ -7362,6 +7611,17 @@ impl SupervisorTrait for Supervisor {
         self.cache_hit_counter.load(Ordering::Relaxed)
     }
 
+    /// bd n0uh：永久态快照（/status 一次性声明）。同 lang 双域都记时 All 域
+    /// 优先——(lang, scope) 字典序迭代 All < Hover，or_insert 保留先到的 All。
+    fn semantic_unavailable_snapshot(&self) -> std::collections::BTreeMap<String, String> {
+        let map = self.semantic_unavailable.lock().unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for ((lang, _scope), reason) in map.iter() {
+            out.entry(lang.clone()).or_insert_with(|| reason.clone());
+        }
+        out
+    }
+
     async fn execute_tool(
         &self,
         tool: &str,
@@ -7997,9 +8257,21 @@ impl Supervisor {
                 if hover_is_empty(&value) {
                     // P0-3：`not_ready` 返回 `(warnings, pending)`——探测撞 -32601 时
                     // warning 换「不支持」话术且 pending=false，禁标 semantic-pending。
-                    let (not_ready, pending) = self
-                        .semantic_not_ready_warnings(root, &file, line, col, lang)
-                        .await;
+                    // bd n0uh：平台限制型永久态（bash hover Windows 恒空）先于
+                    // warming 探测收敛——记忆 + 短话术 + pending=false，且不再烧
+                    // overview 探测往返。命中域仅 Hover（def/refs 仍可用）。
+                    let (not_ready, pending) = if let (Some(l), Some(reason)) =
+                        (lang, known_semantic_platform_limitation(lang))
+                    {
+                        self.record_semantic_unavailable(l, SemanticScope::Hover, reason);
+                        (
+                            vec![format!("semantic unavailable (permanent): {reason}")],
+                            false,
+                        )
+                    } else {
+                        self.semantic_not_ready_warnings(root, &file, line, col, lang)
+                            .await
+                    };
                     // 批2-A：未就绪窗口的空 hover = semantic-pending（非权威空），
                     // 结构化告知 AI 重查而非接受 null。
                     ws.extend(not_ready);
@@ -8231,20 +8503,44 @@ impl Supervisor {
                 // bd b72k：`meta:true` 升级聚合形态（doc/signature/location/上一行下一行），
                 // 默认裸 body 字符串 wire 不变。
                 if args.get("meta").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    let report = self
+                    let (mut report, note) = self
                         .tool_symbol_body_meta(root, &file, &symbol, lang)
                         .await?;
-                    serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))
+                    // vqdg：回退命中说明 attach 到响应 warning（禁静默猜）。
+                    attach_warning(&mut report, &note.into_iter().collect::<Vec<_>>());
+                    Ok(report)
                 } else {
-                    serde_json::to_value(self.tool_symbol_body(root, &file, &symbol, lang).await?)
-                        .map_err(|e| ToolError::Serialize(e.into()))
+                    let hit = self
+                        .tool_symbol_body_with_note(root, &file, &symbol, lang)
+                        .await?;
+                    let mut value = serde_json::to_value(hit.body)
+                        .map_err(|e| ToolError::Serialize(e.into()))?;
+                    attach_warning(&mut value, &hit.note.into_iter().collect::<Vec<_>>());
+                    Ok(value)
                 }
             }
             "edit-context" => {
                 // B: 单次调用拿 body + callers + doc + tests（ai-token-features §10-B）。
-                let (file, symbol) = required_symbol_body_args(args)?;
-                let (report, warnings) =
+                // vqdg：`--symbol` 直查形态 —— file 省略时走启发式链解析
+                // （与 find-referencing-code-snippets 参数形状对齐）。
+                let symbol = args
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::BadArgs {
+                        detail: "missing 'symbol'".into(),
+                    })?
+                    .to_owned();
+                let file_arg = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
+                let (file, resolve_notes) = if file_arg.is_empty() {
+                    let (f, _line, _col, note) =
+                        self.resolve_symbol_position(root, &symbol, lang).await?;
+                    (f, note.into_iter().collect::<Vec<_>>())
+                } else {
+                    (file_arg.to_string(), Vec::new())
+                };
+                let (report, mut warnings) =
                     crate::edit_context::collect(self, root, &file, &symbol, lang).await?;
+                warnings.extend(resolve_notes);
                 let mut value =
                     serde_json::to_value(report).map_err(|e| ToolError::Serialize(e.into()))?;
                 // bd serena-rust-e0hi/8vo9：callers 空 + 语义未证就绪 → 降级警示字段。
@@ -8273,15 +8569,19 @@ impl Supervisor {
             }
             "replace-body" => {
                 let (file, symbol, new_body) = required_replace_args(args)?;
-                self.tool_replace_body(root, &file, &symbol, &new_body, lang)
+                let note = self
+                    .tool_replace_body(root, &file, &symbol, &new_body, lang)
                     .await?;
                 let diag = self.post_diag_for_write(root, &file, lang).await;
-                Ok(serde_json::json!({
+                let mut value = serde_json::json!({
                     "applied": true,
                     "file": file,
                     "symbol": symbol,
                     "post_write_diagnostics": diag,
-                }))
+                });
+                // vqdg：回退命中说明 attach 到响应 warning（禁静默猜）。
+                attach_warning(&mut value, &note.into_iter().collect::<Vec<_>>());
+                Ok(value)
             }
             "rename-symbol" => {
                 let (file, line, col, new_name) = required_rename_args(args)?;
@@ -8515,15 +8815,18 @@ impl Supervisor {
                         detail: "missing 'new_text'".into(),
                     })?
                     .to_owned();
-                self.tool_edit_replace_text(root, &file, &symbol, &old_text, &new_text, lang)
+                let note = self
+                    .tool_edit_replace_text(root, &file, &symbol, &old_text, &new_text, lang)
                     .await?;
                 let diag = self.post_diag_for_write(root, &file, lang).await;
-                Ok(serde_json::json!({
+                let mut value = serde_json::json!({
                     "applied": true,
                     "file": file,
                     "symbol": symbol,
                     "post_write_diagnostics": diag,
-                }))
+                });
+                attach_warning(&mut value, &note.into_iter().collect::<Vec<_>>());
+                Ok(value)
             }
             "insert-text-after-symbol" => {
                 let (file, symbol, text) = required_edit_args(args)?;
@@ -8532,15 +8835,17 @@ impl Supervisor {
                     .get("auto_indent")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let (end_line, end_col) = self
+                let ((end_line, end_col), note) = self
                     .tool_edit_insert_after_symbol(root, &file, &symbol, &text, auto_indent, lang)
                     .await?;
                 let diag = self.post_diag_for_write(root, &file, lang).await;
-                Ok(serde_json::json!({
+                let mut value = serde_json::json!({
                     "end_line": end_line,
                     "end_col": end_col,
                     "post_write_diagnostics": diag,
-                }))
+                });
+                attach_warning(&mut value, &note.into_iter().collect::<Vec<_>>());
+                Ok(value)
             }
             "insert-text-before-symbol" => {
                 let (file, symbol, text) = required_edit_args(args)?;
@@ -8549,15 +8854,17 @@ impl Supervisor {
                     .get("auto_indent")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let (end_line, end_col) = self
+                let ((end_line, end_col), note) = self
                     .tool_edit_insert_before_symbol(root, &file, &symbol, &text, auto_indent, lang)
                     .await?;
                 let diag = self.post_diag_for_write(root, &file, lang).await;
-                Ok(serde_json::json!({
+                let mut value = serde_json::json!({
                     "end_line": end_line,
                     "end_col": end_col,
                     "post_write_diagnostics": diag,
-                }))
+                });
+                attach_warning(&mut value, &note.into_iter().collect::<Vec<_>>());
+                Ok(value)
             }
             "delete-text-in-symbol" => {
                 let file = required_file(args)?;
@@ -8580,15 +8887,18 @@ impl Supervisor {
                     .ok_or_else(|| ToolError::BadArgs {
                         detail: "missing 'end_line'".into(),
                     })? as u32;
-                self.tool_edit_delete_text(root, &file, &symbol, start_line, end_line, lang)
+                let note = self
+                    .tool_edit_delete_text(root, &file, &symbol, start_line, end_line, lang)
                     .await?;
                 let diag = self.post_diag_for_write(root, &file, lang).await;
-                Ok(serde_json::json!({
+                let mut value = serde_json::json!({
                     "applied": true,
                     "file": file,
                     "symbol": symbol,
                     "post_write_diagnostics": diag,
-                }))
+                });
+                attach_warning(&mut value, &note.into_iter().collect::<Vec<_>>());
+                Ok(value)
             }
             "safe-delete-symbol" => {
                 let (file, symbol) = required_symbol_body_args(args)?;
@@ -8970,6 +9280,43 @@ async fn read_and_slice(
     lsp_core::offsets::slice_at(&text, start, end, enc).map_err(|e| ToolError::BadArgs {
         detail: format!("slice {file}@{start:?}-{end:?}: {e}"),
     })
+}
+
+/// vqdg：`Resolved` → body 切片 + 回退说明。歧义 = BAD_ARGS 列候选（禁静默猜）；
+/// 未命中 = 原 not found 文案（精确名路径错误逐字节不变）。
+async fn symbol_body_hit_from(
+    resolved: symbol_fallback::Resolved,
+    symbol: &str,
+    path: &Path,
+    file: &str,
+    enc: OffsetEncoding,
+) -> ToolResult<symbol_fallback::SymbolBodyHit> {
+    match resolved {
+        symbol_fallback::Resolved::Exact { range, .. } => Ok(symbol_fallback::SymbolBodyHit {
+            body: read_and_slice(path, file, range, enc).await?,
+            ls_name: None,
+            note: None,
+        }),
+        symbol_fallback::Resolved::Fallback {
+            range,
+            ls_name,
+            note,
+            ..
+        } => Ok(symbol_fallback::SymbolBodyHit {
+            body: read_and_slice(path, file, range, enc).await?,
+            ls_name: Some(ls_name),
+            note: Some(note),
+        }),
+        symbol_fallback::Resolved::Ambiguous { candidates } => Err(ToolError::BadArgs {
+            detail: format!(
+                "symbol `{symbol}` is ambiguous in {file}: {}; refine the symbol name",
+                candidates.join("; ")
+            ),
+        }),
+        symbol_fallback::Resolved::NotFound => Err(ToolError::BadArgs {
+            detail: format!("symbol `{symbol}` not found in {file}"),
+        }),
+    }
 }
 
 /// 找符号的 `(range, selectionRange)`：range = 删除范围，selectionRange = 标识符
@@ -13111,6 +13458,10 @@ mod find_symbol_ls_error_tests {
                 .as_ref()
                 .is_some_and(|p| Path::new(&p.binary_name).is_file())
         )
+        // bd dgky：生态目录兜底同判据——pyright 只装在生态目录（~/.local/bin 等，
+        // 不在 PATH、无 external 注册）时 which_path 经 ecosystem fallback 命中，
+        // all-missing 前提同样失效；守卫与探测同源才不漏判。
+        || ls_adapters::which_path("pyright-langserver").is_some()
     }
 
     #[tokio::test]
@@ -14060,6 +14411,8 @@ mod silent_failure_tests {
             partial: false,
             missed: vec![],
             warning: None,
+            string_literal_hits: vec![],
+            string_literal_truncated: false,
         };
         let s = serde_json::to_string(&empty).unwrap();
         assert!(!s.contains("skipped"), "{s}");
@@ -14067,6 +14420,8 @@ mod silent_failure_tests {
         assert!(!s.contains("partial"), "{s}");
         assert!(!s.contains("missed"), "{s}");
         assert!(!s.contains("warning"), "{s}");
+        // bd necv：无残留时 string_literal_hits/truncated 双双省略（向后兼容）。
+        assert!(!s.contains("string_literal"), "{s}");
 
         let partial = RenameReport {
             files_modified: 1,
@@ -14074,11 +14429,13 @@ mod silent_failure_tests {
             files: vec!["a.rs".into()],
             skipped: vec![RenameSkipped {
                 file: "b.rs".into(),
-                reason: "read failed: os error 2".into(),
+                reason: "read failed".into(),
             }],
             partial: false,
             missed: vec![],
             warning: None,
+            string_literal_hits: vec![],
+            string_literal_truncated: false,
         };
         let s = serde_json::to_string(&partial).unwrap();
         assert!(s.contains("skipped"), "{s}");
@@ -14164,12 +14521,201 @@ mod silent_failure_tests {
                 line: 15,
             }],
             warning: Some("partial rename: 11 of 12 reference location(s) not covered".into()),
+            // bd necv：partial 与 string_literal_hits 并存（契约验收 b：bash 半改
+            // 场景两类信号同现，互不吞并）。
+            string_literal_hits: vec![RenameLiteralHit {
+                file: "docs/usage.md".into(),
+                line: 3,
+                text: "echo \"old helper\"".into(),
+            }],
+            string_literal_truncated: true,
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"partial\":true"), "{s}");
         assert!(s.contains("\"file\":\"bin/deploy.sh\""), "{s}");
         assert!(s.contains("\"line\":15"), "{s}");
         assert!(s.contains("partial rename"), "{s}");
+        assert!(s.contains("\"string_literal_hits\""), "{s}");
+        assert!(s.contains("\"string_literal_truncated\":true"), "{s}");
+    }
+
+    // ---- bd necv：string_literal_hits 词边界扫描纯函数 ----
+
+    /// 扫描通道：词边界命中 / 防子串误报 / 截断标记（契约验收 b）。
+    #[test]
+    fn literal_scan_hits_word_boundary_only_and_truncates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::write(
+            root.join("a.py"),
+            "old_fn(1)\n# old_fn comment\nold_fnx(2)\na_old_fn(3)\ns = \"call old_fn here\"\n",
+        )
+        .unwrap();
+        let re = literal_scan_regex("old_fn").expect("word-boundary regex builds");
+        let (hits, truncated, _) = Supervisor::search_sync_scan(&root, &re, None, &[], 100, false);
+        let lines: Vec<u32> = hits.iter().map(|h| h.line).collect();
+        // 词边界：独立 token 命中（代码行/注释行/字符串行一视同仁——残留提示
+        // 本来就要覆盖 docstring）；old_fnx / a_old_fn 前后连词字符不命中。
+        assert_eq!(lines, vec![1, 2, 5], "{hits:?}");
+        assert!(!truncated);
+
+        // 截断：候选 > LIMIT → 恰 LIMIT 条 + truncated（rename 4.6 传 LIMIT，
+        // scan 的 truncated 信号 = 第 51 个候选被丢弃；恰 LIMIT 条不误标）。
+        let mut big = String::new();
+        for _ in 0..60 {
+            big.push_str("x = \"old_fn\"\n");
+        }
+        std::fs::write(root.join("b.py"), big).unwrap();
+        let (hits, truncated, _) =
+            Supervisor::search_sync_scan(&root, &re, None, &[], STRING_LITERAL_SCAN_LIMIT, false);
+        assert!(truncated, "63 候选 > 50 上限必截断");
+        assert_eq!(hits.len(), STRING_LITERAL_SCAN_LIMIT);
+
+        // 恰 LIMIT 条真实命中：不误标 truncated（len 判定在此会误伤）。
+        std::fs::remove_file(root.join("b.py")).unwrap();
+        let (hits, truncated, _) =
+            Supervisor::search_sync_scan(&root, &re, None, &[], STRING_LITERAL_SCAN_LIMIT, false);
+        assert_eq!(hits.len(), 3);
+        assert!(!truncated, "50 上限内不截断");
+    }
+
+    /// regex 构造兜底：空名/极端 placeholder 不 panic，返 None 跳过扫描。
+    #[test]
+    fn literal_scan_regex_survives_hostile_placeholder() {
+        // 合法标识符构造必成功。
+        assert!(literal_scan_regex("old_fn").is_some());
+        // 空名 → None（`\b\b` 退化为单 `\b` 会命中一切词边界，必须拒扫）。
+        assert!(literal_scan_regex("").is_none());
+    }
+
+    /// 旧名兜底提取（bash-language-server 裸 Range 形态）：词内各列命中同一
+    /// 词；词尾后一格（eol 语义）回退；utf-16 中文行换算；Utf8 编码字节列；
+    /// 非词位置 None。
+    #[test]
+    fn word_at_position_extracts_identifier() {
+        use lsp_core::offsets::OffsetEncoding as Enc;
+        let line = "old_fn() {";
+        assert_eq!(
+            word_at_position(line, 0, Enc::Utf16).as_deref(),
+            Some("old_fn")
+        );
+        assert_eq!(
+            word_at_position(line, 3, Enc::Utf16).as_deref(),
+            Some("old_fn")
+        );
+        assert_eq!(
+            word_at_position(line, 6, Enc::Utf16).as_deref(),
+            Some("old_fn"),
+            "n 词尾后一格 = '(' eol 语义回退"
+        );
+        assert_eq!(
+            word_at_position(line, 7, Enc::Utf16).as_deref(),
+            None,
+            "')' 上回退到 '(' 仍非词 → None"
+        );
+
+        // utf-16 中文行：/* 中文 */ 共 10 units，'o' 起始 col=10。
+        let cjk = "/* 中文 */ old_fn";
+        assert_eq!(
+            word_at_position(cjk, 10, Enc::Utf16).as_deref(),
+            Some("old_fn")
+        );
+        assert_eq!(
+            word_at_position(cjk, 13, Enc::Utf16).as_deref(),
+            Some("old_fn")
+        );
+        // Utf8 编码：character = 字节偏移（中文各 3 字节 → 'o' 在字节 13）。
+        assert_eq!(
+            word_at_position(cjk, 13, Enc::Utf8).as_deref(),
+            Some("old_fn")
+        );
+
+        assert_eq!(
+            word_at_position("   old_fn", 1, Enc::Utf16).as_deref(),
+            None,
+            "空格上回退仍非词 → None"
+        );
+    }
+}
+
+/// bd n0uh：semantic 永久态记忆收敛（平台限制表 / 域隔离 / 幂等 / snapshot）。
+/// 纪律：不拉 LS —— 记忆读写与折叠是纯进程内状态。
+#[cfg(test)]
+mod semantic_permanent_state_tests {
+    use super::*;
+
+    /// 平台限制表：bash+Windows 命中 Hover 域；表外 lang / None 任何平台都 miss
+    /// （TS/Py/Rust/Go 真实 warming 语义零变化）。
+    #[test]
+    fn platform_limitation_table_bash_windows_only() {
+        let r = known_semantic_platform_limitation(Some("bash"));
+        if cfg!(windows) {
+            assert!(r.is_some_and(|s| s.contains("hover")), "{r:?}");
+        } else {
+            assert!(r.is_none(), "非 Windows 无 man 页限制");
+        }
+        for l in ["rust", "python", "typescript", "go", "sql"] {
+            assert!(
+                known_semantic_platform_limitation(Some(l)).is_none(),
+                "{l} 不得被表误伤"
+            );
+        }
+        assert!(known_semantic_platform_limitation(None).is_none());
+    }
+
+    /// 记忆收敛：域隔离（Hover 不连坐 All）+ 回落（All 连坐 Hover）+ 幂等 +
+    /// snapshot 折叠（同 lang 双域 All 优先）+ None lang 永不命中。
+    #[tokio::test]
+    async fn semantic_unavailable_memory_scopes_and_folds() {
+        let sup = Supervisor::direct().await.unwrap();
+        assert!(
+            sup.semantic_unavailable_for(Some("bash"), SemanticScope::All)
+                .is_none()
+        );
+
+        // bash hover 平台限制路径的真实写入（Hover 域）。
+        sup.record_semantic_unavailable("bash", SemanticScope::Hover, "hover: platform");
+        assert_eq!(
+            sup.semantic_unavailable_for(Some("bash"), SemanticScope::Hover)
+                .as_deref(),
+            Some("hover: platform")
+        );
+        // 域隔离：Hover 记忆不污染 All 域查询——def/refs 未就绪话术不受影响。
+        assert!(
+            sup.semantic_unavailable_for(Some("bash"), SemanticScope::All)
+                .is_none()
+        );
+
+        // -32601 路径的真实写入（All 域）→ All 命中且连坐 Hover 查询。
+        sup.record_semantic_unavailable("sql", SemanticScope::All, "no documentSymbol");
+        assert_eq!(
+            sup.semantic_unavailable_for(Some("sql"), SemanticScope::Hover)
+                .as_deref(),
+            Some("no documentSymbol")
+        );
+
+        // 幂等：首笔即定（铁证不因后续抖动被覆盖）。
+        sup.record_semantic_unavailable("sql", SemanticScope::All, "second write");
+        assert_eq!(
+            sup.semantic_unavailable_for(Some("sql"), SemanticScope::All)
+                .as_deref(),
+            Some("no documentSymbol")
+        );
+
+        // snapshot：lang 折叠，同 lang 双域 All 优先（迭代序 All < Hover）。
+        sup.record_semantic_unavailable("bash", SemanticScope::All, "all reason");
+        let snap = SupervisorTrait::semantic_unavailable_snapshot(&sup);
+        assert_eq!(snap.get("bash").map(String::as_str), Some("all reason"));
+        assert_eq!(
+            snap.get("sql").map(String::as_str),
+            Some("no documentSymbol")
+        );
+
+        // None lang 永不命中（防跨语言误收敛）。
+        assert!(
+            sup.semantic_unavailable_for(None, SemanticScope::All)
+                .is_none()
+        );
     }
 }
 

@@ -1041,7 +1041,18 @@ mod tests {
         assert!(parsed.servers.contains_key("crystalline"));
         assert!(spec_for("markdown").is_some(), "languages 维度命中");
         assert!(spec_for("crystal").is_some());
-        assert!(spec_for("rust").is_none(), "手写 T2 语言不进表");
+        // bd dgky 战役修正：断言必须在纯内置 parse 结果上做——spec_for 走 merged
+        // （§5.1 三层，external 胜出），用户机器 ls-use 注册过 [servers.rust] 时
+        // merged 命中 external，"内置表不含 T2 语言"的原意被环境事实污染（本机
+        // 必炸的 environment-sensitive test）。markdown/crystal 保留 spec_for
+        // 断言顺带覆盖 merged 查找路径。
+        assert!(
+            parsed
+                .servers
+                .values()
+                .all(|s| !s.languages.iter().any(|l| l == "rust")),
+            "手写 T2 语言不进表"
+        );
     }
 
     /// 向后兼容硬约束（Wave 1 验收 #3）：74 门中未声明新字段的条目，五通道解析

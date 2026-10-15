@@ -12,6 +12,7 @@
 //!
 //! 锁纪律：纯函数串接，零跨 await；不持 supervisor 内部任何 Mutex。
 use crate::ref_tools::RefSymbolHit;
+use crate::resolve_lang_for_file;
 use crate::{Supervisor, ToolError};
 use lsp_types::{HoverContents, MarkedString};
 use serde::Serialize;
@@ -64,6 +65,8 @@ fn looks_like_test_file(file: &str) -> bool {
 
 /// 从 `tool_symbol_body` 缓存层找匹配符号的 range（line 0-based），为 BodyRange 提供
 /// 起止行号。缓存命中/miss 都能命中——`tool_symbol_body` 写缓存时已把全部符号平铺入库。
+/// vqdg：精确名失败 → 回退链（与 tool_symbol_body_with_note 同一 resolve，
+/// 保证 body 命中与行号来源一致）。
 pub(crate) fn range_from_symbol_cache(
     sup: &Supervisor,
     root: &Path,
@@ -75,9 +78,21 @@ pub(crate) fn range_from_symbol_cache(
     // 的缓存这里读不到。
     let key = crate::doc_symbol_cache_key(root, file, lang_override);
     let hits = sup.symbol_cache_get(&key)?;
-    hits.iter()
-        .find(|h| h.name == symbol)
-        .map(|h| (h.range.start.line, h.range.end.line))
+    let lang = resolve_lang_for_file(file, lang_override).ok();
+    let entries: Vec<crate::symbol_fallback::Entry> = hits
+        .iter()
+        .map(|h| crate::symbol_fallback::Entry {
+            name: h.name.clone(),
+            range: h.range,
+        })
+        .collect();
+    match crate::symbol_fallback::resolve(&entries, symbol, lang.as_deref().unwrap_or("")) {
+        crate::symbol_fallback::Resolved::Exact { range, .. }
+        | crate::symbol_fallback::Resolved::Fallback { range, .. } => {
+            Some((range.start.line, range.end.line))
+        }
+        _ => None,
+    }
 }
 
 /// 在 body 文本内定位符号名 token（相对 body 首行的行偏移 + 0-based 列）。
@@ -117,9 +132,14 @@ pub async fn collect(
     };
     let mut warnings = Vec::new();
 
-    // 1) body：symbol-body + 缓存里取 range。
-    let text = match sup.tool_symbol_body(root, file, symbol, lang).await {
-        Ok(t) => t,
+    // 1) body：symbol-body + 缓存里取 range。vqdg：用 with_note 形态——回退命中的
+    //    解释进 warnings、LS 真名用于 body 内定位（Go 回退场景 body 文本里是
+    //    `(*Triangle).Area` 而非用户输入的 `Triangle.Area`）。
+    let hit = match sup
+        .tool_symbol_body_with_note(root, file, symbol, lang)
+        .await
+    {
+        Ok(h) => h,
         // bd serena-rust-37nl：嵌套名（A.b / A::b）在 documentSymbol 里按平铺
         // 短名检索，not-found 补短名提示；瞬态错（LS_TIMEOUT 等）原样上抛。
         Err(ToolError::BadArgs { detail }) => {
@@ -141,14 +161,15 @@ pub async fn collect(
     report.body = Some(BodyRange {
         start_line: s0 + 1, // 1-based 输出给 AI
         end_line: e0 + 1,
-        text,
+        text: hit.body,
     });
+    let locate_name = hit.ls_name.as_deref().unwrap_or(symbol);
 
     // 2) callers + tests：refs 反查。RA `references` 要求光标在符号名上才返回真引用，
     //    用 locate_name_in_body 找 body 内符号名 token（签名行）作为查点 —— bd syra：
     //    旧实现查 body 第一行（doc 注释行）会落在关键字上。
     if let Some(body) = report.body.as_ref() {
-        let (name_off, name_col) = locate_name_in_body(&body.text, symbol);
+        let (name_off, name_col) = locate_name_in_body(&body.text, locate_name);
         let name_line = body_line_0based + name_off;
         if let Ok((callers, _raw_snip)) = sup
             .tool_referencing_symbols(root, file, name_line, name_col, lang)
@@ -179,7 +200,7 @@ pub async fn collect(
     // 3) doc：hover 同位置（fn name token）拿 doc_string —— bd syra：hover 必须
     //    打在符号名上，打在 doc 注释/`pub` 关键字上会抓到关键字的文档。
     if let Some(body) = report.body.as_ref() {
-        let (name_off, name_col) = locate_name_in_body(&body.text, symbol);
+        let (name_off, name_col) = locate_name_in_body(&body.text, locate_name);
         if let Ok(Some(hover)) = sup
             .tool_hover(root, file, body_line_0based + name_off, name_col, lang)
             .await
@@ -188,6 +209,8 @@ pub async fn collect(
         }
     }
 
+    // vqdg：回退命中说明随响应 warning 透出（放 callers 覆盖之后，防被冲掉）。
+    warnings.extend(hit.note);
     Ok((report, warnings))
 }
 

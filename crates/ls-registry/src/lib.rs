@@ -329,6 +329,27 @@ pub fn entry_routable(id: &str, languages: &[String]) -> bool {
     language_routable(fam)
 }
 
+/// bd 5cko：已知能力受限 LS 的静态表（条目 id → 缺失的核心 LSP 方法清单）。
+/// 数据源 = 裸探针 + daemon 双实锤的能力边界记录（servers.toml [servers.sql] 注释
+/// 2026-09-28），非运行时探测——ls-list 据此标 `limited` + `missing_methods`，
+/// 用户在依赖这些方法前可预知需要自配 sqls config（DB 连接）。
+pub fn limited_missing_methods(id: &str) -> Option<&'static [&'static str]> {
+    // `sql` 与 `sqls-mysql` 是同一 sqls 二进制的两个语言路由（servers.toml 注释），
+    // 能力边界一致，共用一份清单。
+    const SQLS_MISSING: &[&str] = &[
+        "workspace/symbol",
+        "textDocument/documentSymbol",
+        "textDocument/references",
+        "textDocument/prepareRename",
+        "textDocument/implementation",
+        "textDocument/documentHighlight",
+    ];
+    match id {
+        "sql" | "sqls-mysql" => Some(SQLS_MISSING),
+        _ => None,
+    }
+}
+
 /// 扩展名是否被内置 servers.toml 条目的 `extensions` 字段登记 → 返回该条目首选
 /// 语言名。仅供 resolve 失败分支的报错文案分流（「注册了但无 adapter」vs「真未知
 /// 扩展名」）；路由本身不读此表（文件探测权威归 EXT_TABLE，spec.rs 字段注释）。
@@ -588,6 +609,22 @@ mod tests {
     #[test]
     fn resolve_handles_no_extension() {
         assert_eq!(resolve(&PathBuf::from("Makefile")), None);
+    }
+
+    /// bd 5cko：limited 表驱动语义——sql/sqls-mysql 同一 sqls 二进制共用清单，
+    /// 其余条目（含 pgls）返回 None = 不标 limited。
+    #[test]
+    fn limited_missing_methods_covers_sqls_family_only() {
+        for id in ["sql", "sqls-mysql"] {
+            let m = limited_missing_methods(id).expect("sqls 家族应标 limited");
+            assert_eq!(m.len(), 6);
+            assert!(m.contains(&"workspace/symbol"));
+            assert!(m.contains(&"textDocument/documentSymbol"));
+            assert!(m.contains(&"textDocument/references"));
+        }
+        assert_eq!(limited_missing_methods("pgls"), None);
+        assert_eq!(limited_missing_methods("marksman"), None);
+        assert_eq!(limited_missing_methods(""), None);
     }
 
     #[test]

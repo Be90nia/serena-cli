@@ -182,10 +182,35 @@ pub async fn assert_launch_missing_binary<A: LanguageServerAdapter>(adapter: A, 
     with_path_lock(|| async move {
         let dir = tempfile::tempdir().expect("tempdir");
         let original = std::env::var_os("PATH").unwrap_or_default();
-        unsafe { std::env::set_var("PATH", dir.path()) };
+        // bd dgky：生态目录兜底（GOPATH/bin、~/.local/bin、~/.cargo/bin、npm 全局）
+        // 纳入隔离——只清 PATH 时，本机真装了目标二进制（gopls@GOPATH/bin 实锤）
+        // 会误命中生态目录，"missing" 场景反而 launch 成功。全部指向空目录。
+        const ECO_KEYS: [&str; 4] = ["GOPATH", "USERPROFILE", "HOME", "APPDATA"];
+        let originals: Vec<(&str, Option<std::ffi::OsString>)> =
+            ECO_KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        // SAFETY: 持 PATH_LOCK（生态 env 与 PATH 同锁读写）。
+        unsafe {
+            std::env::set_var("PATH", dir.path());
+            for k in ECO_KEYS {
+                std::env::set_var(k, &empty);
+            }
+        }
         let result = adapter.launch_info(&dummy_ctx()).await;
         *err_holder_c.lock().unwrap() = Some(result);
-        unsafe { std::env::set_var("PATH", original) };
+        // SAFETY: 同上，恢复原值。
+        unsafe {
+            std::env::set_var("PATH", original);
+            for (k, v) in originals {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => {
+                        std::env::remove_var(k);
+                    }
+                }
+            }
+        }
     })
     .await;
     let err = err_holder.lock().unwrap().take().unwrap();

@@ -174,7 +174,7 @@ async fn replace_body_handles_external_disk_write() {
         )
         .await;
     match result {
-        Ok(()) => {
+        Ok(_) => {
             let on_disk = std::fs::read_to_string(&impl_cpp).unwrap();
             assert!(on_disk.contains("return 42;"), "成功替换后盘上应含 42");
             let body = sup

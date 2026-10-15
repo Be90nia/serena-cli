@@ -232,7 +232,7 @@ pub fn catalog() -> serde_json::Value {
             },
             "edit-context": {
                 "args": {
-                    "file": {"type": "string", "required": true},
+                    "file": {"type": "string", "required": false, "description": "bd serena-rust-vqdg: omit for direct --symbol lookup (heuristic chain: cache exact name -> prefix -> workspace/symbol; ambiguity -> warning names the chosen file)"},
                     "symbol": {"type": "string", "required": true},
                     "description": "B: body + callers + doc + tests in one call"
                 }

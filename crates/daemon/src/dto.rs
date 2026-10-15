@@ -163,6 +163,10 @@ pub struct StatusResponse {
     /// bd ulq：daemon 进程自身 binary 路径（current_exe 解析失败省略）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
+    /// bd n0uh：semantic 层确认不可用的永久态（lang → reason；含 hover 域平台
+    /// 限制与全域能力缺失；daemon 生命周期内）。空 map 省略（向后兼容）。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub semantic_unavailable: std::collections::BTreeMap<String, String>,
 }
 
 /// 把 supervisor 的 `ToolError` 翻译成 wire error。
@@ -596,6 +600,7 @@ mod tests {
             recent_agents: vec![],
             daemon_version: "0.2.0".into(),
             binary_path: None,
+            semantic_unavailable: Default::default(),
         };
         let j = serde_json::to_value(&resp).unwrap();
         assert!(j.get("recent_errors").is_none(), "empty ring must omit key");
@@ -603,6 +608,7 @@ mod tests {
         assert_eq!(j["in_flight"], 0);
         assert_eq!(j["invocation_count"], 0);
         assert!(j.get("binary_path").is_none(), "None 路径省略键");
+        assert!(j.get("semantic_unavailable").is_none(), "空永久态省略键");
         assert_eq!(j["daemon_version"], "0.2.0");
     }
     /// bd 7tk：旧 daemon 响应（只有 5 个旧字段）→ 新客户端 default 兜底反序列化。
@@ -639,14 +645,25 @@ mod tests {
             recent_agents: vec!["orca-ab12".into()],
             daemon_version: "0.2.0".into(),
             binary_path: Some("D:/bin/serena-cli.exe".into()),
+            semantic_unavailable: std::collections::BTreeMap::from([(
+                "bash".to_string(),
+                "hover: bash-language-server hover output depends on Unix man pages, empty on Windows".to_string(),
+            )]),
         };
         let j = serde_json::to_string(&resp).unwrap();
         assert!(j.contains("\"code\":\"LS_TIMEOUT\""), "got: {j}");
+        assert!(j.contains("\"semantic_unavailable\""), "got: {j}");
         let back: StatusResponse = serde_json::from_str(&j).unwrap();
         assert_eq!(back.in_flight, 2);
         assert_eq!(back.invocation_count, 7);
         assert_eq!(back.recent_errors.len(), 1);
         assert_eq!(back.recent_errors[0].code, WireErrorCode::LsTimeout);
+        assert_eq!(
+            back.semantic_unavailable.get("bash").map(String::as_str),
+            Some(
+                "hover: bash-language-server hover output depends on Unix man pages, empty on Windows"
+            )
+        );
         assert_eq!(back.recent_agents, vec!["orca-ab12".to_string()]);
     }
 }

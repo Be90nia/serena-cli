@@ -635,6 +635,8 @@ async fn status_get(State(state): State<AppState>) -> Response {
         binary_path: std::env::current_exe()
             .ok()
             .map(|p| p.display().to_string()),
+        // bd n0uh：semantic 永久不可用一次性声明（wait-ready / 监控直接消费）。
+        semantic_unavailable: state.supervisor.semantic_unavailable_snapshot(),
     };
     (StatusCode::OK, Json(resp)).into_response()
 }

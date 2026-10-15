@@ -74,7 +74,8 @@ const AFTER_HELP_GUIDE: &str = "\
   LS/环境      status project-info change-history warm wait-ready stop-all install uninstall ls-use ls-list ls-remove doctor shell lint-shell
 
 约定: 行号一律 1-based 含端；stdout 只出 JSON（成功=data 载荷 / 失败=error 对象 {code,message,retryable}，用法错 rc=2 同流），stderr=[warn]/[hint]/[error] 人读行；
-写类命令支持全局 --dry-run（返 would_write[].patch 预览）；--max-tokens/--compress/--json 全局可用。";
+全局旗在子命令前后均可传: --project --lang --json --compress --max-tokens --dry-run --invocation-id --request-timeout --index-timeout --warmup-timeout；
+写类命令支持全局 --dry-run（返 would_write[].patch 预览）。";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -95,8 +96,9 @@ struct Cli {
     #[arg(long)]
     daemon: bool,
 
-    /// 项目根（--direct 模式必填；转发模式透传给 daemon）。
-    #[arg(long, value_name = "ROOT")]
+    /// 项目根（转发模式透传给 daemon；bd 6nxl：全局旗——子命令前后均可传，
+    /// 顶层宣称的位置参数直觉与 git -C 一致）。
+    #[arg(long, global = true, value_name = "ROOT")]
     project: Option<PathBuf>,
 
     /// 完整 JSON 输出：关闭默认的紧凑裁剪（默认已是 JSON、紧凑形态；本 flag 保留全部字段）。
@@ -335,9 +337,12 @@ enum Cmd {
         symbol_flag: Option<String>,
     },
     /// AI 编辑主路径聚合：单次返回 body + callers + doc + tests。
+    /// 免 FILE 直查（bd serena-rust-vqdg）：`--symbol` 给了可省 FILE——启发式链
+    /// 解析首命中（缓存精确名 → 前缀 → workspace/symbol），命中多个时 warning
+    /// 提示用了哪个，零命中 rc=2；形状与 find-referencing-code-snippets 对齐。
     EditContext {
-        /// 目标文件（相对 root）。
-        file: String,
+        /// 目标文件（相对 root；--symbol 可唯一直查时省略）。
+        file: Option<String>,
         /// 符号名（位置第二参，兼容保留）。
         symbol: Option<String>,
         /// 符号名旗标（与位置第二参等价二选一）。
@@ -649,20 +654,13 @@ enum Cmd {
     /// workspace 级 pull diagnostics（workspace/diagnostic）。
     WorkspaceDiagnostic,
     /// 项目元信息：project root + git branch/HEAD + daemon/LS 加载状态。
-    /// 纯探测语义（同 status）：永不 lazy-spawn。
-    ProjectInfo {
-        /// 项目根（缺省顺序：--project > daemon active_project > 当前目录）。
-        #[arg(long, value_name = "ROOT")]
-        project: Option<PathBuf>,
-    },
+    /// 纯探测语义（同 status）：永不 lazy-spawn。项目根走全局 --project
+    /// （bd 6nxl：子命令级重复声明已由全局旗取代）。
+    ProjectInfo,
     /// daemon 状态（uptime / pid / loaded LS）。status 报告的是 daemon 全局状态
-    /// —— 与项目根无关；`--project` 仅与 `project-info` 对齐命令面形状
-    /// （status --project X 不报错），实际不参与 daemon 报告内容。
-    Status {
-        /// 项目根（接受但忽略——status 不依赖 project；与 project-info 命令面形状对齐）。
-        #[arg(long, value_name = "ROOT")]
-        project: Option<PathBuf>,
-    },
+    /// —— 与项目根无关；全局 `--project` 接受但忽略（原 mfht F7 命令面形状
+    /// 对齐语义由全局旗继续承担）。
+    Status,
     /// 变更历史：git log --follow 包装；--symbol 走 `-L :sym:file`
     /// 符号级跟踪。git 缺失 / 非 repo → exit 3 + stderr 原因。
     ChangeHistory {
@@ -935,16 +933,17 @@ async fn cli_main() -> ExitCode {
     // ---- 管理命令：只走 lock/HTTP，不需要 project ----
     match &cli.cmd {
         // bd serena-rust-mfht F7：status 接受 --project 与 project-info 命令面
-        // 对齐；项目根不参与 daemon 报告内容（cmd_status 忽略 _project）。
-        Some(Cmd::Status { project: _ }) => return cmd_status(&lock_path).await,
+        // 对齐；项目根不参与 daemon 报告内容（cmd_status 忽略；bd 6nxl 后
+        // --project 是全局旗，子命令前后均可传）。
+        Some(Cmd::Status) => return cmd_status(&lock_path).await,
         // change-history：纯本地 git log 包装（不碰 daemon/LS）。
         Some(Cmd::ChangeHistory { file, symbol, max }) => {
             let project_root = resolve_project_root(cli.project.clone());
             return cmd_change_history(&project_root, file, symbol.as_deref(), *max);
         }
         // project-info：纯探测（读 lock + GET /status + 本地 .git 解析），不碰 LS。
-        Some(Cmd::ProjectInfo { project }) => {
-            return cmd_project_info(&lock_path, project.clone()).await;
+        Some(Cmd::ProjectInfo) => {
+            return cmd_project_info(&lock_path, cli.project.clone()).await;
         }
         Some(Cmd::StopAll) => return cmd_stop_all(&lock_path).await,
         // lint-shell：纯本地静态分析，不碰 daemon/lock。
@@ -1510,7 +1509,9 @@ fn not_installed_exit(e: &str, lang: Option<&str>) -> Option<ExitCode> {
 ///    BadArgs 的 detail）；
 /// 3. overview 成功载荷带 `overview_skipped` 键（-32601 → 优雅降级的既有出口）；
 /// 4. 成功载荷 `warning` 字段含 `method not supported`（hover/def 空结果 + LS
-///    不支持 documentSymbol 的修后出口）。
+///    不支持 documentSymbol 的修后出口）；
+/// 5. 成功载荷 `warning` 含 `semantic unavailable (permanent)`（bd n0uh：daemon
+///    记忆的永久态——平台限制型 hover 空结果，等不出来）。
 fn unsupported_probe_reason(data: Option<&serde_json::Value>, err: Option<&str>) -> Option<String> {
     if let Some(d) = data {
         if let Some(skipped) = d.get("overview_skipped").and_then(|v| v.as_str()) {
@@ -1518,10 +1519,14 @@ fn unsupported_probe_reason(data: Option<&serde_json::Value>, err: Option<&str>)
         }
         // hover/def 空结果 + LS 不支持 documentSymbol：warning 换「不支持」话术
         //（supervisor semantic_unsupported_message），pending 不再置位。
-        if let Some(w) = d.get("warning").and_then(|v| v.as_str())
-            && w.contains("method not supported")
-        {
-            return Some(w.to_string());
+        if let Some(w) = d.get("warning").and_then(|v| v.as_str()) {
+            if w.contains("method not supported") {
+                return Some(w.to_string());
+            }
+            // bd n0uh：daemon 已记忆的永久态短话术 → 同样 fail-fast。
+            if w.contains("semantic unavailable (permanent)") {
+                return Some(w.to_string());
+            }
         }
     }
     let e = err?;
@@ -1534,9 +1539,11 @@ fn unsupported_probe_reason(data: Option<&serde_json::Value>, err: Option<&str>)
 /// P0-3：探针撞「方法不支持」→ 打印 LS 身份 + method 细节并立即失败（exit 1，
 /// 非 retryable——这不是超时，等下去永远不会好）。契约：错误文本含 LS 身份与
 /// method 名（细节在 reason 里，含 `textDocument/X` 或 method 全名）。
+/// n0uh 扩展：文案中性化为「semantic 永久不可用」——平台限制型（bash hover
+/// Windows 恒空）与能力缺失型（-32601）都走此出口，detail 行各自给原因。
 fn unsupported_exit(reason: &str, lang: Option<&str>) -> ExitCode {
     eprintln!(
-        "wait-ready: LS for lang `{}` does not implement a required method (method not supported); \
+        "wait-ready: semantic layer for lang `{}` is confirmed unavailable (permanent); \
          these probes can never become ready",
         lang.unwrap_or("(auto)")
     );
@@ -1987,7 +1994,7 @@ fn autodetect_lang(cli: &Cli) -> Option<String> {
         Some(Cmd::FindReferencingSymbols { file, .. }) => Some(file),
         Some(Cmd::FindReferencingCodeSnippets { file, .. }) => file.as_deref(),
         Some(Cmd::SymbolBody { file, .. }) => Some(file),
-        Some(Cmd::EditContext { file, .. }) => Some(file),
+        Some(Cmd::EditContext { file, .. }) => file.as_deref(),
         Some(Cmd::Completion { file, .. }) => Some(file),
         Some(Cmd::ContainingSymbol { file, .. }) => Some(file),
         Some(Cmd::DefiningSymbol { file, .. }) => Some(file),
@@ -2360,13 +2367,16 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
                 "symbol": symbol.as_deref().expect("resolved by resolve_with_alias"),
             }),
         ),
-        Some(Cmd::EditContext { file, symbol, .. }) => (
-            "edit-context",
-            json!({
-                "file": file,
+        Some(Cmd::EditContext { file, symbol, .. }) => {
+            // vqdg：file 省略时走 supervisor 侧 --symbol 直查（wire file 键省略）。
+            let mut a = json!({
                 "symbol": symbol.as_deref().expect("resolved by resolve_with_alias"),
-            }),
-        ),
+            });
+            if let Some(f) = file {
+                a["file"] = json!(f);
+            }
+            ("edit-context", a)
+        }
         Some(Cmd::RepoMap { top_n }) => ("repo-map", json!({"top_n": top_n})),
         Some(Cmd::Warm {
             lang, timeout_secs, ..
@@ -2679,8 +2689,8 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             }
             ("recipe", a)
         }
-        Some(Cmd::Status { .. })
-        | Some(Cmd::ProjectInfo { .. })
+        Some(Cmd::Status)
+        | Some(Cmd::ProjectInfo)
         | Some(Cmd::ChangeHistory { .. })
         | Some(Cmd::StopAll)
         | Some(Cmd::Install { .. })
@@ -3670,6 +3680,11 @@ fn cmd_ls_list(table: bool) -> ExitCode {
         if state == "not-installed" {
             entry["install_hint"] = json!(format!("serena-cli install {id}"));
         }
+        // bd 5cko：静态已知能力受限表（不做运行时探测）；空则省略字段（向后兼容）。
+        if let Some(missing_methods) = ls_registry::limited_missing_methods(id) {
+            entry["limited"] = json!(true);
+            entry["missing_methods"] = json!(missing_methods);
+        }
         if state == "installed-unroutable" {
             entry["hint"] = json!(
                 "package installed but no adapter routes this language; requests will fail — \
@@ -3729,6 +3744,11 @@ fn cmd_ls_list(table: bool) -> ExitCode {
                     } else if state == "installed-incomplete" {
                         let m = e["missing"][0].as_str().unwrap_or("");
                         format!("{versions} [incomplete: {m}]")
+                    } else if e["limited"].as_bool() == Some(true) {
+                        let n = e["missing_methods"].as_array().map_or(0, |a| a.len());
+                        format!(
+                            "{versions} [limited: {n} core methods missing; see missing_methods]"
+                        )
                     } else {
                         versions
                     }
@@ -5465,14 +5485,14 @@ mod blindfix_c_tests {
         assert_eq!(symbol.as_deref(), Some("divide"));
 
         let mut both = Cmd::EditContext {
-            file: "calc.py".into(),
+            file: Some("calc.py".into()),
             symbol: Some("a".into()),
             symbol_flag: Some("b".into()),
         };
         assert!(resolve_with_alias(&mut both).is_err(), "双给必拒");
 
         let mut neither = Cmd::EditContext {
-            file: "calc.py".into(),
+            file: Some("calc.py".into()),
             symbol: None,
             symbol_flag: None,
         };
@@ -5720,7 +5740,17 @@ fn resolve_with_alias(cmd: &mut Cmd) -> Result<(), String> {
             symbol,
             symbol_flag,
             ..
-        } => merge(symbol, symbol_flag, "symbol", "symbol"),
+        } => {
+            merge(symbol, symbol_flag, "symbol", "symbol")?;
+            // vqdg：edit-context 免 FILE 直查——FILE 与 --symbol 至少其一。
+            if let Cmd::EditContext { file, symbol, .. } = cmd
+                && file.is_none()
+                && symbol.is_none()
+            {
+                return Err("edit-context requires FILE or --symbol".into());
+            }
+            Ok(())
+        }
         // 杠精 cqns：find-test 补 --symbol 旗（与 symbol-body 形状对齐）。
         Cmd::FindTest {
             symbol,
@@ -7265,22 +7295,65 @@ mod clap_exit_json_tests {
         );
     }
 
-    // ---- bd serena-rust-mfht F7：status 接受 --project（与 project-info 形状对齐）----
+    // ---- bd serena-rust-mfht F7 / bd 6nxl：--project 全局旗，子命令前后均可传 ----
 
     #[test]
     fn status_accepts_project_flag_with_or_without_subcommand_first() {
-        // 子命令前 `--project X status`：Cli 全局 flag + 子命令后置位。
+        // 子命令前 `--project X status`：Cli 全局 flag。
         let cli = Cli::try_parse_from(["serena-cli", "--project", "X", "status"]).unwrap();
         assert!(
-            matches!(cli.cmd, Some(Cmd::Status { .. })),
+            matches!(cli.cmd, Some(Cmd::Status)),
             "--project X status 必须解析为 Status 子命令"
         );
-        // 子命令后 `status --project X`：status 子命令内 `--project` 字段。
+        // 子命令后 `status --project X`：global 旗在子命令侧解析（原 6nxl 症状
+        // = unexpected argument）。
         let cli = Cli::try_parse_from(["serena-cli", "status", "--project", "X"]).unwrap();
         assert!(
-            matches!(cli.cmd, Some(Cmd::Status { .. })),
+            matches!(cli.cmd, Some(Cmd::Status)),
             "status --project X 必须解析为 Status 子命令（不得报 unexpected）"
         );
+    }
+
+    // ---- bd 6nxl：顶层宣称全局的 flag 全子命令可传（审计锁）----
+
+    #[test]
+    fn declared_global_flags_accepted_after_subcommand() {
+        // 帮助文本「全局旗在子命令前后均可传」的宣称面逐条锁：工具类
+        // （find-symbol）与管理类（status）各抽一，任一条 rc=2 即回归。
+        const GLOBAL_FLAGS: &[&[&str]] = &[
+            &["--project", "X"],
+            &["--lang", "rust"],
+            &["--json"],
+            &["--compress"],
+            &["--max-tokens", "100"],
+            &["--dry-run"],
+            &["--invocation-id", "id-1"],
+            &["--request-timeout", "1000"],
+            &["--index-timeout", "1000"],
+            &["--warmup-timeout", "1000"],
+        ];
+        for flag in GLOBAL_FLAGS {
+            for sub_argv in [
+                vec!["find-symbol", "q"],
+                vec!["status"],
+                vec!["insert-at-line", "a.rs", "1", "t"],
+            ] {
+                let mut args = vec!["serena-cli"];
+                args.extend_from_slice(&sub_argv);
+                args.extend_from_slice(flag);
+                let parsed = Cli::try_parse_from(args);
+                assert!(
+                    parsed.is_ok(),
+                    "子命令 {sub_argv:?} 后传 {flag:?} 必须接受，实得: {:?}",
+                    parsed.err().map(|e| e.to_string())
+                );
+            }
+        }
+        // 6nxl 原症状复现锁：find-symbol users --project X。
+        let cli =
+            Cli::try_parse_from(["serena-cli", "find-symbol", "users", "--project", "X"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::FindSymbol { .. })));
+        assert_eq!(cli.project.as_deref(), Some(std::path::Path::new("X")));
     }
 }
 
@@ -7362,6 +7435,22 @@ mod fix_p0_unsupported_probe_tests {
             "warning": "overview probe: LS does not implement textDocument/documentSymbol (method not supported); empty result reflects missing LS capability, not warming — it will never converge"
         });
         assert!(unsupported_probe_reason(Some(&warned), None).is_some());
+        // 形态 5（bd n0uh）：daemon 记忆的永久态短话术（平台限制型 hover 空）。
+        let permanent = serde_json::json!({
+            "items": null,
+            "warning": "semantic unavailable (permanent): hover: bash-language-server hover output depends on Unix man pages, empty on Windows"
+        });
+        let r = unsupported_probe_reason(Some(&permanent), None).expect("永久态话术判不支持");
+        assert!(r.contains("semantic unavailable (permanent)"), "{r}");
+        // 全量 warming 话术（30-60s）不是永久态——继续等。
+        let warming = serde_json::json!({
+            "items": null,
+            "warning": "semantic layer returned empty; the language server's type analysis may not be ready yet (typically ready 30-60s after symbol index on a fresh workspace)"
+        });
+        assert!(
+            unsupported_probe_reason(Some(&warming), None).is_none(),
+            "warming 话术不误杀"
+        );
     }
 
     #[test]

@@ -1586,6 +1586,8 @@ exec = ["{bin}"]
 # 能力边界（裸探针 + daemon 双实锤 2026-09-28）：无 config（DB 连接）时 hover/def/
 # completion 内容全空；formatting 真实输出（语法层活）；capability 无 documentSymbol/
 # references/diagnostics——语义三关的 hover/表名内容需用户自配 sqls config，非接线缺陷。
+# limited badge（bd 5cko）：ls-list 据静态表 ls_registry::limited_missing_methods
+# 标注缺失核心方法（sqls-mysql 同一 sqls 二进制同清单）。
 # 平台组策略同 A 类先例（单值 bin_path 仅容 windows 组：zip 根 sqls.exe）；上游仅
 # 三个资产（windows/linux/darwin 各一，未按 arch 分拆），其余形态待上游细分。
 [servers.sql.download]

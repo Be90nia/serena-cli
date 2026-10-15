@@ -962,19 +962,21 @@ pub(crate) fn which_no_unc(name: &str) -> Option<PathBuf> {
     } else {
         &[""]
     };
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        for ext in exts {
-            let mut candidate = dir.join(name);
-            if !ext.is_empty() {
-                candidate.set_extension(&ext[1..]);
+    // PATH 未设时不 early-return：生态目录兜底（下方）仍需可达（bd dgky）。
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if dir.as_os_str().is_empty() {
+                continue;
             }
-            if candidate.is_file() {
-                // dunce 去 Windows UNC 前缀（\\?\C:\... → C:\...）。
-                return Some(dunce::canonicalize(&candidate).unwrap_or(candidate));
+            for ext in exts {
+                let mut candidate = dir.join(name);
+                if !ext.is_empty() {
+                    candidate.set_extension(&ext[1..]);
+                }
+                if candidate.is_file() {
+                    // dunce 去 Windows UNC 前缀（\\?\C:\... → C:\...）。
+                    return Some(dunce::canonicalize(&candidate).unwrap_or(candidate));
+                }
             }
         }
     }
@@ -1002,6 +1004,26 @@ pub(crate) fn which_no_unc(name: &str) -> Option<PathBuf> {
     {
         return Some(p);
     }
+    // bd dgky：已知生态目录兜底（uv tool / go install / cargo / npm -g 的安装落点
+    // 都不在 PATH）。命中即直接返回路径 = launch 同源生效，无需 ls-use 注册；
+    // stderr [hint] 行告知用户发现位置；多命中列候选（按目录优先序取首个）。
+    let hits = ecosystem_bin_candidates(name);
+    if let Some(first) = hits.first() {
+        let found = dunce::canonicalize(first).unwrap_or_else(|_| first.clone());
+        eprintln!(
+            "[hint] discovered `{name}` at {} (ecosystem dir; used for new launches)",
+            found.display()
+        );
+        if hits.len() > 1 {
+            let list = hits
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            eprintln!("[hint] multiple candidates for `{name}`: {list}");
+        }
+        return Some(found);
+    }
     None
 }
 
@@ -1009,6 +1031,73 @@ pub(crate) fn which_no_unc(name: &str) -> Option<PathBuf> {
 fn macos_cargo_fallback(name: &str, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let p = PathBuf::from(home?).join(".cargo/bin").join(name);
     p.is_file().then_some(p)
+}
+
+/// bd dgky：跨平台 home 目录（Windows USERPROFILE 权威，Unix HOME）。
+fn home_dir_os() -> Option<std::ffi::OsString> {
+    std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+}
+
+/// bd dgky：已知生态安装目录清单（优先级序）。blindtest 实锚：uv tool 装的
+/// pyright 落 `~/.local/bin`、`go install` 的 gopls 落 GOPATH/bin——均不在 PATH，
+/// PATH 探测失败后按此序补查。GOPATH 显式 env 优先，缺省回落 `{home}/go`；
+/// npm 全局 bin 落点分平台（Windows `%APPDATA%\npm`，Unix `~/.npm-global/bin`）。
+/// 纯函数：env 注入供单测。
+fn ecosystem_bin_dirs(
+    home: Option<&std::ffi::OsStr>,
+    gopath: Option<&std::ffi::OsStr>,
+    appdata: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let go_bin = gopath
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| PathBuf::from(h).join("go")))
+        .map(|g| g.join("bin"));
+    if let Some(g) = go_bin {
+        dirs.push(g);
+    }
+    let Some(home) = home else {
+        return dirs;
+    };
+    let home = PathBuf::from(home);
+    dirs.push(home.join(".local/bin"));
+    dirs.push(home.join(".cargo/bin"));
+    if cfg!(windows) {
+        if let Some(a) = appdata {
+            dirs.push(PathBuf::from(a).join("npm"));
+        }
+    } else {
+        dirs.push(home.join(".npm-global/bin"));
+    }
+    dirs
+}
+
+/// 在生态目录里查 `name`（复用 which_no_unc 的 Windows 可执行扩展名形态），按目录
+/// 优先级返回现存候选；多目录同时命中 = 全部返回，由调用方向用户列歧义。
+fn ecosystem_bin_candidates(name: &str) -> Vec<PathBuf> {
+    let exts: &[&str] = if cfg!(windows) {
+        &[".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    let mut hits = Vec::new();
+    for dir in ecosystem_bin_dirs(
+        home_dir_os().as_deref(),
+        std::env::var_os("GOPATH").as_deref(),
+        std::env::var_os("APPDATA").as_deref(),
+    ) {
+        for ext in exts {
+            let mut candidate = dir.join(name);
+            if !ext.is_empty() {
+                candidate.set_extension(&ext[1..]);
+            }
+            if candidate.is_file() {
+                hits.push(candidate);
+                break;
+            }
+        }
+    }
+    hits
 }
 
 /// 在 PATH 中查找可执行文件并去除 Windows UNC 前缀（servers.toml path_only/下载
@@ -1260,5 +1349,125 @@ mod tests {
             None
         );
         assert_eq!(macos_cargo_fallback("rust-analyzer", None), None);
+    }
+
+    /// bd dgky：生态目录清单纯函数——GOPATH 显式优先，缺省回落 {home}/go；
+    /// npm 全局 bin 分平台；home 缺失只保 GOPATH 组。
+    #[test]
+    fn ecosystem_bin_dirs_orders_fallbacks() {
+        // home 用带子目录形态（"H:" 裸盘符 join 丢分隔符，components 歧义）。
+        let home = std::ffi::OsStr::new("H:/home");
+        let gopath = std::ffi::OsStr::new("G:/go-workspace");
+        let appdata = std::ffi::OsStr::new("A:/AppData");
+        let dirs = ecosystem_bin_dirs(Some(home), Some(gopath), Some(appdata));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("G:/go-workspace/bin"),
+                PathBuf::from("H:/home/.local/bin"),
+                PathBuf::from("H:/home/.cargo/bin"),
+                // npm 全局 bin 落点分平台（Windows %APPDATA%\npm）。
+                if cfg!(windows) {
+                    PathBuf::from("A:/AppData/npm")
+                } else {
+                    PathBuf::from("H:/home/.npm-global/bin")
+                },
+            ]
+        );
+        // GOPATH 未设 → {home}/go/bin 回落；home 也缺失 → 只剩 GOPATH 组（空）。
+        assert_eq!(
+            ecosystem_bin_dirs(Some(home), None, Some(appdata))[0],
+            PathBuf::from("H:/home/go/bin")
+        );
+        assert!(ecosystem_bin_dirs(None, None, None).is_empty());
+    }
+
+    /// bd dgky：which_no_unc 生态兜底端到端——PATH 无命中 + GOPATH 指向 tempdir
+    /// 时找到 fake 二进制；PATH 未设（unset）同样可达兜底。stderr [hint] 行为
+    /// e2e 验收职责（人读行不进单测断言）。
+    #[test]
+    fn which_no_unc_finds_binary_in_ecosystem_dir() {
+        let _env = ENV_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let go_bin = dir.path().join("go-workspace/bin");
+        std::fs::create_dir_all(&go_bin).unwrap();
+        let bin_name = if cfg!(windows) {
+            "fake-eco-ls.exe"
+        } else {
+            "fake-eco-ls"
+        };
+        std::fs::write(go_bin.join(bin_name), b"").unwrap();
+
+        // SAFETY: ENV_TEST_LOCK 保证本进程内独占访问 PATH/USERPROFILE/GOPATH/APPDATA。
+        unsafe {
+            std::env::set_var("PATH", dir.path().join("no-such-path-dir"));
+            std::env::set_var("USERPROFILE", dir.path().join("no-home"));
+            std::env::set_var("HOME", dir.path().join("no-home"));
+            std::env::set_var("GOPATH", dir.path().join("go-workspace"));
+            std::env::set_var("APPDATA", dir.path().join("no-appdata"));
+        }
+        let hit = which_no_unc("fake-eco-ls");
+        // SAFETY: 同上，恢复前先清注入值。
+        unsafe {
+            std::env::remove_var("GOPATH");
+            std::env::remove_var("APPDATA");
+        }
+        assert_eq!(
+            hit,
+            Some(dunce::canonicalize(go_bin.join(bin_name)).unwrap())
+        );
+
+        // PATH unset：早退路径已改为穿透生态兜底（bd dgky 修正）。
+        unsafe {
+            std::env::remove_var("PATH");
+            std::env::set_var("GOPATH", dir.path().join("go-workspace"));
+        }
+        let hit = which_no_unc("fake-eco-ls");
+        unsafe {
+            std::env::remove_var("GOPATH");
+            std::env::remove_var("USERPROFILE");
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(
+            hit,
+            Some(dunce::canonicalize(go_bin.join(bin_name)).unwrap())
+        );
+    }
+
+    /// bd dgky：多生态目录同时命中同一名字 = 全部候选返回（歧义列举报由调用方）。
+    #[test]
+    fn ecosystem_bin_candidates_lists_all_hits() {
+        let _env = ENV_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let go_bin = dir.path().join("gw/bin");
+        let local_bin = dir.path().join(".local/bin");
+        std::fs::create_dir_all(&go_bin).unwrap();
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let bin_name = if cfg!(windows) {
+            "dup-eco-ls.exe"
+        } else {
+            "dup-eco-ls"
+        };
+        std::fs::write(go_bin.join(bin_name), b"").unwrap();
+        std::fs::write(local_bin.join(bin_name), b"").unwrap();
+
+        // SAFETY: ENV_TEST_LOCK 保证本进程内独占访问注入的 env。
+        unsafe {
+            std::env::set_var("PATH", dir.path().join("no-such-path-dir"));
+            std::env::set_var("USERPROFILE", dir.path());
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var("GOPATH", dir.path().join("gw"));
+            std::env::set_var("APPDATA", dir.path().join("no-appdata"));
+        }
+        let hits = ecosystem_bin_candidates("dup-eco-ls");
+        unsafe {
+            std::env::remove_var("PATH");
+            std::env::remove_var("USERPROFILE");
+            std::env::remove_var("HOME");
+            std::env::remove_var("GOPATH");
+            std::env::remove_var("APPDATA");
+        }
+        assert_eq!(hits.len(), 2, "两个生态目录命中都应返回: {hits:?}");
+        assert_eq!(hits[0], go_bin.join(bin_name), "GOPATH 优先序");
     }
 }

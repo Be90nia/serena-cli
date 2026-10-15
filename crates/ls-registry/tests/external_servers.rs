@@ -76,9 +76,12 @@ fn merged_lookup_matches_builtin_without_external_table() {
     assert_eq!(id, "marksman", "languages 维度命中（id ≠ 查询 key）");
     assert_eq!(spec.install, "download");
     assert!(merged_spec_for("crystal").is_some());
-    // 手写 T2 语言不进表；来源查询同步为 None。
-    assert!(spec_for("rust").is_none());
-    assert_eq!(spec_source("rust"), None);
+    // bd dgky 战役修正：探针改用确定两表皆无的名字——本机可能 ls-use 注册过
+    // 任意语言（[servers.rust] 实锚），external 参与 merged 后「rust 不被命中」
+    // 不再是环境无关事实；"内置表不含 T2 语言"约束由 config.rs 的 parsed 断言
+    // 持有。本断言在 CI（无 external）与真机（有 external）上都成立。
+    assert!(spec_for("no_such_lang_probe").is_none());
+    assert_eq!(spec_source("no_such_lang_probe"), None);
     assert_eq!(
         spec_for("markdown").map(|(id, _)| id),
         merged_spec_for("markdown").map(|(id, _)| id)

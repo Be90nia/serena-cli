@@ -21,6 +21,7 @@ use lsp_types::{DocumentSymbolResponse, Position};
 use serde_json::json;
 use thiserror::Error;
 
+use crate::symbol_fallback;
 use crate::write_gate;
 
 #[derive(Debug, Error)]
@@ -40,11 +41,14 @@ pub type EditResult<T> = std::result::Result<T, EditError>;
 
 /// 在 `root/file` 内定位 `symbol_name`（递归 documentSymbol 找第一个 name 匹配）。
 /// 失败 → BadArgs。
+/// 返回 `(range, fallback_note)`：精确层 = find_first 裸等值（现状零变化）；
+/// 失败 → vqdg 回退链（候选名与精确层同键裸 LS 名生成），唯一命中才生效，
+/// note 随响应 warning 透出。
 async fn locate_symbol(
     session: &Arc<Session>,
     file: &Path,
     symbol_name: &str,
-) -> EditResult<lsp_types::Range> {
+) -> EditResult<(lsp_types::Range, Option<String>)> {
     let uri = path_to_uri_str(file);
     let params = json!({ "textDocument": { "uri": uri } });
     // bd serena-rust-yxr：写门入口 timeout 改按 adapter 自定（默认 30s；RA 60s /
@@ -56,10 +60,29 @@ async fn locate_symbol(
     let resp: Option<DocumentSymbolResponse> = session
         .request("textDocument/documentSymbol", params, timeout)
         .await?;
-    let range = find_first(resp.as_ref(), symbol_name).ok_or_else(|| EditError::BadArgs {
-        detail: format!("symbol `{symbol_name}` not found"),
-    })?;
-    Ok(range)
+    let lang = session.language_id();
+    let lang = lang.as_str();
+    match find_first(resp.as_ref(), symbol_name) {
+        Some(range) => Ok((range, None)),
+        None => match symbol_fallback::resolve(
+            &symbol_fallback::collect_entries(resp.as_ref(), lang, false),
+            symbol_name,
+            lang,
+        ) {
+            symbol_fallback::Resolved::Exact { range, .. } => Ok((range, None)),
+            symbol_fallback::Resolved::Fallback { range, note, .. } => Ok((range, Some(note))),
+            symbol_fallback::Resolved::Ambiguous { candidates } => Err(EditError::BadArgs {
+                detail: format!(
+                    "symbol `{symbol_name}` is ambiguous in {}: {}; refine the symbol name",
+                    file.display(),
+                    candidates.join("; ")
+                ),
+            }),
+            symbol_fallback::Resolved::NotFound => Err(EditError::BadArgs {
+                detail: format!("symbol `{symbol_name}` not found"),
+            }),
+        },
+    }
 }
 
 fn find_first(resp: Option<&DocumentSymbolResponse>, name: &str) -> Option<lsp_types::Range> {
@@ -224,10 +247,10 @@ pub async fn replace_text_in_symbol(
     symbol: &str,
     old_text: &str,
     new_text: &str,
-) -> EditResult<()> {
+) -> EditResult<Option<String>> {
     let _gate = write_gate::acquire("replace-text-in-symbol").await?;
     let _guard = session.ensure_open(file).await?;
-    let range = locate_symbol(session, file, symbol).await?;
+    let (range, fallback_note) = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
     let (lo, hi) = locate_in_range(
         file,
@@ -241,7 +264,8 @@ pub async fn replace_text_in_symbol(
     new_content.push_str(&content[..lo]);
     new_content.push_str(new_text);
     new_content.push_str(&content[hi..]);
-    commit_change(session, file, root, &new_content).await
+    commit_change(session, file, root, &new_content).await?;
+    Ok(fallback_note)
 }
 
 /// `insert_text_after_symbol`：在 symbol 末尾（range.end）插入 text。
@@ -254,10 +278,10 @@ pub async fn insert_text_after_symbol(
     symbol: &str,
     text: &str,
     auto_indent: bool,
-) -> EditResult<(u32, u32)> {
+) -> EditResult<((u32, u32), Option<String>)> {
     let _gate = write_gate::acquire("insert-text-after-symbol").await?;
     let _guard = session.ensure_open(file).await?;
-    let range = locate_symbol(session, file, symbol).await?;
+    let (range, fallback_note) = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
     // bd bt3h：插入点在符号末尾 —— 新内容层级与 host 符号起始行一致。
     let text = if auto_indent {
@@ -274,7 +298,7 @@ pub async fn insert_text_after_symbol(
     let new_content = format!("{}{}{}", &content[..end_byte], text, &content[end_byte..]);
     let (end_line, end_col) = end_line_col(&new_content, end_byte + text.len());
     commit_change(session, file, root, &new_content).await?;
-    Ok((end_line, end_col))
+    Ok(((end_line, end_col), fallback_note))
 }
 
 /// `insert_text_before_symbol`：在 symbol 开头（range.start）插入 text。
@@ -286,10 +310,10 @@ pub async fn insert_text_before_symbol(
     symbol: &str,
     text: &str,
     auto_indent: bool,
-) -> EditResult<(u32, u32)> {
+) -> EditResult<((u32, u32), Option<String>)> {
     let _gate = write_gate::acquire("insert-text-before-symbol").await?;
     let _guard = session.ensure_open(file).await?;
-    let range = locate_symbol(session, file, symbol).await?;
+    let (range, fallback_note) = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
     // bd bt3h：插入点在符号起始行前 —— 新内容与 host 符号同层级。
     let text = if auto_indent {
@@ -311,7 +335,7 @@ pub async fn insert_text_before_symbol(
     );
     let (end_line, end_col) = end_line_col(&new_content, start_byte + text.len());
     commit_change(session, file, root, &new_content).await?;
-    Ok((end_line, end_col))
+    Ok(((end_line, end_col), fallback_note))
 }
 
 /// `delete_text_in_symbol`：在 symbol 体内删除 `start_line..end_line` 切片（行号 1-based 含端）。
@@ -322,10 +346,10 @@ pub async fn delete_text_in_symbol(
     symbol: &str,
     start_line: u32,
     end_line: u32,
-) -> EditResult<()> {
+) -> EditResult<Option<String>> {
     let _gate = write_gate::acquire("delete-text-in-symbol").await?;
     let _guard = session.ensure_open(file).await?;
-    let range = locate_symbol(session, file, symbol).await?;
+    let (range, fallback_note) = locate_symbol(session, file, symbol).await?;
     let content = tokio::fs::read_to_string(file).await?;
     // start_line/end_line 是 1-based；转 0-based 行号。
     let s = (start_line.saturating_sub(1)) as usize;
@@ -371,7 +395,8 @@ pub async fn delete_text_in_symbol(
     let mut new_content = String::with_capacity(content.len());
     new_content.push_str(&content[..start_byte]);
     new_content.push_str(&content[end_byte..]);
-    commit_change(session, file, root, &new_content).await
+    commit_change(session, file, root, &new_content).await?;
+    Ok(fallback_note)
 }
 
 /// bd ou83：format-on-write —— 把 `textDocument/formatting` 的 TextEdit 落盘。
