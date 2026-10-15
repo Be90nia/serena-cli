@@ -220,11 +220,15 @@ pub type ToolResult<T> = std::result::Result<T, ToolError>;
 /// Some 平面（override 路由）天然分键、互不遮蔽。
 type SymbolCacheKey = (PathBuf, String, Option<(SystemTime, u64)>, Option<String>);
 
-/// O3 解析候选：(file 相对路径, 符号名, 符号全范围)。
-type SymbolCandidates = Vec<(String, String, lsp_types::Range)>;
+/// O3 解析候选：(file 相对路径, 符号名, 符号全范围, kind)——kind 随候选透出，
+/// 歧义 warning 按 name(kind) file:line 列候选（bd serena-rust-ed3q 反馈6）。
+type SymbolCandidates = Vec<(String, String, lsp_types::Range, SymbolKindTag)>;
 
-/// O3 pick 中间形态：(符号名, 符号全范围)——扫描侧再拼 file 维度成 SymbolCandidates。
-type SymbolNameRanges = Vec<(String, lsp_types::Range)>;
+/// O3 pick 中间形态：(符号名, 符号全范围, kind)——扫描侧再拼 file 维度成 SymbolCandidates。
+type SymbolNameRanges = Vec<(String, lsp_types::Range, SymbolKindTag)>;
+
+/// 歧义 warning 列出的候选上限（预算卫生；超出折叠 `+N more`）。
+const AMBIGUITY_CANDIDATES_SHOWN: usize = 10;
 
 /// overview / symbol-body 的缓存 key；文件不可 stat（不存在/失败）→ None（确定性 key）。
 /// `lang_override`：用户显式 `--lang`（bd 8ges，见 [`SymbolCacheKey`] 注）。
@@ -503,6 +507,12 @@ pub struct Supervisor {
     /// → 写入时刻。find_symbol 在 TTL 内对这些文件强制 documentSymbol 对齐 ——
     /// RA wssym 写后可能**缺条目**（命中集缩水，基线实测），行号比对检不出缺失。
     recent_writes: Mutex<HashMap<(PathBuf, String), std::time::Instant>>,
+    /// 盲测 P2（bd serena-rust-ed3q）：stale warning 降噪——已发过全量 stale 告警的
+    /// (root_identity, uri_lowercase) 集合。同 key 重复 stale（多 agent 共 daemon 的
+    /// 常态）降为单行短句；misaligned 事实始终可见，retry 指引不再逐条重复。
+    /// daemon 生命周期 = Supervisor 生命周期，集合随进程存活（无淘汰：条目 =
+    /// 出现过写后 stale 的文件，量级远小于 diag_cache）。
+    stale_warned: Mutex<std::collections::HashSet<(String, String)>>,
     /// workspace 加载失败记录（bd serena-rust-xzb）：key = `key_root_identity(root)`，
     /// value = LS 经 `window/showMessage` / `window/logMessage` 报告的原始错误消息。
     /// cargo metadata 失败（FetchWorkspaceError）等场景语义工具全静默返空，AI 以为
@@ -625,6 +635,26 @@ impl std::hash::Hash for Key {
 /// root 的身份形式：小写字符串（Windows 大小写不敏感 FS 的路径归一）。
 fn key_root_identity(root: &Path) -> String {
     root.to_string_lossy().to_lowercase()
+}
+
+/// 盲测 P2：stale 告警文本两档。`repeat=false` = 该 (root,file) 首告，保留既有
+/// 全量文本（含 retry 指引与 realign 失败详情——消费者可能 grep 原文，逐字不变）；
+/// `repeat=true` = daemon 生命周期内同 key 重复 stale，单行短句——misaligned
+/// 事实保留可见（降噪不许吞关键信息），只砍重复的指引长文。
+fn stale_warning_text(files: usize, request_failures: usize, repeat: bool) -> String {
+    if repeat {
+        return format!(
+            "symbol index stale for {files} file(s) (repeat); results may be misaligned"
+        );
+    }
+    format!(
+        "symbol index stale for {files} file(s) after recent write; results may be misaligned, retry find-symbol shortly{}",
+        if request_failures > 0 {
+            format!("; {request_failures} realign docsym request(s) failed (details in daemon log)")
+        } else {
+            String::new()
+        }
+    )
 }
 
 /// 对外暴露给工具调用方的"位置"结构（直接复用 lsp-types `Location`，
@@ -752,6 +782,7 @@ impl Supervisor {
             version_seen: std::sync::Arc::new(Mutex::new(HashMap::new())),
             diag_pending_streak: Mutex::new(HashMap::new()),
             recent_writes: Mutex::new(HashMap::new()),
+            stale_warned: Mutex::new(std::collections::HashSet::new()),
             workspace_errors: std::sync::Arc::new(Mutex::new(HashMap::new())),
             symbol_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             delta_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -3761,16 +3792,24 @@ impl Supervisor {
             }
             tokio::time::sleep(Duration::from_millis(REALIGN_ROUND_MS)).await;
         }
-        Err(format!(
-            "symbol index stale for {} file(s) after recent write; results may be misaligned, retry find-symbol shortly{}",
-            targets.len(),
-            if request_failures > 0 {
-                format!(
-                    "; {request_failures} realign docsym request(s) failed (details in daemon log)"
-                )
-            } else {
-                String::new()
+        // 盲测 P2：登记 (root,file) 首告并按降噪档取文本——首次全量（retry 指引
+        // + 失败详情），同 key 重复 stale 降为单行短句（多 agent 共 daemon 场景
+        // 每条 find-symbol 都带全文 = 6 倍 token 噪音，盲测 go 实锤）。
+        let root_key = key_root_identity(root);
+        let any_new_file = {
+            let mut warned = self.stale_warned.lock().unwrap();
+            let mut any_new = false;
+            for uri in &targets {
+                if warned.insert((root_key.clone(), uri.as_str().to_lowercase())) {
+                    any_new = true;
+                }
             }
+            any_new
+        };
+        Err(stale_warning_text(
+            targets.len(),
+            request_failures,
+            !any_new_file,
         ))
     }
     /// `Location[]`，lsp-types 在 capability 上声明多形态——M0 只解 `Option<Location>`）。
@@ -4025,15 +4064,15 @@ impl Supervisor {
         name: &str,
         lang: Option<&str>,
     ) -> ToolResult<(String, u32, u32, Option<String>)> {
-        // (name, range) 候选对；精确名优先于前缀，同级确定性排序（file 维度在扫描侧拼）。
+        // (name, range, kind) 候选三元组；精确名优先于前缀，同级确定性排序（file 维度在扫描侧拼）。
         let pick = |hits: &[SymbolHit]| -> (SymbolNameRanges, SymbolNameRanges) {
             let mut exact: SymbolNameRanges = Vec::new();
             let mut prefix: SymbolNameRanges = Vec::new();
             for h in hits {
                 if h.name == name {
-                    exact.push((h.name.clone(), h.range));
+                    exact.push((h.name.clone(), h.range, h.kind.clone()));
                 } else if h.name.starts_with(name) {
-                    prefix.push((h.name.clone(), h.range));
+                    prefix.push((h.name.clone(), h.range, h.kind.clone()));
                 }
             }
             (exact, prefix)
@@ -4056,8 +4095,8 @@ impl Supervisor {
             .collect();
         for (file, hits) in &cached_files {
             let (e, p) = pick(hits);
-            exact.extend(e.into_iter().map(|(n, r)| (file.clone(), n, r)));
-            prefix.extend(p.into_iter().map(|(n, r)| (file.clone(), n, r)));
+            exact.extend(e.into_iter().map(|(n, r, k)| (file.clone(), n, r, k)));
+            prefix.extend(p.into_iter().map(|(n, r, k)| (file.clone(), n, r, k)));
         }
 
         // 2) 缓存零命中 → workspace/symbol 兜底（冷 daemon 窗口）。暖机窗口内
@@ -4079,9 +4118,9 @@ impl Supervisor {
                                 .replace('\\', "/")
                                 .to_string();
                             if h.name == name {
-                                exact.push((rel, h.name.clone(), h.range));
+                                exact.push((rel, h.name.clone(), h.range, h.kind.clone()));
                             } else if h.name.starts_with(name) {
-                                prefix.push((rel, h.name.clone(), h.range));
+                                prefix.push((rel, h.name.clone(), h.range, h.kind.clone()));
                             }
                         }
                     }
@@ -4102,8 +4141,8 @@ impl Supervisor {
         }
         let warming = !self.index_warming_warnings(root).is_empty();
 
-        let by_pos = |a: &(String, String, lsp_types::Range),
-                      b: &(String, String, lsp_types::Range)| {
+        let by_pos = |a: &(String, String, lsp_types::Range, SymbolKindTag),
+                      b: &(String, String, lsp_types::Range, SymbolKindTag)| {
             a.0.cmp(&b.0)
                 .then(a.2.start.line.cmp(&b.2.start.line))
                 .then(a.2.start.character.cmp(&b.2.start.character))
@@ -4116,7 +4155,7 @@ impl Supervisor {
         } else {
             (&prefix, prefix.len())
         };
-        let Some((file, sym_name, range)) = chosen.first().cloned() else {
+        let Some((file, sym_name, range, _kind)) = chosen.first().cloned() else {
             // 打回修复（bd serena-rust-bxd）：暖机窗口内零命中 ≠ 符号不存在——
             // wssym 可能仍未爬完，错误必须带 hint 防 AI 误判（对齐 find-symbol
             // 的 partial warning，不能比它更误导）。
@@ -4138,10 +4177,21 @@ impl Supervisor {
             .ok()
             .map(|text| refine_symbol_name_position(&text, &sym_name, range))
             .unwrap_or(range.start);
+        // bd serena-rust-ed3q 反馈6：歧义 warning 逐候选列 name(kind) file:line——
+        // 裸 "N matches; using first" 无法一眼辨歧义（同名 class vs function）。
         let note = (total > 1).then(|| {
+            let mut cands: Vec<String> = chosen
+                .iter()
+                .take(AMBIGUITY_CANDIDATES_SHOWN)
+                .map(|(f, n, r, k)| format!("{n}({}) {f}:{}", k.label(), r.start.line + 1))
+                .collect();
+            if chosen.len() > cands.len() {
+                cands.push(format!("+{} more", chosen.len() - cands.len()));
+            }
             format!(
-                "resolved --symbol {name} -> {file}:{} ({total} matches; using first, 1-based line)",
-                pos.line + 1
+                "resolved --symbol {name} -> {file}:{} ({total} matches; using first, 1-based line; candidates: {})",
+                pos.line + 1,
+                cands.join("; ")
             )
         });
         Ok((file, pos.line, pos.character, note))
@@ -6871,6 +6921,23 @@ fn position_in_hits(hits: &[SymbolHit], line: u32, col: u32) -> bool {
     })
 }
 
+/// bd serena-rust-ed3q：hover 坐标行是否越过文件末行（0-based line ≥ 总行数）。
+/// 越界位置不可能有符号——确定性短路，无需 LS 探测。按字节计 `\n`（UTF-16 文件
+/// 的换行符低字节同为 0x0A，计数不受影响）；空文件 0 行 → 任何位置都越界；
+/// 读盘失败 → false 保守放行走既有探测级联。
+fn position_beyond_file(path: &Path, line: u32) -> bool {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mut lines = bytes.iter().filter(|&&b| b == b'\n').count();
+            if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+                lines += 1; // 末行无换行符也占一行
+            }
+            line as usize >= lines
+        }
+        Err(_) => false,
+    }
+}
+
 /// 语义工具空结果的「可能未就绪」warning 文案（bd serena-rust-we0）。
 /// documentSymbol/workspaceSymbol 先就绪、类型分析（def/refs/hover）晚 30-60s；
 /// warm 以 find-symbol 非空为判据覆盖不到类型分析窗口 —— 空结果必须自带线索
@@ -8255,6 +8322,20 @@ impl Supervisor {
                 // bd serena-rust-xzb：workspace 加载错误无条件透出（结果不可信）。
                 let mut ws = self.workspace_error_warnings(root);
                 if hover_is_empty(&value) {
+                    // bd serena-rust-ed3q 反馈5：越界坐标（行 ≥ 文件行数）= 调用方
+                    // 输入错误，与 LS 就绪/能力正交——确定性回答「此位置无符号」，
+                    // 禁标 semantic-pending（误导「LS 未就绪」）。先于永久态/探测
+                    // 级联：位置错误是更强的答案，且省一次 overview 探测往返；
+                    // 文件读不到 → false 保守落回原级联，不替 LS 下结论。
+                    if position_beyond_file(&root.join(&file), line) {
+                        ws.push(format!(
+                            "no symbol at this position (line {}, col {}) — line beyond end of file",
+                            line + 1,
+                            col + 1
+                        ));
+                        attach_warning(&mut value, &ws);
+                        return Ok(value);
+                    }
                     // P0-3：`not_ready` 返回 `(warnings, pending)`——探测撞 -32601 时
                     // warning 换「不支持」话术且 pending=false，禁标 semantic-pending。
                     // bd n0uh：平台限制型永久态（bash hover Windows 恒空）先于
@@ -8276,12 +8357,14 @@ impl Supervisor {
                     // 结构化告知 AI 重查而非接受 null。
                     ws.extend(not_ready);
                     // 杠精 ke2a-5：裸 null 5 字符无法区分「位置无符号」和「未就绪」；
-                    // 未就绪已由 we0 warning 表达，就绪态的空结果补静态 hint 收口。
+                    // 未就绪已由 we0 warning 表达，就绪态的空结果补静态 hint 收口
+                    // （ed3q 反馈5：坐标回显，调用方可直接核对自己的输入）。
                     if ws.is_empty() {
-                        ws.push(
-                            "hover null: no symbol information at this position (semantic layer is ready; for a symbol name use find-symbol / edit-context)"
-                                .into(),
-                        );
+                        ws.push(format!(
+                            "hover null: no symbol at this position (line {}, col {}) (semantic layer is ready; for a symbol name use find-symbol / edit-context)",
+                            line + 1,
+                            col + 1
+                        ));
                     }
                     attach_warning(&mut value, &ws);
                     if pending {
@@ -10938,6 +11021,54 @@ mod write_consistency_tests {
             "写后必须清 root 信号 TTL 条目，否则 find_symbol 在 2s 窗口内命中写前缓存"
         );
     }
+
+    /// 盲测 P2：stale 文本两档——首告逐字保留既有全文（retry 指引 / 失败详情），
+    /// 重复 stale 降为单行短句（misaligned 事实保留）。
+    #[test]
+    fn stale_warning_text_full_on_first_short_on_repeat() {
+        let first = stale_warning_text(1, 0, false);
+        assert_eq!(
+            first,
+            "symbol index stale for 1 file(s) after recent write; results may be misaligned, retry find-symbol shortly",
+            "首告文本逐字不变（既有消费者/测试可能 grep）"
+        );
+        let first_fail = stale_warning_text(2, 3, false);
+        assert!(
+            first_fail.contains("3 realign docsym request(s) failed"),
+            "失败详情只在首告全文: {first_fail}"
+        );
+        let repeat = stale_warning_text(1, 3, true);
+        assert_eq!(
+            repeat, "symbol index stale for 1 file(s) (repeat); results may be misaligned",
+            "重复档单行短句，misaligned 可见、无 retry 指引"
+        );
+    }
+
+    /// 盲测 P2：stale_warned 集合首告/重复语义——同 (root, uri) 第二次不再算新
+    /// 文件；异 root / 异 uri 各自独立首告。
+    #[tokio::test]
+    async fn stale_warned_set_dedupes_by_root_and_uri() {
+        let sup = Supervisor::direct().await.unwrap();
+        let root_a = key_root_identity(Path::new("Z:/no/such/proj-a"));
+        let root_b = key_root_identity(Path::new("Z:/no/such/proj-b"));
+        let uri = "file:///z:/no/such/proj-a/lib.rs";
+        {
+            let mut warned = sup.stale_warned.lock().unwrap();
+            assert!(warned.insert((root_a.clone(), uri.to_string())), "首告=新");
+            assert!(
+                !warned.insert((root_a.clone(), uri.to_string())),
+                "同 key 二次=重复（降短句）"
+            );
+            assert!(
+                warned.insert((root_b.clone(), uri.to_string())),
+                "异 root 独立首告（多项目不连坐）"
+            );
+            assert!(
+                warned.insert((root_a.clone(), format!("{uri}/other.rs"))),
+                "异 uri 独立首告"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -11276,6 +11407,67 @@ mod symbol_cache_tests {
             (expected, 3, 0),
             "ws? 伪文件名不得当选，必须用 URI 派生路径"
         );
+    }
+
+    /// bd serena-rust-ed3q：hover 越界坐标的确定性判定——行 ≥ 总行数即越界；
+    /// 空文件任何位置越界；读盘失败保守放行。
+    #[test]
+    fn position_beyond_file_counts_lines_like_lsp() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        std::fs::write(&p, "a\nb\n").unwrap();
+        assert!(!position_beyond_file(&p, 0));
+        assert!(!position_beyond_file(&p, 1));
+        assert!(
+            position_beyond_file(&p, 2),
+            "trailing newline 不产生可 hover 的第 3 行"
+        );
+        std::fs::write(&p, "a\nb").unwrap();
+        assert!(position_beyond_file(&p, 2));
+        assert!(!position_beyond_file(&p, 1), "末行无换行符仍占一行");
+        std::fs::write(&p, "").unwrap();
+        assert!(position_beyond_file(&p, 0), "空文件任何位置都无符号");
+        assert!(
+            !position_beyond_file(&dir.path().join("nope.txt"), 99),
+            "读盘失败保守放行，落回既有探测级联"
+        );
+    }
+
+    /// bd serena-rust-ed3q 反馈6：歧义 warning 逐候选列 name(kind) file:line，
+    /// 裸 "N matches; using first" 无法一眼辨歧义。
+    #[tokio::test]
+    async fn resolve_symbol_position_ambiguity_warning_lists_name_kind_position() {
+        let sup = Supervisor::direct().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.py"), "class User:\n    pass\n").unwrap();
+        std::fs::write(root.join("b.py"), "def User():\n    pass\n").unwrap();
+        let hit = |name: &str, kind: SymbolKindTag| SymbolHit {
+            name: name.into(),
+            kind,
+            uri: "file:///x/f.py".into(),
+            range: lsp_types::Range {
+                start: Position::new(0, 0),
+                end: Position::new(1, 8),
+            },
+            container: None,
+        };
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "a.py", None),
+            vec![hit("User", SymbolKindTag::Class)],
+        );
+        sup.symbol_cache_put(
+            doc_symbol_cache_key(root, "b.py", None),
+            vec![hit("User", SymbolKindTag::Function)],
+        );
+        let (_, _, _, note) = sup
+            .resolve_symbol_position(root, "User", None)
+            .await
+            .unwrap();
+        let note = note.expect("双命中必须出歧义 note");
+        assert!(note.contains("2 matches; using first"), "{note}");
+        assert!(note.contains("User(Class) a.py:1"), "{note}");
+        assert!(note.contains("User(Function) b.py:1"), "{note}");
     }
 
     /// bd serena-rust-gqyp：名字精化的换算约定——整词匹配、UTF-16 col、找不到回退。

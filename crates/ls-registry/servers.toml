@@ -981,6 +981,9 @@ allowed_hosts = ["github.com", "release-assets.githubusercontent.com", "objects.
 "windows-x86_64" = "phpantom_lsp.exe"
 "windows-aarch64" = "phpantom_lsp.exe"
 
+# 诊断/悬浮文案语言（bd serena-rust-ed3q）：PSES 文案跟 Windows「区域格式」culture，
+# 不读 LANG/LC_ALL env——CLI 侧 spawn 注入无效（实测 2026-10-15）。要英文诊断：
+# Windows 设置 > 时间和语言 > 语言和区域 > 区域格式 改 English (United States)。
 [servers.powershell]
 languages = ["powershell"]
 install = "download"

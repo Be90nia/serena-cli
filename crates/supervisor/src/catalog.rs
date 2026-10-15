@@ -239,7 +239,7 @@ pub fn catalog() -> serde_json::Value {
             },
             "repo-map": {
                 "args": {
-                    "top_n": {"type": "number", "required": false, "default": 20, "description": "E: per-file top-level symbol map (top N); bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"}
+                    "top_n": {"type": "number", "required": false, "default": 20, "description": "E: per-file top-level symbol map (top N; heat-tier sorted, truncated:true/raw_count on cap); CLI alias --max-symbols (distinct from global --max-tokens byte budget); bd z0kg: absent → SERENA_DEFAULT_MAX_ITEMS env when set"}
                 }
             },
             "warm": {

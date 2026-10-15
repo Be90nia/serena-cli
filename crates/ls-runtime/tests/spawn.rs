@@ -43,6 +43,34 @@ async fn spawn_wires_stdio_pipes() {
     );
 }
 
+/// bd serena-rust-ed3q：LS spawn 统一注入英文 UTF-8 locale——cmd 对未定义变量
+/// 原样回显 `%VAR%`，注入后应输出 en_US.UTF-8。
+#[tokio::test]
+async fn spawn_injects_utf8_locale_env() {
+    let mut child = Child::spawn(launch(&["cmd", "/C", "echo %LANG% %LC_ALL%"])).unwrap();
+    let mut out = String::new();
+    child.stdout.read_to_string(&mut out).await.unwrap();
+    assert!(
+        out.contains("en_US.UTF-8 en_US.UTF-8"),
+        "LANG/LC_ALL 应注入 en_US.UTF-8，实际: {out:?}"
+    );
+}
+
+/// adapter 显式同名 env 覆盖 locale 注入（envs() 后写胜出）。
+#[tokio::test]
+async fn spawn_adapter_env_overrides_locale_injection() {
+    let mut info = launch(&["cmd", "/C", "echo %LANG%"]);
+    info.env = vec![("LANG".into(), "adapter-custom".into())];
+    let mut child = Child::spawn(info).unwrap();
+    let mut out = String::new();
+    child.stdout.read_to_string(&mut out).await.unwrap();
+    assert!(
+        out.contains("adapter-custom"),
+        "adapter 显式 LANG 应覆盖注入，实际: {out:?}"
+    );
+    assert!(!out.contains("en_US.UTF-8"), "注入值不得漏出: {out:?}");
+}
+
 /// drop ChildHandle → Job 句柄关闭 → KILL_ON_JOB_CLOSE 灭掉整棵进程树，无孤儿残留。
 #[tokio::test]
 async fn drop_kills_process_tree() {

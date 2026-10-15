@@ -228,6 +228,13 @@ impl Child {
         if !info.cwd.as_os_str().is_empty() {
             cmd.current_dir(&info.cwd);
         }
+        // bd serena-rust-ed3q：LS 子进程统一英文 UTF-8 locale——部分 LS 按系统
+        // culture 产诊断文案，压平跨机器差异。先注入后 envs()：adapter 显式同名
+        // env 覆盖注入。Windows 无功能 LANG，注入幂等无害；实测 PSES 无视 env
+        // （诊断文案跟 Windows 区域格式 culture）——用户自修路径见 servers.toml
+        // powershell 条目注释，CLI 侧注入是 best-effort 而非承诺。
+        cmd.env("LANG", "en_US.UTF-8");
+        cmd.env("LC_ALL", "en_US.UTF-8");
         cmd.envs(info.env.iter().map(|(k, v)| (k, v)));
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())

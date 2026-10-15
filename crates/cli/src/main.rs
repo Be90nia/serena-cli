@@ -349,10 +349,17 @@ enum Cmd {
         #[arg(long = "symbol", value_name = "NAME")]
         symbol_flag: Option<String>,
     },
-    /// 全 workspace 符号地图（按调用热度 top N）。
+    /// 全 workspace 符号地图（按热度档排序 top N；响应带 truncated/raw_count）。
     RepoMap {
-        /// top N 符号（默认 20；超过按文件+顶层符号清单截断）。
-        #[arg(long, default_value_t = 20)]
+        /// top N 符号（默认 20）。`--max-symbols` 是本参数的可见别名（同义）。
+        /// 区别于全局 `--max-tokens`：本参数是条数硬上限、先应用；
+        /// `--max-tokens` 是响应字节的软上限、其后兜底应用。
+        #[arg(
+            long,
+            visible_alias = "max-symbols",
+            value_name = "N",
+            default_value_t = 20
+        )]
         top_n: u32,
     },
     /// 预热 LS + 索引：开工前一发，首个真实工具调用免吃冷启动。
@@ -685,6 +692,10 @@ enum Cmd {
         /// 装 servers.toml 全部条目。
         #[arg(long)]
         all: bool,
+        /// 装完自动 `stop-all` 让 daemon 下次调用即用新 LS（bd serena-rust-ed3q
+        /// 反馈8；默认不动 daemon）。
+        #[arg(long)]
+        restart_daemon: bool,
     },
     /// 卸载 serena 托管的 LS 安装缓存（`{cache_root}/{id}/` 全版本/变体）。
     /// PATH 探测型（path_only/uvx）非 serena 托管，明确拒删、不受影响。
@@ -719,6 +730,10 @@ enum Cmd {
         /// 移除注册条目（其余内容与注释逐字节保留）。
         #[arg(long, value_name = "ID")]
         remove: Option<String>,
+        /// 注册/移除成功后自动 `stop-all`（bd serena-rust-ed3q 反馈8；默认不动
+        /// daemon，注册在 daemon 重启后生效）。
+        #[arg(long)]
+        restart_daemon: bool,
     },
     /// 全量 LS 清单（内置 servers.toml 条目 × 实装状态 + external 新语言条目）。
     LsList {
@@ -967,20 +982,25 @@ async fn cli_main() -> ExitCode {
             return ExitCode::from(lint_shell::run(&text, *json, *strict));
         }
         // install 内部自建 blocking runtime（下载），必须在阻塞线程跑。
-        Some(Cmd::Install { lang, all }) => {
-            if *all {
-                return tokio::task::spawn_blocking(cmd_install_all)
+        Some(Cmd::Install {
+            lang,
+            all,
+            restart_daemon,
+        }) => {
+            let code = if *all {
+                tokio::task::spawn_blocking(cmd_install_all)
                     .await
-                    .unwrap_or(ExitCode::from(3));
-            }
-            if lang.is_empty() {
+                    .unwrap_or(ExitCode::from(3))
+            } else if lang.is_empty() {
                 eprintln!("install: --lang <ID> or --all required");
-                return ExitCode::from(2);
-            }
-            let lang = lang.clone();
-            return tokio::task::spawn_blocking(move || cmd_install(&lang))
-                .await
-                .unwrap_or(ExitCode::from(3));
+                ExitCode::from(2)
+            } else {
+                let lang = lang.clone();
+                tokio::task::spawn_blocking(move || cmd_install(&lang))
+                    .await
+                    .unwrap_or(ExitCode::from(3))
+            };
+            return finish_ls_mgmt(*restart_daemon, code, &lock_path).await;
         }
         // uninstall 纯本地 fs 操作，同 install 先例走阻塞线程。
         Some(Cmd::Uninstall { lang, json }) => {
@@ -998,6 +1018,7 @@ async fn cli_main() -> ExitCode {
             lang,
             ext,
             remove,
+            restart_daemon,
         }) => {
             let id = lang_or_id.clone();
             let bin = path.clone();
@@ -1005,11 +1026,12 @@ async fn cli_main() -> ExitCode {
             let new_lang = lang.clone();
             let new_ext = ext.clone();
             let remove = remove.clone();
-            return tokio::task::spawn_blocking(move || {
+            let code = tokio::task::spawn_blocking(move || {
                 cmd_ls_use(&id, bin, list, new_lang, new_ext, remove)
             })
             .await
             .unwrap_or(ExitCode::from(3));
+            return finish_ls_mgmt(*restart_daemon, code, &lock_path).await;
         }
         Some(Cmd::LsList { table }) => {
             let table = *table;
@@ -1109,17 +1131,26 @@ async fn run_direct(cli: &Cli) -> ExitCode {
             match print_json(&data) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("{e}");
+                    eprintln!("{}", direct_error_line(&e));
                     ExitCode::from(tool_error_exit(&e))
                 }
             }
         }
         Err(e) => {
             let exit = tool_error_exit(&e);
-            eprintln!("{e}");
+            eprintln!("{}", direct_error_line(&e));
             ExitCode::from(exit)
         }
     }
+}
+
+/// --direct 工具错误行：wire 同款 {code,message,retryable} 单行 JSON 落 stderr
+/// （bd serena-rust-ed3q：裸 Display 的 `core error: …` 对 JSON 解析方不可消费，
+/// 与 07u5-1 BAD_ARGS JSON 化同理；rc 语义仍由 `tool_error_exit` 决定）。
+fn direct_error_line(e: &ToolError) -> String {
+    let wire = daemon::dto::wire_error_from_tool_error(e);
+    serde_json::json!({ "code": wire.code, "message": wire.message, "retryable": wire.retryable })
+        .to_string()
 }
 
 fn tool_error_exit(e: &ToolError) -> u8 {
@@ -1129,6 +1160,35 @@ fn tool_error_exit(e: &ToolError) -> u8 {
         ToolError::Protocol { .. } => 1,
         ToolError::Serialize(_) => 3,
         ToolError::Core(_) | ToolError::Launch(_) => 3,
+    }
+}
+
+/// bd serena-rust-ed3q：--direct 错误行 JSON 形态锁（wire 三键 + 单行可解析）。
+#[cfg(test)]
+mod direct_error_json_tests {
+    use super::*;
+
+    #[test]
+    fn core_terminated_maps_to_wire_shape_retryable() {
+        let line = direct_error_line(&ToolError::Core(supervisor::CoreErrorWire::Terminated {
+            ls: "sqls".into(),
+            cause: "panicked".into(),
+        }));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["code"], "LS_TERMINATED");
+        assert_eq!(v["retryable"], true);
+        assert!(v["message"].as_str().unwrap().contains("sqls"));
+        assert!(!line.contains('\n'), "必须单行: {line}");
+    }
+
+    #[test]
+    fn bad_args_maps_flat_non_retryable() {
+        let line = direct_error_line(&ToolError::BadArgs {
+            detail: "col=0".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["code"], "BAD_ARGS");
+        assert_eq!(v["retryable"], false);
     }
 }
 
@@ -2921,9 +2981,10 @@ async fn forward(
                 ls_env_mismatch_hint(lang, &project_root).await;
             }
             // bd fdmj-F10：错误统一裸 JSON 走 stdout（与成功载荷/clap 用法错同流
-            // 同形，agent 不再分形态解析）；原 "tool error: " 人读前缀挪 stderr
-            // [error] 行——两流职责分明（stdout=JSON、stderr=人读诊断）。
-            eprintln!("[error] {err}");
+            // 同形，agent 不再分形态解析）。盲测 P2：stderr 的 [error] 行原样打
+            // JSON 全文 = 同一错误两流各一份（2>&1 合并流双 JSON 破坏 find('{')
+            // 解析）——改打 `code: message` 人读摘要，JSON 本体只在 stdout 单份。
+            eprintln!("[error] {}", error_human_line(&err));
             println!("{err}");
             if let Some(hint) = unknown_tool_hint(&err) {
                 eprintln!("[hint] {hint}");
@@ -3010,6 +3071,22 @@ fn relay_progress_lines(path: &Path, offset: u64) -> u64 {
         }
     }
     len
+}
+
+/// ls-use/install 成功后的 daemon 生效收尾（bd serena-rust-ed3q 反馈8）：
+/// 默认打 stderr hint（注册/安装在 daemon 重启后生效，手动 stop-all 易漏）；
+/// `--restart-daemon` opt-in 自动 `stop-all`，不改默认行为。失败现场优先，
+/// 不追加重启。
+async fn finish_ls_mgmt(restart: bool, code: ExitCode, lock_path: &Path) -> ExitCode {
+    if code == ExitCode::SUCCESS {
+        if restart {
+            return cmd_stop_all(lock_path).await;
+        }
+        eprintln!(
+            "[hint][DAEMON_RESTART] takes effect after daemon restart; run `serena-cli stop-all` or rerun with --restart-daemon"
+        );
+    }
+    code
 }
 
 /// `install` 子命令（Task 21）：配置驱动 LS 安装（幂等——已装即返回路径）。
@@ -5861,6 +5938,19 @@ fn bad_args_exit(detail: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
+/// forward 错误臂 stderr 人读行：`code: message` 摘要（盲测 P2——原样打 JSON 全文
+/// 是 stdout 的错误副本双写）。code/message 任一缺失时回退原 JSON 文本（防御
+/// daemon 返回的未知错误形态，信息不丢）。
+fn error_human_line(err: &serde_json::Value) -> String {
+    match (
+        err.get("code").and_then(|v| v.as_str()),
+        err.get("message").and_then(|v| v.as_str()),
+    ) {
+        (Some(c), Some(m)) => format!("{c}: {m}"),
+        _ => err.to_string(),
+    }
+}
+
 /// bd serena-rust-p2zp：clap 原生 parse 错（missing subcommand / invalid value /
 /// unknown arg 等）从裸文本 + `e.exit()`（std::process::exit，Drop 来不及 flush）
 /// 改为：人读文本（clap 渲染保留 usage 提示）→ wire JSON error 对象 → rc=2。
@@ -7611,5 +7701,57 @@ mod drain_takeover_tests {
         assert!(r.is_err(), "peer 恒 draining 必须超时 Err 而非空转");
         assert!(r.unwrap_err().contains("still draining"));
         let _ = std::fs::remove_file(&lock);
+    }
+}
+
+/// 盲测 P2（bd serena-rust-ed3q）输出卫生组：[error] 双写合并 + --max-symbols 别名。
+#[cfg(test)]
+mod fix_p2_output_hygiene_tests {
+    use super::*;
+
+    /// forward 错误臂 stderr 人读行：code/message 齐全 → `code: message` 摘要
+    /// （不再是 JSON 全文副本——stdout 单份 JSON 契约不破）。
+    #[test]
+    fn error_human_line_prefers_code_message_summary() {
+        let err = json!({"code": "BAD_ARGS", "message": "symbol not found", "retryable": false});
+        assert_eq!(error_human_line(&err), "BAD_ARGS: symbol not found");
+    }
+
+    /// 未知错误形态（缺 code/message）→ 回退原 JSON 文本，信息不丢。
+    #[test]
+    fn error_human_line_falls_back_to_json_text() {
+        let err = json!({"weird": true});
+        assert_eq!(error_human_line(&err), r#"{"weird":true}"#);
+        assert_eq!(error_human_line(&json!("plain")), r#""plain""#);
+    }
+
+    /// 盲测 bash W2：`--max-symbols` 必须可用（--top-n 的可见别名），不再
+    /// unexpected argument 被误导到 --max-tokens。
+    #[test]
+    fn repo_map_accepts_max_symbols_alias_as_top_n() {
+        let cli = Cli::try_parse_from(["serena-cli", "repo-map", "--max-symbols", "5"]).unwrap();
+        let Some(Cmd::RepoMap { top_n }) = cli.cmd else {
+            panic!("expected repo-map");
+        };
+        assert_eq!(top_n, 5, "--max-symbols 归一到 top_n");
+        // 既有主名不回退。
+        let cli = Cli::try_parse_from(["serena-cli", "repo-map", "--top-n", "7"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::RepoMap { top_n: 7 })));
+    }
+
+    /// 别名必须在 help 里可见（盲测痛点 = 用户猜不到可用 flag）。
+    #[test]
+    fn repo_map_help_shows_max_symbols_alias() {
+        use clap::Parser as _;
+        let err = Cli::try_parse_from(["serena-cli", "repo-map", "--help"]).expect_err("--help");
+        let help = err.render().to_string();
+        assert!(
+            help.contains("--max-symbols"),
+            "help 必须展示 max-symbols 别名: {help}"
+        );
+        assert!(
+            help.contains("--max-tokens"),
+            "帮助写清与 --max-tokens 的区别"
+        );
     }
 }

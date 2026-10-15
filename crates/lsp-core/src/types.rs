@@ -48,6 +48,21 @@ impl SymbolKindTag {
         }
     }
 
+    /// 人读标签（与 wire 序列化同形："Class" / "Struct" / "Other(23)"）；
+    /// supervisor 歧义 warning 等非序列化场景复用（bd serena-rust-ed3q）。
+    pub fn label(&self) -> String {
+        match self {
+            Self::File => "File".to_string(),
+            Self::Module => "Module".to_string(),
+            Self::Class => "Class".to_string(),
+            Self::Method => "Method".to_string(),
+            Self::Function => "Function".to_string(),
+            Self::Field => "Field".to_string(),
+            Self::Variable => "Variable".to_string(),
+            Self::Other(n) => Self::wire_name(*n),
+        }
+    }
+
     /// LSP 3.17 SymbolKind 线号 → 上游名字；表外号码 → `Other(n)`。
     fn wire_name(n: u8) -> String {
         match n {
@@ -85,16 +100,6 @@ impl SymbolKindTag {
 
 impl Serialize for SymbolKindTag {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let name = match self {
-            Self::File => "File".to_string(),
-            Self::Module => "Module".to_string(),
-            Self::Class => "Class".to_string(),
-            Self::Method => "Method".to_string(),
-            Self::Function => "Function".to_string(),
-            Self::Field => "Field".to_string(),
-            Self::Variable => "Variable".to_string(),
-            Self::Other(n) => Self::wire_name(*n),
-        };
-        serializer.serialize_str(&name)
+        serializer.serialize_str(&self.label())
     }
 }

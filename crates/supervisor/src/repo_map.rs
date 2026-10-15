@@ -9,7 +9,13 @@
 //! LS 层零符号（冷窗口 / 会话失败 / 空缓存）→ 纯文本顶层定义行扫描兜底，保证任何
 //! 有源码的项目非空。符号清单本身已足够指示 API 面。
 //!
-//! ponytail: 不做引用计数/热度排序——等 LS 语义层稳定后再加回来。
+//! 盲测 P2（bd serena-rust-ed3q）：top 截断前按 `heat`（kind 档位，见
+//! [`kind_heat`]）降序稳定排序——盲测 TS 实锤 53 符号按文件序裁 20，截剩全是一个
+//! 文件的符号；排序后 top N 才是"top"。响应带 `truncated`/`raw_count` 截断标记
+//! （与 read-file 的 truncated/total_bytes 同款形态）。
+//!
+//! ponytail: heat 是 kind 档位近似（无引用计数）——refs/PageRank 热度等 LS 语义
+//! 层稳定后再加回来（fj17 首版曾因冷启动全空被否决）。
 
 use serde::Serialize;
 
@@ -24,6 +30,9 @@ pub struct RepoMapEntry {
     pub container: Option<String>,
     pub file: String,
     pub kind: String,
+    /// 粗粒度热度档位（3=类型面 / 2=可调用 / 1=成员面，见 [`kind_heat`]）。
+    /// 相对序有效，绝对值无语义——消费者凭它理解 top N 的取舍。
+    pub heat: u32,
 }
 
 /// repo-map 工具响应。
@@ -32,6 +41,12 @@ pub struct RepoMapReport {
     pub total_symbols: usize,
     pub top: Vec<RepoMapEntry>,
     pub budget_bytes: usize,
+    /// 盲测 P2：top_n 截断发生（total_symbols > top 上限）时 true——静默截断
+    /// 曾让 agent 误以为看到了全量（TS 实锤 53 裁 20 无标记）。
+    pub truncated: bool,
+    /// 截断前的全量符号条数（与 read-file 的 total_bytes 同款截断协议字段；
+    /// 数值上等于 total_symbols，显式给出免消费者推断）。
+    pub raw_count: usize,
 }
 
 /// 文件数保险丝（万级文件目录不拖垮扫描；与 symbol-tree 同量级）。
@@ -67,6 +82,47 @@ fn is_real_symbol_kind(kind: &str) -> bool {
     REPO_MAP_SYMBOL_KINDS.contains(&k.as_str())
 }
 
+/// 盲测 P2：粗粒度热度档位。类型定义（API 骨架）> 可调用（行为面）> 成员细节。
+/// 相对序有效、绝对值无语义；未知 kind 兜底 1（比误判成高热度安全）。
+fn kind_heat(kind: &str) -> u32 {
+    match kind.to_ascii_lowercase().as_str() {
+        "class" | "struct" | "interface" | "trait" | "enum" | "impl" | "type" | "module"
+        | "namespace" | "package" => 3,
+        "function" | "method" | "constructor" => 2,
+        _ => 1,
+    }
+}
+
+/// 盲测 P2（go 报告）：gopls documentSymbol 方法名 = `(*Type).Method`，而
+/// find-symbol 输出消费者直觉形态 `Type.Method`——统一成后者，跨命令阅读免切
+/// 心智模型。非 receiver 前缀形态（裸名/尾部括号如 swift `handle(req)`/lua
+/// `M.foo`）恒等返回；receiver 含空格/嵌套括号的未知形态保守原样。
+fn unify_method_name(name: &str) -> String {
+    let Some(rest) = name.strip_prefix('(') else {
+        return name.to_string();
+    };
+    let Some((recv, tail)) = rest.split_once(')') else {
+        return name.to_string();
+    };
+    let Some(method) = tail.strip_prefix('.') else {
+        return name.to_string();
+    };
+    let recv = recv.strip_prefix('*').unwrap_or(recv);
+    if recv.is_empty() || method.is_empty() || recv.contains(['(', ' ', '\t']) {
+        return name.to_string();
+    }
+    format!("{recv}.{method}")
+}
+
+/// 盲测 P2：heat 降序稳定排序（同分保持文件扫描序）后按 top_n 截断。
+/// 返回 (截断结果, 是否发生截断)。
+fn rank_and_truncate(mut top: Vec<RepoMapEntry>, top_n: usize) -> (Vec<RepoMapEntry>, bool) {
+    top.sort_by(|a, b| b.heat.cmp(&a.heat));
+    let truncated = top.len() > top_n;
+    top.truncate(top_n);
+    (top, truncated)
+}
+
 /// repo-map 主入口。`lang = None` → 走 multi-lang 自动探测。
 pub async fn build(
     sup: &Supervisor,
@@ -95,12 +151,14 @@ pub async fn build(
         top = text_scan_top_level(root);
     }
     let total_symbols = top.len();
-    top.truncate(top_n);
+    let (top, truncated) = rank_and_truncate(top, top_n);
     let budget_bytes = serde_json::to_vec(&top).map(|v| v.len()).unwrap_or(0);
     RepoMapReport {
         total_symbols,
         top,
         budget_bytes,
+        truncated,
+        raw_count: total_symbols,
     }
 }
 
@@ -141,13 +199,14 @@ fn flatten_symbols(tree: Option<serde_json::Value>) -> Vec<RepoMapEntry> {
                 continue;
             }
             out.push(RepoMapEntry {
-                name: name.to_string(),
+                name: unify_method_name(name),
                 container: s
                     .get("container")
                     .and_then(|v| v.as_str())
                     .map(String::from),
                 file: file.to_string(),
-                kind,
+                kind: kind.clone(),
+                heat: kind_heat(&kind),
             });
         }
     }
@@ -232,6 +291,7 @@ fn text_scan_top_level(root: &Path) -> Vec<RepoMapEntry> {
                     name,
                     container: None,
                     file: rel.clone(),
+                    heat: kind_heat(kind),
                     kind: kind.to_string(),
                 });
             }
@@ -441,5 +501,60 @@ mod tests {
         assert_eq!((kind, name.as_str()), ("class", "Foo"));
         assert!(top_level_def("    fn indented() {}").is_none());
         assert!(top_level_def("use std::fmt;").is_none());
+    }
+
+    /// 盲测 P2（go）：gopls `(*Type).Method` 归一成 find-symbol 消费者直觉形态
+    /// `Type.Method`；非 receiver 形态恒等（swift 尾括号 / lua 点路径 / 裸名）。
+    #[test]
+    fn unify_method_name_normalizes_gopls_receiver_form() {
+        assert_eq!(unify_method_name("(*Circle).Area"), "Circle.Area");
+        assert_eq!(unify_method_name("(Circle).Area"), "Circle.Area");
+        // 恒等：非 receiver 前缀形态。
+        assert_eq!(unify_method_name("Area"), "Area");
+        assert_eq!(unify_method_name("handle(req)"), "handle(req)");
+        assert_eq!(unify_method_name("M.foo"), "M.foo");
+        assert_eq!(unify_method_name("Triangle.Area"), "Triangle.Area");
+        // 未知形态保守原样：receiver 含空格（值 receiver `c *Circle`）或嵌套括号。
+        assert_eq!(unify_method_name("(c *Circle).Area"), "(c *Circle).Area");
+        assert_eq!(unify_method_name("(*weird (x)).y"), "(*weird (x)).y");
+        // 空段不产畸形。
+        assert_eq!(unify_method_name("(*).x"), "(*).x");
+        assert_eq!(unify_method_name("(Circle)."), "(Circle).");
+    }
+
+    /// 盲测 P2：heat 档位相对序（类型面 3 > 可调用 2 > 成员 1；未知兜底 1）。
+    #[test]
+    fn kind_heat_orders_type_over_callable_over_member() {
+        assert!(kind_heat("class") > kind_heat("function"));
+        assert!(kind_heat("Function") > kind_heat("field"));
+        assert_eq!(kind_heat("field"), kind_heat("constant"));
+        assert_eq!(kind_heat("method"), 2);
+        assert_eq!(kind_heat("totally-unknown"), 1, "未知 kind 兜底成员档");
+    }
+
+    /// 盲测 P2：rank_and_truncate heat 降序 + 同分稳定（文件序）；truncated 语义。
+    #[test]
+    fn rank_and_truncate_sorts_by_heat_then_keeps_insertion_order() {
+        let e = |name: &str, heat: u32| RepoMapEntry {
+            name: name.into(),
+            container: None,
+            file: "f".into(),
+            kind: "x".into(),
+            heat,
+        };
+        let (out, truncated) = rank_and_truncate(vec![e("m", 1), e("t", 3), e("f", 2)], 10);
+        assert!(!truncated);
+        let names: Vec<&str> = out.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["t", "f", "m"], "heat 降序: {names:?}");
+
+        // 同分保持插入序（stable sort——文件扫描序不回退）。
+        let (out, _) = rank_and_truncate(vec![e("a", 2), e("b", 2), e("c", 2)], 10);
+        let names: Vec<&str> = out.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+
+        let (out, truncated) = rank_and_truncate(vec![e("t", 3), e("m", 1)], 1);
+        assert!(truncated, "53 裁 20 场景必须带标记");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "t", "截剩高热度");
     }
 }

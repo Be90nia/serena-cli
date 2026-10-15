@@ -488,8 +488,9 @@ struct InvocationRecord<'a> {
 const INVOCATION_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// 条数封顶（超短行的极端场景兜底）。
 const INVOCATION_LOG_MAX_LINES: u64 = 1_000_000;
-/// 保留的轮转代数（.1 ~ .2）。
-const INVOCATION_LOG_KEEP: u32 = 2;
+/// 保留的轮转代数（.1 ~ .3，bd serena-rust-ed3q：≥3 代——盲测排障时仅 2 代
+/// 被清走即断粮；磁盘上界 = 4 × 100MB）。
+const INVOCATION_LOG_KEEP: u32 = 3;
 /// 轮转探测节流窗：每 N 次追加才做一次 metadata 探测（高频工具调用下
 /// 每条都 stat 是纯浪费；8MB 增量粒度足够，越限滞后 ≤ 一个节流窗）。
 const INVOCATION_LOG_CHECK_EVERY: u64 = 4096;
@@ -1947,6 +1948,31 @@ mod tests {
         );
         // keep=2：旧 .2 已删，无 .3。
         assert!(!invocation_log_gen(&log, 3).exists(), "最旧代必须删除");
+    }
+
+    /// bd serena-rust-ed3q：生产 KEEP=3 —— 连续三轮轮转后 .1/.2/.3 依序保留，
+    /// 第 4 代永不出现（≥3 代排障断粮防线锁）。
+    #[test]
+    fn invocation_log_keep_const_retains_three_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations.jsonl");
+        for round in 0..3u32 {
+            std::fs::write(&log, format!("gen{round}\n")).unwrap();
+            rotate_invocation_log(&log, INVOCATION_LOG_KEEP);
+        }
+        assert_eq!(
+            std::fs::read_to_string(invocation_log_gen(&log, 1)).unwrap(),
+            "gen2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(invocation_log_gen(&log, 2)).unwrap(),
+            "gen1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(invocation_log_gen(&log, 3)).unwrap(),
+            "gen0\n"
+        );
+        assert!(!invocation_log_gen(&log, 4).exists(), "KEEP=3 之外不保留");
     }
 
     #[test]
