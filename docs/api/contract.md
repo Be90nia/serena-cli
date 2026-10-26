@@ -42,7 +42,7 @@
   }
   ```
 
-## 4. 错误码枚举（10 个 + HTTP 保留码）
+## 4. 错误码枚举（11 个 + HTTP 保留码）
 
 完整表见 `ARCHITECTURE.md §6.3`：
 
@@ -57,6 +57,7 @@
 | `RPC_ERROR` | case | 1 |
 | `WRITE_CONFLICT` | false | 1 |
 | `INTERNAL` | false | 3 |
+| `STALE_READ` | false | 1（bd serena-rust-1282；附 `expected_version`/`current_version`/`changed_since` 三要素 + hint，先重读再重放） |
 | `DAEMON_DRAINING` | false | 3（仅 503 body，ADR-0008；CLI ≤5s 窗口自愈） |
 
 HTTP 保留：`404` 未知工具名、`503` daemon 关停中（CLI 自愈 ≤5s 窗口）、`426` 协议版本不匹配（待 `WIRE_PROTOCOL_VERSION` 协商机制落地，bd `serena-rust-1mnf`）。

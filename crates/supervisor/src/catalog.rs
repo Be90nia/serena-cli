@@ -227,7 +227,7 @@ pub fn catalog() -> serde_json::Value {
                 "args": {
                     "file": {"type": "string", "required": true},
                     "symbol": {"type": "string", "required": true},
-                    "meta": {"type": "bool", "required": false, "default": false, "description": "bd b72k: true → aggregate object (doc/signature/location/prev_line/next_line); default keeps bare body string"}
+                    "meta": {"type": "bool", "required": false, "default": false, "description": "bd b72k: true → aggregate object (doc/signature/location/prev_line/next_line; carries content_version for read-write lineage, bd serena-rust-1282); default keeps bare body string"}
                 }
             },
             "edit-context": {
@@ -252,7 +252,8 @@ pub fn catalog() -> serde_json::Value {
                 "args": {
                     "file": {"type": "string", "required": true},
                     "symbol": {"type": "string", "required": true},
-                    "new_body": {"type": "string", "required": true}
+                    "new_body": {"type": "string", "required": true},
+                    "expected_version": {"type": "number", "required": false, "description": "bd serena-rust-1282: optional content_version from a prior read/write response; mismatch rejects with STALE_READ (hint: re-read then re-apply). Scope = daemon lifetime (reset on restart; external edits do not bump); responses carry current content_version"}
                 }
             },
             "rename-symbol": {
@@ -315,6 +316,7 @@ pub fn catalog() -> serde_json::Value {
                     "symbol": {"type": "string", "required": true},
                     "old_text": {"type": "string", "required": true},
                     "new_text": {"type": "string", "required": true},
+                    "expected_version": {"type": "number", "required": false, "description": "bd serena-rust-1282: optional content_version guard; mismatch rejects with STALE_READ (re-read then re-apply). Scope = daemon lifetime"},
                     "format_on_write": {"type": "bool", "required": false, "default": false, "description": "bd ou83: run textDocument/formatting on the file after a successful write and apply edits to disk (all write tools accept this)"}
                 }
             },
@@ -323,6 +325,7 @@ pub fn catalog() -> serde_json::Value {
                     "file": {"type": "string", "required": true},
                     "symbol": {"type": "string", "required": true},
                     "text": {"type": "string", "required": true},
+                    "expected_version": {"type": "number", "required": false, "description": "bd serena-rust-1282: optional content_version guard; mismatch rejects with STALE_READ (re-read then re-apply). Scope = daemon lifetime"},
                     "auto_indent": {"type": "bool", "required": false, "default": true, "description": "bd bt3h: indent continuation lines to the host symbol's indentation (set false to disable)"},
                     "format_on_write": {"type": "bool", "required": false, "default": false, "description": "bd ou83: format the file after a successful write"}
                 }
@@ -332,6 +335,7 @@ pub fn catalog() -> serde_json::Value {
                     "file": {"type": "string", "required": true},
                     "symbol": {"type": "string", "required": true},
                     "text": {"type": "string", "required": true},
+                    "expected_version": {"type": "number", "required": false, "description": "bd serena-rust-1282: optional content_version guard; mismatch rejects with STALE_READ (re-read then re-apply). Scope = daemon lifetime"},
                     "auto_indent": {"type": "bool", "required": false, "default": true, "description": "bd bt3h: indent continuation lines to the host symbol's indentation (set false to disable)"},
                     "format_on_write": {"type": "bool", "required": false, "default": false, "description": "bd ou83: format the file after a successful write"}
                 }
@@ -341,7 +345,8 @@ pub fn catalog() -> serde_json::Value {
                     "file": {"type": "string", "required": true},
                     "symbol": {"type": "string", "required": true},
                     "start_line": {"type": "number", "required": true, "description": "1-based inclusive"},
-                    "end_line": {"type": "number", "required": true, "description": "1-based inclusive"}
+                    "end_line": {"type": "number", "required": true, "description": "1-based inclusive"},
+                    "expected_version": {"type": "number", "required": false, "description": "bd serena-rust-1282: optional content_version guard; mismatch rejects with STALE_READ (re-read then re-apply). Scope = daemon lifetime"}
                 }
             },
             "safe-delete-symbol": {
@@ -355,7 +360,8 @@ pub fn catalog() -> serde_json::Value {
                     "file": {"type": "string", "required": true},
                     "line": {"type": "number", "required": true, "description": "1-based"},
                     "content": {"type": "string", "required": true},
-                    "expected_hash": {"type": "string", "required": false, "description": "hash for write-conflict guard"}
+                    "expected_hash": {"type": "string", "required": false, "description": "hash for write-conflict guard"},
+                    "expected_version": {"type": "number", "required": false, "description": "bd serena-rust-1282: optional content_version guard; mismatch rejects with STALE_READ (re-read then re-apply). Scope = daemon lifetime"}
                 }
             },
             "replace-lines": {
@@ -364,7 +370,8 @@ pub fn catalog() -> serde_json::Value {
                     "start_line": {"type": "number", "required": true, "description": "1-based inclusive"},
                     "end_line": {"type": "number", "required": true, "description": "1-based inclusive"},
                     "content": {"type": "string", "required": true},
-                    "expected_hash": {"type": "string", "required": false}
+                    "expected_hash": {"type": "string", "required": false},
+                    "expected_version": {"type": "number", "required": false, "description": "bd serena-rust-1282: optional content_version guard; mismatch rejects with STALE_READ (re-read then re-apply). Scope = daemon lifetime"}
                 }
             },
             "delete-lines": {
@@ -372,13 +379,15 @@ pub fn catalog() -> serde_json::Value {
                     "file": {"type": "string", "required": true},
                     "start_line": {"type": "number", "required": true, "description": "1-based inclusive"},
                     "end_line": {"type": "number", "required": true, "description": "1-based inclusive"},
-                    "expected_hash": {"type": "string", "required": false}
+                    "expected_hash": {"type": "string", "required": false},
+                    "expected_version": {"type": "number", "required": false, "description": "bd serena-rust-1282: optional content_version guard; mismatch rejects with STALE_READ (re-read then re-apply). Scope = daemon lifetime"}
                 }
             },
             "create-text-file": {
                 "args": {
                     "file": {"type": "string", "required": true, "description": "target path relative to project root; must NOT exist"},
-                    "content": {"type": "string", "required": true, "description": "full file content"}
+                    "content": {"type": "string", "required": true, "description": "full file content"},
+                    "expected_version": {"type": "number", "required": false, "description": "bd serena-rust-1282: optional content_version guard (new file = 0); mismatch rejects with STALE_READ. Scope = daemon lifetime"}
                 }
             },
             "undo": {

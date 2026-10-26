@@ -85,6 +85,9 @@ pub enum WireErrorCode {
     /// daemon 排空关停中（bd xvs7 A-3 / ADR-0008）：仅出现在 draining 503 body，
     /// 不产生于 ToolError 映射；CLI 客户端对 503+此码做 ≤5s 自愈重试（g0m）。
     DaemonDraining,
+    /// 读-写断档（bd serena-rust-1282）：expected_version 与版本账本不符。不可
+    /// 盲重试——必须先重读再重放写（hint）。exit 1（WRITE_CONFLICT 同桶）。
+    StaleRead,
 }
 
 impl WireErrorCode {
@@ -107,6 +110,14 @@ pub struct WireError {
     /// 参数错、重读后重试即可。其余错误码 None（序列化时省略，向后兼容）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// STALE_READ 结构化详情（bd serena-rust-1282）：一眼可执行的重放三要素。
+    /// 其余错误码 None（省略，向后兼容——hint 同款 skip 语义）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_since: Option<String>,
 }
 
 /// bd 7tk：`recent_errors` 环条目（daemon 侧最近 N 条工具级失败）。
@@ -227,6 +238,20 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
         ToolError::WriteConflict { path, reason } => {
             (WireErrorCode::WriteConflict, format!("{path}: {reason}"))
         }
+        // bd serena-rust-1282：结构化重放三要素进专字段（expected/current/changed_since），
+        // message 人读形态兜底。
+        ToolError::StaleRead {
+            path,
+            expected,
+            current,
+            changed_since,
+        } => (
+            WireErrorCode::StaleRead,
+            format!(
+                "{path}: stale read — expected content_version {expected}, current {current} \
+                 (changed since {changed_since})"
+            ),
+        ),
     };
     let ls = match err {
         ToolError::Core(supervisor::CoreErrorWire::Terminated { ls, .. }) => Some(ls.clone()),
@@ -235,19 +260,35 @@ pub fn wire_error_from_tool_error(err: &supervisor::ToolError) -> WireError {
     };
     // bd serena-rust-i4j：写门/内容冲突统一带自检 hint —— agent 拿到的是
     // 「盘上内容与预期不符」而非参数错，指引重读重试，避免误诊为 BAD_ARGS。
-    let hint = match err {
+    let mut hint = match err {
         ToolError::WriteConflict { .. } => Some(
             "another write may hold the gate or content has changed; re-read the file and retry"
                 .to_string(),
         ),
         _ => None,
     };
+    // bd serena-rust-1282：STALE_READ 重放三要素（一眼可执行：重读 → 按 current
+    // 版本重放；盲重试必再拒，故不可 retryable）。
+    let mut stale = (None, None, None);
+    if let ToolError::StaleRead {
+        expected,
+        current,
+        changed_since,
+        ..
+    } = err
+    {
+        hint = Some("re-read then re-apply".to_string());
+        stale = (Some(*expected), Some(*current), Some(changed_since.clone()));
+    }
     WireError {
         code,
         message,
         ls,
         retryable: code.retryable(),
         hint,
+        expected_version: stale.0,
+        current_version: stale.1,
+        changed_since: stale.2,
     }
 }
 
@@ -260,6 +301,9 @@ pub fn wire_error_code_to_exit(code: WireErrorCode) -> u8 {
     match code {
         WireErrorCode::BadArgs => 2,
         WireErrorCode::WriteConflict => 1,
+        // bd serena-rust-1282：写被拒（需重读重放），WRITE_CONFLICT 同桶；
+        // retryable 桶(5)不适用——re-read 前重试必再拒。
+        WireErrorCode::StaleRead => 1,
         WireErrorCode::Internal => 3,
         WireErrorCode::DaemonDraining => 3,
         other if other.retryable() => 5,
@@ -297,6 +341,51 @@ mod tests {
         let back: WireErrorCode = serde_json::from_str("\"DAEMON_DRAINING\"").unwrap();
         assert_eq!(back, WireErrorCode::DaemonDraining);
         assert!(!WireErrorCode::DaemonDraining.retryable());
+    }
+
+    /// bd serena-rust-1282：第 11 wire 码 STALE_READ 形态锁定——序列化串 +
+    /// ToolError 映射（结构化三要素 + hint + 不可 retryable）+ exit 1。
+    #[test]
+    fn stale_read_wire_contract() {
+        assert_eq!(
+            serde_json::to_string(&WireErrorCode::StaleRead).unwrap(),
+            "\"STALE_READ\""
+        );
+        assert!(!WireErrorCode::StaleRead.retryable());
+        assert_eq!(wire_error_code_to_exit(WireErrorCode::StaleRead), 1);
+        let err = supervisor::ToolError::StaleRead {
+            path: "src/a.rs".into(),
+            expected: 3,
+            current: 5,
+            changed_since: "replace-body by tx-12, 40s ago".into(),
+        };
+        let w = wire_error_from_tool_error(&err);
+        assert_eq!(w.code, WireErrorCode::StaleRead);
+        assert!(!w.retryable);
+        assert_eq!(w.hint.as_deref(), Some("re-read then re-apply"));
+        assert_eq!(w.expected_version, Some(3));
+        assert_eq!(w.current_version, Some(5));
+        assert_eq!(
+            w.changed_since.as_deref(),
+            Some("replace-body by tx-12, 40s ago")
+        );
+        // 三要素专字段序列化在 wire 面（非 message 内嵌）——AI 按字段消费。
+        let j = serde_json::to_value(&w).unwrap();
+        assert_eq!(j["expected_version"], serde_json::json!(3));
+        assert_eq!(j["current_version"], serde_json::json!(5));
+    }
+
+    /// bd serena-rust-1282：非 STALE_READ 错误的三要素专字段必须省略
+    /// （skip_serializing_if，向后兼容）。
+    #[test]
+    fn stale_fields_omitted_on_other_errors() {
+        let err = supervisor::ToolError::BadArgs {
+            detail: "nope".into(),
+        };
+        let j = serde_json::to_value(wire_error_from_tool_error(&err)).unwrap();
+        assert!(j.get("expected_version").is_none(), "{j}");
+        assert!(j.get("current_version").is_none(), "{j}");
+        assert!(j.get("changed_since").is_none(), "{j}");
     }
 
     #[test]
@@ -354,6 +443,9 @@ mod tests {
             ls: None,
             retryable: false,
             hint: None,
+            expected_version: None,
+            current_version: None,
+            changed_since: None,
         };
         let j = serde_json::to_string(&e).unwrap();
         assert!(j.contains("\"code\":\"WRITE_CONFLICT\""), "got: {j}");
@@ -412,6 +504,9 @@ mod tests {
                 ls: None,
                 retryable: false,
                 hint: None,
+                expected_version: None,
+                current_version: None,
+                changed_since: None,
             },
         };
         let j = serde_json::to_string(&resp).unwrap();

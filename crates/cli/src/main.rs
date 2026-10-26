@@ -326,7 +326,7 @@ enum Cmd {
         debug_raw: bool,
     },
     /// 取符号体切片（position-free；documentSymbol 定位）。符号名：位置第二参或
-    /// `--symbol`（二选一；与 find-referencing-code-snippets 参数形状对齐）。
+    /// `--symbol`（二选一；与 find-referencing-code-snippets 的 `--symbol` 形状对齐）。
     SymbolBody {
         /// 目标文件（相对 root）。
         file: String,
@@ -335,6 +335,11 @@ enum Cmd {
         /// 符号名旗标（与位置第二参等价二选一）。
         #[arg(long = "symbol", value_name = "NAME")]
         symbol_flag: Option<String>,
+        /// 聚合形态（doc/signature/location + `content_version`——读-写 lineage：
+        /// 拿版本号供下一步 `--expected-version` 写护栏；bd serena-rust-1282）。
+        /// 默认裸 body 字符串 wire 不变。
+        #[arg(long)]
+        meta: bool,
     },
     /// AI 编辑主路径聚合：单次返回 body + callers + doc + tests。
     /// 免 FILE 直查（bd serena-rust-vqdg）：`--symbol` 给了可省 FILE——启发式链
@@ -405,6 +410,11 @@ enum Cmd {
         /// `--new-body` 同义别名，与 recipe fix-bug 互通）。
         #[arg(long = "with", visible_alias = "new-body")]
         new_body: String,
+        /// 可选：上次读/写响应的 content_version，与账本不符拒写（STALE_READ，
+        /// hint=re-read then re-apply）。作用域 = daemon 生命周期（重启归零、
+        /// 外部编辑不 bump）。
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// 在 symbol 体内替换 old → new（行级字节切片）。
     ReplaceTextInSymbol {
@@ -414,6 +424,9 @@ enum Cmd {
         old_text: String,
         /// 新文。
         new_text: String,
+        /// 可选：content_version 防覆盖（STALE_READ 拒写；作用域 daemon 生命周期）。
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// 在 symbol 开头插入 text。
     /// 文本可走位置参数或 `--with`（与 replace-body 同形）。
@@ -423,6 +436,9 @@ enum Cmd {
         text: Option<String>,
         #[arg(long = "with")]
         with: Option<String>,
+        /// 可选：content_version 防覆盖（STALE_READ 拒写；作用域 daemon 生命周期）。
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// 在 symbol 末尾插入 text。文本可走位置参数或 `--with`。
     InsertTextAfterSymbol {
@@ -431,6 +447,9 @@ enum Cmd {
         text: Option<String>,
         #[arg(long = "with")]
         with: Option<String>,
+        /// 可选：content_version 防覆盖（STALE_READ 拒写；作用域 daemon 生命周期）。
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// 在 symbol 体内删除 [start_line, end_line] 切片（1-based 含端）。
     DeleteTextInSymbol {
@@ -438,6 +457,9 @@ enum Cmd {
         symbol: String,
         start_line: u32,
         end_line: u32,
+        /// 可选：content_version 防覆盖（STALE_READ 拒写；作用域 daemon 生命周期）。
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// 安全删除符号：无引用才删；有引用拒删并列出引用位置。
     SafeDeleteSymbol { file: String, symbol: String },
@@ -452,6 +474,9 @@ enum Cmd {
         /// 可选：上次 read-file 返回的全文 hash，不符拒写。
         #[arg(long)]
         expected_hash: Option<String>,
+        /// 可选：content_version 防覆盖（STALE_READ 拒写；作用域 daemon 生命周期）。
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// 用新内容替换 [start_line, end_line]（1-based 含端）。
     /// 文本可走位置参数或 `--with`。
@@ -465,6 +490,9 @@ enum Cmd {
         /// 可选：上次 read-file 返回的全文 hash，不符拒写。
         #[arg(long)]
         expected_hash: Option<String>,
+        /// 可选：content_version 防覆盖（STALE_READ 拒写；作用域 daemon 生命周期）。
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// 删除 [start_line, end_line]（1-based 含端）。
     DeleteLines {
@@ -474,6 +502,9 @@ enum Cmd {
         /// 可选：上次 read-file 返回的全文 hash，不符拒写。
         #[arg(long)]
         expected_hash: Option<String>,
+        /// 可选：content_version 防覆盖（STALE_READ 拒写；作用域 daemon 生命周期）。
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// 新建文件（已存在 = 参数错）。写入自动进 undo 事务（created=true）。
     /// 内容可走位置参数、`--with`、`--stdin` 或 `--content-file`（多行内容
@@ -490,6 +521,9 @@ enum Cmd {
         /// 从文件读全文（与其他内容来源互斥）。
         #[arg(long, value_name = "PATH")]
         content_file: Option<String>,
+        /// 可选：content_version 防覆盖（STALE_READ 拒写；新建文件恒 0）。
+        #[arg(long)]
+        expected_version: Option<u64>,
     },
     /// 回滚最近的写事务（IDE undo）。project_root 由 --project 或 cwd 定位。
     /// 遇外部编辑冲突（sha 不符）：该事务 discarded 并**立即停止**——不回滚
@@ -1156,7 +1190,10 @@ fn direct_error_line(e: &ToolError) -> String {
 fn tool_error_exit(e: &ToolError) -> u8 {
     match e {
         ToolError::BadArgs { .. } => 2,
-        ToolError::WriteConflict { .. } | ToolError::NotInstalled { .. } => 1,
+        // bd serena-rust-1282：写被拒（需重读重放），WRITE_CONFLICT 同桶 exit 1。
+        ToolError::WriteConflict { .. }
+        | ToolError::StaleRead { .. }
+        | ToolError::NotInstalled { .. } => 1,
         ToolError::Protocol { .. } => 1,
         ToolError::Serialize(_) => 3,
         ToolError::Core(_) | ToolError::Launch(_) => 3,
@@ -2420,11 +2457,14 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             }
             ("find-referencing-code-snippets", a)
         }
-        Some(Cmd::SymbolBody { file, symbol, .. }) => (
+        Some(Cmd::SymbolBody {
+            file, symbol, meta, ..
+        }) => (
             "symbol-body",
             json!({
                 "file": file,
                 "symbol": symbol.as_deref().expect("resolved by resolve_with_alias"),
+                "meta": meta,
             }),
         ),
         Some(Cmd::EditContext { file, symbol, .. }) => {
@@ -2445,40 +2485,51 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             file,
             symbol,
             new_body,
+            expected_version,
         }) => (
             "replace-body",
-            json!({"file": file, "symbol": symbol, "new_body": new_body}),
+            json!({"file": file, "symbol": symbol, "new_body": new_body, "expected_version": expected_version}),
         ),
         Some(Cmd::ReplaceTextInSymbol {
             file,
             symbol,
             old_text,
             new_text,
+            expected_version,
         }) => (
             "replace-text-in-symbol",
-            json!({"file": file, "symbol": symbol, "old_text": old_text, "new_text": new_text}),
+            json!({"file": file, "symbol": symbol, "old_text": old_text, "new_text": new_text, "expected_version": expected_version}),
         ),
         Some(Cmd::InsertTextBeforeSymbol {
-            file, symbol, text, ..
+            file,
+            symbol,
+            text,
+            expected_version,
+            ..
         }) => (
             "insert-text-before-symbol",
             // --with 别名已由 resolve_with_alias 落回 text（cli_main 必经）。
-            json!({"file": file, "symbol": symbol, "text": text.as_deref().expect("resolved by resolve_with_alias")}),
+            json!({"file": file, "symbol": symbol, "text": text.as_deref().expect("resolved by resolve_with_alias"), "expected_version": expected_version}),
         ),
         Some(Cmd::InsertTextAfterSymbol {
-            file, symbol, text, ..
+            file,
+            symbol,
+            text,
+            expected_version,
+            ..
         }) => (
             "insert-text-after-symbol",
-            json!({"file": file, "symbol": symbol, "text": text.as_deref().expect("resolved by resolve_with_alias")}),
+            json!({"file": file, "symbol": symbol, "text": text.as_deref().expect("resolved by resolve_with_alias"), "expected_version": expected_version}),
         ),
         Some(Cmd::DeleteTextInSymbol {
             file,
             symbol,
             start_line,
             end_line,
+            expected_version,
         }) => (
             "delete-text-in-symbol",
-            json!({"file": file, "symbol": symbol, "start_line": start_line, "end_line": end_line}),
+            json!({"file": file, "symbol": symbol, "start_line": start_line, "end_line": end_line, "expected_version": expected_version}),
         ),
         Some(Cmd::SafeDeleteSymbol { file, symbol }) => (
             "safe-delete-symbol",
@@ -2489,6 +2540,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             line,
             text,
             expected_hash,
+            expected_version,
             ..
         }) => (
             "insert-at-line",
@@ -2497,6 +2549,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
                 "line": line,
                 "content": text.as_deref().expect("resolved by resolve_with_alias"),
                 "expected_hash": expected_hash,
+                "expected_version": expected_version,
             }),
         ),
         Some(Cmd::ReplaceLines {
@@ -2505,6 +2558,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             end_line,
             text,
             expected_hash,
+            expected_version,
             ..
         }) => (
             "replace-lines",
@@ -2514,6 +2568,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
                 "end_line": end_line,
                 "content": text.as_deref().expect("resolved by resolve_with_alias"),
                 "expected_hash": expected_hash,
+                "expected_version": expected_version,
             }),
         ),
         Some(Cmd::DeleteLines {
@@ -2521,6 +2576,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             start_line,
             end_line,
             expected_hash,
+            expected_version,
         }) => (
             "delete-lines",
             json!({
@@ -2528,6 +2584,7 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
                 "start_line": start_line,
                 "end_line": end_line,
                 "expected_hash": expected_hash,
+                "expected_version": expected_version,
             }),
         ),
         Some(Cmd::Completion {
@@ -2685,9 +2742,14 @@ fn tool_request(cmd: &Option<Cmd>) -> Option<(&'static str, serde_json::Value)> 
             ("moniker", json!({"file": file, "line": line, "col": col}))
         }
         Some(Cmd::WorkspaceDiagnostic) => ("workspace-diagnostic", json!({})),
-        Some(Cmd::CreateTextFile { file, content, .. }) => (
+        Some(Cmd::CreateTextFile {
+            file,
+            content,
+            expected_version,
+            ..
+        }) => (
             "create-text-file",
-            json!({"file": file, "content": content.as_deref().expect("resolved by resolve_with_alias")}),
+            json!({"file": file, "content": content.as_deref().expect("resolved by resolve_with_alias"), "expected_version": expected_version}),
         ),
         Some(Cmd::Undo { steps, list }) => ("undo", json!({"steps": steps, "list": list})),
         Some(Cmd::Redo) => ("redo", json!({})),
@@ -5244,6 +5306,7 @@ mod with_alias_tests {
             symbol: "f".into(),
             text: None,
             with: Some("body".into()),
+            expected_version: None,
         };
         resolve_with_alias(&mut cmd).unwrap();
         let Cmd::InsertTextAfterSymbol { text, .. } = &cmd else {
@@ -5260,6 +5323,7 @@ mod with_alias_tests {
             text: Some("t".into()),
             with: None,
             expected_hash: None,
+            expected_version: None,
         };
         resolve_with_alias(&mut cmd).unwrap();
         let Cmd::InsertAtLine { text, .. } = &cmd else {
@@ -5277,6 +5341,7 @@ mod with_alias_tests {
             text: Some("a".into()),
             with: Some("b".into()),
             expected_hash: None,
+            expected_version: None,
         };
         assert!(resolve_with_alias(&mut both).is_err(), "双给必拒");
 
@@ -5286,6 +5351,7 @@ mod with_alias_tests {
             with: None,
             stdin: false,
             content_file: None,
+            expected_version: None,
         };
         assert!(resolve_with_alias(&mut neither).is_err(), "全缺必拒");
     }
@@ -5328,6 +5394,7 @@ mod with_alias_tests {
             with: None,
             stdin: false,
             content_file: Some(p.to_string_lossy().to_string()),
+            expected_version: None,
         };
         resolve_with_alias(&mut cmd).unwrap();
         let Cmd::CreateTextFile { content, .. } = &cmd else {
@@ -5345,6 +5412,7 @@ mod with_alias_tests {
             with: None,
             stdin: true,
             content_file: None,
+            expected_version: None,
         };
         assert!(resolve_with_alias(&mut both).is_err(), "双来源必拒");
     }
@@ -5434,6 +5502,7 @@ mod blindfix_c_tests {
             file,
             symbol,
             symbol_flag,
+            ..
         }) = cli.cmd
         else {
             panic!("expected symbol-body");
@@ -5554,6 +5623,7 @@ mod blindfix_c_tests {
             file: "calc.py".into(),
             symbol: None,
             symbol_flag: Some("divide".into()),
+            meta: false,
         };
         resolve_with_alias(&mut flag_only).unwrap();
         let Cmd::SymbolBody { symbol, .. } = &flag_only else {
@@ -6221,6 +6291,7 @@ mod tests {
             text: Some("// foo".into()),
             with: None,
             expected_hash: None,
+            expected_version: None,
         };
         normalize_positions(&mut cmd).unwrap();
         let Cmd::InsertAtLine { line, .. } = &cmd else {

@@ -295,6 +295,9 @@ cargo tree -p lsp-core && cargo tree -p supervisor   # 分层铁律
 | `WRITE_GATE: tokio::sync::Mutex<()>` | `supervisor write_gate.rs` | 写事务全局串行化 | 最外层·跨 await |
 | `WAITERS: AtomicUsize` | `supervisor write_gate.rs` | 排队取门请求数 | 叶 |
 | `HOLDER: StdMutex<Option<&'static str>>` | `supervisor write_gate.rs` | 当前持门者标签 | 叶 |
+| `VERSIONS: StdMutex<BTreeMap<PathBuf, u64>>` | `supervisor version_ledger.rs` | content_version 版本账本（bd serena-rust-1282；daemon 生命周期作用域） | 叶 |
+| `ACTIVITY: StdMutex<Vec<WriteRec>>` | `supervisor version_ledger.rs` | 近期写活动环（others_active/changed_since 数据源，cap 256） | 叶 |
+| `STALE_HITS: StdMutex<BTreeMap<u64, StaleHit>>` | `supervisor version_ledger.rs` | STALE_READ 侧信道（uid 打标，execute_tool 收尾取走） | 叶 |
 | `OPEN_TXNS: StdMutex<Vec<(u64, PathBuf)>>` | `supervisor undo.rs` | 在飞 undo 事务登记（static） | 叶 |
 | `NEXT_UID: AtomicU64` | `supervisor undo.rs` | 事务 uid 分配（static） | 叶 |
 | `TOUCHED: StdMutex<Vec<(u64, TouchedFile)>>` | `supervisor undo.rs` | 恢复写文件登记（static，LS 态同步桥） | 叶 |

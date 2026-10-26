@@ -45,6 +45,7 @@ pub mod ref_tools;
 pub mod repo_map;
 mod symbol_fallback;
 pub mod undo;
+pub mod version_ledger;
 pub mod warm;
 pub mod write_gate;
 
@@ -198,6 +199,19 @@ pub enum ToolError {
     /// wire RPC_ERROR（不可重试，exit 1）。tool 标识出错的上层工具语义。
     #[error("protocol error from `{tool}`: {reason}")]
     Protocol { tool: String, reason: String },
+
+    /// 读-写断档（bd serena-rust-1282）：expected_version 与版本账本当前值不符
+    /// —— 写拒绝，exit 1（同 WRITE_CONFLICT 桶：写被拒非参数错；bd 719 retryable
+    /// 桶不适用——re-read 前重试必再拒）。changed_since 指认最近一次写者。
+    #[error(
+        "stale read on {path}: expected content_version {expected}, current {current} (changed since: {changed_since})"
+    )]
+    StaleRead {
+        path: String,
+        expected: u64,
+        current: u64,
+        changed_since: String,
+    },
 }
 
 /// supervisor 公共结果类型（库层 Result 别名）。
@@ -7778,10 +7792,16 @@ impl SupervisorTrait for Supervisor {
             // （recorded_write 前置持久化 txn 记录）。root 不可解析时在此早失败，
             // 任何目标文件都尚未写 —— 优于旧版「写成功后 commit 才报 BAD_ARGS」。
             let store = undo::store_for(root)?;
-            undo::TXN_STORE
+            // bd serena-rust-1282：版本戳上下文（expected_version + 目标文件）随
+            // 写类 dispatch 注入；recorded_write 门内据此做权威校验。
+            let ctx = version_ledger::write_ctx_from_args(root, tool, &args)?;
+            version_ledger::WRITE_CTX
                 .scope(
-                    store,
-                    undo::TXN_UID.scope(txn_uid, self.dispatch_tool(tool, root, &args, lang)),
+                    ctx,
+                    undo::TXN_STORE.scope(
+                        store,
+                        undo::TXN_UID.scope(txn_uid, self.dispatch_tool(tool, root, &args, lang)),
+                    ),
                 )
                 .await
         } else {
@@ -7807,6 +7827,12 @@ impl SupervisorTrait for Supervisor {
                 Err(_) => {
                     undo::abort(txn_uid);
                     txn.settle();
+                    // bd serena-rust-1282：STALE_READ 信号替换——recorded_write 门内
+                    // 校验失败以 io 错误冒泡（各写点错误映射各异），结构化详情经
+                    // 侧信道带出；此处还原成干净 STALE_READ（uid 打标防并发串号）。
+                    if let Some(hit) = version_ledger::take_stale_hit(txn_uid) {
+                        return Err(hit.into_tool_error());
+                    }
                 }
             }
         }
@@ -9198,6 +9224,10 @@ impl Supervisor {
         // `?` 一行收口零分支改动（11 特性已改动各分支，最小侵入）。
         // tfa3：写回执瘦身——诊断空时只留语义（先于预算截断，省下的字节不再进预算）。
         slim_write_receipt(&mut value);
+        // bd serena-rust-1282：协同字段统一塞入（读类 content_version；写类 +
+        // edit-context + overview 另塞 others_active，空省略）。裸数组响应无处
+        // 可塞即跳过（overview 默认 wire 兼容优先）。
+        version_ledger::attach_collab_fields(tool, root, args, &mut value);
         // br41：SERENA_DEFAULT_MAX_TOKENS 未设 = 无预算（现行为）；设了 = 未显式
         // `_max_tokens` 时的默认预算，显式旗永远优先。
         if let Some(max_tokens) = args

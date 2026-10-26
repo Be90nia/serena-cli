@@ -293,6 +293,7 @@ flowchart TB
 | 索引跟踪 `IndexProgressTracker`（`Mutex<HashSet<String>>` active 表 + `watch` 计数广播） | lsp-core `session.rs`（cf54869a mirror） | `$/progress`/`window/workDoneProgress/create` 在飞索引 token | 微秒，无 await；等待侧仅 `watch::changed`，不持锁 |
 | 诊断缓存 `DiagCache`（`Mutex<HashMap<(root,uri), items>>`）+ `diag_generation: AtomicU64` | supervisor `lib.rs`（`Δ` 自 lsp-core 上移；`↖ mirror: _published_diagnostics_condition`） | 诊断缓存与代际（`diagnostics --wait-gen`） | 微秒；wait_gen 为 100ms 探询（5s 上限），不跨 await 持锁 |
 | 符号缓存 `symbol_cache`（`Mutex<HashMap<SymbolCacheKey, _>>`，mtime/指纹键控） | supervisor `lib.rs`（`Δ` 同上） | 文件指纹→符号缓存 | 微秒；磁盘 IO 在锁外 |
+| 版本账本 `VERSIONS`（`Mutex<BTreeMap<canon file, u64>>`）+ 活动环 `ACTIVITY`（`Mutex<Vec<WriteRec>>` cap 256）+ `STALE_HITS`（`Mutex<BTreeMap<uid, StaleHit>>`） | supervisor `version_ledger.rs`（bd serena-rust-1282） | content_version 账本 / others_active 活动环 / STALE_READ 侧信道 | 微秒，无 await；校验+bump 在写门内经 `recorded_write` 单点执行 |
 | `tokio::sync::Mutex` ×N（per-key） | supervisor `lib.rs` | LS 冷启动去重 | 跨 await（秒级） |
 | `tokio::sync::Mutex<()>` ×1（全局） | supervisor `write_gate.rs` | 写事务串行化 | 跨 await（写事务全程） |
 | `Mutex<HashMap<Key, Entry>>` | supervisor `lib.rs` | 实例表 | 微秒，无 await |
@@ -552,6 +553,9 @@ flowchart LR
     "hint": "another write may hold the gate or content has changed; re-read the file and retry"
                                         // 可选（bd serena-rust-i4j）：WRITE_CONFLICT 专属
                                         // 自检指引；其余错误码省略该字段
+                                        // （例外：STALE_READ 带 hint + 重放三要素
+                                        // expected_version/current_version/changed_since，
+                                        // bd serena-rust-1282）
   } }
 ```
 
@@ -566,6 +570,7 @@ flowchart LR
 | `RPC_ERROR` | LS 返回 JSON-RPC error | case | 1 |
 | `WRITE_CONFLICT` | 盘上内容与 LSP 状态不符（§3.3 防线）；wire 附 `hint`（重读后重试指引，bd serena-rust-i4j） | false（需重读） | 1 |
 | `INTERNAL` | daemon 内部 bug（anyhow 兜底，含 chain 摘要） | false | 3 |
+| `STALE_READ` | 读-写断档（bd serena-rust-1282）：expected_version 与版本账本不符，写已拒绝。wire 附结构化重放三要素 `expected_version` / `current_version` / `changed_since`（最近写者 + 距今秒数）+ `hint: re-read then re-apply`。版本作用域 = daemon 生命周期（重启归零、外部编辑不 bump、undo 回滚内容不回退版本——单调防 ABA）；`rename-symbol`/`safe-delete-symbol` 不接受 expected_version | false（需先重读） | 1 |
 | `DAEMON_DRAINING` | daemon 排空关停中（ShutdownDraining 收尾窗口），拒绝新请求；仅出现在 503 body，不产生于 ToolError 映射（ADR-0008，bd xvs7）。CLI 客户端 ≤5s 窗口自愈、超窗 rc=3（bd serena-rust-g0m） | false | 3 |
 
 HTTP 层错误保留给传输语义：`404` 未知工具名、`503` daemon 关停中。**工具级失败走 200 + `{ok:false}`**，让 CLI 的分支只看 JSON，不看状态码二次判错。CLI exit：0 成功 / 1 工具失败（非 retryable）/ 2 用法错误 / 3 daemon 或传输故障（含 daemon 拉起失败）/ 4 `wait-ready` 超时（bd serena-rust-55m）/ 5 retryable 工具失败（瞬态可直接重试，bd 719——此前与 1 合桶，agent 需读 body 才知可重试）。转发路径对 `503 DAEMON_DRAINING`（stop-all 后 reaper 收尾窗口）做客户端侧自愈：≤5s 窗口内每 300ms 重试一次完整链路（重新探活 + lazy-spawn），超窗仍 draining 则原样报错 rc=3（bd serena-rust-g0m）。
@@ -646,7 +651,7 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 
 ## 9. 相对 DESIGN.md 的差异记录（ADR 式，供 v0.2 汇总）
 
-> A1–A11 逐条对应 `docs/adr/0001~0011` 完整决策记录（NNN-kebab 文件名，序号不复用）；本表为摘要，背景/备选/后果以 ADR 文件为准。
+> A1–A12 逐条对应 `docs/adr/0001~0012` 完整决策记录（NNN-kebab 文件名，序号不复用）；本表为摘要，背景/备选/后果以 ADR 文件为准。
 
 | # | 决策 | 理由与代价 |
 |---|---|---|
@@ -661,6 +666,7 @@ daemon 启动时读取一次；非法值（负数/非数字）warn 后用默认�
 | A9 | 配置分层收敛为 3 层（删用户目录独立 `servers.toml` 层）（`docs/adr/0009`） | 代码是事实源——4 层是宪法写错（文档向代码收敛）；未来真要独立层再加回，成本极低 |
 | A10 | 写类工具响应立返，诊断确认异步化走 `wait_gen` 通道（`docs/adr/0010`） | 写响应 p50 3029ms→<500ms；诊断价值保留（异步回查进 diag_cache），调用方 JSON 契约零变化 |
 | A11 | LS 工具级预算覆盖出站发送段（`docs/adr/0011`） | 发送与响应等待共享同一 timeout，出站积压场景 300ms 内返 retryable `LS_TIMEOUT`（修复前无界挂死）；零新 wire 码 |
+| A12 | content_version 版本账本 + 第 11 个 wire 错误码 `STALE_READ`（`docs/adr/0012`，bd serena-rust-1282） | 多 agent 同仓写碰撞从静默覆盖变结构化拒绝（重放三要素 expected/current/changed_since）；校验+bump 单点收口 `recorded_write`（门内，零竞窗）；expected_version 未提供零破坏；others_active 搭车可见；枚举纯新增非破坏 |
 
 **本文档不决定**（遵循任务非目标）：§11 开放问题（项目名、replace-body 里程碑归属等）维持 DESIGN.md 现状，不在此拍板。
 

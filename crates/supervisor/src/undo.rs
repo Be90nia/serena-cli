@@ -292,21 +292,44 @@ pub(crate) async fn recorded_write(path: &Path, new_content: &str) -> std::io::R
         return Ok(());
     }
     let uid = TXN_UID.try_with(|v| *v).unwrap_or(0);
-    if uid == 0 {
-        return crate::atomic_write(path, new_content).await;
+    // bd serena-rust-1282：写门内、动盘前的版本戳权威校验（expected_version 由
+    // execute_tool 写类分支经 WRITE_CTX 注入）。校验在此（而非 execute_tool 层）
+    // 是因为门内校验才能封死「校验通过 → 等门期间他人写盘 → 覆盖」竞窗。io::Error
+    // 面保真不了 STALE_READ 结构化详情——hit 进侧信道，execute_tool 收尾按 uid
+    // 替换为干净 STALE_READ。
+    if let Err(hit) = crate::version_ledger::stale_guard_check(path) {
+        crate::version_ledger::stash_stale_hit(uid, hit);
+        return Err(std::io::Error::other(
+            "content_version mismatch; wire reports STALE_READ (bd serena-rust-1282)",
+        ));
     }
-    let store = TXN_STORE.try_with(|s| s.clone()).map_err(|_| {
-        std::io::Error::other("undo txn store not in scope (missing TXN_STORE wiring)")
-    })?;
-    // 快照必须在写盘前取（契约设计第 2 条：成功写盘前把旧状态快照入栈）。
-    let (before, created) = match tokio::fs::read_to_string(path).await {
-        Ok(c) => (Some(c), false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, true),
-        Err(e) => return Err(e),
+    let wrote = if uid == 0 {
+        crate::atomic_write(path, new_content).await
+    } else {
+        let store = TXN_STORE.try_with(|s| s.clone()).map_err(|_| {
+            std::io::Error::other("undo txn store not in scope (missing TXN_STORE wiring)")
+        })?;
+        // 快照必须在写盘前取（契约设计第 2 条：成功写盘前把旧状态快照入栈）。
+        let (before, created) = match tokio::fs::read_to_string(path).await {
+            Ok(c) => (Some(c), false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, true),
+            Err(e) => return Err(e),
+        };
+        // WAL：先记账（txn 目录 + manifest 原子重写），再动目标文件。
+        wal_append(&store, uid, path, before, created, new_content).await?;
+        crate::atomic_write(path, new_content).await
     };
-    // WAL：先记账（txn 目录 + manifest 原子重写），再动目标文件。
-    wal_append(&store, uid, path, before, created, new_content).await?;
-    crate::atomic_write(path, new_content).await
+    // bd serena-rust-1282：写盘成功 = 版本账本 +1（唯一 bump 点，全部写路径汇聚
+    // 于本函数）。dry-run 分支上方已 return，不会虚记。
+    if wrote.is_ok() {
+        crate::version_ledger::record_write(path);
+    }
+    wrote
+}
+
+/// 当前事务 uid（version_ledger 活动记账用；scope 外 = 0）。
+pub(crate) fn current_txn_uid() -> u64 {
+    TXN_UID.try_with(|v| *v).unwrap_or(0)
 }
 
 /// WAL 初始化：uid 首笔写入时 prune → 分配事务号 → 建 `txn-{N}` 目录 → 写空
